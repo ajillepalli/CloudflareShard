@@ -1,3 +1,5 @@
+import { DurableObject } from "cloudflare:workers";
+
 type ExecutePayload = {
   sql: string;
   params?: unknown[];
@@ -8,7 +10,7 @@ type ExecutePayload = {
 export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
   }
@@ -58,8 +60,10 @@ export class ShardDO extends DurableObject {
 
       const counts: Array<{ table: string; rowCount: number }> = [];
       for (const t of tables) {
-        const safeName = t.name.replace(/"/g, '""');
-        const result = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${safeName}"`);
+        const safeName = t.name.replace(/"/g, '""');
+
+        const result = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${safeName}"`);
+
         counts.push({ table: t.name, rowCount: result?.n ?? 0 });
       }
 
