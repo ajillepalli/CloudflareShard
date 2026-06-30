@@ -1,0 +1,15 @@
+name = "cloudflare-shard-mvp"
+main = "src/index.ts"
+compatibility_date = "2026-06-29"
+
+[[durable_objects.bindings]]
+name = "CATALOG"
+class_name = "CatalogDO"
+
+[[durable_objects.bindings]]
+name = "SHARD"
+class_name = "ShardDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CatalogDO", "ShardDO"]
