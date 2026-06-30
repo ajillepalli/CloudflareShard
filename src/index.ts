@@ -29,11 +29,16 @@ function isMutation(sql: string): boolean {
 
 /** Deny-list: block statements tenants must never be able to run. */
 function isDangerous(sql: string): boolean {
-  const s = sql.trim().toLowerCase();
-  const noTrailingSemicolon = s.replace(/;\s*$/, "");
-  // Disallow multi-statement payloads (e.g. "select 1; drop table ...").
-  if (noTrailingSemicolon.includes(";")) return true;
-  return /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter|create)\b/.test(noTrailingSemicolon);
+  const s = sql.trim().toLowerCase();
+
+  const noTrailingSemicolon = s.replace(/;\s*$/, "");
+
+  // Disallow multi-statement payloads (e.g. "select 1; drop table ...").
+
+  if (noTrailingSemicolon.includes(";")) return true;
+
+  return /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter|create)\b/.test(noTrailingSemicolon);
+
 }
 
 function assertParamsArray(params: unknown): params is unknown[] {
@@ -122,7 +127,7 @@ export default {
           return json(
             {
               error: "Missing required fields: sql, table, tenantId.",
-            },
+        const mutating = /\b(insert|update|delete|replace|create|drop|alter)\b/i.test(body.sql);
             400,
           );
         }
