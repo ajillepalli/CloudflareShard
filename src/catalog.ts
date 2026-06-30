@@ -238,12 +238,25 @@ export class CatalogDO extends DurableObject {
       const composite = `${body.tenantId}:${body.table}:${body.partitionKey}`;
       const vbucket = this.hashKey(composite) % config.total_vbuckets;
 
-      const mapped = this.one<{ shard_id: string }>(
-        "SELECT shard_id FROM vbucket_map WHERE vbucket = ?",
+      const mapped = this.one<{ shard_id: string; status: string }>(
+        `
+        SELECT vm.shard_id, s.status
+        FROM vbucket_map vm
+        JOIN shards s ON s.shard_id = vm.shard_id
+        WHERE vm.vbucket = ?
+        `,
         vbucket,
       );
       if (!mapped) {
         return json({ error: `No shard mapping for vbucket ${vbucket}` }, 500);
+      }
+      if (mapped.status !== "active") {
+        return json(
+          {
+            error: `Mapped shard ${mapped.shard_id} is ${mapped.status}. Reassign this vbucket before routing.`,
+          },
+          503,
+        );
       }
 
       return json({
