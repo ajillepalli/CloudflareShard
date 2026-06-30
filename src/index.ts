@@ -45,12 +45,21 @@ function assertParamsArray(params: unknown): params is unknown[] {
   return Array.isArray(params);
 }
 
-async function routeToCatalog(env: Env, path: string, payload: unknown): Promise<Response> {
+async function routeToCatalog(
+  env: Env,
+  path: string,
+  payload: unknown,
+  authorization?: string,
+): Promise<Response> {
   const id = env.CATALOG.idFromName("cluster-catalog");
   const stub = env.CATALOG.get(id);
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (authorization) {
+    headers.authorization = authorization;
+  }
   return stub.fetch(`https://catalog.internal${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
   });
 }
@@ -97,18 +106,33 @@ export default {
       }
 
       if (url.pathname === "/admin/status") {
-        const res = await routeToCatalog(env, "/status", {});
+        const res = await routeToCatalog(
+          env,
+          "/status",
+          {},
+          request.headers.get("authorization") ?? undefined,
+        );
         return new Response(res.body, { status: res.status, headers: res.headers });
       }
 
       if (url.pathname === "/admin/list-tables") {
-        const res = await routeToCatalog(env, "/list-tables", {});
+        const res = await routeToCatalog(
+          env,
+          "/list-tables",
+          {},
+          request.headers.get("authorization") ?? undefined,
+        );
         return new Response(res.body, { status: res.status, headers: res.headers });
       }
 
       if (url.pathname === "/admin/drain-shard") {
         const payload = await request.json();
-        const res = await routeToCatalog(env, "/drain-shard", payload);
+        const res = await routeToCatalog(
+          env,
+          "/drain-shard",
+          payload,
+          request.headers.get("authorization") ?? undefined,
+        );
         return new Response(res.body, { status: res.status, headers: res.headers });
       }
 
