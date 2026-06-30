@@ -242,6 +242,66 @@ export class CatalogDO extends DurableObject {
       return json({ shardIds: shards.map((s) => s.shard_id) });
     }
 
+    if (url.pathname === "/status") {
+      const config = this.one<{
+        total_vbuckets: number;
+        metadata_version: number;
+        initialized_at: string;
+      }>("SELECT total_vbuckets, metadata_version, initialized_at FROM cluster_config WHERE singleton = 1");
+
+      if (!config) {
+        return json({ initialized: false });
+      }
+
+      const shardRows = this.many<{ shard_id: string; status: string }>(
+        "SELECT shard_id, status FROM shards ORDER BY shard_id ASC",
+      );
+      const activeShards = shardRows.filter((s) => s.status === "active").length;
+      const drainingShards = shardRows.filter((s) => s.status === "draining").length;
+
+      return json({
+        initialized: true,
+        totalVBuckets: config.total_vbuckets,
+        metadataVersion: config.metadata_version,
+        initializedAt: config.initialized_at,
+        shards: {
+          total: shardRows.length,
+          active: activeShards,
+          draining: drainingShards,
+        },
+      });
+    }
+
+    if (url.pathname === "/list-tables") {
+      const tables = this.many<{ table_name: string; partitioning: string; created_at: string }>(
+        "SELECT table_name, partitioning, created_at FROM table_rules ORDER BY table_name ASC",
+      );
+      return json({ tables });
+    }
+
+    if (url.pathname === "/drain-shard") {
+      const body = (await request.json()) as { shardId: string };
+      if (!body.shardId) {
+        return json({ error: "Missing shardId" }, 400);
+      }
+
+      const existing = this.one<{ shard_id: string; status: string }>(
+        "SELECT shard_id, status FROM shards WHERE shard_id = ?",
+        body.shardId,
+      );
+      if (!existing) {
+        return json({ error: `Shard ${body.shardId} not found` }, 404);
+      }
+
+      this.sql.exec(
+        "UPDATE shards SET status = 'draining' WHERE shard_id = ?",
+        body.shardId,
+      );
+
+      const version = this.bumpMetadataVersion();
+      return json({ ok: true, shardId: body.shardId, metadataVersion: version });
+    }
+
     if (url.pathname === "/split-vbucket") {
       const body = (await request.json()) as {
         vbucket: number;
