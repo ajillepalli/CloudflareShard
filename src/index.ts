@@ -240,21 +240,27 @@ export default {
         const listPayload = (await listRes.json()) as { shardIds: string[] };
         const scatterStart = Date.now();
 
-        const settled = await Promise.allSettled(
-          listPayload.shardIds.map(async (shardId) => {
-            const shardRes = await routeToShard(env, shardId, "/execute", {
-              sql: body.sql,
-              params: body.params ?? [],
-              requestId: crypto.randomUUID(),
-              isMutation: false,
-            });
-            if (!shardRes.ok) {
-              throw new Error(`shard ${shardId} responded ${shardRes.status}`);
-            }
-            const payload = (await shardRes.json()) as { rows?: unknown[] };
-            return { shardId, rows: payload.rows ?? [] };
-          }),
-        );
+        const CONCURRENCY = 10;
+        const settled: Array<PromiseSettledResult<{ shardId: string; rows: unknown[] }>> = [];
+        for (let i = 0; i < listPayload.shardIds.length; i += CONCURRENCY) {
+          const batch = listPayload.shardIds.slice(i, i + CONCURRENCY);
+          const batchSettled = await Promise.allSettled(
+            batch.map(async (shardId) => {
+              const shardRes = await routeToShard(env, shardId, "/execute", {
+                sql: body.sql,
+                params: body.params ?? [],
+                requestId: crypto.randomUUID(),
+                isMutation: false,
+              });
+              if (!shardRes.ok) {
+                throw new Error(`shard ${shardId} responded ${shardRes.status}`);
+              }
+              const payload = (await shardRes.json()) as { rows?: unknown[] };
+              return { shardId, rows: payload.rows ?? [] };
+            }),
+          );
+          settled.push(...batchSettled);
+        }
 
         const scatterMs = Date.now() - scatterStart;
         const outputs: Array<{ shardId: string; rows: unknown[] }> = [];
