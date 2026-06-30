@@ -27,7 +27,8 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 ## Setup
 
 ```powershell
-cd C:\Users\ananth.jillepalli\repos\CloudflareShard
+git clone https://github.com/ajillepalli/CloudflareShard.git
+cd CloudflareShared
 npm install
 ```
 
