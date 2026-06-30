@@ -151,7 +151,7 @@ export default {
           return json(
             {
               error: "Missing required fields: sql, table, tenantId.",
-        const mutating = /\b(insert|update|delete|replace|create|drop|alter)\b/i.test(body.sql);
+            },
             400,
           );
         }
