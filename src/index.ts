@@ -27,12 +27,39 @@ function isMutation(sql: string): boolean {
   return /^(\s*)(insert|update|delete|replace|create|drop|alter)/i.test(sql);
 }
 
-async function routeToCatalog(env: Env, path: string, payload: unknown): Promise<Response> {
+/** Deny-list: block statements tenants must never be able to run. */
+function isDangerous(sql: string): boolean {
+  const s = sql.trim().toLowerCase();
+
+  const noTrailingSemicolon = s.replace(/;\s*$/, "");
+
+  // Disallow multi-statement payloads (e.g. "select 1; drop table ...").
+
+  if (noTrailingSemicolon.includes(";")) return true;
+
+  return /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter|create)\b/.test(noTrailingSemicolon);
+
+}
+
+function assertParamsArray(params: unknown): params is unknown[] {
+  return Array.isArray(params);
+}
+
+async function routeToCatalog(
+  env: Env,
+  path: string,
+  payload: unknown,
+  authorization?: string,
+): Promise<Response> {
   const id = env.CATALOG.idFromName("cluster-catalog");
   const stub = env.CATALOG.get(id);
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (authorization) {
+    headers.authorization = authorization;
+  }
   return stub.fetch(`https://catalog.internal${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(payload),
   });
 }
@@ -78,18 +105,67 @@ export default {
         return new Response(res.body, { status: res.status, headers: res.headers });
       }
 
+      if (url.pathname === "/admin/status") {
+        const res = await routeToCatalog(
+          env,
+          "/status",
+          {},
+          request.headers.get("authorization") ?? undefined,
+        );
+        return new Response(res.body, { status: res.status, headers: res.headers });
+      }
+
+      if (url.pathname === "/admin/list-tables") {
+        const res = await routeToCatalog(
+          env,
+          "/list-tables",
+          {},
+          request.headers.get("authorization") ?? undefined,
+        );
+        return new Response(res.body, { status: res.status, headers: res.headers });
+      }
+
+      if (url.pathname === "/admin/drain-shard") {
+        const payload = await request.json();
+        const res = await routeToCatalog(
+          env,
+          "/drain-shard",
+          payload,
+          request.headers.get("authorization") ?? undefined,
+        );
+        return new Response(res.body, { status: res.status, headers: res.headers });
+      }
+
+      if (url.pathname === "/admin/shard-stats") {
+        const body = (await request.json()) as { shardId: string };
+        if (!body.shardId) {
+          return json({ error: "Missing shardId" }, 400);
+        }
+        const res = await routeToShard(env, body.shardId, "/stats", {});
+        return new Response(res.body, { status: res.status, headers: res.headers });
+      }
+
       if (url.pathname === "/v1/sql") {
         const body = (await request.json()) as SqlRequest;
         if (!body.sql || !body.table || !body.tenantId) {
           return json(
             {
               error: "Missing required fields: sql, table, tenantId.",
-            },
+        const mutating = /\b(insert|update|delete|replace|create|drop|alter)\b/i.test(body.sql);
             400,
           );
         }
 
         const mutating = isMutation(body.sql);
+
+        if (isDangerous(body.sql)) {
+          return json({ error: "SQL statement not permitted." }, 403);
+        }
+
+        if (body.params !== undefined && !assertParamsArray(body.params)) {
+          return json({ error: "params must be an array." }, 400);
+        }
+
         if (!body.partitionKey) {
           if (mutating) {
             return json(
@@ -110,11 +186,13 @@ export default {
           );
         }
 
+        const routeStart = Date.now();
         const routeRes = await routeToCatalog(env, "/route", {
           table: body.table,
           tenantId: body.tenantId,
           partitionKey: body.partitionKey,
         });
+        const routeLookupMs = Date.now() - routeStart;
 
         if (!routeRes.ok) {
           return new Response(routeRes.body, {
@@ -130,12 +208,14 @@ export default {
         };
 
         const requestId = body.requestId ?? crypto.randomUUID();
+        const shardStart = Date.now();
         const shardRes = await routeToShard(env, route.shardId, "/execute", {
           sql: body.sql,
           params: body.params ?? [],
           requestId,
           isMutation: mutating,
         });
+        const shardExecuteMs = Date.now() - shardStart;
 
         if (!shardRes.ok) {
           return new Response(shardRes.body, {
@@ -148,6 +228,11 @@ export default {
         return json({
           route,
           requestId,
+          observability: {
+            routeLookupMs,
+            shardExecuteMs,
+            metadataVersion: route.metadataVersion,
+          },
           result: shardPayload,
         });
       }
@@ -167,6 +252,14 @@ export default {
           return json({ error: "Scatter endpoint supports SELECT only." }, 400);
         }
 
+        if (isDangerous(body.sql)) {
+          return json({ error: "SQL statement not permitted." }, 403);
+        }
+
+        if (body.params !== undefined && !assertParamsArray(body.params)) {
+          return json({ error: "params must be an array." }, 400);
+        }
+
         const listRes = await routeToCatalog(env, "/list-shards", {});
         if (!listRes.ok) {
           return new Response(listRes.body, {
@@ -176,28 +269,81 @@ export default {
         }
 
         const listPayload = (await listRes.json()) as { shardIds: string[] };
+        const scatterStart = Date.now();
+
+        const CONCURRENCY = 10;
+
+        const settled: Array<PromiseSettledResult<{ shardId: string; rows: unknown[] }>> = [];
+
+        for (let i = 0; i < listPayload.shardIds.length; i += CONCURRENCY) {
+
+          const batch = listPayload.shardIds.slice(i, i + CONCURRENCY);
+
+          const batchSettled = await Promise.allSettled(
+
+            batch.map(async (shardId) => {
+
+              const shardRes = await routeToShard(env, shardId, "/execute", {
+
+                sql: body.sql,
+
+                params: body.params ?? [],
+
+                requestId: crypto.randomUUID(),
+
+                isMutation: false,
+
+              });
+
+              if (!shardRes.ok) {
+
+                throw new Error(`shard ${shardId} responded ${shardRes.status}`);
+
+              }
+
+              const payload = (await shardRes.json()) as { rows?: unknown[] };
+
+              return { shardId, rows: payload.rows ?? [] };
+
+            }),
+
+          );
+
+          settled.push(...batchSettled);
+
+        }
+
+
+        const scatterMs = Date.now() - scatterStart;
         const outputs: Array<{ shardId: string; rows: unknown[] }> = [];
+        const errors: Array<{ shardId: string; reason: string }> = [];
 
-        for (const shardId of listPayload.shardIds) {
-          const shardRes = await routeToShard(env, shardId, "/execute", {
-            sql: body.sql,
-            params: body.params ?? [],
-            requestId: crypto.randomUUID(),
-            isMutation: false,
-          });
-
-          if (!shardRes.ok) {
-            continue;
+        for (let i = 0; i < settled.length; i++) {
+          const result = settled[i];
+          if (result.status === "fulfilled") {
+            outputs.push(result.value);
+          } else {
+            errors.push({
+              shardId: listPayload.shardIds[i],
+              reason: result.reason instanceof Error ? result.reason.message : String(result.reason),
+            });
           }
-
-          const shardPayload = (await shardRes.json()) as { rows?: unknown[] };
-          outputs.push({ shardId, rows: shardPayload.rows ?? [] });
         }
 
         const merged = outputs.flatMap((x) => x.rows);
         const capped = typeof body.limit === "number" ? merged.slice(0, body.limit) : merged;
 
-        return json({ shardCount: outputs.length, rows: capped, perShard: outputs });
+        return json({
+          observability: {
+            scatterMs,
+            shardCount: listPayload.shardIds.length,
+            successCount: outputs.length,
+            errorCount: errors.length,
+          },
+          rows: capped,
+          perShard: outputs,
+          ...(errors.length > 0 ? { errors } : {}),
+        });
       }
 
       return json({ error: `Unknown route: ${url.pathname}` }, 404);
