@@ -164,8 +164,9 @@ This project provides:
 
 ## Install
 
-1. cd C:/Users/ananth.jillepalli/repos/CloudflareShard
-2. npm install
+1. git clone https://github.com/ajillepalli/CloudflareShard.git
+2. cd CloudflareShared
+3. npm install
 
 ## Run Locally
 
