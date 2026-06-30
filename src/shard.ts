@@ -51,6 +51,29 @@ export class ShardDO extends DurableObject {
       return json({ error: "Only POST allowed for shard endpoints." }, 405);
     }
 
+    if (url.pathname === "/stats") {
+      const tables = this.rows(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('applied_requests', 'sqlite_sequence') ORDER BY name ASC",
+      ) as Array<{ name: string }>;
+
+      const counts: Array<{ table: string; rowCount: number }> = [];
+      for (const t of tables) {
+        const safeName = t.name.replace(/"/g, '""');
+        const result = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${safeName}"`);
+        counts.push({ table: t.name, rowCount: result?.n ?? 0 });
+      }
+
+      const idempotencyCount = this.one<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM applied_requests",
+      );
+
+      return json({
+        ok: true,
+        tables: counts,
+        idempotencyTableSize: idempotencyCount?.n ?? 0,
+      });
+    }
+
     if (url.pathname !== "/execute") {
       return json({ error: `Unknown shard route: ${url.pathname}` }, 404);
     }
@@ -61,6 +84,8 @@ export class ShardDO extends DurableObject {
     }
 
     try {
+      const execStart = Date.now();
+
       if (payload.isMutation) {
         const prior = this.one<{ result_json: string }>(
           "SELECT result_json FROM applied_requests WHERE request_id = ?",
@@ -81,6 +106,7 @@ export class ShardDO extends DurableObject {
             ok: true,
             type: "mutation",
             rowsAffected: changedRow?.count ?? 0,
+            executeMs: Date.now() - execStart,
           };
 
           this.sql.exec(
@@ -101,7 +127,13 @@ export class ShardDO extends DurableObject {
       }
 
       const rows = this.rows(payload.sql, ...(payload.params ?? []));
-      return json({ ok: true, type: "query", rowCount: rows.length, rows });
+      return json({
+        ok: true,
+        type: "query",
+        rowCount: rows.length,
+        executeMs: Date.now() - execStart,
+        rows,
+      });
     } catch (error) {
       return json(
         {
