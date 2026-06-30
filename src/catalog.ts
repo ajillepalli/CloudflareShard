@@ -1,9 +1,14 @@
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
+  private readonly adminToken?: string;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.adminToken =
+      typeof (env as { ADMIN_TOKEN?: unknown }).ADMIN_TOKEN === "string"
+        ? (env as { ADMIN_TOKEN: string }).ADMIN_TOKEN
+        : undefined;
   }
 
   private ensureSchema(): void {
@@ -95,6 +100,19 @@ export class CatalogDO extends DurableObject {
 
     if (method !== "POST") {
       return json({ error: "Only POST allowed for catalog endpoints." }, 405);
+    }
+
+    if (
+      url.pathname === "/status" ||
+      url.pathname === "/list-tables" ||
+      url.pathname === "/drain-shard"
+    ) {
+      if (!this.adminToken) {
+        return json({ error: "ADMIN_TOKEN is not configured." }, 500);
+      }
+      if (request.headers.get("authorization") !== "Bearer " + this.adminToken) {
+        return json({ error: "Unauthorized." }, 401);
+      }
     }
 
     if (url.pathname === "/init") {
