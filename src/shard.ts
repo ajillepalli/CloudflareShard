@@ -58,7 +58,8 @@ export class ShardDO extends DurableObject {
 
       const counts: Array<{ table: string; rowCount: number }> = [];
       for (const t of tables) {
-        const result = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${t.name}"`);
+        const safeName = t.name.replace(/"/g, '""');
+        const result = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${safeName}"`);
         counts.push({ table: t.name, rowCount: result?.n ?? 0 });
       }
 
