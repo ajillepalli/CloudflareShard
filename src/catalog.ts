@@ -1,8 +1,10 @@
+import { DurableObject } from "cloudflare:workers";
+
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly adminToken?: string;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.adminToken =
