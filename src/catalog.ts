@@ -1,9 +1,14 @@
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
+  private readonly adminToken?: string;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.adminToken =
+      typeof (env as { ADMIN_TOKEN?: unknown }).ADMIN_TOKEN === "string"
+        ? (env as { ADMIN_TOKEN: string }).ADMIN_TOKEN
+        : undefined;
   }
 
   private ensureSchema(): void {
@@ -95,6 +100,19 @@ export class CatalogDO extends DurableObject {
 
     if (method !== "POST") {
       return json({ error: "Only POST allowed for catalog endpoints." }, 405);
+    }
+
+    if (
+      url.pathname === "/status" ||
+      url.pathname === "/list-tables" ||
+      url.pathname === "/drain-shard"
+    ) {
+      if (!this.adminToken) {
+        return json({ error: "ADMIN_TOKEN is not configured." }, 500);
+      }
+      if (request.headers.get("authorization") !== "Bearer " + this.adminToken) {
+        return json({ error: "Unauthorized." }, 401);
+      }
     }
 
     if (url.pathname === "/init") {
@@ -220,12 +238,25 @@ export class CatalogDO extends DurableObject {
       const composite = `${body.tenantId}:${body.table}:${body.partitionKey}`;
       const vbucket = this.hashKey(composite) % config.total_vbuckets;
 
-      const mapped = this.one<{ shard_id: string }>(
-        "SELECT shard_id FROM vbucket_map WHERE vbucket = ?",
+      const mapped = this.one<{ shard_id: string; status: string }>(
+        `
+        SELECT vm.shard_id, s.status
+        FROM vbucket_map vm
+        JOIN shards s ON s.shard_id = vm.shard_id
+        WHERE vm.vbucket = ?
+        `,
         vbucket,
       );
       if (!mapped) {
         return json({ error: `No shard mapping for vbucket ${vbucket}` }, 500);
+      }
+      if (mapped.status !== "active") {
+        return json(
+          {
+            error: `Mapped shard ${mapped.shard_id} is ${mapped.status}. Reassign this vbucket before routing.`,
+          },
+          503,
+        );
       }
 
       return json({
@@ -240,6 +271,66 @@ export class CatalogDO extends DurableObject {
         "SELECT shard_id FROM shards WHERE status = 'active' ORDER BY shard_id ASC",
       );
       return json({ shardIds: shards.map((s) => s.shard_id) });
+    }
+
+    if (url.pathname === "/status") {
+      const config = this.one<{
+        total_vbuckets: number;
+        metadata_version: number;
+        initialized_at: string;
+      }>("SELECT total_vbuckets, metadata_version, initialized_at FROM cluster_config WHERE singleton = 1");
+
+      if (!config) {
+        return json({ initialized: false });
+      }
+
+      const shardRows = this.many<{ shard_id: string; status: string }>(
+        "SELECT shard_id, status FROM shards ORDER BY shard_id ASC",
+      );
+      const activeShards = shardRows.filter((s) => s.status === "active").length;
+      const drainingShards = shardRows.filter((s) => s.status === "draining").length;
+
+      return json({
+        initialized: true,
+        totalVBuckets: config.total_vbuckets,
+        metadataVersion: config.metadata_version,
+        initializedAt: config.initialized_at,
+        shards: {
+          total: shardRows.length,
+          active: activeShards,
+          draining: drainingShards,
+        },
+      });
+    }
+
+    if (url.pathname === "/list-tables") {
+      const tables = this.many<{ table_name: string; partitioning: string; created_at: string }>(
+        "SELECT table_name, partitioning, created_at FROM table_rules ORDER BY table_name ASC",
+      );
+      return json({ tables });
+    }
+
+    if (url.pathname === "/drain-shard") {
+      const body = (await request.json()) as { shardId: string };
+      if (!body.shardId) {
+        return json({ error: "Missing shardId" }, 400);
+      }
+
+      const existing = this.one<{ shard_id: string; status: string }>(
+        "SELECT shard_id, status FROM shards WHERE shard_id = ?",
+        body.shardId,
+      );
+      if (!existing) {
+        return json({ error: `Shard ${body.shardId} not found` }, 404);
+      }
+
+      this.sql.exec(
+        "UPDATE shards SET status = 'draining' WHERE shard_id = ?",
+        body.shardId,
+      );
+
+      const version = this.bumpMetadataVersion();
+      return json({ ok: true, shardId: body.shardId, metadataVersion: version });
     }
 
     if (url.pathname === "/split-vbucket") {
