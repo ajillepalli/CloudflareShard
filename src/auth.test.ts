@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { isValidBearerToken, timingSafeEqual } from "./auth";
+import { checkAdminAuth, isValidBearerToken, timingSafeEqual } from "./auth";
+
+function req(authorization?: string) {
+  const headers = new Headers();
+  if (authorization) headers.set("authorization", authorization);
+  return new Request("https://internal/test", { headers });
+}
 
 describe("timingSafeEqual", () => {
   it("returns true for identical strings", () => {
@@ -38,5 +44,21 @@ describe("isValidBearerToken", () => {
 
   it("rejects a header missing the Bearer prefix", () => {
     expect(isValidBearerToken("abc123", "abc123")).toBe(false);
+  });
+});
+
+describe("checkAdminAuth", () => {
+  it("returns a 500 when no admin token is configured", () => {
+    const result = checkAdminAuth(undefined, req("Bearer anything"));
+    expect(result).toEqual({ error: "ADMIN_TOKEN is not configured.", status: 500 });
+  });
+
+  it("returns a 401 for a missing or wrong token", () => {
+    expect(checkAdminAuth("secret", req())).toEqual({ error: "Unauthorized.", status: 401 });
+    expect(checkAdminAuth("secret", req("Bearer wrong"))).toEqual({ error: "Unauthorized.", status: 401 });
+  });
+
+  it("returns null (no error) for a correct token", () => {
+    expect(checkAdminAuth("secret", req("Bearer secret"))).toBeNull();
   });
 });
