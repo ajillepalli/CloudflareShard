@@ -28,7 +28,7 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 
 ```powershell
 git clone https://github.com/ajillepalli/CloudflareShard.git
-cd CloudflareShared
+cd CloudflareShard
 npm install
 ```
 
@@ -62,17 +62,21 @@ curl -X POST http://127.0.0.1:8787/admin/register-table \
   -d '{"table":"events"}'
 ```
 
-### 3) Create table (route to one shard)
+### 3) Create the table's schema (admin-mediated, applies to every shard)
+
+Schema changes (`CREATE TABLE`, etc.) are not allowed through `/v1/sql` — that
+endpoint's deny-list blocks `CREATE`/`DROP`/`ALTER` to keep tenant-supplied SQL
+restricted to data operations. Use `/admin/create-table` instead; it registers
+the table and applies the schema to every physical shard across every catalog
+shard so any tenant's rows land on a shard that already has the table.
 
 ```bash
-curl -X POST http://127.0.0.1:8787/v1/sql \
+curl -X POST http://127.0.0.1:8787/admin/create-table \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{
     "table":"events",
-    "tenantId":"t1",
-    "partitionKey":"user-1",
-    "sql":"CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT, body TEXT, created_at TEXT)",
-    "params":[]
+    "schema":"CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT, body TEXT, created_at TEXT)"
   }'
 ```
 
@@ -119,11 +123,28 @@ curl -X POST http://127.0.0.1:8787/v1/scatter \
 
 ### 7) Move one vBucket to a new shard (manual split prototype)
 
+The cluster is partitioned across a fixed set of catalog shards (see
+"Catalog sharding" below); `vbucket` numbering is local to one catalog shard,
+so `catalogShardId` is required.
+
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/split-vbucket \
   -H "content-type: application/json" \
-  -d '{"vbucket":42,"newShardId":"shard-hotfix-1"}'
+  -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"catalogShardId":"catalog-0","vbucket":42,"newShardId":"shard-hotfix-1"}'
 ```
+
+## Catalog sharding
+
+The cluster is partitioned across a fixed, well-known set of catalog shards
+(`catalog-0`, `catalog-1`, ... — count controlled by the `CATALOG_SHARD_COUNT`
+var, default 4). A tenant's catalog shard is computed by hashing `tenantId` —
+there's no lookup step, which avoids the bootstrapping problem of sharding the
+metadata store itself. Cluster-wide admin operations (`/admin/init`,
+`/admin/register-table`, `/admin/create-table`, `/admin/status`) fan out to
+every catalog shard; shard-scoped operations (`/admin/split-vbucket`,
+`/admin/drain-shard`) require an explicit `catalogShardId` since vBucket/shard
+identifiers are local to one catalog shard.
 
 ## Known MVP limitations
 
@@ -139,72 +160,3 @@ curl -X POST http://127.0.0.1:8787/admin/split-vbucket \
 3. Add automated split controller with backfill and dual-write cutover.
 4. Add index service and query planner enhancements.
 5. Add observability and SLO alerting per shard and per route.
-# Cloudflare Shard MVP
-
-A concrete MVP for a Durable Object based sharded SQLite service on Cloudflare.
-
-This project provides:
-- Catalog Durable Object for vBucket routing metadata.
-- Shard Durable Object for SQLite query execution.
-- Gateway Worker endpoints for single-shard SQL and scatter reads.
-- Admin APIs to initialize and rebalance cluster mappings.
-
-## Project Structure
-
-- src/index.ts: Gateway Worker routes.
-- src/catalog.ts: Control-plane Durable Object.
-- src/shard.ts: Data-plane Durable Object.
-- docs/SPEC.md: Concrete architecture and protocol specification.
-
-## Prerequisites
-
-- Node.js 20+
-- Cloudflare account
-- Wrangler authenticated (wrangler login)
-
-## Install
-
-1. git clone https://github.com/ajillepalli/CloudflareShard.git
-2. cd CloudflareShared
-3. npm install
-
-## Run Locally
-
-1. npm run dev
-2. In a separate terminal, initialize cluster:
-
-PowerShell example:
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/admin/init" -ContentType "application/json" -Body '{"numShards":4,"totalVBuckets":256}'
-
-3. Register a logical table:
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/admin/register-table" -ContentType "application/json" -Body '{"table":"orders"}'
-
-4. Create table on one shard (tenant + partitionKey define route):
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/v1/sql" -ContentType "application/json" -Body '{"sql":"CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, tenant_id TEXT, customer_id TEXT, amount REAL)","table":"orders","tenantId":"t1","partitionKey":"c1"}'
-
-5. Insert row:
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/v1/sql" -ContentType "application/json" -Body '{"sql":"INSERT INTO orders (id, tenant_id, customer_id, amount) VALUES (?, ?, ?, ?)","params":["o1","t1","c1",42.5],"table":"orders","tenantId":"t1","partitionKey":"c1"}'
-
-6. Query same partition:
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/v1/sql" -ContentType "application/json" -Body '{"sql":"SELECT * FROM orders WHERE customer_id = ?","params":["c1"],"table":"orders","tenantId":"t1","partitionKey":"c1"}'
-
-7. Scatter query (debug/admin use):
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/v1/scatter" -ContentType "application/json" -Body '{"sql":"SELECT * FROM orders","limit":100}'
-
-## Deploy
-
-- npm run deploy
-
-## Current MVP Limitations
-
-- SQL is not fully parsed; caller provides table + partitionKey metadata.
-- Cross-shard joins are not supported.
-- Rebalance endpoint updates map only; no live row migration yet.
-- Scatter reads are expensive and intended for operational/admin use.
-
-## Next Steps
-
-- Add SQL parser to infer table and partition predicate.
-- Add background vBucket mover and dual-write cutover.
-- Add auth middleware and tenant policy checks.
-- Add global secondary index service for non-partition queries.
