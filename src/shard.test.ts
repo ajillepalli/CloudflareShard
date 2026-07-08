@@ -152,7 +152,7 @@ describe("ShardDO error boundary", () => {
     );
     expect(res.status).toBe(500);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("Unhandled shard error");
+    expect(body.error).toBe("Internal error.");
   });
 });
 

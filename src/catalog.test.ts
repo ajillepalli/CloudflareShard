@@ -35,7 +35,7 @@ describe("CatalogDO error boundary", () => {
     );
     expect(res.status).toBe(500);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("Unhandled catalog error");
+    expect(body.error).toBe("Internal error.");
   });
 });
 

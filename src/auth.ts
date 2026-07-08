@@ -15,3 +15,18 @@ export function isValidBearerToken(authorizationHeader: string | null, expectedT
   if (!authorizationHeader) return false;
   return timingSafeEqual(authorizationHeader, `Bearer ${expectedToken}`);
 }
+
+/** Shared admin-token gate used by both the Worker and CatalogDO — a single
+ * place to change the auth error shape or token scheme for every admin route. */
+export function checkAdminAuth(
+  adminToken: string | undefined,
+  request: Request,
+): { error: string; status: number } | null {
+  if (!adminToken) {
+    return { error: "ADMIN_TOKEN is not configured.", status: 500 };
+  }
+  if (!isValidBearerToken(request.headers.get("authorization"), adminToken)) {
+    return { error: "Unauthorized.", status: 401 };
+  }
+  return null;
+}
