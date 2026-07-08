@@ -41,16 +41,26 @@ function isMutation(sql: string): boolean {
   return /^(\s*)(insert|update|delete|replace|create|drop|alter)/i.test(sql);
 }
 
-/** Deny-list: block statements tenants must never be able to run. */
-function isDangerous(sql: string): boolean {
+function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {
   const s = sql.trim().toLowerCase();
-
   const noTrailingSemicolon = s.replace(/;\s*$/, "");
 
   // Disallow multi-statement payloads (e.g. "select 1; drop table ...").
   if (noTrailingSemicolon.includes(";")) return true;
 
-  return /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter|create)\b/.test(noTrailingSemicolon);
+  return bannedKeywords.test(noTrailingSemicolon);
+}
+
+/** Deny-list: block statements tenants must never be able to run. */
+function isDangerous(sql: string): boolean {
+  return hasMultiStatementOrKeyword(sql, /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter|create)\b/);
+}
+
+/** Same deny-list as isDangerous(), minus "create" — /admin/create-table's schema
+ * field is required to start with CREATE TABLE, so it can't ban that keyword, but
+ * still must reject multi-statement payloads and other destructive keywords. */
+function isDangerousSchema(sql: string): boolean {
+  return hasMultiStatementOrKeyword(sql, /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter)\b/);
 }
 
 function assertParamsArray(params: unknown): params is unknown[] {
@@ -166,9 +176,6 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
 }
 
 async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
-  const authError = requireAdminAuth(env, request);
-  if (authError) return authError;
-
   const body = (await request.json()) as {
     table?: string;
     schema?: string;
@@ -179,6 +186,9 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
   }
   if (!/^\s*create\s+table\b/i.test(body.schema)) {
     return json({ error: "schema must be a CREATE TABLE statement." }, 400);
+  }
+  if (isDangerousSchema(body.schema)) {
+    return json({ error: "schema statement not permitted." }, 403);
   }
 
   const registerResults = await fanOutToAllCatalogs(
@@ -288,9 +298,6 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
 }
 
 async function handleAdminShardStats(request: Request, env: Env): Promise<Response> {
-  const authError = requireAdminAuth(env, request);
-  if (authError) return authError;
-
   const body = (await request.json()) as { shardId: string };
   if (!body.shardId) {
     return json({ error: "Missing shardId" }, 400);
@@ -481,6 +488,17 @@ export default {
 
       if (request.method !== "POST") {
         return json({ error: "Only POST is supported for this endpoint." }, 405);
+      }
+
+      // Structural safeguard: every /admin/* route requires the admin token,
+      // checked once here rather than trusting each handler to remember to call
+      // requireAdminAuth() itself (a per-handler check is exactly how
+      // /admin/shard-stats ended up unauthenticated). CatalogDO applies its own
+      // gate too for routes that pass through it — this is deliberately
+      // redundant defense-in-depth, not a replacement for it.
+      if (url.pathname.startsWith("/admin/")) {
+        const authError = requireAdminAuth(env, request);
+        if (authError) return authError;
       }
 
       const handler = ROUTES[url.pathname];
