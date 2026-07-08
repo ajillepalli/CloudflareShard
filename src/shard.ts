@@ -1,12 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { log } from "./log";
+import { isMutation } from "./sql-safety";
+import { hashKey } from "./hash";
 
 type ExecutePayload = {
   sql: string;
   params?: unknown[];
   requestId: string;
-  isMutation: boolean;
+  /** Caller's classification, unused for the routing decision — ShardDO derives
+   * this itself from the SQL so a caller (or a caller-side classification bug)
+   * can't disguise a mutation as a read by sending isMutation: false. Kept only
+   * for logging/back-compat. */
+  isMutation?: boolean;
 };
 
 const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -36,10 +42,28 @@ export class ShardDO extends DurableObject {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS applied_requests (
         request_id TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL DEFAULT '',
         result_json TEXT NOT NULL,
         applied_at TEXT NOT NULL
       )
     `);
+    this.ensureColumn("applied_requests", "request_hash", "TEXT NOT NULL DEFAULT ''");
+  }
+
+  /** Add a column if a table predating it doesn't have it yet — mirrors
+   * CatalogDO's migration guard for the same reason (CREATE TABLE IF NOT
+   * EXISTS doesn't retroactively alter already-provisioned tables). */
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const existing = Array.from(this.sql.exec(`PRAGMA table_info(${table})`)) as Array<{ name: string }>;
+    if (!existing.some((col) => col.name === column)) {
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  /** Hash of the request's (sql, params) — detects a requestId reused with
+   * different content instead of silently replaying a stale cached result. */
+  private requestHash(sql: string, params: unknown[]): string {
+    return String(hashKey(JSON.stringify({ sql, params })));
   }
 
   private one<T extends object>(sql: string, ...params: unknown[]): T | null {
@@ -108,15 +132,24 @@ export class ShardDO extends DurableObject {
       return json({ error: "Missing sql or requestId" }, 400);
     }
 
+    const mutating = isMutation(payload.sql);
+
     try {
       const execStart = Date.now();
 
-      if (payload.isMutation) {
-        const prior = this.one<{ result_json: string }>(
-          "SELECT result_json FROM applied_requests WHERE request_id = ?",
+      if (mutating) {
+        const incomingHash = this.requestHash(payload.sql, payload.params ?? []);
+        const prior = this.one<{ result_json: string; request_hash: string }>(
+          "SELECT result_json, request_hash FROM applied_requests WHERE request_id = ?",
           payload.requestId,
         );
         if (prior) {
+          if (prior.request_hash !== incomingHash) {
+            return json(
+              { error: "requestId was already used with different sql/params — refusing to replay a mismatched result." },
+              409,
+            );
+          }
           return json({ duplicated: true, ...(JSON.parse(prior.result_json) as object) });
         }
 
@@ -135,10 +168,11 @@ export class ShardDO extends DurableObject {
 
           this.sql.exec(
             `
-            INSERT INTO applied_requests (request_id, result_json, applied_at)
-            VALUES (?, ?, ?)
+            INSERT INTO applied_requests (request_id, request_hash, result_json, applied_at)
+            VALUES (?, ?, ?, ?)
             `,
             payload.requestId,
+            incomingHash,
             JSON.stringify(txResult),
             new Date().toISOString(),
           );
@@ -157,14 +191,8 @@ export class ShardDO extends DurableObject {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      log("shard.execution_failed", { requestId: payload.requestId, isMutation: payload.isMutation, message });
-      return json(
-        {
-          error: "Shard execution failed",
-          details: message,
-        },
-        400,
-      );
+      log("shard.execution_failed", { requestId: payload.requestId, isMutation: mutating, message });
+      return json({ error: "SQL execution failed." }, 400);
     }
   }
 }

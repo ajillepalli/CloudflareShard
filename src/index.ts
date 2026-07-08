@@ -4,6 +4,7 @@ import { json } from "./http";
 import { hashKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
+import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } from "./sql-safety";
 
 export { CatalogDO, ShardDO };
 
@@ -37,31 +38,6 @@ type SqlRequest = {
   requestId?: string;
 };
 
-function isMutation(sql: string): boolean {
-  return /^(\s*)(insert|update|delete|replace|create|drop|alter)/i.test(sql);
-}
-
-function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {
-  const s = sql.trim().toLowerCase();
-  const noTrailingSemicolon = s.replace(/;\s*$/, "");
-
-  // Disallow multi-statement payloads (e.g. "select 1; drop table ...").
-  if (noTrailingSemicolon.includes(";")) return true;
-
-  return bannedKeywords.test(noTrailingSemicolon);
-}
-
-/** Deny-list: block statements tenants must never be able to run. */
-function isDangerous(sql: string): boolean {
-  return hasMultiStatementOrKeyword(sql, /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter|create)\b/);
-}
-
-/** Same deny-list as isDangerous(), minus "create" — /admin/create-table's schema
- * field is required to start with CREATE TABLE, so it can't ban that keyword, but
- * still must reject multi-statement payloads and other destructive keywords. */
-function isDangerousSchema(sql: string): boolean {
-  return hasMultiStatementOrKeyword(sql, /\b(drop|truncate|attach|detach|pragma|vacuum|reindex|alter)\b/);
-}
 
 function assertParamsArray(params: unknown): params is unknown[] {
   return Array.isArray(params);
@@ -189,6 +165,18 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
   }
   if (isDangerousSchema(body.schema)) {
     return json({ error: "schema statement not permitted." }, 403);
+  }
+
+  const schemaTableName = extractCreateTableName(body.schema);
+  if (schemaTableName === null || schemaTableName !== body.table) {
+    return json(
+      {
+        error: "schema's CREATE TABLE name does not match body.table.",
+        table: body.table,
+        schemaTableName,
+      },
+      400,
+    );
   }
 
   const registerResults = await fanOutToAllCatalogs(
