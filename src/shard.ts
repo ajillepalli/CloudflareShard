@@ -60,13 +60,7 @@ export class ShardDO extends DurableObject {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log("shard.unhandled_error", { path: new URL(request.url).pathname, message });
-      return json(
-        {
-          error: "Unhandled shard error",
-          details: message,
-        },
-        500,
-      );
+      return json({ error: "Internal error." }, 500);
     }
   }
 

@@ -122,6 +122,33 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(401);
   });
 
+  it("/admin/create-table reports a shard-level failure when the schema fails to apply", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    // Missing PRIMARY KEY column type makes this a syntactically invalid CREATE TABLE.
+    const res = await post(
+      "/admin/create-table",
+      { table: "broken", schema: "CREATE TABLE broken (id PRIMARY" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("Failed to create table");
+  });
+
+  it("/admin/shard-stats requires an admin token (regression: this endpoint had no auth check at all)", async () => {
+    await initCluster(1, 4);
+    const res = await post("/admin/shard-stats", { shardId: "catalog-0-shard-0" });
+    expect(res.status).toBe(401);
+  });
+
+  it("/admin/shard-stats returns stats with a valid admin token", async () => {
+    await initCluster(1, 4);
+    const res = await post("/admin/shard-stats", { shardId: "catalog-0-shard-0" }, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean };
+    expect(body.ok).toBe(true);
+  });
+
   it("/v1/sql rejects requests when the cluster's stored catalog shard count differs from the Worker's configured count", async () => {
     await initCluster();
 
@@ -183,7 +210,7 @@ describe("Worker top-level routes", () => {
     });
     expect(res.status).toBe(500);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("Unhandled worker error");
+    expect(body.error).toBe("Internal error.");
   });
 });
 
