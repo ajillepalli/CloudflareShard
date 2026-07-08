@@ -122,6 +122,31 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(401);
   });
 
+  it("/admin/create-table rejects a schema smuggling a semicolon-chained statement", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY); DROP TABLE events" },
+      AUTH(),
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("/admin/create-table rejects a schema containing a banned keyword like ATTACH", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY) attach database 'x' as y" },
+      AUTH(),
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("/admin/init requires an admin token at the Worker level (structural /admin/* gate)", async () => {
+    const res = await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true });
+    expect(res.status).toBe(401);
+  });
+
   it("/admin/create-table reports a shard-level failure when the schema fails to apply", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     // Missing PRIMARY KEY column type makes this a syntactically invalid CREATE TABLE.
