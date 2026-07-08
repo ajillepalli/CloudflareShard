@@ -1,4 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
+import { json } from "./http";
+import { log } from "./log";
 
 type ExecutePayload = {
   sql: string;
@@ -7,12 +9,27 @@ type ExecutePayload = {
   isMutation: boolean;
 };
 
+const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
 export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    ctx.blockConcurrencyWhile(async () => {
+      if ((await ctx.storage.getAlarm()) === null) {
+        await ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+      }
+    });
+  }
+
+  async alarm(): Promise<void> {
+    this.ensureSchema();
+    const cutoff = new Date(Date.now() - APPLIED_REQUESTS_TTL_MS).toISOString();
+    this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
+    await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
   }
 
   private ensureSchema(): void {
@@ -38,16 +55,26 @@ export class ShardDO extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.handle(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("shard.unhandled_error", { path: new URL(request.url).pathname, message });
+      return json(
+        {
+          error: "Unhandled shard error",
+          details: message,
+        },
+        500,
+      );
+    }
+  }
+
+  private async handle(request: Request): Promise<Response> {
     this.ensureSchema();
 
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
-
-    const json = (data: unknown, status = 200): Response =>
-      new Response(JSON.stringify(data, null, 2), {
-        status,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
 
     if (method !== "POST") {
       return json({ error: "Only POST allowed for shard endpoints." }, 405);
@@ -99,14 +126,13 @@ export class ShardDO extends DurableObject {
           return json({ duplicated: true, ...(JSON.parse(prior.result_json) as object) });
         }
 
-        this.sql.exec("BEGIN");
-        try {
+        const result = this.ctx.storage.transactionSync(() => {
           this.sql.exec(payload.sql, ...(payload.params ?? []));
           const changedRow = this.one<{ count: number }>(
             "SELECT changes() AS count",
           );
 
-          const result = {
+          const txResult = {
             ok: true,
             type: "mutation",
             rowsAffected: changedRow?.count ?? 0,
@@ -119,15 +145,12 @@ export class ShardDO extends DurableObject {
             VALUES (?, ?, ?)
             `,
             payload.requestId,
-            JSON.stringify(result),
+            JSON.stringify(txResult),
             new Date().toISOString(),
           );
-          this.sql.exec("COMMIT");
-          return json(result);
-        } catch (error) {
-          this.sql.exec("ROLLBACK");
-          throw error;
-        }
+          return txResult;
+        });
+        return json(result);
       }
 
       const rows = this.rows(payload.sql, ...(payload.params ?? []));
@@ -139,10 +162,12 @@ export class ShardDO extends DurableObject {
         rows,
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("shard.execution_failed", { requestId: payload.requestId, isMutation: payload.isMutation, message });
       return json(
         {
           error: "Shard execution failed",
-          details: error instanceof Error ? error.message : String(error),
+          details: message,
         },
         400,
       );
