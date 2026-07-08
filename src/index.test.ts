@@ -156,3 +156,115 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(403);
   });
 });
+
+describe("Worker top-level routes", () => {
+  it("GET /health returns ok", async () => {
+    const res = await SELF.fetch("https://worker.internal/health");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; service: string };
+    expect(body.ok).toBe(true);
+  });
+
+  it("returns 405 for non-POST on a POST-only route", async () => {
+    const res = await SELF.fetch("https://worker.internal/v1/sql", { method: "GET" });
+    expect(res.status).toBe(405);
+  });
+
+  it("returns 404 for an unknown route", async () => {
+    const res = await post("/not-a-real-route", {});
+    expect(res.status).toBe(404);
+  });
+
+  it("returns a clean 500 instead of a crash on malformed JSON", async () => {
+    const res = await SELF.fetch("https://worker.internal/v1/sql", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not valid json",
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("Unhandled worker error");
+  });
+});
+
+describe("Worker /v1/sql input validation", () => {
+  it("returns 400 for missing sql/table/tenantId", async () => {
+    const res = await post("/v1/sql", { table: "events" });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 when params is not an array", async () => {
+    await initCluster();
+    const res = await post("/v1/sql", {
+      sql: "SELECT * FROM events",
+      table: "events",
+      tenantId: "t1",
+      partitionKey: "p1",
+      params: "not-an-array",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for a mutating statement without partitionKey", async () => {
+    await initCluster();
+    const res = await post("/v1/sql", {
+      sql: "INSERT INTO events (id, v) VALUES ('1','a')",
+      table: "events",
+      tenantId: "t1",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for a SELECT without partitionKey (must use /v1/scatter)", async () => {
+    await initCluster();
+    const res = await post("/v1/sql", {
+      sql: "SELECT * FROM events",
+      table: "events",
+      tenantId: "t1",
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("/v1/scatter");
+  });
+});
+
+describe("Worker /v1/scatter input validation and partial failure", () => {
+  it("returns 400 for missing sql", async () => {
+    const res = await post("/v1/scatter", {});
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for a mutating statement", async () => {
+    const res = await post("/v1/scatter", { sql: "INSERT INTO events (id) VALUES ('1')" });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 403 for a dangerous non-mutation statement", async () => {
+    // PRAGMA isn't classified as a mutation prefix, so it reaches the
+    // isDangerous() deny-list check rather than the mutation-rejection check.
+    const res = await post("/v1/scatter", { sql: "PRAGMA table_info(events)" });
+    expect(res.status).toBe(403);
+  });
+
+  it("returns 400 when params is not an array", async () => {
+    const res = await post("/v1/scatter", { sql: "SELECT 1", params: "nope" });
+    expect(res.status).toBe(400);
+  });
+
+  it("caps results at the requested limit", async () => {
+    await initCluster(1, 64);
+    for (let i = 0; i < 5; i += 1) {
+      await post("/v1/sql", {
+        sql: "INSERT INTO events (id, v) VALUES (?, ?)",
+        params: [`id-${i}`, "x"],
+        table: "events",
+        tenantId: `tenant-${i}`,
+        partitionKey: "p1",
+      });
+    }
+    const res = await post("/v1/scatter", { sql: "SELECT id FROM events", limit: 2 });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: unknown[] };
+    expect(body.rows.length).toBeLessThanOrEqual(2);
+  });
+});
