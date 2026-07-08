@@ -180,8 +180,11 @@ export class CatalogDO extends DurableObject {
       catalogShardCount?: number;
     };
 
-    const numShards = Math.max(1, body.numShards ?? 8);
-    const totalVBuckets = Math.max(64, body.totalVBuckets ?? 1024);
+    // Ceilings prevent a single admin call from creating a pathologically
+    // large cluster that exhausts this DO's CPU/time budget mid-loop (the
+    // shard/vbucket population loops below have no batching or rollback).
+    const numShards = Math.min(256, Math.max(1, body.numShards ?? 8));
+    const totalVBuckets = Math.min(65536, Math.max(64, body.totalVBuckets ?? 1024));
     const force = body.force === true;
     const catalogShardId = body.catalogShardId ?? null;
     const catalogShardCount = body.catalogShardCount ?? null;

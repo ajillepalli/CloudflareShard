@@ -124,6 +124,46 @@ describe("ShardDO /execute input validation", () => {
     );
     expect(res.status).toBe(400);
   });
+
+  it("does not leak the raw SQL error to the caller", async () => {
+    const stub = await freshShard();
+    const res = await stub.fetch(
+      post("/execute", { sql: "SELECT * FROM nonexistent_table", requestId: "req-q2", isMutation: false }),
+    );
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("SQL execution failed.");
+  });
+
+  it("regression: derives isMutation from the SQL itself, ignoring a false caller-supplied flag", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)", requestId: "req-schema", isMutation: true }),
+    );
+
+    // Caller (or a comment-obfuscated bypass upstream) falsely claims this is
+    // not a mutation. ShardDO must still classify it as one — via the
+    // idempotent transactionSync path, recorded in applied_requests — not
+    // silently execute it as a bare read.
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id) VALUES ('poisoned')",
+        requestId: "req-lied",
+        isMutation: false,
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { type: string; rowsAffected: number };
+    expect(body.type).toBe("mutation");
+    expect(body.rowsAffected).toBe(1);
+
+    // Confirm it went through the idempotency path: replaying the same
+    // requestId returns the cached result instead of re-executing.
+    const replay = await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id) VALUES ('poisoned')", requestId: "req-lied", isMutation: false }),
+    );
+    const replayBody = (await replay.json()) as { duplicated: boolean };
+    expect(replayBody.duplicated).toBe(true);
+  });
 });
 
 describe("ShardDO route/method guards", () => {
