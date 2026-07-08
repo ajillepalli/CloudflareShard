@@ -1,4 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
+import { json } from "./http";
+import { hashKey } from "./hash";
+import { isValidBearerToken } from "./auth";
+import { log } from "./log";
 
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
@@ -13,6 +17,16 @@ export class CatalogDO extends DurableObject {
         : undefined;
   }
 
+  /** Add a column if a table predating it doesn't have it yet — CREATE TABLE IF
+   * NOT EXISTS doesn't retroactively alter already-provisioned tables, so schema
+   * additions need an explicit migration step. */
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const existing = this.many<{ name: string }>(`PRAGMA table_info(${table})`);
+    if (!existing.some((col) => col.name === column)) {
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
   private ensureSchema(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS cluster_config (
@@ -22,6 +36,8 @@ export class CatalogDO extends DurableObject {
         initialized_at TEXT NOT NULL
       )
     `);
+    this.ensureColumn("cluster_config", "catalog_shard_id", "TEXT");
+    this.ensureColumn("cluster_config", "catalog_shard_count", "INTEGER");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS shards (
@@ -47,6 +63,25 @@ export class CatalogDO extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint TEXT NOT NULL,
+        request_summary TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+  }
+
+  private audit(endpoint: string, requestSummary: Record<string, unknown>): void {
+    log("catalog.admin_action", { endpoint, ...requestSummary });
+    this.sql.exec(
+      `INSERT INTO audit_log (endpoint, request_summary, created_at) VALUES (?, ?, ?)`,
+      endpoint,
+      JSON.stringify(requestSummary),
+      new Date().toISOString(),
+    );
   }
 
   private one<T extends object>(sql: string, ...params: unknown[]): T | null {
@@ -59,15 +94,6 @@ export class CatalogDO extends DurableObject {
 
   private many<T extends object>(sql: string, ...params: unknown[]): T[] {
     return Array.from(this.sql.exec(sql, ...params)) as T[];
-  }
-
-  private hashKey(input: string): number {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < input.length; i += 1) {
-      h ^= input.charCodeAt(i);
-      h = Math.imul(h, 0x01000193);
-    }
-    return h >>> 0;
   }
 
   private metadataVersion(): number {
@@ -89,16 +115,26 @@ export class CatalogDO extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.handle(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("catalog.unhandled_error", { path: new URL(request.url).pathname, message });
+      return json(
+        {
+          error: "Unhandled catalog error",
+          details: message,
+        },
+        500,
+      );
+    }
+  }
+
+  private async handle(request: Request): Promise<Response> {
     this.ensureSchema();
 
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
-
-    const json = (data: unknown, status = 200): Response =>
-      new Response(JSON.stringify(data, null, 2), {
-        status,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
 
     if (method !== "POST") {
       return json({ error: "Only POST allowed for catalog endpoints." }, 405);
@@ -107,12 +143,16 @@ export class CatalogDO extends DurableObject {
     if (
       url.pathname === "/status" ||
       url.pathname === "/list-tables" ||
-      url.pathname === "/drain-shard"
+      url.pathname === "/drain-shard" ||
+      url.pathname === "/init" ||
+      url.pathname === "/register-table" ||
+      url.pathname === "/split-vbucket" ||
+      url.pathname === "/audit-log"
     ) {
       if (!this.adminToken) {
         return json({ error: "ADMIN_TOKEN is not configured." }, 500);
       }
-      if (request.headers.get("authorization") !== "Bearer " + this.adminToken) {
+      if (!isValidBearerToken(request.headers.get("authorization"), this.adminToken)) {
         return json({ error: "Unauthorized." }, 401);
       }
     }
@@ -122,11 +162,18 @@ export class CatalogDO extends DurableObject {
         numShards?: number;
         totalVBuckets?: number;
         force?: boolean;
+        catalogShardId?: string;
+        catalogShardCount?: number;
       };
 
       const numShards = Math.max(1, body.numShards ?? 8);
       const totalVBuckets = Math.max(64, body.totalVBuckets ?? 1024);
       const force = body.force === true;
+      const catalogShardId = body.catalogShardId ?? null;
+      const catalogShardCount = body.catalogShardCount ?? null;
+      const shardPrefix = catalogShardId ? `${catalogShardId}-` : "";
+
+      this.audit("/init", { numShards, totalVBuckets, force, catalogShardId });
 
       const existing = this.one<{ total_vbuckets: number }>(
         "SELECT total_vbuckets FROM cluster_config WHERE singleton = 1",
@@ -147,15 +194,17 @@ export class CatalogDO extends DurableObject {
 
       this.sql.exec(
         `
-        INSERT OR REPLACE INTO cluster_config (singleton, total_vbuckets, metadata_version, initialized_at)
-        VALUES (1, ?, 1, ?)
+        INSERT OR REPLACE INTO cluster_config (singleton, total_vbuckets, metadata_version, initialized_at, catalog_shard_id, catalog_shard_count)
+        VALUES (1, ?, 1, ?, ?, ?)
         `,
         totalVBuckets,
         new Date().toISOString(),
+        catalogShardId,
+        catalogShardCount,
       );
 
       for (let i = 0; i < numShards; i += 1) {
-        const shardId = `shard-${i}`;
+        const shardId = `${shardPrefix}shard-${i}`;
         this.sql.exec(
           `
           INSERT OR IGNORE INTO shards (shard_id, status, created_at)
@@ -167,7 +216,7 @@ export class CatalogDO extends DurableObject {
       }
 
       for (let vb = 0; vb < totalVBuckets; vb += 1) {
-        const shardId = `shard-${vb % numShards}`;
+        const shardId = `${shardPrefix}shard-${vb % numShards}`;
         this.sql.exec(
           `
           INSERT OR REPLACE INTO vbucket_map (vbucket, shard_id, map_version, updated_at)
@@ -179,7 +228,7 @@ export class CatalogDO extends DurableObject {
         );
       }
 
-      return json({ ok: true, numShards, totalVBuckets });
+      return json({ ok: true, numShards, totalVBuckets, catalogShardId });
     }
 
     if (url.pathname === "/register-table") {
@@ -191,6 +240,8 @@ export class CatalogDO extends DurableObject {
       if (!body.table) {
         return json({ error: "Missing table" }, 400);
       }
+
+      this.audit("/register-table", { table: body.table, partitioning: body.partitioning });
 
       this.sql.exec(
         `
@@ -217,18 +268,37 @@ export class CatalogDO extends DurableObject {
         return json({ error: "Missing table, tenantId, or partitionKey" }, 400);
       }
 
-      const config = this.one<{ total_vbuckets: number; metadata_version: number }>(
-        "SELECT total_vbuckets, metadata_version FROM cluster_config WHERE singleton = 1",
+      const config = this.one<{
+        total_vbuckets: number;
+        metadata_version: number;
+        catalog_shard_count: number | null;
+      }>(
+        "SELECT total_vbuckets, metadata_version, catalog_shard_count FROM cluster_config WHERE singleton = 1",
       );
       if (!config) {
         return json({ error: "Cluster not initialized. Call /admin/init first." }, 400);
       }
 
-      const rule = this.one<{ table_name: string }>(
-        "SELECT table_name FROM table_rules WHERE table_name = ?",
+      const composite = `${body.tenantId}:${body.table}:${body.partitionKey}`;
+      const vbucket = hashKey(composite) % config.total_vbuckets;
+
+      const mapped = this.one<{ table_registered: string | null; shard_id: string; status: string }>(
+        `
+        SELECT
+          (SELECT table_name FROM table_rules WHERE table_name = ?) AS table_registered,
+          vm.shard_id AS shard_id,
+          s.status AS status
+        FROM vbucket_map vm
+        JOIN shards s ON s.shard_id = vm.shard_id
+        WHERE vm.vbucket = ?
+        `,
         body.table,
+        vbucket,
       );
-      if (!rule) {
+      if (!mapped) {
+        return json({ error: `No shard mapping for vbucket ${vbucket}` }, 500);
+      }
+      if (!mapped.table_registered) {
         return json(
           {
             error: `Table ${body.table} is not registered. Call /admin/register-table first.`,
@@ -236,23 +306,8 @@ export class CatalogDO extends DurableObject {
           400,
         );
       }
-
-      const composite = `${body.tenantId}:${body.table}:${body.partitionKey}`;
-      const vbucket = this.hashKey(composite) % config.total_vbuckets;
-
-      const mapped = this.one<{ shard_id: string; status: string }>(
-        `
-        SELECT vm.shard_id, s.status
-        FROM vbucket_map vm
-        JOIN shards s ON s.shard_id = vm.shard_id
-        WHERE vm.vbucket = ?
-        `,
-        vbucket,
-      );
-      if (!mapped) {
-        return json({ error: `No shard mapping for vbucket ${vbucket}` }, 500);
-      }
       if (mapped.status !== "active") {
+        log("catalog.route_rejected_draining", { table: body.table, vbucket, shardId: mapped.shard_id, status: mapped.status });
         return json(
           {
             error: `Mapped shard ${mapped.shard_id} is ${mapped.status}. Reassign this vbucket before routing.`,
@@ -265,6 +320,7 @@ export class CatalogDO extends DurableObject {
         shardId: mapped.shard_id,
         vbucket,
         metadataVersion: config.metadata_version,
+        catalogShardCount: config.catalog_shard_count,
       });
     }
 
@@ -312,6 +368,19 @@ export class CatalogDO extends DurableObject {
       return json({ tables });
     }
 
+    if (url.pathname === "/audit-log") {
+      const entries = this.many<{ endpoint: string; request_summary: string; created_at: string }>(
+        "SELECT endpoint, request_summary, created_at FROM audit_log ORDER BY id DESC LIMIT 100",
+      );
+      return json({
+        entries: entries.map((e) => ({
+          endpoint: e.endpoint,
+          request: JSON.parse(e.request_summary) as unknown,
+          createdAt: e.created_at,
+        })),
+      });
+    }
+
     if (url.pathname === "/drain-shard") {
       const body = (await request.json()) as { shardId: string };
       if (!body.shardId) {
@@ -325,6 +394,8 @@ export class CatalogDO extends DurableObject {
       if (!existing) {
         return json({ error: `Shard ${body.shardId} not found` }, 404);
       }
+
+      this.audit("/drain-shard", { shardId: body.shardId });
 
       this.sql.exec(
         "UPDATE shards SET status = 'draining' WHERE shard_id = ?",
@@ -353,7 +424,13 @@ export class CatalogDO extends DurableObject {
         return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
       }
 
-      const targetShard = body.newShardId ?? `shard-split-${Date.now()}`;
+      this.audit("/split-vbucket", { vbucket: body.vbucket, newShardId: body.newShardId, fromShard: existingMap.shard_id });
+
+      const config = this.one<{ catalog_shard_id: string | null }>(
+        "SELECT catalog_shard_id FROM cluster_config WHERE singleton = 1",
+      );
+      const shardPrefix = config?.catalog_shard_id ? `${config.catalog_shard_id}-` : "";
+      const targetShard = body.newShardId ?? `${shardPrefix}shard-split-${Date.now()}`;
       this.sql.exec(
         `
         INSERT OR IGNORE INTO shards (shard_id, status, created_at)
