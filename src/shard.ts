@@ -82,7 +82,7 @@ export class ShardDO extends DurableObject {
 
     if (url.pathname === "/stats") {
       const tables = this.rows(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('applied_requests', 'sqlite_sequence') ORDER BY name ASC",
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('applied_requests', 'sqlite_sequence') AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name ASC",
       ) as Array<{ name: string }>;
 
       const counts: Array<{ table: string; rowCount: number }> = [];
