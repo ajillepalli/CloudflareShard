@@ -198,6 +198,17 @@ describe("CatalogDO input validation and lifecycle", () => {
     expect(body.totalVBuckets).toBe(64);
   });
 
+  it("/init clamps numShards/totalVBuckets to a safe range instead of allowing an unbounded cluster", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(
+      post("/init", { numShards: 100000, totalVBuckets: 10000000, force: true }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { numShards: number; totalVBuckets: number };
+    expect(body.numShards).toBe(256);
+    expect(body.totalVBuckets).toBe(65536);
+  });
+
   it("/init with force:true wipes existing shard/vbucket state and re-initializes", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 64 }, `Bearer ${env.ADMIN_TOKEN}`));

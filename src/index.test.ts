@@ -147,6 +147,29 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(401);
   });
 
+  it("/admin/create-table rejects a schema whose CREATE TABLE name doesn't match body.table (regression: could register 'events' while creating a table named 'orders')", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "mismatch_regression_evt", schema: "CREATE TABLE mismatch_regression_orders (id TEXT PRIMARY KEY)" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; schemaTableName: string };
+    expect(body.error).toContain("does not match");
+    expect(body.schemaTableName).toBe("mismatch_regression_orders");
+  });
+
+  it("/admin/create-table accepts a quoted table name matching body.table", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "quoted_regression_evt", schema: 'CREATE TABLE IF NOT EXISTS "quoted_regression_evt" (id TEXT PRIMARY KEY)' },
+      AUTH(),
+    );
+    expect(res.status).toBe(200);
+  });
+
   it("/admin/create-table reports a shard-level failure when the schema fails to apply", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     // Missing PRIMARY KEY column type makes this a syntactically invalid CREATE TABLE.
@@ -289,6 +312,15 @@ describe("Worker /v1/scatter input validation and partial failure", () => {
   it("returns 400 for a mutating statement", async () => {
     const res = await post("/v1/scatter", { sql: "INSERT INTO events (id) VALUES ('1')" });
     expect(res.status).toBe(400);
+  });
+
+  it("regression: rejects a comment-prefixed mutation instead of executing it as a read", async () => {
+    await initCluster();
+    const res = await post("/v1/scatter", { sql: "-- harmless\nDELETE FROM events" });
+    expect(res.status).toBe(400);
+
+    const res2 = await post("/v1/scatter", { sql: "/*x*/ UPDATE events SET v = 'pwned'" });
+    expect(res2.status).toBe(400);
   });
 
   it("returns 403 for a dangerous non-mutation statement", async () => {
