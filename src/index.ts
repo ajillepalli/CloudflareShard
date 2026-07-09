@@ -259,7 +259,9 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
       // attempt for the same table — the second rollback would replay the
       // FIRST rollback's cached "success" instead of actually re-executing,
       // leaving the just-recreated table behind despite the 400 response.
-      const rollbackAttemptId = Date.now();
+      // crypto.randomUUID(), not Date.now(): two rollback attempts landing
+      // in the same millisecond would otherwise collide on the same key.
+      const rollbackAttemptId = crypto.randomUUID();
       await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId) => {
         await routeToShard(env, shardId, "/execute", {
           sql: `DROP TABLE IF EXISTS "${body.table}"`,
