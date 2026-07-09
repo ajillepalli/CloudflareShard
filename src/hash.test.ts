@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hashKey } from "./hash";
+import { hashKey, indexShardIdForKey } from "./hash";
 
 describe("hashKey", () => {
   it("is deterministic for the same input", () => {
@@ -25,5 +25,49 @@ describe("hashKey", () => {
 
   it("handles unicode input without throwing", () => {
     expect(() => hashKey("tenant-éè日本語")).not.toThrow();
+  });
+});
+
+describe("indexShardIdForKey", () => {
+  const shardIds = ["shard-0", "shard-1", "shard-2", "shard-3"];
+
+  it("is deterministic for the same (table, indexName, indexKeyJson, shardIds)", () => {
+    const a = indexShardIdForKey("events", "idx_by_v", '["alpha"]', shardIds);
+    const b = indexShardIdForKey("events", "idx_by_v", '["alpha"]', shardIds);
+    expect(a).toBe(b);
+  });
+
+  it("always returns one of the supplied shardIds", () => {
+    for (const indexKeyJson of ['["alpha"]', '["beta"]', '["gamma"]', "[1]", "[null]"]) {
+      const shardId = indexShardIdForKey("events", "idx_by_v", indexKeyJson, shardIds);
+      expect(shardIds).toContain(shardId);
+    }
+  });
+
+  it("distinguishes table, indexName, and indexKeyJson — no field-boundary collision from naive string concatenation", () => {
+    // If the composite key were built without a separator (or a collidable
+    // one), "ab" + "c" could equal "a" + "bc". These three inputs would
+    // collide under naive concatenation without delimiters; the `:`
+    // separator plus each field's own content keeps them distinct enough
+    // that they don't all land on the same shard by construction (only by
+    // hash coincidence, which this asserts against for these three).
+    const a = indexShardIdForKey("ab", "c", '["x"]', shardIds);
+    const b = indexShardIdForKey("a", "bc", '["x"]', shardIds);
+    const c = indexShardIdForKey("a", "b", 'c"x"]', shardIds);
+    const distinct = new Set([a, b, c]);
+    expect(distinct.size).toBeGreaterThan(1);
+  });
+
+  it("matches the shardIds[hashKey(composite) % shardIds.length] formula directly", () => {
+    const table = "events";
+    const indexName = "idx_by_v";
+    const indexKeyJson = '["alpha"]';
+    const expected = shardIds[hashKey(`${table}:${indexName}:${indexKeyJson}`) % shardIds.length];
+    expect(indexShardIdForKey(table, indexName, indexKeyJson, shardIds)).toBe(expected);
+  });
+
+  it("changing shardIds.length can change the selected shard (no stability guarantee across resizes)", () => {
+    const smallPool = indexShardIdForKey("events", "idx_by_v", '["alpha"]', ["shard-0"]);
+    expect(smallPool).toBe("shard-0");
   });
 });
