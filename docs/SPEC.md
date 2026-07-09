@@ -197,6 +197,40 @@ Response:
 
 Row-ownership is structural, not conditional: `compileMutation` always ANDs the partition-key predicate into `update`/`delete`'s `WHERE` clause and force-sets it in `insert`/`upsert`'s `values` — an absent `where` still only ever touches the one partitioned row/set, never the whole table. Rejected 409 (`PARTITION_KEY_COLUMN_UNSET`) against a table still carrying the `'__unset__'` sentinel.
 
+POST /v1/tx (tenant bearer token)
+Request:
+- mutations array of StructuredMutation (see /v1/mutate above), 1 or more, bounded to 8 distinct (tenantId, table, partitionKey) rows
+- requestId string (required — the transaction's idempotency key; a retry with the same requestId returns the prior outcome rather than re-running 2PC)
+
+Response (200, committed):
+- ok: true
+- txId string
+- status: "committed" (or "committed_pending_ack" if a commit acknowledgement from one or more shards is still outstanding and queued for alarm-driven retry — the transaction is durably committed either way, only the ack is pending)
+
+Response (409, aborted):
+- error { code: "TX_ABORTED", message, details } — prepare failed on at least one participant shard; every participant was rolled back (or had nothing to roll back, given /prepare's shadow-write design)
+
+Drives `CoordinatorDO`'s two-phase commit across every shard touched by the mutation set: each mutation is individually routed and validated (so a cross-tenant mutation in the same batch 401s the same way a lone `/v1/mutate` call would, with no separate check needed), grouped by shardId, then `/begin` fans out `/prepare` to all participants, aborts everyone on any failure, or fans out `/commit` on universal success.
+
+POST /admin/tx-status (ADMIN_TOKEN)
+Request:
+- txId string
+
+Response:
+- found boolean
+- status string (if found — preparing/prepared/committing/committed/aborted)
+
+POST /admin/tx-force-abort (ADMIN_TOKEN)
+Request:
+- txId string
+
+Response:
+- ok boolean
+- txId
+- status: "aborted"
+
+Manual escape hatch for a transaction stuck past a reasonable window (visible via `/admin/tx-status`) — aborts every participant shard and marks the transaction aborted. Rejects 409 if the transaction already committed.
+
 POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
 - sql string (SELECT only)
@@ -242,18 +276,27 @@ This prevents duplicate writes after network retries and stops a reused requestI
   - Bounded to at most 8 participant shards per transaction.
   - Requires the structured mutation contract (Section 7, `/v1/mutate`) and a mandatory
     partition-key-column convention on every registered table — both shipped.
-  - **Shard-level primitives (implementation status: shipped, not yet publicly reachable).**
-    Each `ShardDO` now exposes internal `/prepare`, `/commit`, `/abort`, `/tx-status`, and
+  - **Shard-level primitives (implementation status: shipped and reachable via `/v1/tx`).**
+    Each `ShardDO` exposes internal `/prepare`, `/commit`, `/abort`, `/tx-status`, and
     `/pending-intent-count` routes implementing the participant side of 2PC: `/prepare`
     validates a mutation by executing it inside a transaction and forcing a rollback (so a
     concurrent read never sees it), then durably records a lock + pending intent in a
     separate transaction; `/commit` re-executes for real; `/abort` has nothing to undo,
-    since prepare never left anything applied. These are DO-binding-only — no public Worker
-    route calls them yet. `/v1/tx` (Milestone 1 Chunk 3, not yet built) is what will
-    actually drive them via a new `CoordinatorDO`, sharded by `hash(txId) % COORDINATOR_SHARD_COUNT`.
+    since prepare never left anything applied. These are DO-binding-only, called from
+    `CoordinatorDO`, never directly by the Worker.
+  - **CoordinatorDO (Milestone 1 Chunk 3 — shipped).** One `CoordinatorDO` instance per
+    transaction (`env.COORDINATOR.idFromName(txId)`, no sharding — see the cost-model
+    decision in the milestone plan: Cloudflare DO billing has no per-instantiation cost, so
+    the simpler keying wins over a sharded pool at this project's realistic near-term scale).
+    `txId = sha256Hex([mutations[0].tenantId, requestId])`. `/begin` persists the
+    transaction and its participants, fans out `/prepare` to every participant shard, aborts
+    everyone on any failure, or fans out `/commit` on universal success. A commit
+    acknowledgement that fails to reach one or more shards is queued in `recovery_queue` and
+    retried via `alarm()` with exponential backoff — the transaction is already durably
+    committed at that point, so this only affects when the shard-side state catches up, not
+    correctness. `/v1/tx` (Section 7) is the public entry point.
   - Raw `/v1/sql` and `/v1/mutate` mutations against a row locked by an in-flight
-    coordinated transaction reject 409 (`TX_PARTICIPANT_LOCKED`) — but since nothing can
-    create a lock yet (Chunk 3 not built), this can't currently fire in practice.
+    coordinated transaction reject 409 (`TX_PARTICIPANT_LOCKED`).
 
 ## 11) Rebalancing and Split (MVP)
 

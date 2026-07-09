@@ -190,7 +190,45 @@ curl -X POST http://127.0.0.1:8787/v1/mutate \
 
 Response: `{"ok":true,"rowsAffected":1}`.
 
-### 8) Fan-out query (all shards)
+### 8) Cross-shard atomic transaction
+
+`/v1/tx` atomically commits a batch of structured mutations that may span
+multiple shards, via two-phase commit (`CoordinatorDO`). Every mutation must
+share the same `tenantId`; the batch is capped at 8 distinct
+`(tenantId, table, partitionKey)` rows. `requestId` is required and doubles as
+the transaction's idempotency key — retrying the same `requestId` returns the
+prior outcome instead of re-running 2PC.
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/tx \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $TENANT_TOKEN" \
+  -d '{
+    "mutations": [
+      {"op":"insert","table":"events","tenantId":"t1","partitionKey":"e1","values":{"user_id":"user-1","body":"a"}},
+      {"op":"insert","table":"events","tenantId":"t1","partitionKey":"e2","values":{"user_id":"user-1","body":"b"}}
+    ],
+    "requestId": "req-tx-1"
+  }'
+```
+
+Response: `{"ok":true,"txId":"...","status":"committed"}`. If any participant
+shard fails to prepare, every participant is rolled back and the call returns
+409 (`TX_ABORTED`) — nothing is left half-applied.
+
+An operator can check on or force-abort a stuck transaction:
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/tx-status \
+  -H "content-type: application/json" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"txId":"..."}'
+
+curl -X POST http://127.0.0.1:8787/admin/tx-force-abort \
+  -H "content-type: application/json" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"txId":"..."}'
+```
+
+### 9) Fan-out query (all shards)
 
 `/v1/scatter` reads across every tenant indiscriminately, so it's an admin
 operation — it requires `ADMIN_TOKEN`, not a tenant token.
@@ -206,7 +244,7 @@ curl -X POST http://127.0.0.1:8787/v1/scatter \
   }'
 ```
 
-### 9) Move one vBucket to a new shard (manual split prototype)
+### 10) Move one vBucket to a new shard (manual split prototype)
 
 The cluster is partitioned across a fixed set of catalog shards (see
 "Catalog sharding" below); `vbucket` numbering is local to one catalog shard,
@@ -261,12 +299,14 @@ callers with zero overlap window; a known limitation, not yet addressed).
 
 - No SQL parser or policy sandboxing yet.
 - No automatic backfill/dual-write during split.
-- Cross-shard transactions are not implemented.
+- Cross-shard transactions (`/v1/tx`) are bounded to 8 participant rows and
+  don't yet interact with shard draining (Milestone 1 Chunk 4) — starting a
+  transaction against a shard mid-drain is not yet blocked or coordinated.
 - Global secondary indexes are not implemented.
 
 ## Next production steps
 
-1. Add authenticated tenant authorization in Gateway.
+1. ~~Add authenticated tenant authorization in Gateway.~~ Done (Milestone 1 Chunk 0).
 2. Introduce SQL allowlist/parser and bounded query plans.
 3. Add automated split controller with backfill and dual-write cutover.
 4. Add index service and query planner enhancements.
