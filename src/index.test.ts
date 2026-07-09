@@ -1505,6 +1505,94 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     const body = (await res.json()) as { rows: unknown[] };
     expect(body.rows).toHaveLength(2);
   });
+
+  it("eng-review fix: does not under-fill results when stale entries sort before live matches under a limit", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_pagestale_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_pagestale_by_v", table: "idx_c4_pagestale_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c4_pagestale_evt", tenantId, partitionKey: "z-live-1", values: { v: "shared" } }, token);
+    await post("/v1/mutate", { op: "insert", table: "idx_c4_pagestale_evt", tenantId, partitionKey: "z-live-2", values: { v: "shared" } }, token);
+    const liveRows = await pollIndexRows("idx_c4_pagestale_by_v", (r) => r.length === 2);
+    const indexKeyJson = liveRows[0].index_key_json;
+
+    // Directly seed 6 stale entries on the SAME index shard, same
+    // index_key_json ("shared"), whose partition keys sort alphabetically
+    // BEFORE the two live ones ("z-live-1"/"z-live-2") — they point at
+    // partition keys that don't exist in the base table, so the staleness
+    // re-check filters every one of them. Under the old single-LIMIT-then-
+    // filter behavior, a limit of 2 would only ever see these 6 stale
+    // entries and return an empty result even though 2 live matches exist.
+    let seededOnShardId: string | null = null;
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+      const found = await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idx_c4_pagestale_by_v"));
+        return rows.length > 0;
+      });
+      if (found) {
+        seededOnShardId = shardId;
+        break;
+      }
+    }
+    expect(seededOnShardId).not.toBeNull();
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(seededOnShardId as string));
+    await runInDurableObject(targetStub, async (_instance: unknown, state: DurableObjectState) => {
+      for (let i = 0; i < 6; i++) {
+        state.storage.sql.exec(
+          "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+          "idx_c4_pagestale_evt",
+          "idx_c4_pagestale_by_v",
+          indexKeyJson,
+          `a-stale-${i}`,
+          seededOnShardId,
+          new Date().toISOString(),
+        );
+      }
+    });
+
+    const res = await post(
+      "/v1/index-query",
+      { table: "idx_c4_pagestale_evt", indexName: "idx_c4_pagestale_by_v", tenantId, values: { v: "shared" }, limit: 2 },
+      token,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ id: string }> };
+    expect(body.rows).toHaveLength(2);
+    expect(body.rows.map((r) => r.id).sort()).toEqual(["z-live-1", "z-live-2"]);
+  });
+
+  it("eng-review fix: rejects a query against an index still backfilling, 425 INDEX_BUILDING", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_building_evt");
+    // Register directly against CatalogDO (bypassing the Worker's
+    // /admin/create-index, which always backfills-then-marks-ready
+    // synchronously before returning) so the index is left in its
+    // just-registered 'building' state for this test to observe.
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at) VALUES (?, ?, ?, 'building', ?)",
+        "idx_c4_building_by_v",
+        "idx_c4_building_evt",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+      );
+    });
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post(
+      "/v1/index-query",
+      { table: "idx_c4_building_evt", indexName: "idx_c4_building_by_v", tenantId, values: { v: "alpha" } },
+      token,
+    );
+    expect(res.status).toBe(425);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INDEX_BUILDING");
+  });
 });
 
 function median(values: number[]): number {

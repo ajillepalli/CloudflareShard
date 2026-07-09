@@ -1445,42 +1445,63 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
 
   const indexKeyJson = JSON.stringify(lookupBody.columns.map((c) => (body.values as Record<string, unknown>)[c] ?? null));
   const indexShardId = indexShardIdForKey(body.table, body.indexName, indexKeyJson, shardIds);
-  const indexRes = await routeToShard(env, indexShardId, "/execute", {
-    sql: "SELECT partition_key, source_shard_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? LIMIT ?",
-    params: [body.table, body.indexName, indexKeyJson, limit],
-    requestId: `index-query-lookup-${crypto.randomUUID()}`,
-    isMutation: false,
-  });
-  if (!indexRes.ok) {
-    return new Response(indexRes.body, { status: indexRes.status, headers: indexRes.headers });
-  }
-  const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; source_shard_id: string }> };
-  const matches = indexBody.rows ?? [];
 
   const safeTable = `"${body.table}"`;
   const safePkCol = `"${lookupBody.partitionKeyColumn}"`;
   const queriedValues = body.values as Record<string, unknown>;
+
+  // Eng-review fix: LIMIT used to apply to the raw __cf_indexes scan before
+  // the staleness re-check ran, so a run of stale entries at the front could
+  // starve out live matches that exist further down the index — an
+  // under-filled or empty result even though enough live rows exist. Instead,
+  // page through raw entries (ordered by partition_key for a stable cursor)
+  // and keep pulling batches until `limit` verified rows are collected or the
+  // index is exhausted. rawScanCap bounds total work against a pathologically
+  // stale index (e.g. after a burst of deletes whose async cleanup hasn't
+  // caught up yet) rather than scanning without bound.
   const rows: Array<Record<string, unknown>> = [];
-  for (const match of matches) {
-    const rowRes = await routeToShard(env, match.source_shard_id, "/execute", {
-      sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
-      params: [match.partition_key],
-      requestId: `index-query-hydrate-${crypto.randomUUID()}`,
+  const rawScanCap = limit * 5;
+  let offset = 0;
+  while (rows.length < limit && offset < rawScanCap) {
+    const batchLimit = Math.min(limit, rawScanCap - offset);
+    const indexRes = await routeToShard(env, indexShardId, "/execute", {
+      sql: "SELECT partition_key, source_shard_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ? OFFSET ?",
+      params: [body.table, body.indexName, indexKeyJson, batchLimit, offset],
+      requestId: `index-query-lookup-${crypto.randomUUID()}`,
       isMutation: false,
     });
-    if (!rowRes.ok) continue; // base row/shard unreachable — skip rather than fail the whole query
-    const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
-    const row = rowBody.rows?.[0];
-    if (!row) continue; // row deleted since the index entry was written — stale, exclude
+    if (!indexRes.ok) {
+      return new Response(indexRes.body, { status: indexRes.status, headers: indexRes.headers });
+    }
+    const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; source_shard_id: string }> };
+    const matches = indexBody.rows ?? [];
+    if (matches.length === 0) break; // index exhausted
 
-    // Staleness re-check (Chunk 2's index maintenance is async): only
-    // surface this row if it still actually matches the queried tuple.
-    // Excludes a stale entry silently, exactly as if it didn't exist yet —
-    // never returns a row that doesn't match what the caller asked for.
-    const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
-    if (!stillMatches) continue;
+    for (const match of matches) {
+      const rowRes = await routeToShard(env, match.source_shard_id, "/execute", {
+        sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
+        params: [match.partition_key],
+        requestId: `index-query-hydrate-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!rowRes.ok) continue; // base row/shard unreachable — skip rather than fail the whole query
+      const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
+      const row = rowBody.rows?.[0];
+      if (!row) continue; // row deleted since the index entry was written — stale, exclude
 
-    rows.push(row);
+      // Staleness re-check (Chunk 2's index maintenance is async): only
+      // surface this row if it still actually matches the queried tuple.
+      // Excludes a stale entry silently, exactly as if it didn't exist yet —
+      // never returns a row that doesn't match what the caller asked for.
+      const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
+      if (!stillMatches) continue;
+
+      rows.push(row);
+      if (rows.length >= limit) break;
+    }
+
+    offset += matches.length;
+    if (matches.length < batchLimit) break; // fewer than requested means exhausted
   }
   return json({ rows });
 }
