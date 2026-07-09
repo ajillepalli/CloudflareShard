@@ -33,7 +33,7 @@ const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const PENDING_INTENT_TTL_MS = 5 * 60 * 1000;
 
-const INTERNAL_TABLES = new Set(["applied_requests", "sqlite_sequence", "pending_intents", "row_locks"]);
+const INTERNAL_TABLES = new Set(["applied_requests", "sqlite_sequence", "pending_intents", "row_locks", "__cf_indexes"]);
 
 /** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
  * to force a rollback — distinguishes "validation succeeded, roll back on
@@ -178,6 +178,24 @@ export class ShardDO extends DurableObject {
         lock_key TEXT PRIMARY KEY,
         coordinator_tx_id TEXT NOT NULL,
         acquired_at TEXT NOT NULL
+      )
+    `);
+
+    // Milestone 2 (Index Service). Lives on a shard chosen by hashing
+    // (table, indexName, indexKeyJson) — independent of the base row's own
+    // shard, so /v1/index-query resolves a lookup on one shard rather than
+    // scattering (see the Milestone 2 design doc's index-placement decision).
+    // No tenant_id column — matches base table rows, which also carry no
+    // tenant_id physically (docs/SPEC.md §14's documented trust model).
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_indexes (
+        table_name TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        index_key_json TEXT NOT NULL,
+        partition_key TEXT NOT NULL,
+        source_shard_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (table_name, index_name, index_key_json, partition_key)
       )
     `);
   }
