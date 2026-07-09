@@ -2,7 +2,6 @@ import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { log } from "./log";
 import { isMutation } from "./sql-safety";
-import { coordinatorShardCount, coordinatorShardIdForTx } from "./hash";
 import { rowKey } from "./structured-op";
 
 type ExecutePayload = {
@@ -128,9 +127,10 @@ export class ShardDO extends DurableObject {
     coordinatorTxId: string,
   ): Promise<"committed" | "aborted" | "not_found" | "pending" | "unreachable"> {
     try {
-      const count = coordinatorShardCount(this.shardEnv);
-      const shardId = coordinatorShardIdForTx(coordinatorTxId, count);
-      const id = this.shardEnv.COORDINATOR.idFromName(shardId);
+      // One CoordinatorDO instance per transaction (env.COORDINATOR.idFromName
+      // is keyed directly on coordinatorTxId) — see Chunk 3's cost-model
+      // decision. No sharding/hashing needed to find the right instance.
+      const id = this.shardEnv.COORDINATOR.idFromName(coordinatorTxId);
       const stub = this.shardEnv.COORDINATOR.get(id);
       const res = await stub.fetch("https://coordinator.internal/tx-status", {
         method: "POST",

@@ -2,13 +2,13 @@
 
 ## Architecture
 
-### Validate CoordinatorDO sharded-pool choice against real transaction volume
+### Re-evaluate CoordinatorDO keying against real transaction volume
 
-**What:** Confirm the sharded coordinator pool (`coordinator-${hash(txId) % N}`, many transactions per DO instance) is actually justified versus the simpler one-DO-per-transaction alternative, using real observed transaction volume once Milestone 1 ships.
+**What:** Confirm one-DO-per-transaction (`env.COORDINATOR.idFromName(txId)`, no sharding) stays the right choice once real transaction volume exists, or re-introduce a sharded pool (`coordinator-${hash(txId) % N}`) if cold-start latency becomes a measurable problem at scale.
 
-**Why:** Both CEO-review voices independently flagged this as asserted rather than argued — no cost model (expected tx/sec, DO instantiation cost) exists anywhere in the Milestone 1 plan. It was a deliberate, informed choice at plan time, but it's a decision worth re-checking with data rather than aesthetics once there's real usage to look at.
+**Why:** The cost-model analysis that chose one-DO-per-transaction was reasoning from Cloudflare's published billing model and this project's realistic near-term (self-hosted, pre-product, low-volume) scale — not from observed production numbers, since none exist yet.
 
-**Context:** If per-transaction DOs turn out to be cheap enough and volume is low, the sharded pool's added complexity (CPU-budget management per alarm tick, cross-transaction interference risk within one shard) may not be earning its keep. Re-key is possible but disruptive once live transaction state exists — better to check early.
+**Context:** If sustained transaction volume gets high enough that coordinator cold-starts become a measurable latency cost, re-introducing sharding is a bounded, mostly-mechanical change (only the DO-keying line changes; the WAL schema and 2PC orchestration logic are unaffected). Re-key is more disruptive once live transaction state exists — better to check before volume grows, not after.
 
 **Effort:** S
 **Priority:** P3

@@ -2,7 +2,6 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ShardDO } from "./shard";
 import type { CoordinatorDO } from "./coordinator";
-import { coordinatorShardCount, coordinatorShardIdForTx } from "./hash";
 
 async function freshShard() {
   const id = env.SHARD.idFromName(`shard-${crypto.randomUUID()}`);
@@ -17,14 +16,13 @@ function post(path: string, body: unknown) {
   });
 }
 
-/** Directly seeds a transactions row in whichever CoordinatorDO shard a given
- * coordinatorTxId actually hashes to — must use the same mapping function
- * ShardDO's own sweep uses, or the seed lands on the wrong instance. */
+/** Directly seeds a transactions row in the one CoordinatorDO instance that
+ * owns this coordinatorTxId (one-DO-per-transaction — see Chunk 3's
+ * cost-model decision) — must use the same idFromName() key ShardDO's own
+ * sweep uses, or the seed lands on the wrong instance. */
 async function seedCoordinatorDecision(coordinatorTxId: string, status: string | null): Promise<void> {
   if (status === null) return; // simulate "no record" by seeding nothing
-  const count = coordinatorShardCount({});
-  const shardId = coordinatorShardIdForTx(coordinatorTxId, count);
-  const id = env.COORDINATOR.idFromName(shardId);
+  const id = env.COORDINATOR.idFromName(coordinatorTxId);
   const stub = env.COORDINATOR.get(id);
   // ensureSchema() only runs on fetch(), not on raw runInDurableObject storage
   // access — trigger it first with a harmless request.
