@@ -10,7 +10,7 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 - Deterministic single-shard routing via tenantId + table + partitionKey.
 - Scatter read endpoint for fan-out SELECT.
 - Manual vBucket reassignment for basic rebalancing.
-- Mutation idempotency via requestId.
+- Mutation idempotency via requestId, rejecting replay with a mismatched SQL/params pair instead of returning a stale result.
 
 ## Project layout
 
@@ -54,6 +54,9 @@ curl -X POST http://127.0.0.1:8787/admin/init \
   -d '{"numShards":4,"totalVBuckets":256}'
 ```
 
+`numShards` is clamped to 1-256 and `totalVBuckets` to 64-65536 (defaults 8 and 1024)
+so a single call can't provision an oversized, unrollbackable cluster.
+
 ### 2) Register a logical table
 
 ```bash
@@ -79,6 +82,9 @@ curl -X POST http://127.0.0.1:8787/admin/create-table \
     "schema":"CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT, body TEXT, created_at TEXT)"
   }'
 ```
+
+The `schema`'s `CREATE TABLE` name must match `table` exactly — a mismatch is
+rejected with a 400 rather than silently creating a differently-named table.
 
 ### 4) Insert data
 
