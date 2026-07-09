@@ -1215,6 +1215,143 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
   });
 });
 
+describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
+  it("finds a row inserted via /v1/mutate (async index path)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_mutate_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_mutate_by_v", table: "idx_c4_mutate_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c4_mutate_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await pollIndexRows("idx_c4_mutate_by_v", (r) => r.length === 1);
+
+    const res = await post("/v1/index-query", { table: "idx_c4_mutate_evt", indexName: "idx_c4_mutate_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(body.rows).toHaveLength(1);
+    expect(body.rows[0].id).toBe("row-1");
+    expect(body.rows[0].v).toBe("alpha");
+  });
+
+  it("finds a row inserted via /v1/tx (2PC piggyback path)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_tx_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_tx_by_v", table: "idx_c4_tx_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/tx", { mutations: [{ op: "insert", table: "idx_c4_tx_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }], requestId: "req-c4-tx" }, token);
+
+    const res = await post("/v1/index-query", { table: "idx_c4_tx_evt", indexName: "idx_c4_tx_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ id: string }> };
+    expect(body.rows).toHaveLength(1);
+    expect(body.rows[0].id).toBe("row-1");
+  });
+
+  it("returns an empty result for no matching rows", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_empty_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_empty_by_v", table: "idx_c4_empty_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post("/v1/index-query", { table: "idx_c4_empty_evt", indexName: "idx_c4_empty_by_v", tenantId, values: { v: "ghost" } }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: unknown[] };
+    expect(body.rows).toHaveLength(0);
+  });
+
+  it("requires a tenant token", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_auth_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_auth_by_v", table: "idx_c4_auth_evt", columns: ["v"] }, AUTH());
+    const res = await post("/v1/index-query", { table: "idx_c4_auth_evt", indexName: "idx_c4_auth_by_v", tenantId: "t1", values: { v: "alpha" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects a query against an unregistered index name", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_ghost_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/index-query", { table: "idx_c4_ghost_evt", indexName: "idx_c4_ghost_index", tenantId, values: { v: "alpha" } }, token);
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INDEX_NOT_REGISTERED");
+  });
+
+  it("rejects a query missing a value for one of the index's columns", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c4_partial_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c4_partial_evt (id TEXT PRIMARY KEY, a TEXT, b TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    await post("/admin/create-index", { indexName: "idx_c4_partial_by_ab", table: "idx_c4_partial_evt", columns: ["a", "b"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post("/v1/index-query", { table: "idx_c4_partial_evt", indexName: "idx_c4_partial_by_ab", tenantId, values: { a: "x" } }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INCOMPLETE_INDEX_KEY");
+  });
+
+  it("excludes a stale index entry whose base row no longer matches (async staleness re-check)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_stale_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_stale_by_v", table: "idx_c4_stale_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c4_stale_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await pollIndexRows("idx_c4_stale_by_v", (r) => r.length === 1);
+
+    // Simulate a race: the base row changed, but the OLD index entry
+    // (pointing at "alpha") hasn't been cleaned up yet — directly seed a
+    // stale entry alongside whatever the real async write already produced,
+    // by updating the base row without going through /v1/mutate's index
+    // maintenance (mirrors a lagging async write mid-flight).
+    for (const candidateShardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        const rows = Array.from(state.storage.sql.exec("SELECT * FROM idx_c4_stale_evt WHERE id = 'row-1'"));
+        if (rows.length > 0) {
+          state.storage.sql.exec("UPDATE idx_c4_stale_evt SET v = 'beta' WHERE id = 'row-1'");
+        }
+      });
+    }
+
+    // The stale __cf_indexes entry (still keyed on "alpha") must not surface
+    // a row whose actual current value no longer matches.
+    const res = await post("/v1/index-query", { table: "idx_c4_stale_evt", indexName: "idx_c4_stale_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: unknown[] };
+    expect(body.rows).toHaveLength(0);
+  });
+
+  it("caps fan-out at the requested limit", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c4_limit_evt");
+    await post("/admin/create-index", { indexName: "idx_c4_limit_by_v", table: "idx_c4_limit_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    for (let i = 0; i < 5; i++) {
+      await post("/v1/mutate", { op: "insert", table: "idx_c4_limit_evt", tenantId, partitionKey: `row-${i}`, values: { v: "shared" } }, token);
+    }
+    await pollIndexRows("idx_c4_limit_by_v", (r) => r.length === 5);
+
+    const res = await post("/v1/index-query", { table: "idx_c4_limit_evt", indexName: "idx_c4_limit_by_v", tenantId, values: { v: "shared" }, limit: 2 }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: unknown[] };
+    expect(body.rows).toHaveLength(2);
+  });
+});
+
 describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {
   it("/admin/tx-status requires an admin token", async () => {
     const res = await post("/admin/tx-status", { txId: "whatever" });

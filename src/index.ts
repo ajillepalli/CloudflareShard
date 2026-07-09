@@ -1228,6 +1228,108 @@ async function handleAdminTxForceAbort(request: Request, env: Env): Promise<Resp
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
+const MAX_INDEX_QUERY_LIMIT = 100;
+const DEFAULT_INDEX_QUERY_LIMIT = 20;
+
+/** Milestone 2, Chunk 4. Tenant-facing point lookup by a registered
+ * secondary index — exact full-tuple only (no leftmost-prefix yet, see the
+ * design doc's Open Questions). Resolves in three hops: CatalogDO validates
+ * the tenant token and the index's columns, the computed index shard
+ * resolves matching (partitionKey, sourceShardId) pairs, then each match's
+ * base row is read from its own shard. Because /v1/mutate's index
+ * maintenance is async (Chunk 2), a matched entry can be stale by the time
+ * it's read — the base row is re-checked against the queried tuple before
+ * being returned, so a stale delete/update never surfaces a wrong result;
+ * it's silently excluded, same as if the index entry didn't exist yet. */
+async function handleV1IndexQuery(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as {
+    table?: string;
+    indexName?: string;
+    tenantId?: string;
+    values?: Record<string, unknown>;
+    limit?: number;
+  };
+  if (!body.table || !body.indexName || !body.tenantId || !body.values) {
+    return json({ error: { code: "MISSING_FIELDS", message: "Missing table, indexName, tenantId, or values." } }, 400);
+  }
+  const limit = Math.max(1, Math.min(MAX_INDEX_QUERY_LIMIT, body.limit ?? DEFAULT_INDEX_QUERY_LIMIT));
+
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+  const lookupRes = await routeToCatalog(
+    env,
+    catalogShardId,
+    "/lookup-index",
+    { table: body.table, indexName: body.indexName, tenantId: body.tenantId },
+    request.headers.get("authorization") ?? undefined,
+  );
+  if (!lookupRes.ok) {
+    return new Response(lookupRes.body, { status: lookupRes.status, headers: lookupRes.headers });
+  }
+  const lookupBody = (await lookupRes.json()) as { columns: string[]; partitionKeyColumn: string };
+  const missing = lookupBody.columns.filter((c) => !(c in (body.values as Record<string, unknown>)));
+  if (missing.length > 0) {
+    return json(
+      {
+        error: {
+          code: "INCOMPLETE_INDEX_KEY",
+          message: `Missing value(s) for indexed column(s): ${missing.join(", ")}.`,
+          fix: "Exact full-tuple lookups require a value for every column the index covers (leftmost-prefix lookups are not yet supported).",
+        },
+      },
+      400,
+    );
+  }
+
+  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+  const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
+  if (listFailed) return listFailed;
+  const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+  if (shardIds.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet." } }, 400);
+  }
+
+  const indexKeyJson = JSON.stringify(lookupBody.columns.map((c) => (body.values as Record<string, unknown>)[c] ?? null));
+  const indexShardId = indexShardIdForKey(body.table, body.indexName, indexKeyJson, shardIds);
+  const indexRes = await routeToShard(env, indexShardId, "/execute", {
+    sql: "SELECT partition_key, source_shard_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? LIMIT ?",
+    params: [body.table, body.indexName, indexKeyJson, limit],
+    requestId: `index-query-lookup-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (!indexRes.ok) {
+    return new Response(indexRes.body, { status: indexRes.status, headers: indexRes.headers });
+  }
+  const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; source_shard_id: string }> };
+  const matches = indexBody.rows ?? [];
+
+  const safeTable = `"${body.table}"`;
+  const safePkCol = `"${lookupBody.partitionKeyColumn}"`;
+  const queriedValues = body.values as Record<string, unknown>;
+  const rows: Array<Record<string, unknown>> = [];
+  for (const match of matches) {
+    const rowRes = await routeToShard(env, match.source_shard_id, "/execute", {
+      sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
+      params: [match.partition_key],
+      requestId: `index-query-hydrate-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    if (!rowRes.ok) continue; // base row/shard unreachable — skip rather than fail the whole query
+    const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
+    const row = rowBody.rows?.[0];
+    if (!row) continue; // row deleted since the index entry was written — stale, exclude
+
+    // Staleness re-check (Chunk 2's index maintenance is async): only
+    // surface this row if it still actually matches the queried tuple.
+    // Excludes a stale entry silently, exactly as if it didn't exist yet —
+    // never returns a row that doesn't match what the caller asked for.
+    const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
+    if (!stillMatches) continue;
+
+    rows.push(row);
+  }
+  return json({ rows });
+}
+
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
@@ -1328,6 +1430,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
+  "/v1/index-query": handleV1IndexQuery,
   "/v1/scatter": handleV1Scatter,
 };
 

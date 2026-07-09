@@ -47,6 +47,7 @@ export class CatalogDO extends DurableObject {
       "/set-partition-key-column": this.handleSetPartitionKeyColumn.bind(this),
       "/create-index": this.handleCreateIndex.bind(this),
       "/list-indexes": this.handleListIndexes.bind(this),
+      "/lookup-index": this.handleLookupIndex.bind(this),
     };
   }
 
@@ -455,6 +456,38 @@ export class CatalogDO extends DurableObject {
         createdAt: i.created_at,
       })),
     });
+  }
+
+  /** Milestone 2, Chunk 4. Tenant-auth-gated (not admin-gated, unlike
+   * /list-indexes) — /v1/index-query is a tenant-facing data-plane route, so
+   * this checks the caller's token the same way /route does, without
+   * requiring a partitionKey (nothing to route to a specific row yet —
+   * that's what the index lookup itself resolves). */
+  private async handleLookupIndex(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string; indexName?: string; tenantId?: string };
+    if (!body.table || !body.indexName || !body.tenantId) {
+      return json({ error: "Missing table, indexName, or tenantId" }, 400);
+    }
+    const authError = await this.checkTenantAuth(body.tenantId, request);
+    if (authError) return authError;
+
+    const index = this.one<{ columns_json: string; partition_key_column: string }>(
+      `
+      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column
+      FROM index_rules ir
+      JOIN table_rules tr ON tr.table_name = ir.table_name
+      WHERE ir.index_name = ? AND ir.table_name = ?
+      `,
+      body.indexName,
+      body.table,
+    );
+    if (!index) {
+      return json(
+        { error: { code: "INDEX_NOT_REGISTERED", message: `Index ${body.indexName} is not registered on table ${body.table}.` } },
+        404,
+      );
+    }
+    return json({ columns: JSON.parse(index.columns_json) as string[], partitionKeyColumn: index.partition_key_column });
   }
 
   /** Data-plane tenant auth check: does the caller's bearer token match the
