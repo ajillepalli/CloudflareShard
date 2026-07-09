@@ -692,6 +692,66 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
   });
 });
 
+describe("Worker /admin/drop-index (Milestone 2 Chunk 6)", () => {
+  it("requires an admin token", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post("/admin/drop-index", { indexName: "idx_c6_auth_by_v" });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects dropping a nonexistent index", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post("/admin/drop-index", { indexName: "idx_c6_ghost" }, AUTH());
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("INDEX_NOT_REGISTERED");
+  });
+
+  it("drops an index: unregisters it, cleans up physical rows, and blocks future queries", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c6_drop_evt");
+    await post("/admin/create-index", { indexName: "idx_c6_drop_by_v", table: "idx_c6_drop_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c6_drop_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await pollIndexRows("idx_c6_drop_by_v", (r) => r.length === 1);
+
+    const dropRes = await post("/admin/drop-index", { indexName: "idx_c6_drop_by_v" }, AUTH());
+    expect(dropRes.status).toBe(200);
+    const dropBody = (await dropRes.json()) as { ok: boolean; indexName: string; warning?: string };
+    expect(dropBody.ok).toBe(true);
+    expect(dropBody.warning).toBeUndefined();
+
+    // Unregistered: /admin/list-indexes no longer includes it.
+    const listRes = await post("/admin/list-indexes", {}, AUTH());
+    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string }> };
+    expect(listBody.indexes.map((i) => i.indexName)).not.toContain("idx_c6_drop_by_v");
+
+    // Unregistered: a new /v1/index-query is rejected, not silently empty.
+    const queryRes = await post("/v1/index-query", { table: "idx_c6_drop_evt", indexName: "idx_c6_drop_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(queryRes.status).toBe(404);
+
+    // Physical rows cleaned up on every shard.
+    for (const candidateShardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        const rows = Array.from(state.storage.sql.exec("SELECT * FROM __cf_indexes WHERE index_name = ?", "idx_c6_drop_by_v"));
+        expect(rows).toHaveLength(0);
+      });
+    }
+
+    // Raw /v1/sql mutations against the table are unblocked again — no
+    // index left to desync.
+    const rawRes = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO idx_c6_drop_evt (id, v) VALUES (?, ?)", params: ["row-2", "beta"], table: "idx_c6_drop_evt", tenantId, partitionKey: "row-2" },
+      token,
+    );
+    expect(rawRes.status).toBe(200);
+  });
+});
+
 describe("Worker /v1/sql raw mutation against an indexed table (Milestone 2 Chunk 1)", () => {
   it("rejects a raw /v1/sql mutation against a table with a registered index", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());

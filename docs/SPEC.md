@@ -153,6 +153,17 @@ POST /admin/list-indexes (ADMIN_TOKEN) — Milestone 2, Chunk 1
 Response:
 - indexes: array of `{indexName, table, columns, createdAt}`
 
+POST /admin/drop-index (ADMIN_TOKEN) — Milestone 2, Chunk 6
+Request:
+- indexName string
+
+Response:
+- ok
+- indexName
+- warning string (only present if physical cleanup failed on one or more shards — the index is still unregistered and unqueryable either way)
+
+Unregisters the index in `CatalogDO` (fanned to every catalog shard) *before* fanning out physical `__cf_indexes` row cleanup — so `/v1/index-query` and raw `/v1/sql` mutations against the table both see the index as gone (404 / no longer blocked, respectively) immediately, even while physical cleanup is still in flight across shards. A write already in progress when the drop runs may still land one last `__cf_indexes` row after cleanup passes over it — a known, accepted eventual-consistency window for this rare admin operation, not a linearizability guarantee this milestone makes.
+
 `/v1/mutate` async index maintenance — Milestone 2, Chunk 2 (no new route; extends the existing `/v1/mutate` handler)
 When the target table has any registered index, `handleV1Mutate` computes the resulting `__cf_indexes` deltas and dispatches them via the Worker's own `ctx.waitUntil()` — after the base row's write has already succeeded and the response is on its way back to the caller, so this never adds latency to the base write. For `update`/`delete`/`upsert` (which may hit the `ON CONFLICT UPDATE` path), the row's prior indexed-column values are read once before the mutation runs, so removing a now-stale index entry doesn't need a second read-after-write — whatever column wasn't in the caller's `values` is taken from that pre-read. If the best-effort write to the computed index shard fails, it's recorded via `ShardDO./enqueue-index-job` on the *base* shard (not the index shard, which may be the one that's unreachable) and retried by that shard's own `alarm()` with exponential backoff (`index_pending_jobs` table) — the same recovery-queue pattern `CoordinatorDO` already uses for 2PC. A write to a table with no registered index pays none of this cost.
 

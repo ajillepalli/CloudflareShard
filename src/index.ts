@@ -562,6 +562,51 @@ async function handleAdminListIndexes(request: Request, env: Env): Promise<Respo
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
+/** Milestone 2, Chunk 6. Unregisters the index in CatalogDO first (fanned to
+ * every catalog shard) so /v1/index-query and /lookup-index start rejecting
+ * it immediately, then best-effort deletes its physical __cf_indexes rows
+ * across every shard — the index could be on any shard given hash-based
+ * placement, so this fans out rather than targeting one. */
+async function handleAdminDropIndex(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { indexName?: string };
+  if (!body.indexName) {
+    return json({ error: "Missing indexName" }, 400);
+  }
+
+  const unregisterResults = await fanOutToAllCatalogs(
+    env,
+    "/drop-index",
+    () => ({ indexName: body.indexName }),
+    request.headers.get("authorization") ?? undefined,
+  );
+  const unregisterFailed = firstCatalogFanOutFailure(unregisterResults, "Failed to unregister index.");
+  if (unregisterFailed) return unregisterFailed;
+
+  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+  const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
+  if (listFailed) return listFailed;
+  const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+
+  const cleanupResults = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId) => {
+    const res = await routeToShard(env, shardId, "/execute", {
+      sql: "DELETE FROM __cf_indexes WHERE index_name = ?",
+      params: [body.indexName],
+      requestId: `drop-index-cleanup-${body.indexName}-${shardId}-${crypto.randomUUID()}`,
+      isMutation: true,
+    });
+    return { shardId, ok: res.ok };
+  });
+  const cleanupFailures = cleanupResults.filter((r) => !r.ok).map((r) => r.shardId);
+
+  return json({
+    ok: true,
+    indexName: body.indexName,
+    ...(cleanupFailures.length > 0
+      ? { warning: `Physical cleanup failed on shard(s): ${cleanupFailures.join(", ")}. The index is unregistered and no longer queryable, but stale __cf_indexes rows may remain on those shards.` }
+      : {}),
+  });
+}
+
 async function handleAdminDrainShard(request: Request, env: Env): Promise<Response> {
   const payload = (await request.json()) as { shardId: string; catalogShardId?: string };
   if (!payload.catalogShardId) {
@@ -1445,6 +1490,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/set-partition-key-column": handleAdminSetPartitionKeyColumn,
   "/admin/create-index": handleAdminCreateIndex,
   "/admin/list-indexes": handleAdminListIndexes,
+  "/admin/drop-index": handleAdminDropIndex,
   "/admin/tx-status": handleAdminTxStatus,
   "/admin/tx-force-abort": handleAdminTxForceAbort,
   "/v1/sql": handleV1Sql,
