@@ -117,7 +117,7 @@ POST /admin/create-table
 Request:
 - table string
 - schema string (must be a `CREATE TABLE` statement whose table name matches `table`)
-- partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist)
+- partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist. The rollback also clears the create-table idempotency-cache entry on each shard via `/invalidate-request`, so a retry with a corrected `partitionKeyColumn` genuinely re-creates the table rather than replaying a stale cached "success" for a table that no longer exists)
 
 Response:
 - ok
@@ -277,8 +277,9 @@ This prevents duplicate writes after network retries and stops a reused requestI
   - Requires the structured mutation contract (Section 7, `/v1/mutate`) and a mandatory
     partition-key-column convention on every registered table — both shipped.
   - **Shard-level primitives (implementation status: shipped and reachable via `/v1/tx`).**
-    Each `ShardDO` exposes internal `/prepare`, `/commit`, `/abort`, `/tx-status`, and
-    `/pending-intent-count` routes implementing the participant side of 2PC: `/prepare`
+    Each `ShardDO` exposes internal `/prepare`, `/commit`, `/abort`, `/tx-status`,
+    `/pending-intent-count`, and `/invalidate-request` routes implementing the participant
+    side of 2PC: `/prepare`
     validates a mutation by executing it inside a transaction and forcing a rollback (so a
     concurrent read never sees it), then durably records a lock + pending intent in a
     separate transaction; `/commit` re-executes for real; `/abort` has nothing to undo,
@@ -294,7 +295,18 @@ This prevents duplicate writes after network retries and stops a reused requestI
     acknowledgement that fails to reach one or more shards is queued in `recovery_queue` and
     retried via `alarm()` with exponential backoff — the transaction is already durably
     committed at that point, so this only affects when the shard-side state catches up, not
-    correctness. `/v1/tx` (Section 7) is the public entry point.
+    correctness. `/v1/tx` (Section 7) is the public entry point. `CoordinatorDO` stores a
+    hash of the participant/mutation set alongside each `txId`; retrying an existing `txId`
+    (any status — in-flight, committed, or aborted) with a different mutation set rejects 409
+    (`TX_ID_REQUEST_MISMATCH`) instead of silently resuming 2PC with the new data or replaying
+    a stale "committed" for content that was never actually applied — mirrors `/v1/sql`'s
+    existing `request_hash` mismatch rejection for the same class of bug (found by a Codex
+    review pass against the merged milestone).
+  - A batch may legitimately contain multiple mutations against the same row (e.g. insert
+    then update in one `/v1/tx` call — nothing caps mutation count, only distinct participant
+    keys); `ShardDO./prepare` acquires each row lock with `INSERT OR IGNORE` rather than a
+    plain `INSERT`, so this no longer crashes on a `row_locks` primary-key violation (also
+    found by the same Codex pass).
   - Raw `/v1/sql` and `/v1/mutate` mutations against a row locked by an in-flight
     coordinated transaction reject 409 (`TX_PARTICIPANT_LOCKED`).
   - **Draining interaction (Milestone 1 Chunk 4 — shipped).** A new transaction targeting an

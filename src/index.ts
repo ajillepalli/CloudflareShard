@@ -252,13 +252,20 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     const introspectBody = (await introspectRes.json()) as { rows?: Array<{ name: string }> };
     const columns = (introspectBody.rows ?? []).map((c) => c.name);
     if (!columns.includes(body.partitionKeyColumn)) {
-      await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, (shardId) =>
-        routeToShard(env, shardId, "/execute", {
+      await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId) => {
+        await routeToShard(env, shardId, "/execute", {
           sql: `DROP TABLE IF EXISTS "${body.table}"`,
           requestId: `create-table-rollback-${body.table}-${shardId}`,
           isMutation: true,
-        }),
-      );
+        });
+        // Undo the idempotency-cache side effect together with the DDL: the
+        // "success" cached under the original create requestId is now a lie
+        // (the table it recorded creating no longer exists), so a retry must
+        // genuinely re-execute rather than replay that cached result.
+        await routeToShard(env, shardId, "/invalidate-request", {
+          requestId: `create-table-${body.table}-${shardId}`,
+        });
+      });
       return json(
         {
           error: {

@@ -224,6 +224,27 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(registerRes.status).toBe(200);
   });
 
+  it("regression (Codex-found): retrying /admin/create-table with the same table+schema after a partitionKeyColumn rollback actually recreates the table, instead of replaying a stale cached success", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "retry_after_rollback_evt";
+    const schema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+
+    const failed = await post("/admin/create-table", { table, schema, partitionKeyColumn: "nonexistent_col" }, AUTH());
+    expect(failed.status).toBe(400);
+
+    // Same table, same schema, corrected partitionKeyColumn — this reuses the
+    // exact create-table requestId from the failed attempt. Without
+    // invalidating that requestId's idempotency-cache entry on rollback, this
+    // would replay the cached "success" from the first attempt without
+    // actually recreating the (already-dropped) table.
+    const retried = await post("/admin/create-table", { table, schema, partitionKeyColumn: "id" }, AUTH());
+    expect(retried.status).toBe(200);
+
+    const introspect = await post("/admin/shard-stats", { shardId: "catalog-0-shard-0" }, AUTH());
+    const introspectBody = (await introspect.json()) as { tables: Array<{ table: string; rowCount: number }> };
+    expect(introspectBody.tables.map((t) => t.table)).toContain(table);
+  });
+
   it("/admin/create-table reports a shard-level failure when the schema fails to apply", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     // Missing PRIMARY KEY column type makes this a syntactically invalid CREATE TABLE.
