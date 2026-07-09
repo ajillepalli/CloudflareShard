@@ -9,10 +9,13 @@ import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } fr
 import {
   compileMutation,
   IDENTIFIER_RE,
+  participantKey,
   UNSET_PARTITION_KEY_COLUMN,
   validateMutation,
   type StructuredMutation,
+  type StructuredOperation,
 } from "./structured-op";
+import { sha256Hex } from "./auth";
 
 export { CatalogDO, ShardDO, CoordinatorDO };
 
@@ -26,6 +29,7 @@ export interface Env {
 
 const DEFAULT_CATALOG_SHARD_COUNT = 4;
 const SHARD_FANOUT_CONCURRENCY = 10;
+const MAX_TX_PARTICIPANT_KEYS = 8;
 
 /** Maps over items in bounded-size batches so a large shard count can't fire
  * unbounded simultaneous Durable Object calls in one request. */
@@ -621,6 +625,139 @@ async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
   return json({ ok: true, rowsAffected: shardPayload.rowsAffected ?? 0 });
 }
 
+/** Cross-shard atomic write via CoordinatorDO's 2PC. Every mutation is
+ * individually routed (so cross-tenant mismatches 401 the same way a single
+ * /route call would — no separate check needed) and validated/compiled with
+ * its own table's partitionKeyColumn, then grouped by shardId into the
+ * participant list /begin expects. */
+async function handleV1Tx(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as StructuredOperation;
+  if (!body.mutations || body.mutations.length === 0) {
+    return json({ error: { code: "MISSING_MUTATIONS", message: "mutations must be a non-empty array." } }, 400);
+  }
+  if (!body.requestId) {
+    return json({ error: { code: "MISSING_REQUEST_ID", message: "Missing requestId.", fix: "Provide a client-generated requestId for idempotent retries." } }, 400);
+  }
+
+  const distinctKeys = new Set(body.mutations.map((m) => participantKey(m)));
+  if (distinctKeys.size > MAX_TX_PARTICIPANT_KEYS) {
+    return json(
+      {
+        error: {
+          code: "TOO_MANY_PARTICIPANTS",
+          message: `Transaction touches ${distinctKeys.size} distinct rows, exceeding the cap of ${MAX_TX_PARTICIPANT_KEYS}.`,
+          fix: "Split this into multiple smaller transactions.",
+        },
+      },
+      400,
+    );
+  }
+
+  const compiledByShardId = new Map<
+    string,
+    Array<{ sql: string; params: unknown[]; tenantId: string; table: string; partitionKey: string }>
+  >();
+  const currentCount = catalogShardCount(env);
+  const authorization = request.headers.get("authorization") ?? undefined;
+
+  for (const mutation of body.mutations) {
+    if (!mutation.table || !mutation.tenantId || !mutation.partitionKey) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Each mutation requires table, tenantId, partitionKey." } }, 400);
+    }
+
+    const catalogShardId = catalogShardIdForTenant(env, mutation.tenantId);
+    const routeRes = await routeToCatalog(
+      env,
+      catalogShardId,
+      "/route",
+      { table: mutation.table, tenantId: mutation.tenantId, partitionKey: mutation.partitionKey },
+      authorization,
+    );
+    if (!routeRes.ok) {
+      return new Response(routeRes.body, { status: routeRes.status, headers: routeRes.headers });
+    }
+    const route = (await routeRes.json()) as {
+      shardId: string;
+      catalogShardCount: number | null;
+      partitionKeyColumn: string | null;
+    };
+    if (route.catalogShardCount !== null && route.catalogShardCount !== currentCount) {
+      return json(
+        {
+          error: `Catalog shard count mismatch: cluster was initialized with ${route.catalogShardCount} catalog shards, but this Worker is configured for ${currentCount}.`,
+        },
+        409,
+      );
+    }
+
+    const partitionKeyColumn = route.partitionKeyColumn ?? UNSET_PARTITION_KEY_COLUMN;
+    const validation = validateMutation(mutation, partitionKeyColumn);
+    if (!validation.ok) {
+      return json({ error: { code: validation.code, message: validation.error, fix: "Check the request against the error message above." } }, validation.status);
+    }
+
+    const { sql, params } = compileMutation(mutation, partitionKeyColumn);
+    const intent = { sql, params, tenantId: mutation.tenantId, table: mutation.table, partitionKey: mutation.partitionKey };
+    const existing = compiledByShardId.get(route.shardId);
+    if (existing) {
+      existing.push(intent);
+    } else {
+      compiledByShardId.set(route.shardId, [intent]);
+    }
+  }
+
+  // txId is derived from the first mutation's tenantId — every mutation is
+  // guaranteed to share the same tenantId by this point, since a mismatched
+  // tenantId would already have 401'd against that mutation's /route call
+  // above (routing forwards the caller's own bearer token, which is scoped
+  // to a single tenant).
+  const txId = await sha256Hex(JSON.stringify([body.mutations[0].tenantId, body.requestId]));
+  const participants = Array.from(compiledByShardId.entries()).map(([shardId, intents]) => ({ shardId, intents }));
+
+  const coordinatorId = env.COORDINATOR.idFromName(txId);
+  const coordinatorStub = env.COORDINATOR.get(coordinatorId);
+  const beginRes = await coordinatorStub.fetch("https://coordinator.internal/begin", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ txId, participants }),
+  });
+  const beginBody = await beginRes.json();
+  return new Response(JSON.stringify(beginBody), {
+    status: beginRes.status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function handleAdminTxStatus(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { txId?: string };
+  if (!body.txId) {
+    return json({ error: "Missing txId" }, 400);
+  }
+  const id = env.COORDINATOR.idFromName(body.txId);
+  const stub = env.COORDINATOR.get(id);
+  const res = await stub.fetch("https://coordinator.internal/tx-status", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ txId: body.txId }),
+  });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminTxForceAbort(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { txId?: string };
+  if (!body.txId) {
+    return json({ error: "Missing txId" }, 400);
+  }
+  const id = env.COORDINATOR.idFromName(body.txId);
+  const stub = env.COORDINATOR.get(id);
+  const res = await stub.fetch("https://coordinator.internal/force-abort", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ txId: body.txId }),
+  });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
@@ -714,8 +851,11 @@ const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> 
   "/admin/register-tenant": handleAdminRegisterTenant,
   "/admin/revoke-tenant": handleAdminRevokeTenant,
   "/admin/set-partition-key-column": handleAdminSetPartitionKeyColumn,
+  "/admin/tx-status": handleAdminTxStatus,
+  "/admin/tx-force-abort": handleAdminTxForceAbort,
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
+  "/v1/tx": handleV1Tx,
   "/v1/scatter": handleV1Scatter,
 };
 
