@@ -57,6 +57,7 @@ export class ShardDO extends DurableObject {
       "/abort": this.handleAbort.bind(this),
       "/tx-status": this.handleTxStatus.bind(this),
       "/pending-intent-count": this.handlePendingIntentCount.bind(this),
+      "/invalidate-request": this.handleInvalidateRequest.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -272,6 +273,22 @@ export class ShardDO extends DurableObject {
     });
   }
 
+  /** Deletes a specific applied_requests entry, letting a subsequent /execute
+   * with the same requestId genuinely re-run instead of replaying a cached
+   * result. Needed when a caller undoes the mutation's effect out from under
+   * the idempotency layer (e.g. /admin/create-table's DROP TABLE rollback on
+   * a partitionKeyColumn mismatch) — without this, the cached "success"
+   * becomes a lie the moment the caller rolls back what it recorded. Trusts
+   * its caller the same way every other DO-binding-only route does. */
+  private async handleInvalidateRequest(request: Request): Promise<Response> {
+    const body = (await request.json()) as { requestId?: string };
+    if (!body.requestId) {
+      return json({ error: "Missing requestId" }, 400);
+    }
+    this.sql.exec("DELETE FROM applied_requests WHERE request_id = ?", body.requestId);
+    return json({ ok: true });
+  }
+
   private async handleExecute(request: Request): Promise<Response> {
     const payload = (await request.json()) as ExecutePayload;
     if (!payload.sql || !payload.requestId) {
@@ -433,8 +450,14 @@ export class ShardDO extends DurableObject {
     const now = new Date().toISOString();
     this.ctx.storage.transactionSync(() => {
       intents.forEach((intent, i) => {
+        // OR IGNORE: a batch may legitimately contain multiple mutations
+        // against the same row (e.g. insert then update in one /v1/tx call —
+        // nothing caps mutation count, only distinct participant keys). The
+        // pre-check loop above already guarantees any existing lock on this
+        // key belongs to this same coordinatorTxId, so re-acquiring it here
+        // is a safe no-op rather than a PRIMARY KEY violation.
         this.sql.exec(
-          "INSERT INTO row_locks (lock_key, coordinator_tx_id, acquired_at) VALUES (?, ?, ?)",
+          "INSERT OR IGNORE INTO row_locks (lock_key, coordinator_tx_id, acquired_at) VALUES (?, ?, ?)",
           lockKeys[i],
           coordinatorTxId,
           now,
