@@ -297,6 +297,16 @@ This prevents duplicate writes after network retries and stops a reused requestI
     correctness. `/v1/tx` (Section 7) is the public entry point.
   - Raw `/v1/sql` and `/v1/mutate` mutations against a row locked by an in-flight
     coordinated transaction reject 409 (`TX_PARTICIPANT_LOCKED`).
+  - **Draining interaction (Milestone 1 Chunk 4 — shipped).** A new transaction targeting an
+    already-draining shard is rejected 503 by `CatalogDO`'s existing `/route` check (shard
+    status must be `active`) — no new code needed there. The other direction — draining a
+    shard that has in-flight prepared 2PC intents — is handled in the Worker's
+    `handleAdminDrainShard`, not by adding a `SHARD` binding to `CatalogDO`: it calls the
+    target `ShardDO`'s `/pending-intent-count` first, and only proceeds to `CatalogDO`'s
+    `/drain-shard` if that count is 0; otherwise it rejects 409
+    (`SHARD_HAS_IN_FLIGHT_TRANSACTIONS`). This preserves the "Worker orchestrates, DOs don't
+    call each other directly" invariant. Relies on Chunk 3's recovery loop (bounded time) or
+    `/admin/tx-force-abort` (manual escape hatch) to unblock a stuck retry.
 
 ## 11) Rebalancing and Split (MVP)
 

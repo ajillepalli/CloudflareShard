@@ -274,6 +274,13 @@ last 100 admin actions (`/init`, `/register-table`, `/split-vbucket`,
 `/drain-shard`) into one list sorted newest-first, tagged with the
 `catalogShardId` that logged each entry.
 
+`/admin/drain-shard` first checks the target shard's in-flight `/v1/tx`
+transaction count and rejects with 409 (`SHARD_HAS_IN_FLIGHT_TRANSACTIONS`)
+if any are still prepared — retry once they resolve (Chunk 3's recovery loop
+bounds how long that takes), or use `/admin/tx-force-abort` to unstick one
+manually. A shard that's already draining rejects any *new* `/v1/tx`/`/v1/sql`
+write with 503.
+
 ## Tenant authorization
 
 `/v1/sql` and `/v1/mutate` require a tenant bearer token (`POST
@@ -299,9 +306,7 @@ callers with zero overlap window; a known limitation, not yet addressed).
 
 - No SQL parser or policy sandboxing yet.
 - No automatic backfill/dual-write during split.
-- Cross-shard transactions (`/v1/tx`) are bounded to 8 participant rows and
-  don't yet interact with shard draining (Milestone 1 Chunk 4) — starting a
-  transaction against a shard mid-drain is not yet blocked or coordinated.
+- Cross-shard transactions (`/v1/tx`) are bounded to 8 participant rows.
 - Global secondary indexes are not implemented.
 
 ## Next production steps
