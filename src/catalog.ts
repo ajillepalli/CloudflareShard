@@ -18,6 +18,7 @@ const ADMIN_GATED_ROUTES = new Set([
   "/set-partition-key-column",
   "/create-index",
   "/list-indexes",
+  "/drop-index",
 ]);
 
 export class CatalogDO extends DurableObject {
@@ -48,6 +49,7 @@ export class CatalogDO extends DurableObject {
       "/create-index": this.handleCreateIndex.bind(this),
       "/list-indexes": this.handleListIndexes.bind(this),
       "/lookup-index": this.handleLookupIndex.bind(this),
+      "/drop-index": this.handleDropIndex.bind(this),
     };
   }
 
@@ -442,6 +444,29 @@ export class CatalogDO extends DurableObject {
     );
 
     return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
+  }
+
+  /** Milestone 2, Chunk 6. Unregisters the index — the Worker calls this
+   * BEFORE fanning out physical __cf_indexes cleanup, so any /v1/index-query
+   * or /lookup-index call that starts after this returns sees the index as
+   * gone immediately (404 INDEX_NOT_REGISTERED), even while physical
+   * cleanup is still in flight across shards. A write already in progress
+   * when this runs may still land one last __cf_indexes row after physical
+   * cleanup passes over it — a known, accepted eventual-consistency window,
+   * not a correctness gap this milestone closes (DROP INDEX is a rare admin
+   * operation, not a hot path). */
+  private async handleDropIndex(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: "Missing indexName" }, 400);
+    }
+    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", body.indexName);
+    if (!existing) {
+      return json({ error: { code: "INDEX_NOT_REGISTERED", message: `Index ${body.indexName} is not registered.` } }, 404);
+    }
+    this.audit("/drop-index", { indexName: body.indexName });
+    this.sql.exec("DELETE FROM index_rules WHERE index_name = ?", body.indexName);
+    return json({ ok: true, indexName: body.indexName });
   }
 
   private async handleListIndexes(): Promise<Response> {
