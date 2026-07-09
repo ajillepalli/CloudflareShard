@@ -580,7 +580,7 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
   if (!pendingRes.ok) {
     return new Response(pendingRes.body, { status: pendingRes.status, headers: pendingRes.headers });
   }
-  const pendingBody = (await pendingRes.json()) as { count: number };
+  const pendingBody = (await pendingRes.json()) as { count: number; indexPendingJobCount?: number };
   if (pendingBody.count > 0) {
     return json(
       {
@@ -588,6 +588,26 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
           code: "SHARD_HAS_IN_FLIGHT_TRANSACTIONS",
           message: `Shard ${payload.shardId} has ${pendingBody.count} in-flight transaction(s).`,
           fix: "Retry after they resolve, or use /admin/tx-force-abort to unblock a stuck one.",
+        },
+      },
+      409,
+    );
+  }
+
+  // Milestone 2, Chunk 5: also block on unresolved async index-write retries
+  // queued on this shard (Chunk 2's index_pending_jobs) — draining doesn't
+  // stop the underlying DO or its alarm() from continuing to retry them, but
+  // an operator draining a shard ahead of decommissioning it should see and
+  // resolve outstanding index-repair work first, not have it silently
+  // continue running on a shard the catalog no longer routes traffic to.
+  const indexPendingJobCount = pendingBody.indexPendingJobCount ?? 0;
+  if (indexPendingJobCount > 0) {
+    return json(
+      {
+        error: {
+          code: "SHARD_HAS_PENDING_INDEX_JOBS",
+          message: `Shard ${payload.shardId} has ${indexPendingJobCount} unresolved index-write retry job(s).`,
+          fix: "Retry after they resolve (check /admin/shard-stats for indexPendingJobCount), or investigate why the target index shard is unreachable.",
         },
       },
       409,

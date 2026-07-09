@@ -360,6 +360,17 @@ This prevents duplicate writes after network retries and stops a reused requestI
     (`SHARD_HAS_IN_FLIGHT_TRANSACTIONS`). This preserves the "Worker orchestrates, DOs don't
     call each other directly" invariant. Relies on Chunk 3's recovery loop (bounded time) or
     `/admin/tx-force-abort` (manual escape hatch) to unblock a stuck retry.
+  - **Index-shard drain interaction (Milestone 2 Chunk 5 — shipped).** Index-shard placement
+    (`indexShardIdForKey`) is a pure hash over the current shard pool, independent of
+    `vbucket_map`/`shards.status` — draining a shard in the catalog sense doesn't stop the
+    underlying `ShardDO` instance or its `alarm()` from continuing to exist and run. The real
+    risk is an operator draining a shard ahead of decommissioning it while that shard still
+    has unresolved `index_pending_jobs` (Chunk 2's retry queue) — silently letting those keep
+    retrying against a shard the catalog no longer routes traffic to. `handleAdminDrainShard`
+    now also checks `/pending-intent-count`'s (extended) `indexPendingJobCount` field and
+    rejects 409 (`SHARD_HAS_PENDING_INDEX_JOBS`) if it's nonzero, mirroring the 2PC
+    in-flight-transaction check exactly. `/admin/shard-stats` also reports
+    `indexPendingJobCount` and `indexEntryCount` for observability.
 
 ## 11) Rebalancing and Split (MVP)
 

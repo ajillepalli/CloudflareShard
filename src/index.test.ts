@@ -1453,6 +1453,83 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     );
     expect(res.status).toBe(503);
   });
+
+  it("rejects draining a shard with an unresolved index-write retry job, 409 (Milestone 2 Chunk 5)", async () => {
+    await initCluster(1, 4);
+    const shardId = "catalog-0-shard-0";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+    await shardStub.fetch(
+      shardPost("/enqueue-index-job", {
+        targetShardId: "some-unreachable-index-shard",
+        sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        params: ["t", "idx", JSON.stringify(["v"]), "pk-1", shardId, new Date().toISOString()],
+        requestId: "drain-index-job-1",
+      }),
+    );
+
+    const res = await post("/admin/drain-shard", { shardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SHARD_HAS_PENDING_INDEX_JOBS");
+
+    // Clean up for subsequent tests reusing this same shard name.
+    await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM index_pending_jobs");
+    });
+  });
+
+  it("a retried drain succeeds once the pending index job resolves", async () => {
+    await initCluster(1, 4);
+    const shardId = "catalog-0-shard-0";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+
+    // Target a real, reachable shard this time so the alarm-driven retry
+    // actually succeeds and clears the job.
+    const targetStub = env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0"));
+    await targetStub.fetch(shardPost("/execute", { sql: "SELECT 1", requestId: "warmup", isMutation: false }));
+
+    await shardStub.fetch(
+      shardPost("/enqueue-index-job", {
+        targetShardId: "catalog-1-shard-0",
+        sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        params: ["t", "idx", JSON.stringify(["v"]), "pk-1", shardId, new Date().toISOString()],
+        requestId: "drain-index-job-2",
+      }),
+    );
+
+    const blocked = await post("/admin/drain-shard", { shardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(blocked.status).toBe(409);
+
+    await runInDurableObject(shardStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    const retried = await post("/admin/drain-shard", { shardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(retried.status).toBe(200);
+  });
+
+  it("/admin/shard-stats reports indexPendingJobCount and indexEntryCount", async () => {
+    await initCluster(1, 4);
+    const shardId = "catalog-0-shard-0";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+    await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "t",
+        "idx",
+        JSON.stringify(["v"]),
+        "pk-1",
+        shardId,
+        new Date().toISOString(),
+      );
+    });
+
+    const res = await post("/admin/shard-stats", { shardId }, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { indexPendingJobCount: number; indexEntryCount: number };
+    expect(body.indexEntryCount).toBeGreaterThanOrEqual(1);
+    expect(body.indexPendingJobCount).toBe(0);
+  });
 });
 
 describe("Worker top-level routes", () => {
