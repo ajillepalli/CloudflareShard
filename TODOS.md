@@ -38,18 +38,6 @@
 **Priority:** P3
 **Depends on:** None — can be decided independently, informed by real developer feedback post-Milestone-1.
 
-### Autoincrement-safe coordinated transactions
-
-**What:** Extend Milestone 1's `pending_intents` prepare/abort mechanism to handle `INTEGER PRIMARY KEY AUTOINCREMENT` tables without leaking sequence gaps on every aborted transaction.
-
-**Why:** SQLite's `ROLLBACK` doesn't reset `sqlite_sequence`, so the prepare-then-forced-rollback validation trick in Milestone 1's Chunk 2 permanently consumes an autoincrement ID even when the transaction never commits. Milestone 1 documents this as a known boundary and excludes such tables from coordinated transactions rather than fixing it.
-
-**Context:** Only matters if/when a tenant wants a table with gapless or tightly-packed autoincrement IDs to participate in cross-shard transactions. Likely low priority — most tenant schemas can use non-sequential keys (UUIDs, the existing partition-key convention) instead.
-
-**Effort:** M
-**Priority:** P4
-**Depends on:** Milestone 1 (Transaction Coordinator) shipping first.
-
 ### Choose an OSS license
 
 **What:** Pick and add a LICENSE file (MIT/Apache-2.0/etc.) now that the distribution model is resolved to self-hosted/OSS-first.

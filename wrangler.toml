@@ -10,6 +10,14 @@ class_name = "CatalogDO"
 name = "SHARD"
 class_name = "ShardDO"
 
+[[durable_objects.bindings]]
+name = "COORDINATOR"
+class_name = "CoordinatorDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CatalogDO", "ShardDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CoordinatorDO"]
