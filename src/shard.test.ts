@@ -539,6 +539,72 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     const checkBody = (await checkRes.json()) as { rows: Array<{ id: number }> };
     expect(checkBody.rows[0].id).toBe(1);
   });
+
+  it("regression (Codex-found): a batch with two intents on the same (tenantId, table, partitionKey) prepares cleanly instead of crashing on a duplicate row_locks insert", async () => {
+    const stub = await freshShard();
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)");
+
+    const prepareRes = await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: "tx-dup-lock",
+        intents: [
+          { sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["row-dup", "a"], tenantId: "t1", table: "t", partitionKey: "row-dup" },
+          { sql: "UPDATE t SET v = ? WHERE id = ?", params: ["b", "row-dup"], tenantId: "t1", table: "t", partitionKey: "row-dup" },
+        ],
+      }),
+    );
+    expect(prepareRes.status).toBe(200);
+    const prepareBody = (await prepareRes.json()) as { ok: boolean; prepared: number };
+    expect(prepareBody.ok).toBe(true);
+    expect(prepareBody.prepared).toBe(2);
+
+    const commitRes = await stub.fetch(post("/commit", { coordinatorTxId: "tx-dup-lock" }));
+    expect(commitRes.status).toBe(200);
+
+    const checkRes = await stub.fetch(
+      post("/execute", { sql: "SELECT v FROM t WHERE id = ?", params: ["row-dup"], requestId: "req-check-dup", isMutation: false }),
+    );
+    const checkBody = (await checkRes.json()) as { rows: Array<{ v: string }> };
+    expect(checkBody.rows).toHaveLength(1);
+    expect(checkBody.rows[0].v).toBe("b");
+  });
+});
+
+describe("ShardDO /invalidate-request", () => {
+  it("clears a cached idempotency entry so a subsequent /execute with the same requestId genuinely re-runs", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)", requestId: "req-schema", isMutation: true }),
+    );
+
+    const first = await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id) VALUES (?)", params: ["1"], requestId: "req-invalidate", isMutation: true }),
+    );
+    expect(first.status).toBe(200);
+
+    // Without invalidation, replaying this requestId just returns the cached
+    // result. Simulate the caller having undone the effect out from under it
+    // (e.g. DROP TABLE) — the cache would otherwise lie about what's real.
+    await stub.fetch(post("/execute", { sql: "DROP TABLE t", requestId: "req-drop", isMutation: true }));
+    await stub.fetch(post("/invalidate-request", { requestId: "req-invalidate" }));
+
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)", requestId: "req-schema-2", isMutation: true }),
+    );
+    const retry = await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id) VALUES (?)", params: ["1"], requestId: "req-invalidate", isMutation: true }),
+    );
+    expect(retry.status).toBe(200);
+    const retryBody = (await retry.json()) as { duplicated?: boolean; rowsAffected: number };
+    expect(retryBody.duplicated).toBeUndefined();
+    expect(retryBody.rowsAffected).toBe(1);
+  });
+
+  it("requires requestId", async () => {
+    const stub = await freshShard();
+    const res = await stub.fetch(post("/invalidate-request", {}));
+    expect(res.status).toBe(400);
+  });
 });
 
 describe("ShardDO 2PC: TTL sweep queries the coordinator, never unilaterally aborts", () => {
