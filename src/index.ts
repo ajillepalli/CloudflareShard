@@ -22,7 +22,6 @@ export interface Env {
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   ADMIN_TOKEN?: string;
   CATALOG_SHARD_COUNT?: string;
-  COORDINATOR_SHARD_COUNT?: string;
 }
 
 const DEFAULT_CATALOG_SHARD_COUNT = 4;
