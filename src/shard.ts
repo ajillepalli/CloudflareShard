@@ -2,7 +2,6 @@ import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { log } from "./log";
 import { isMutation } from "./sql-safety";
-import { hashKey } from "./hash";
 
 type ExecutePayload = {
   sql: string;
@@ -60,10 +59,18 @@ export class ShardDO extends DurableObject {
     }
   }
 
-  /** Hash of the request's (sql, params) — detects a requestId reused with
-   * different content instead of silently replaying a stale cached result. */
-  private requestHash(sql: string, params: unknown[]): string {
-    return String(hashKey(JSON.stringify({ sql, params })));
+  /** SHA-256 of the request's (sql, params) — detects a requestId reused with
+   * different content instead of silently replaying a stale cached result.
+   * Must be collision-resistant: a 32-bit hash (e.g. hashKey()) collides
+   * easily enough that a reused requestId with different content could pass
+   * this check undetected and silently serve a stale result instead of
+   * either rejecting or applying the new request. */
+  private async requestHash(sql: string, params: unknown[]): Promise<string> {
+    const data = new TextEncoder().encode(JSON.stringify({ sql, params }));
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
   }
 
   private one<T extends object>(sql: string, ...params: unknown[]): T | null {
@@ -138,7 +145,7 @@ export class ShardDO extends DurableObject {
       const execStart = Date.now();
 
       if (mutating) {
-        const incomingHash = this.requestHash(payload.sql, payload.params ?? []);
+        const incomingHash = await this.requestHash(payload.sql, payload.params ?? []);
         const prior = this.one<{ result_json: string; request_hash: string }>(
           "SELECT result_json, request_hash FROM applied_requests WHERE request_id = ?",
           payload.requestId,
