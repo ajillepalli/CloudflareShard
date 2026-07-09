@@ -1,5 +1,6 @@
 import { CatalogDO } from "./catalog";
 import { ShardDO } from "./shard";
+import { CoordinatorDO } from "./coordinator";
 import { json } from "./http";
 import { hashKey } from "./hash";
 import { checkAdminAuth } from "./auth";
@@ -13,13 +14,15 @@ import {
   type StructuredMutation,
 } from "./structured-op";
 
-export { CatalogDO, ShardDO };
+export { CatalogDO, ShardDO, CoordinatorDO };
 
 export interface Env {
   CATALOG: DurableObjectNamespace<CatalogDO>;
   SHARD: DurableObjectNamespace<ShardDO>;
+  COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   ADMIN_TOKEN?: string;
   CATALOG_SHARD_COUNT?: string;
+  COORDINATOR_SHARD_COUNT?: string;
 }
 
 const DEFAULT_CATALOG_SHARD_COUNT = 4;
@@ -537,6 +540,9 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
     params: body.params ?? [],
     requestId,
     isMutation: mutating,
+    tenantId: body.tenantId,
+    table: body.table,
+    partitionKey: body.partitionKey,
   });
   const shardExecuteMs = Date.now() - shardStart;
 
@@ -604,6 +610,9 @@ async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
     params,
     requestId,
     isMutation: true,
+    tenantId: body.tenantId,
+    table: body.table,
+    partitionKey: body.partitionKey,
   });
   if (!shardRes.ok) {
     return new Response(shardRes.body, { status: shardRes.status, headers: shardRes.headers });

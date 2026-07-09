@@ -26,12 +26,20 @@ export type ValidationResult =
   | { ok: true }
   | { ok: false; status: 400 | 409; code: string; error: string };
 
-/** Distinct-row grouping key for a mutation. JSON-encoded rather than
- * `${tenantId}:${table}:${partitionKey}` string interpolation — a `:` inside
- * any field would otherwise let two distinct logical rows collide onto the
- * same key. */
+/** Distinct-row identity key for (tenantId, table, partitionKey). JSON-encoded
+ * rather than `${tenantId}:${table}:${partitionKey}` string interpolation — a
+ * `:` inside any field would otherwise let two distinct logical rows collide
+ * onto the same key. Shared by participantKey() here and ShardDO's row_locks
+ * key derivation (shard.ts) — both must compute the identical key for the
+ * same logical row, or Chunk 3's coordinator locks silently fail to line up
+ * with what ShardDO actually locked. */
+export function rowKey(tenantId: string, table: string, partitionKey: string): string {
+  return JSON.stringify([tenantId, table, partitionKey]);
+}
+
+/** Distinct-row grouping key for a mutation. See rowKey(). */
 export function participantKey(m: StructuredMutation): string {
-  return JSON.stringify([m.tenantId, m.table, m.partitionKey]);
+  return rowKey(m.tenantId, m.table, m.partitionKey);
 }
 
 /** All validation for a StructuredMutation lives here, in one shared place —

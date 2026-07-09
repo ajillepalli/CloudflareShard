@@ -240,8 +240,20 @@ This prevents duplicate writes after network retries and stops a reused requestI
     Section 2). A caller derives a `StructuredMutation` set; the coordinator resolves
     participant shards and drives prepare/commit/abort across all of them atomically.
   - Bounded to at most 8 participant shards per transaction.
-  - Requires the structured mutation contract (Section 6-bis, TODO once Milestone 1 lands)
-    and a mandatory partition-key-column convention on every registered table.
+  - Requires the structured mutation contract (Section 7, `/v1/mutate`) and a mandatory
+    partition-key-column convention on every registered table — both shipped.
+  - **Shard-level primitives (implementation status: shipped, not yet publicly reachable).**
+    Each `ShardDO` now exposes internal `/prepare`, `/commit`, `/abort`, `/tx-status`, and
+    `/pending-intent-count` routes implementing the participant side of 2PC: `/prepare`
+    validates a mutation by executing it inside a transaction and forcing a rollback (so a
+    concurrent read never sees it), then durably records a lock + pending intent in a
+    separate transaction; `/commit` re-executes for real; `/abort` has nothing to undo,
+    since prepare never left anything applied. These are DO-binding-only — no public Worker
+    route calls them yet. `/v1/tx` (Milestone 1 Chunk 3, not yet built) is what will
+    actually drive them via a new `CoordinatorDO`, sharded by `hash(txId) % COORDINATOR_SHARD_COUNT`.
+  - Raw `/v1/sql` and `/v1/mutate` mutations against a row locked by an in-flight
+    coordinated transaction reject 409 (`TX_PARTICIPANT_LOCKED`) — but since nothing can
+    create a lock yet (Chunk 3 not built), this can't currently fire in practice.
 
 ## 11) Rebalancing and Split (MVP)
 
