@@ -89,8 +89,8 @@ Application tables are created by tenant SQL statements routed to target shards.
 
 POST /admin/init
 Request:
-- numShards number (default 8)
-- totalVBuckets number (default 1024)
+- numShards number (default 8, clamped to 1-256)
+- totalVBuckets number (default 1024, clamped to 64-65536)
 - force boolean (optional)
 
 Response:
@@ -107,6 +107,15 @@ Response:
 - ok
 - table
 - metadataVersion
+
+POST /admin/create-table
+Request:
+- table string
+- schema string (must be a `CREATE TABLE` statement whose table name matches `table`)
+
+Response:
+- ok
+- table
 
 POST /admin/split-vbucket
 Request:
@@ -160,10 +169,11 @@ Response:
 - If omitted, Gateway generates UUID.
 - For mutating SQL:
   - Shard checks applied_requests by requestId.
-  - If found, returns previously stored result.
-  - If not found, executes mutation in transaction and records requestId.
+  - If found and the stored request hash matches the incoming (sql, params), returns the previously stored result.
+  - If found but the hash differs, rejects the replay with a 409 instead of returning a stale or wrong result.
+  - If not found, executes mutation in transaction and records requestId plus a hash of (sql, params).
 
-This prevents duplicate writes after network retries.
+This prevents duplicate writes after network retries and stops a reused requestId from being replayed against different SQL/params.
 
 ## 10) Transaction Semantics
 
