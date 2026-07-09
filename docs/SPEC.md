@@ -12,8 +12,12 @@
 
 - Full ANSI SQL parser/planner.
 - Transparent cross-shard joins.
-- Strict global serializable transactions across shards.
 - Zero-downtime live data movement in first cut.
+
+Cross-shard transactional writes (2PC) were originally scoped out of the MVP (see prior
+revision) but were reclassified as a non-negotiable day-one requirement, alongside global
+secondary indexes, per the founder's explicit decision during product review — see
+Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
 
 ## 3) Components
 
@@ -129,7 +133,26 @@ Response:
 - toShard
 - metadataVersion
 
-POST /v1/sql
+POST /admin/register-tenant (ADMIN_TOKEN)
+Request:
+- tenantId string
+- rotate boolean (optional — issues a new token for an already-registered tenant, invalidating the old one immediately)
+
+Response:
+- ok
+- tenantId
+- token string (plaintext, returned exactly once)
+
+POST /admin/revoke-tenant (ADMIN_TOKEN)
+Request:
+- tenantId string
+
+Response:
+- ok
+- tenantId
+- revoked boolean
+
+POST /v1/sql (tenant bearer token)
 Request:
 - sql string
 - params array (optional)
@@ -143,7 +166,7 @@ Response:
 - requestId
 - result (query or mutation payload)
 
-POST /v1/scatter
+POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
 - sql string (SELECT only)
 - params array (optional)
@@ -180,9 +203,14 @@ This prevents duplicate writes after network retries and stops a reused requestI
 - Single-shard operations:
   - Strong, local ACID semantics.
 
-- Cross-shard operations (future):
-  - Saga mode default.
-  - Optional 2PC mode behind feature flag.
+- Cross-shard operations (Milestone 1 — Transaction Coordinator):
+  - Full 2PC is the only mode, not feature-flagged. Cross-shard transactional writes were
+    reclassified from "future, saga-first" to a non-negotiable day-one requirement (see
+    Section 2). A caller derives a `StructuredMutation` set; the coordinator resolves
+    participant shards and drives prepare/commit/abort across all of them atomically.
+  - Bounded to at most 8 participant shards per transaction.
+  - Requires the structured mutation contract (Section 6-bis, TODO once Milestone 1 lands)
+    and a mandatory partition-key-column convention on every registered table.
 
 ## 11) Rebalancing and Split (MVP)
 
@@ -221,8 +249,9 @@ Emit structured logs and counters for:
 
 ## 14) Security and Multi-tenancy
 
-- Require authenticated principal at Gateway.
-- Verify tenantId belongs to principal before route.
+- Require authenticated principal at Gateway — implemented via `tenant_auth` bearer tokens (`/admin/register-tenant`), checked in `CatalogDO.handleRoute` before any routing info is returned.
+- Verify tenantId belongs to principal before route — implemented: the caller's bearer token is hashed and compared against the claimed `tenantId`'s stored hash; missing/wrong/revoked tokens are all rejected with 401.
+- This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary — see README.md's "Tenant authorization" section for the operator/tenant distinction this milestone's distribution model assumes.
 - Enforce SQL policy allowlist in production (MVP currently permissive).
 
 ## 15) Migration Path to Production
