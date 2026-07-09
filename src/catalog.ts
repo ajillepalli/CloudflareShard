@@ -470,6 +470,22 @@ export class CatalogDO extends DurableObject {
     return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
   }
 
+  /** Shared by handleMarkIndexReady and handleDropIndex — both need to
+   * confirm an index is registered before acting, and return the identical
+   * 404 shape if it isn't. Returns null (not a Response) when found, so
+   * callers can `if (!existing) return ...` on a real row without an extra
+   * unwrap. */
+  private requireIndexRule(indexName: string): { found: true } | { found: false; response: Response } {
+    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", indexName);
+    if (!existing) {
+      return {
+        found: false,
+        response: json({ error: { code: "INDEX_NOT_REGISTERED", message: `Index ${indexName} is not registered.` } }, 404),
+      };
+    }
+    return { found: true };
+  }
+
   /** Eng-review fix: flips an index from 'building' to 'ready' once the
    * Worker's backfill loop has fully completed. Called as the last step of
    * /admin/create-index, after every shard has been scanned and every row's
@@ -479,12 +495,10 @@ export class CatalogDO extends DurableObject {
   private async handleMarkIndexReady(request: Request): Promise<Response> {
     const body = (await request.json()) as { indexName?: string };
     if (!body.indexName) {
-      return json({ error: "Missing indexName" }, 400);
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName." } }, 400);
     }
-    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", body.indexName);
-    if (!existing) {
-      return json({ error: { code: "INDEX_NOT_REGISTERED", message: `Index ${body.indexName} is not registered.` } }, 404);
-    }
+    const rule = this.requireIndexRule(body.indexName);
+    if (!rule.found) return rule.response;
     this.sql.exec("UPDATE index_rules SET status = 'ready' WHERE index_name = ?", body.indexName);
     return json({ ok: true, indexName: body.indexName });
   }
@@ -501,12 +515,10 @@ export class CatalogDO extends DurableObject {
   private async handleDropIndex(request: Request): Promise<Response> {
     const body = (await request.json()) as { indexName?: string };
     if (!body.indexName) {
-      return json({ error: "Missing indexName" }, 400);
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName." } }, 400);
     }
-    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", body.indexName);
-    if (!existing) {
-      return json({ error: { code: "INDEX_NOT_REGISTERED", message: `Index ${body.indexName} is not registered.` } }, 404);
-    }
+    const rule = this.requireIndexRule(body.indexName);
+    if (!rule.found) return rule.response;
     this.audit("/drop-index", { indexName: body.indexName });
     this.sql.exec("DELETE FROM index_rules WHERE index_name = ?", body.indexName);
     return json({ ok: true, indexName: body.indexName });
@@ -535,7 +547,7 @@ export class CatalogDO extends DurableObject {
   private async handleLookupIndex(request: Request): Promise<Response> {
     const body = (await request.json()) as { table?: string; indexName?: string; tenantId?: string };
     if (!body.table || !body.indexName || !body.tenantId) {
-      return json({ error: "Missing table, indexName, or tenantId" }, 400);
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing table, indexName, or tenantId." } }, 400);
     }
     const authError = await this.checkTenantAuth(body.tenantId, request);
     if (authError) return authError;

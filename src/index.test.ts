@@ -1035,6 +1035,73 @@ describe("ShardDO index_pending_jobs retry queue (Milestone 2 Chunk 2)", () => {
     );
     expect(res.status).toBe(400);
   });
+
+  it("a job whose target shard returns non-2xx stays queued with attempt_count incremented and next_attempt_at following exponential backoff", async () => {
+    const baseShardId = `idx-retry-fail-base-${crypto.randomUUID()}`;
+    const baseStub = env.SHARD.get(env.SHARD.idFromName(baseShardId));
+
+    // "nonexistent_table_xyz" was never created on the target shard, so
+    // /execute fails with a non-2xx response — exercising processIndexPendingJobs'
+    // `throw new Error(...)` / catch branch, not the happy-path retry the
+    // sibling test above covers.
+    const enqueueRes = await baseStub.fetch(
+      new Request("https://shard.internal/enqueue-index-job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetShardId: `idx-retry-fail-target-${crypto.randomUUID()}`,
+          sql: "INSERT INTO nonexistent_table_xyz (a) VALUES (?)",
+          params: ["x"],
+          requestId: "retry-fail-req-1",
+        }),
+      }),
+    );
+    expect(enqueueRes.status).toBe(200);
+
+    const alarmStart = Date.now();
+    await runInDurableObject(baseStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    // First failure: attempt_count 0 -> 1, backoff = base delay (5000ms,
+    // shard.ts's INDEX_JOB_BASE_DELAY_MS) from the time of this attempt.
+    await runInDurableObject(baseStub, async (_instance: unknown, state: DurableObjectState) => {
+      const jobs = Array.from(
+        state.storage.sql.exec("SELECT attempt_count, next_attempt_at FROM index_pending_jobs"),
+      ) as Array<{ attempt_count: number; next_attempt_at: string }>;
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].attempt_count).toBe(1);
+      const nextAttemptMs = new Date(jobs[0].next_attempt_at).getTime();
+      expect(nextAttemptMs).toBeGreaterThanOrEqual(alarmStart + 4000);
+      expect(nextAttemptMs).toBeLessThanOrEqual(alarmStart + 7000);
+
+      // Force it due now, and simulate a job that's already failed many
+      // times, to assert the delay caps at INDEX_JOB_MAX_DELAY_MS (60000ms)
+      // rather than growing unbounded.
+      state.storage.sql.exec(
+        "UPDATE index_pending_jobs SET next_attempt_at = ?, attempt_count = 10 WHERE request_id = ?",
+        new Date().toISOString(),
+        "retry-fail-req-1",
+      );
+    });
+
+    const secondAlarmStart = Date.now();
+    await runInDurableObject(baseStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    await runInDurableObject(baseStub, async (_instance: unknown, state: DurableObjectState) => {
+      const jobs = Array.from(
+        state.storage.sql.exec("SELECT attempt_count, next_attempt_at FROM index_pending_jobs"),
+      ) as Array<{ attempt_count: number; next_attempt_at: string }>;
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].attempt_count).toBe(11);
+      const nextAttemptMs = new Date(jobs[0].next_attempt_at).getTime();
+      // 5000 * 2**10 would be ~5.1M ms uncapped; must be clamped to 60000ms.
+      expect(nextAttemptMs).toBeGreaterThanOrEqual(secondAlarmStart + 59000);
+      expect(nextAttemptMs).toBeLessThanOrEqual(secondAlarmStart + 61000);
+    });
+  });
 });
 
 /** Finds two partitionKey values that route to different shardIds under the

@@ -34,6 +34,7 @@ const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const PENDING_INTENT_TTL_MS = 5 * 60 * 1000;
 const INDEX_JOB_BASE_DELAY_MS = 5000;
 const INDEX_JOB_MAX_DELAY_MS = 60000;
+const INDEX_JOB_BATCH_SIZE = 20;
 
 const INTERNAL_TABLES = new Set(["applied_requests", "sqlite_sequence", "pending_intents", "row_locks", "__cf_indexes", "index_pending_jobs"]);
 
@@ -94,8 +95,9 @@ export class ShardDO extends DurableObject {
       request_id: string;
       attempt_count: number;
     }>(
-      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM index_pending_jobs WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT 20",
+      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM index_pending_jobs WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?",
       new Date().toISOString(),
+      INDEX_JOB_BATCH_SIZE,
     );
 
     for (const job of due) {
