@@ -30,6 +30,28 @@ describe("isMutation", () => {
   it("still classifies a comment-prefixed SELECT as non-mutation", () => {
     expect(isMutation("-- just a select\nSELECT * FROM events")).toBe(false);
   });
+
+  it("is not fooled by a leading WITH/CTE clause (CVE-class bypass)", () => {
+    expect(isMutation("WITH x AS (SELECT 1) DELETE FROM events")).toBe(true);
+    expect(isMutation("with x as (select 1) update events set y = 1")).toBe(true);
+    expect(isMutation("WITH RECURSIVE x AS (SELECT 1) INSERT INTO events VALUES (1)")).toBe(true);
+  });
+
+  it("classifies a WITH/CTE-prefixed SELECT as non-mutation", () => {
+    expect(isMutation("WITH x AS (SELECT 1) SELECT * FROM x")).toBe(false);
+  });
+
+  it("handles multiple CTEs before the terminal mutation", () => {
+    expect(isMutation("WITH a AS (SELECT 1), b AS (SELECT 2) DELETE FROM events")).toBe(true);
+  });
+
+  it("is not fooled by a paren or comma inside a CTE's string literal", () => {
+    expect(isMutation("WITH x AS (SELECT ')' AS c, '(' AS d) DELETE FROM events")).toBe(true);
+  });
+
+  it("is not fooled by a comment-then-WITH-then-comment stack", () => {
+    expect(isMutation("-- a\nWITH x AS (SELECT 1) -- b\nDELETE FROM events")).toBe(true);
+  });
 });
 
 describe("isDangerous", () => {
