@@ -771,11 +771,125 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
   });
 }
 
+type IndexDefinition = { indexName: string; columns: string[] };
+
+/** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
+ * failure, records a retry job on the BASE shard (not the index shard, which
+ * may be the one that's unreachable) via /enqueue-index-job — ShardDO's
+ * alarm() picks it up from there. Never throws: this always runs inside
+ * ctx.waitUntil(), after the caller's response has already been sent, so
+ * there's no one left to propagate an exception to. */
+async function writeIndexEntryBestEffort(
+  env: Env,
+  baseShardId: string,
+  targetShardId: string,
+  sql: string,
+  params: unknown[],
+  requestId: string,
+): Promise<void> {
+  try {
+    const res = await routeToShard(env, targetShardId, "/execute", { sql, params, requestId, isMutation: true });
+    if (res.ok) return;
+    throw new Error(`shard responded ${res.status}`);
+  } catch (error) {
+    log("worker.index_write_failed_enqueuing_retry", {
+      baseShardId,
+      targetShardId,
+      requestId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    try {
+      await routeToShard(env, baseShardId, "/enqueue-index-job", { targetShardId, sql, params, requestId });
+    } catch (enqueueError) {
+      // Base shard itself unreachable — nothing left to do; the write is
+      // lost until a future write to the same row happens to correct it.
+      // Known limitation, not silently swallowed: logged for visibility.
+      log("worker.index_job_enqueue_failed", {
+        baseShardId,
+        targetShardId,
+        requestId,
+        message: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+      });
+    }
+  }
+}
+
+/** Computes and dispatches (via ctx.waitUntil, non-blocking) the __cf_indexes
+ * writes needed after a base-row mutation succeeds. `beforeRow` is the row's
+ * state before the mutation (null for insert, where none exists yet) —
+ * needed to remove a now-stale index entry on update/delete. `afterValues`
+ * is the mutation's own body.values (insert/update; undefined for delete) —
+ * merged over beforeRow to get each indexed column's new value, so update
+ * doesn't need a second read-after-write: whatever wasn't in body.values is
+ * unchanged from beforeRow. */
+async function maintainIndexesAsync(
+  env: Env,
+  ctx: ExecutionContext,
+  table: string,
+  baseShardId: string,
+  partitionKey: string,
+  indexes: IndexDefinition[],
+  op: "insert" | "update" | "upsert" | "delete",
+  beforeRow: Record<string, unknown> | null,
+  afterValues: Record<string, unknown> | undefined,
+): Promise<void> {
+  if (indexes.length === 0) return;
+
+  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+  const shardIds = listResults.flatMap((r) => ((r.body as { shardIds?: string[] }).shardIds ?? []));
+  if (shardIds.length === 0) return;
+
+  const now = new Date().toISOString();
+  for (const index of indexes) {
+    const oldKeyJson = beforeRow ? JSON.stringify(index.columns.map((c) => beforeRow[c] ?? null)) : null;
+    const newKeyJson =
+      op === "delete"
+        ? null
+        : JSON.stringify(index.columns.map((c) => (afterValues && c in afterValues ? afterValues[c] : beforeRow?.[c] ?? null)));
+
+    if (oldKeyJson === newKeyJson) continue; // no change for this index
+
+    if (oldKeyJson !== null) {
+      const oldShardId = indexShardIdForKey(table, index.indexName, oldKeyJson, shardIds);
+      const requestId = `index-delete-${index.indexName}-${crypto.randomUUID()}`;
+      ctx.waitUntil(
+        writeIndexEntryBestEffort(
+          env,
+          baseShardId,
+          oldShardId,
+          "DELETE FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? AND partition_key = ?",
+          [table, index.indexName, oldKeyJson, partitionKey],
+          requestId,
+        ),
+      );
+    }
+    if (newKeyJson !== null) {
+      const newShardId = indexShardIdForKey(table, index.indexName, newKeyJson, shardIds);
+      const requestId = `index-write-${index.indexName}-${crypto.randomUUID()}`;
+      ctx.waitUntil(
+        writeIndexEntryBestEffort(
+          env,
+          baseShardId,
+          newShardId,
+          "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+          [table, index.indexName, newKeyJson, partitionKey, baseShardId, now],
+          requestId,
+        ),
+      );
+    }
+  }
+}
+
 /** Single structured mutation, single-shard, non-transactional — routes like
  * /v1/sql but through compileMutation() for structural row-ownership
  * enforcement. An incremental, independently-testable deliverable that
- * de-risks the DSL before Chunk 3 builds the coordinator on top of it. */
-async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
+ * de-risks the DSL before Chunk 3 builds the coordinator on top of it.
+ * Milestone 2, Chunk 2: if the table carries any registered indexes, index
+ * maintenance is dispatched via ctx.waitUntil() after the base write
+ * succeeds and the response is ready — non-blocking for the caller, with
+ * ShardDO's alarm()-driven retry queue as the repair path for a failed
+ * attempt (see maintainIndexesAsync). */
+async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = (await request.json()) as StructuredMutation & { requestId?: string };
   if (!body.table || !body.tenantId || !body.partitionKey) {
     return json({ error: "Missing required fields: table, tenantId, partitionKey." }, 400);
@@ -797,6 +911,7 @@ async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
     shardId: string;
     catalogShardCount: number | null;
     partitionKeyColumn: string | null;
+    indexes?: IndexDefinition[];
   };
 
   const currentCount = catalogShardCount(env);
@@ -815,6 +930,34 @@ async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
     return json({ error: { code: validation.code, message: validation.error, fix: "Check the request against the error message above." } }, validation.status);
   }
 
+  const indexes = route.indexes ?? [];
+  const indexedColumns = Array.from(new Set(indexes.flatMap((i) => i.columns)));
+
+  // For update/delete/upsert on an indexed table, read the row's current
+  // state BEFORE the mutation — needed to remove its now-stale index
+  // entries. upsert is included because it may hit the ON CONFLICT UPDATE
+  // path just like a plain update (we can't tell from compileMutation's
+  // output which branch will fire); if it turns out to insert instead,
+  // beforeRow simply comes back null, which is the correct insert case
+  // anyway. Not needed for a plain insert (no prior row can exist) or a
+  // table with no indexes.
+  let beforeRow: Record<string, unknown> | null = null;
+  if (indexedColumns.length > 0 && (body.op === "update" || body.op === "delete" || body.op === "upsert")) {
+    const safeTable = `"${body.table}"`;
+    const safePkCol = `"${partitionKeyColumn}"`;
+    const selectCols = indexedColumns.map((c) => `"${c}"`).join(", ");
+    const preReadRes = await routeToShard(env, route.shardId, "/execute", {
+      sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePkCol} = ?`,
+      params: [body.partitionKey],
+      requestId: `index-preread-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    if (preReadRes.ok) {
+      const preReadBody = (await preReadRes.json()) as { rows?: Array<Record<string, unknown>> };
+      beforeRow = preReadBody.rows?.[0] ?? null;
+    }
+  }
+
   const { sql, params } = compileMutation(body, partitionKeyColumn);
   const requestId = body.requestId ?? crypto.randomUUID();
   const shardRes = await routeToShard(env, route.shardId, "/execute", {
@@ -831,6 +974,23 @@ async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
   }
 
   const shardPayload = (await shardRes.json()) as { rowsAffected?: number };
+
+  if (indexes.length > 0) {
+    ctx.waitUntil(
+      maintainIndexesAsync(
+        env,
+        ctx,
+        body.table,
+        route.shardId,
+        body.partitionKey,
+        indexes,
+        body.op,
+        beforeRow,
+        body.op === "delete" ? undefined : body.values,
+      ),
+    );
+  }
+
   return json({ ok: true, rowsAffected: shardPayload.rowsAffected ?? 0 });
 }
 
@@ -1047,7 +1207,7 @@ async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   });
 }
 
-const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> = {
+const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext) => Promise<Response>> = {
   "/admin/init": handleAdminInit,
   "/admin/register-table": handleAdminRegisterTable,
   "/admin/create-table": handleAdminCreateTable,
@@ -1071,7 +1231,7 @@ const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> 
 };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
 
@@ -1096,7 +1256,7 @@ export default {
 
       const handler = ROUTES[url.pathname];
       if (handler) {
-        return await handler(request, env);
+        return await handler(request, env, ctx);
       }
 
       return json({ error: `Unknown route: ${url.pathname}` }, 404);
