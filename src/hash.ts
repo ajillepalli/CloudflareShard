@@ -6,3 +6,4 @@ export function hashKey(input: string): number {
   }
   return h >>> 0;
 }
+
