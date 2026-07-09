@@ -154,6 +154,11 @@ every catalog shard; shard-scoped operations (`/admin/split-vbucket`,
 `/admin/drain-shard`) require an explicit `catalogShardId` since vBucket/shard
 identifiers are local to one catalog shard.
 
+`/admin/audit-log` fans out to every catalog shard and merges each shard's
+last 100 admin actions (`/init`, `/register-table`, `/split-vbucket`,
+`/drain-shard`) into one list sorted newest-first, tagged with the
+`catalogShardId` that logged each entry.
+
 ## Known MVP limitations
 
 - No SQL parser or policy sandboxing yet.

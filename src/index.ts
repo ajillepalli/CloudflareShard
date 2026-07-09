@@ -285,6 +285,23 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
+async function handleAdminAuditLog(request: Request, env: Env): Promise<Response> {
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const results = await fanOutToAllCatalogs(env, "/audit-log", () => ({}), authorization);
+  const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to report the audit log.");
+  if (failed) return failed;
+  type AuditEntry = { endpoint: string; request: unknown; createdAt: string };
+  const entries = results
+    .flatMap((r) =>
+      ((r.body as { entries: AuditEntry[] }).entries ?? []).map((e) => ({
+        catalogShardId: r.catalogShardId,
+        ...e,
+      })),
+    )
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+  return json({ entries });
+}
+
 async function handleAdminShardStats(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { shardId: string };
   if (!body.shardId) {
@@ -461,6 +478,7 @@ const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> 
   "/admin/list-tables": handleAdminListTables,
   "/admin/drain-shard": handleAdminDrainShard,
   "/admin/shard-stats": handleAdminShardStats,
+  "/admin/audit-log": handleAdminAuditLog,
   "/v1/sql": handleV1Sql,
   "/v1/scatter": handleV1Scatter,
 };

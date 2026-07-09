@@ -197,6 +197,22 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(body.ok).toBe(true);
   });
 
+  it("/admin/audit-log requires an admin token", async () => {
+    await initCluster(2, 16);
+    const res = await post("/admin/audit-log", {});
+    expect(res.status).toBe(401);
+  });
+
+  it("/admin/audit-log merges entries across all catalog shards (regression: this route was never wired into the Worker, only reachable directly on the CatalogDO)", async () => {
+    await initCluster(2, 16);
+    const res = await post("/admin/audit-log", {}, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { entries: Array<{ catalogShardId: string; endpoint: string }> };
+    const catalogShardIds = new Set(body.entries.map((e) => e.catalogShardId));
+    expect(catalogShardIds.size).toBeGreaterThan(1);
+    expect(body.entries.map((e) => e.endpoint)).toEqual(expect.arrayContaining(["/init", "/register-table"]));
+  });
+
   it("/v1/sql rejects requests when the cluster's stored catalog shard count differs from the Worker's configured count", async () => {
     await initCluster();
 
