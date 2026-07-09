@@ -2,6 +2,18 @@
 
 ## Architecture
 
+### Unique-index support for the Index Service
+
+**What:** Support rejecting a write that would violate a declared uniqueness constraint on a registered index, instead of today's non-unique-only model (`__cf_indexes` uses `INSERT OR REPLACE`, no constraint check).
+
+**Why:** Deliberately scoped out of Milestone 2 entirely (Chunk 7) — no chunk in that plan allocated space to build it. Real uniqueness enforcement needs either a `UNIQUE` constraint at the index-shard level or explicit pre-check-plus-lock coordination to close the race between two concurrent writes both claiming to be first; both are genuine design work, not a small addition.
+
+**Context:** Milestone 2 itself shipped ahead of validated demand (see its design doc's Demand Evidence — no named user or query exists yet). Building uniqueness enforcement on top of an already-ahead-of-demand feature would compound that, not reduce it. Revisit once a real adopter's schema actually needs a unique secondary index (e.g. "email must be unique per tenant").
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** A real adopter's use case — not committed work.
+
 ### Re-evaluate CoordinatorDO keying against real transaction volume
 
 **What:** Confirm one-DO-per-transaction (`env.COORDINATOR.idFromName(txId)`, no sharding) stays the right choice once real transaction volume exists, or re-introduce a sharded pool (`coordinator-${hash(txId) % N}`) if cold-start latency becomes a measurable problem at scale.
