@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { hashKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
+import type { ShardDO } from "./shard";
 
 function tenantForCatalogShard(catalogIndex: number, catalogShardCount: number): string {
   for (let i = 0; ; i += 1) {
@@ -626,24 +627,30 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     expect(body.ok).toBe(true);
     expect(body.indexName).toBe("idx_backfill_by_v");
 
-    // With numShards=1, the index entry's computed shard is deterministically
-    // the one shard that exists — inspect __cf_indexes directly there.
-    const shardId = "catalog-0-shard-0";
-    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
-    await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
-      const rows = Array.from(
-        state.storage.sql.exec(
-          "SELECT table_name, index_name, index_key_json, partition_key, source_shard_id FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key ASC",
-          "idx_backfill_by_v",
-        ),
-      ) as Array<{ table_name: string; index_name: string; index_key_json: string; partition_key: string; source_shard_id: string }>;
-      expect(rows).toHaveLength(2);
-      expect(rows[0].partition_key).toBe("row-1");
-      expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
-      expect(rows[0].source_shard_id).toBe(shardId);
-      expect(rows[1].partition_key).toBe("row-2");
-      expect(JSON.parse(rows[1].index_key_json)).toEqual(["beta"]);
-    });
+    // numShards:1 still means 4 total physical shards (one per default
+    // catalog shard) — indexShardIdForKey can hash a given entry onto any of
+    // them, so search all four rather than assuming catalog-0-shard-0.
+    const foundRows: Array<{ table_name: string; index_name: string; index_key_json: string; partition_key: string; source_shard_id: string }> = [];
+    for (const candidateShardId of ["catalog-0-shard-0", "catalog-1-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"]) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        foundRows.push(
+          ...(Array.from(
+            state.storage.sql.exec(
+              "SELECT table_name, index_name, index_key_json, partition_key, source_shard_id FROM __cf_indexes WHERE index_name = ?",
+              "idx_backfill_by_v",
+            ),
+          ) as Array<{ table_name: string; index_name: string; index_key_json: string; partition_key: string; source_shard_id: string }>),
+        );
+      });
+    }
+    foundRows.sort((a, b) => (a.partition_key < b.partition_key ? -1 : 1));
+    expect(foundRows).toHaveLength(2);
+    expect(foundRows[0].partition_key).toBe("row-1");
+    expect(JSON.parse(foundRows[0].index_key_json)).toEqual(["alpha"]);
+    expect(foundRows[0].source_shard_id).toBe("catalog-0-shard-0");
+    expect(foundRows[1].partition_key).toBe("row-2");
+    expect(JSON.parse(foundRows[1].index_key_json)).toEqual(["beta"]);
 
     const listRes = await post("/admin/list-indexes", {}, AUTH());
     expect(listRes.status).toBe(200);
@@ -730,6 +737,195 @@ describe("Worker /v1/sql raw mutation against an indexed table (Milestone 2 Chun
       token,
     );
     expect(res.status).toBe(200);
+  });
+});
+
+// With numShards:1, each of the 4 default catalog shards still gets its own
+// physical shard (catalog-0-shard-0 .. catalog-3-shard-0) — 4 total, not 1.
+// indexShardIdForKey hashes into that full pool, so a given index entry can
+// land on any of them; tests must search all four, not assume shard 0.
+const ALL_TEST_SHARD_IDS = ["catalog-0-shard-0", "catalog-1-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"];
+
+/** Polls __cf_indexes across every shard in the pool until the predicate
+ * matches the combined row set, or the attempt budget runs out —
+ * ctx.waitUntil()'s index-maintenance work runs after the response is
+ * already sent, so a test asserting on its effect can't just check
+ * synchronously after the /v1/mutate call resolves. */
+async function pollIndexRows(
+  indexName: string,
+  predicate: (rows: Array<{ partition_key: string; index_key_json: string }>) => boolean,
+): Promise<Array<{ partition_key: string; index_key_json: string }>> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const rows: Array<{ partition_key: string; index_key_json: string }> = [];
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        rows.push(
+          ...(Array.from(
+            state.storage.sql.exec(
+              "SELECT partition_key, index_key_json FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key ASC",
+              indexName,
+            ),
+          ) as Array<{ partition_key: string; index_key_json: string }>),
+        );
+      });
+    }
+    rows.sort((a, b) => (a.partition_key < b.partition_key ? -1 : a.partition_key > b.partition_key ? 1 : 0));
+    if (predicate(rows)) return rows;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`pollIndexRows timed out waiting for predicate on index ${indexName}`);
+}
+
+describe("Worker /v1/mutate async index maintenance (Milestone 2 Chunk 2)", () => {
+
+  it("insert on an indexed table creates an index entry", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c2_insert_evt");
+    await post("/admin/create-index", { indexName: "idx_c2_insert_by_v", table: "idx_c2_insert_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post("/v1/mutate", { op: "insert", table: "idx_c2_insert_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    expect(res.status).toBe(200);
+
+    const rows = await pollIndexRows("idx_c2_insert_by_v", (r) => r.length === 1);
+    expect(rows[0].partition_key).toBe("row-1");
+    expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+  });
+
+  it("update on an indexed table removes the old entry and creates the new one", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c2_update_evt");
+    await post("/admin/create-index", { indexName: "idx_c2_update_by_v", table: "idx_c2_update_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c2_update_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await pollIndexRows("idx_c2_update_by_v", (r) => r.length === 1);
+
+    const res = await post("/v1/mutate", { op: "update", table: "idx_c2_update_evt", tenantId, partitionKey: "row-1", values: { v: "beta" } }, token);
+    expect(res.status).toBe(200);
+
+    const rows = await pollIndexRows("idx_c2_update_by_v", (r) => r.length === 1 && JSON.parse(r[0].index_key_json)[0] === "beta");
+    expect(rows[0].partition_key).toBe("row-1");
+    expect(JSON.parse(rows[0].index_key_json)).toEqual(["beta"]);
+  });
+
+  it("delete on an indexed table removes the index entry", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c2_delete_evt");
+    await post("/admin/create-index", { indexName: "idx_c2_delete_by_v", table: "idx_c2_delete_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c2_delete_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await pollIndexRows("idx_c2_delete_by_v", (r) => r.length === 1);
+
+    const res = await post("/v1/mutate", { op: "delete", table: "idx_c2_delete_evt", tenantId, partitionKey: "row-1" }, token);
+    expect(res.status).toBe(200);
+
+    await pollIndexRows("idx_c2_delete_by_v", (r) => r.length === 0);
+  });
+
+  it("update that doesn't touch an indexed column leaves the index entry unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c2_untouched_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c2_untouched_evt (id TEXT PRIMARY KEY, v TEXT, other TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    await post("/admin/create-index", { indexName: "idx_c2_untouched_by_v", table: "idx_c2_untouched_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "idx_c2_untouched_evt", tenantId, partitionKey: "row-1", values: { v: "alpha", other: "x" } }, token);
+    await pollIndexRows("idx_c2_untouched_by_v", (r) => r.length === 1);
+
+    // Update only the non-indexed "other" column — "v" (indexed) is unchanged.
+    const res = await post("/v1/mutate", { op: "update", table: "idx_c2_untouched_evt", tenantId, partitionKey: "row-1", values: { other: "y" } }, token);
+    expect(res.status).toBe(200);
+
+    // Give any (incorrect) async churn a moment, then assert the entry is
+    // stable at exactly one row with the original indexed value.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const rows = await pollIndexRows("idx_c2_untouched_by_v", (r) => r.length === 1);
+    expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+  });
+
+  it("a write to a table with no registered index creates no __cf_indexes rows", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c2_noindex_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post("/v1/mutate", { op: "insert", table: "idx_c2_noindex_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    expect(res.status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    for (const candidateShardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        const rows = Array.from(state.storage.sql.exec("SELECT * FROM __cf_indexes WHERE table_name = ?", "idx_c2_noindex_evt"));
+        expect(rows).toHaveLength(0);
+      });
+    }
+  });
+});
+
+describe("ShardDO index_pending_jobs retry queue (Milestone 2 Chunk 2)", () => {
+  it("a job enqueued via /enqueue-index-job is retried and cleared by alarm()", async () => {
+    const targetShardId = `idx-retry-target-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await targetStub.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sql: "SELECT 1", requestId: "warmup", isMutation: false }),
+      }),
+    );
+
+    const baseShardId = `idx-retry-base-${crypto.randomUUID()}`;
+    const baseStub = env.SHARD.get(env.SHARD.idFromName(baseShardId));
+    const enqueueRes = await baseStub.fetch(
+      new Request("https://shard.internal/enqueue-index-job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetShardId,
+          sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+          params: ["t", "idx_retry", JSON.stringify(["v"]), "pk-1", baseShardId, new Date().toISOString()],
+          requestId: "retry-req-1",
+        }),
+      }),
+    );
+    expect(enqueueRes.status).toBe(200);
+
+    await runInDurableObject(baseStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    await runInDurableObject(targetStub, async (_instance: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT * FROM __cf_indexes WHERE index_name = ?", "idx_retry"));
+      expect(rows).toHaveLength(1);
+    });
+    await runInDurableObject(baseStub, async (_instance: unknown, state: DurableObjectState) => {
+      const jobs = Array.from(state.storage.sql.exec("SELECT * FROM index_pending_jobs"));
+      expect(jobs).toHaveLength(0);
+    });
+  });
+
+  it("requires targetShardId, sql, and requestId", async () => {
+    const stub = env.SHARD.get(env.SHARD.idFromName(`idx-retry-missing-${crypto.randomUUID()}`));
+    const res = await stub.fetch(
+      new Request("https://shard.internal/enqueue-index-job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+    );
+    expect(res.status).toBe(400);
   });
 });
 
