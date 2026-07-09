@@ -9,6 +9,7 @@ import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } fr
 import {
   compileMutation,
   IDENTIFIER_RE,
+  mutationWhereClause,
   participantKey,
   UNSET_PARTITION_KEY_COLUMN,
   validateMutation,
@@ -528,6 +529,20 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
     }
   }
 
+  // Backfill fully succeeded on every shard — flip the index from 'building'
+  // to 'ready' so /v1/index-query stops rejecting reads against it. If this
+  // fan-out fails, the index stays 'building'; a retry of this whole
+  // /admin/create-index call (idempotent on registration, redundant-but-safe
+  // on backfill) will attempt it again.
+  const readyResults = await fanOutToAllCatalogs(
+    env,
+    "/mark-index-ready",
+    () => ({ indexName }),
+    request.headers.get("authorization") ?? undefined,
+  );
+  const readyFailed = firstCatalogFanOutFailure(readyResults, "Failed to mark index ready.");
+  if (readyFailed) return readyFailed;
+
   return json({ ok: true, indexName, table, columns });
 }
 
@@ -938,6 +953,18 @@ function computeIndexDeltas(
   beforeRow: Record<string, unknown> | null,
   afterValues: Record<string, unknown> | undefined,
 ): IndexDelta[] {
+  // Eng-review fix: a null beforeRow is ambiguous between "insert (no prior
+  // row can exist yet)" and "update/delete whose predicate matched nothing
+  // (0 rows affected)". For insert, a null beforeRow legitimately means
+  // "write a new entry from afterValues". For update specifically, it means
+  // the mutation was a no-op — synthesizing a "new" entry from afterValues
+  // in that case would write a phantom __cf_indexes row for a base-row
+  // change that never actually happened. delete already can't hit this
+  // (newKeyJson is unconditionally null for delete), so only update needs
+  // the explicit no-op short-circuit.
+  if (op === "update" && beforeRow === null) {
+    return [];
+  }
   const deltas: IndexDelta[] = [];
   for (const index of indexes) {
     const oldKeyJson = beforeRow ? JSON.stringify(index.columns.map((c) => beforeRow[c] ?? null)) : null;
@@ -1100,8 +1127,17 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
   }
 
   const shardPayload = (await shardRes.json()) as { rowsAffected?: number };
+  const rowsAffected = shardPayload.rowsAffected ?? 0;
 
-  if (indexes.length > 0) {
+  // Eng-review fix: only maintain the index if the mutation actually
+  // changed a row. A StructuredMutation's optional `where` can narrow
+  // update/delete beyond the partitionKey (compileMutation ANDs it in), but
+  // beforeRow above is pre-read by partitionKey alone — so a where clause
+  // that doesn't match (0 rows affected) must NOT still delete/rewrite the
+  // row's index entry based on a beforeRow that describes a row nothing
+  // actually touched. Without this gate, a live, unchanged row would
+  // silently vanish from index-query results.
+  if (indexes.length > 0 && rowsAffected > 0) {
     ctx.waitUntil(
       maintainIndexesAsync(
         env,
@@ -1117,7 +1153,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
     );
   }
 
-  return json({ ok: true, rowsAffected: shardPayload.rowsAffected ?? 0 });
+  return json({ ok: true, rowsAffected });
 }
 
 /** Cross-shard atomic write via CoordinatorDO's 2PC. Every mutation is
@@ -1232,11 +1268,25 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     let beforeRow: Record<string, unknown> | null = null;
     if (indexedColumns.length > 0 && (mutation.op === "update" || mutation.op === "delete" || mutation.op === "upsert")) {
       const safeTable = `"${mutation.table}"`;
-      const safePkCol = `"${partitionKeyColumn}"`;
       const selectCols = indexedColumns.map((c) => `"${c}"`).join(", ");
+      // update/delete's actual SQL (compileMutation) filters by partitionKey
+      // AND any caller-supplied `where` — the pre-read must filter by the
+      // EXACT SAME predicate (mutationWhereClause, shared with
+      // compileMutation) or a `where` that won't match would still see a
+      // beforeRow snapshot and wrongly delete/rewrite that row's index entry
+      // for a mutation that, once /begin actually runs it, never touches
+      // it. There's no rowsAffected-gating equivalent here the way Chunk 2's
+      // /v1/mutate has: 2PC participants (including index deltas) must be
+      // decided before /begin, before the mutation has executed at all.
+      // upsert never takes a `where` (compileMutation ignores it for
+      // upsert), so its pre-read stays partitionKey-only.
+      const { sql: whereSql, params: whereParams } =
+        mutation.op === "upsert"
+          ? { sql: `"${partitionKeyColumn}" = ?`, params: [mutation.partitionKey] }
+          : mutationWhereClause(mutation, partitionKeyColumn);
       const preReadRes = await routeToShard(env, route.shardId, "/execute", {
-        sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePkCol} = ?`,
-        params: [mutation.partitionKey],
+        sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${whereSql}`,
+        params: whereParams,
         requestId: `tx-index-preread-${crypto.randomUUID()}`,
         isMutation: false,
       });
