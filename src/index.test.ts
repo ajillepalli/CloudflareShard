@@ -699,6 +699,79 @@ describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {
   });
 });
 
+describe("Worker /admin/drain-shard: draining interaction with in-flight transactions (Milestone 1 Chunk 4)", () => {
+  function shardPost(path: string, body: unknown) {
+    return new Request(`https://shard.internal${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("drains a shard with zero pending intents unchanged", async () => {
+    await initCluster(1, 4);
+    const res = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects draining a shard with an in-flight prepared transaction, 409", async () => {
+    await initCluster(1, 4);
+    const shardId = "catalog-0-shard-0";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+    await shardStub.fetch(
+      shardPost("/prepare", {
+        coordinatorTxId: "drain-test-tx",
+        intents: [{ sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["drain-row", "x"], tenantId: "t1", table: "events", partitionKey: "drain-row" }],
+      }),
+    );
+
+    const res = await post("/admin/drain-shard", { shardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SHARD_HAS_IN_FLIGHT_TRANSACTIONS");
+
+    // Clean up: this shard's DO storage (unlike CatalogDO's) isn't reset by
+    // /admin/init between tests in this suite, since every test in this
+    // describe block deliberately reuses the same deterministic shard name.
+    await shardStub.fetch(shardPost("/abort", { coordinatorTxId: "drain-test-tx" }));
+  });
+
+  it("a retried drain succeeds once the in-flight transaction resolves", async () => {
+    await initCluster(1, 4);
+    const shardId = "catalog-0-shard-0";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+    await shardStub.fetch(
+      shardPost("/prepare", {
+        coordinatorTxId: "drain-test-tx-2",
+        intents: [{ sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["drain-row-2", "x"], tenantId: "t1", table: "events", partitionKey: "drain-row-2" }],
+      }),
+    );
+
+    const blocked = await post("/admin/drain-shard", { shardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(blocked.status).toBe(409);
+
+    await shardStub.fetch(shardPost("/commit", { coordinatorTxId: "drain-test-tx-2" }));
+
+    const retried = await post("/admin/drain-shard", { shardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(retried.status).toBe(200);
+  });
+
+  it("confirms a new mutation targeting an already-draining shard is rejected 503 (existing CatalogDO behavior)", async () => {
+    await initCluster(1, 4);
+    const drainRes = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
+    expect(drainRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["p1", "a"], table: "events", tenantId, partitionKey: "p1" },
+      token,
+    );
+    expect(res.status).toBe(503);
+  });
+});
+
 describe("Worker top-level routes", () => {
   it("GET /health returns ok", async () => {
     const res = await SELF.fetch("https://worker.internal/health");

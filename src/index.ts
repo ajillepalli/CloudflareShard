@@ -404,6 +404,33 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. Shard ownership is scoped to a catalog shard." }, 400);
   }
+  if (!payload.shardId) {
+    return json({ error: "Missing shardId." }, 400);
+  }
+
+  // Check for in-flight prepared 2PC intents before draining — this is a
+  // Worker-level check (not pushed into CatalogDO) to preserve the existing
+  // invariant that CatalogDO and ShardDO never call each other directly.
+  // Chunk 3's recovery loop bounds how long a prepared intent can linger, and
+  // /admin/tx-force-abort is the manual escape hatch if it doesn't resolve.
+  const pendingRes = await routeToShard(env, payload.shardId, "/pending-intent-count", {});
+  if (!pendingRes.ok) {
+    return new Response(pendingRes.body, { status: pendingRes.status, headers: pendingRes.headers });
+  }
+  const pendingBody = (await pendingRes.json()) as { count: number };
+  if (pendingBody.count > 0) {
+    return json(
+      {
+        error: {
+          code: "SHARD_HAS_IN_FLIGHT_TRANSACTIONS",
+          message: `Shard ${payload.shardId} has ${pendingBody.count} in-flight transaction(s).`,
+          fix: "Retry after they resolve, or use /admin/tx-force-abort to unblock a stuck one.",
+        },
+      },
+      409,
+    );
+  }
+
   const res = await routeToCatalog(
     env,
     payload.catalogShardId,
