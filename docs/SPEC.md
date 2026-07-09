@@ -147,11 +147,14 @@ Response:
 - table
 - columns
 
-Registers a secondary index and backfills it against every existing row on every shard (single-pass, not chunked — see the Milestone 2 design doc's stated pre-product-scale simplification). Index entries live in each shard's internal `__cf_indexes` table, placed on a shard chosen by hashing `(table, indexName, indexKeyJson)` — independent of the base row's own shard, so a future index-query lookup resolves on one shard instead of scattering. Once any index is registered on a table, raw `/v1/sql` mutations against that table are rejected 409 (`TABLE_HAS_INDEX`) — raw SQL bypasses every index-maintenance mechanism, so it's blocked outright rather than silently desyncing the index; use `/v1/mutate` or `/v1/tx` instead (their own index-maintenance mechanisms are a later Milestone 2 chunk, not yet built).
+Registers a secondary index and backfills it against every existing row on every shard (single-pass, not chunked — see the Milestone 2 design doc's stated pre-product-scale simplification). Index entries live in each shard's internal `__cf_indexes` table, placed on a shard chosen by hashing `(table, indexName, indexKeyJson)` — independent of the base row's own shard, so a future index-query lookup resolves on one shard instead of scattering. Once any index is registered on a table, raw `/v1/sql` mutations against that table are rejected 409 (`TABLE_HAS_INDEX`) — raw SQL bypasses every index-maintenance mechanism, so it's blocked outright rather than silently desyncing the index; use `/v1/mutate` or `/v1/tx` instead. `/v1/mutate`'s async maintenance is live as of Chunk 2 below; `/v1/tx`'s 2PC-piggyback maintenance is a later Milestone 2 chunk, not yet built.
 
 POST /admin/list-indexes (ADMIN_TOKEN) — Milestone 2, Chunk 1
 Response:
 - indexes: array of `{indexName, table, columns, createdAt}`
+
+`/v1/mutate` async index maintenance — Milestone 2, Chunk 2 (no new route; extends the existing `/v1/mutate` handler)
+When the target table has any registered index, `handleV1Mutate` computes the resulting `__cf_indexes` deltas and dispatches them via the Worker's own `ctx.waitUntil()` — after the base row's write has already succeeded and the response is on its way back to the caller, so this never adds latency to the base write. For `update`/`delete`/`upsert` (which may hit the `ON CONFLICT UPDATE` path), the row's prior indexed-column values are read once before the mutation runs, so removing a now-stale index entry doesn't need a second read-after-write — whatever column wasn't in the caller's `values` is taken from that pre-read. If the best-effort write to the computed index shard fails, it's recorded via `ShardDO./enqueue-index-job` on the *base* shard (not the index shard, which may be the one that's unreachable) and retried by that shard's own `alarm()` with exponential backoff (`index_pending_jobs` table) — the same recovery-queue pattern `CoordinatorDO` already uses for 2PC. A write to a table with no registered index pays none of this cost.
 
 POST /admin/split-vbucket
 Request:

@@ -673,11 +673,14 @@ export class CatalogDO extends DurableObject {
 
     // Milestone 2: lets the Worker reject a raw /v1/sql mutation against a
     // table carrying a registered index (ShardDO has no CatalogDO access to
-    // check this itself — see the Milestone 2 eng review's correction).
-    const indexNames = this.many<{ index_name: string }>(
-      "SELECT index_name FROM index_rules WHERE table_name = ?",
+    // check this itself — see the Milestone 2 eng review's correction), and
+    // lets /v1/mutate's async index maintenance (Chunk 2) know which columns
+    // each registered index actually covers.
+    const indexRows = this.many<{ index_name: string; columns_json: string }>(
+      "SELECT index_name, columns_json FROM index_rules WHERE table_name = ?",
       body.table,
-    ).map((r) => r.index_name);
+    );
+    const indexes = indexRows.map((r) => ({ indexName: r.index_name, columns: JSON.parse(r.columns_json) as string[] }));
 
     return json({
       shardId: mapped.shard_id,
@@ -685,7 +688,8 @@ export class CatalogDO extends DurableObject {
       metadataVersion: config.metadata_version,
       catalogShardCount: config.catalog_shard_count,
       partitionKeyColumn: mapped.partition_key_column,
-      indexNames,
+      indexNames: indexes.map((i) => i.indexName),
+      indexes,
     });
   }
 
