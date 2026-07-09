@@ -1,5 +1,5 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { hashKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
@@ -942,6 +942,44 @@ describe("Worker /v1/mutate async index maintenance (Milestone 2 Chunk 2)", () =
       });
     }
   });
+
+  it("eng-review fix: a delete whose extra where clause doesn't match affects 0 rows and must not delete the row's live index entry", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c2_zerorow_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c2_zerorow_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    await post("/admin/create-index", { indexName: "idx_c2_zerorow_by_v", table: "idx_c2_zerorow_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post(
+      "/v1/mutate",
+      { op: "insert", table: "idx_c2_zerorow_evt", tenantId, partitionKey: "row-1", values: { v: "alpha", status: "open" } },
+      token,
+    );
+    await pollIndexRows("idx_c2_zerorow_by_v", (r) => r.length === 1);
+
+    // where.status doesn't match the row's actual status ("open") — the
+    // shard-level DELETE affects 0 rows. Before the fix, this still deleted
+    // the "alpha" index entry (computed from a beforeRow pre-read that
+    // ignored `where`), silently hiding the still-live row from index-query.
+    const res = await post(
+      "/v1/mutate",
+      { op: "delete", table: "idx_c2_zerorow_evt", tenantId, partitionKey: "row-1", where: { status: "closed" } },
+      token,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rowsAffected: number };
+    expect(body.rowsAffected).toBe(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const rows = await pollIndexRows("idx_c2_zerorow_by_v", (r) => r.length === 1);
+    expect(rows[0].partition_key).toBe("row-1");
+    expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+  });
 });
 
 describe("ShardDO index_pending_jobs retry queue (Milestone 2 Chunk 2)", () => {
@@ -1283,6 +1321,53 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     expect(postIndexBody.ok).toBe(true);
     expect(postIndexBody.status).toBe("committed");
   });
+
+  it("eng-review fix: an update via /v1/tx whose where clause doesn't match leaves the index entry unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c3_zerorow_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c3_zerorow_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    await post("/admin/create-index", { indexName: "idx_c3_zerorow_by_v", table: "idx_c3_zerorow_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post(
+      "/v1/tx",
+      { mutations: [{ op: "insert", table: "idx_c3_zerorow_evt", tenantId, partitionKey: "row-1", values: { v: "alpha", status: "open" } }], requestId: "req-c3-zerorow-1" },
+      token,
+    );
+    await pollIndexRows("idx_c3_zerorow_by_v", (r) => r.length === 1);
+
+    // where.status doesn't match ("open" !== "closed") — the compiled UPDATE
+    // affects 0 rows on the base shard. Before the fix, the tx-piggyback
+    // pre-read ignored `where` entirely, so it would still see beforeRow
+    // (v: "alpha") and piggyback a delta that rewrote the index entry to
+    // "beta" even though the base row was never actually touched by this tx.
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [{ op: "update", table: "idx_c3_zerorow_evt", tenantId, partitionKey: "row-1", where: { status: "closed" }, values: { v: "beta" } }],
+        requestId: "req-c3-zerorow-2",
+      },
+      token,
+    );
+    expect(res.status).toBe(200);
+
+    const checkRes = await post(
+      "/v1/sql",
+      { sql: "SELECT v FROM idx_c3_zerorow_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_zerorow_evt", tenantId, partitionKey: "row-1" },
+      token,
+    );
+    const checkBody = (await checkRes.json()) as { result: { rows: Array<{ v: string }> } };
+    expect(checkBody.result.rows[0].v).toBe("alpha");
+
+    const rows = await pollIndexRows("idx_c3_zerorow_by_v", (r) => r.length === 1);
+    expect(rows[0].partition_key).toBe("row-1");
+    expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+  });
 });
 
 describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
@@ -1523,10 +1608,52 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     });
   }
 
+  // Milestone 2 eng-review fix: draining is now blocked while any index is
+  // registered, cluster-wide (index-shard placement hashes over the active
+  // shard set, so draining orphans __cf_indexes entries). index_rules isn't
+  // cleared by /admin/init's force:true (only vbucket_map/shards/
+  // cluster_config are), so an index registered by an earlier describe block
+  // in this file persists on catalog-0's storage and would otherwise leak
+  // into these unrelated pre-existing drain tests. Clear it directly so this
+  // block tests drain-vs-2PC/index-job interaction only, not index presence.
+  beforeEach(async () => {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM index_rules");
+    });
+  });
+
   it("drains a shard with zero pending intents unchanged", async () => {
     await initCluster(1, 4);
     const res = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
     expect(res.status).toBe(200);
+  });
+
+  it("eng-review fix: rejects draining a shard while any index is registered, 409 SHARD_DRAIN_BLOCKED_BY_INDEXES; succeeds again once dropped", async () => {
+    await initCluster(1, 4);
+    const createTableRes = await post(
+      "/admin/create-table",
+      { table: "drain_idx_evt", schema: "CREATE TABLE IF NOT EXISTS drain_idx_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createTableRes.status).toBe(200);
+    const createIndexRes = await post(
+      "/admin/create-index",
+      { indexName: "idx_drain_block_by_v", table: "drain_idx_evt", columns: ["v"] },
+      AUTH(),
+    );
+    expect(createIndexRes.status).toBe(200);
+
+    const blocked = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
+    expect(blocked.status).toBe(409);
+    const blockedBody = (await blocked.json()) as { error: { code: string } };
+    expect(blockedBody.error.code).toBe("SHARD_DRAIN_BLOCKED_BY_INDEXES");
+
+    const dropRes = await post("/admin/drop-index", { indexName: "idx_drain_block_by_v" }, AUTH());
+    expect(dropRes.status).toBe(200);
+
+    const allowed = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
+    expect(allowed.status).toBe(200);
   });
 
   it("rejects draining a shard with an in-flight prepared transaction, 409", async () => {
