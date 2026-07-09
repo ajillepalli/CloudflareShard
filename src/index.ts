@@ -483,7 +483,35 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
     const scanBody = (await scanRes.json()) as { rows: Array<Record<string, unknown>> };
     for (const row of scanBody.rows) {
       const partitionKey = String(row[pkCol]);
-      const indexKeyJson = JSON.stringify(columns.map((c) => row[c] ?? null));
+
+      // Re-read this row's CURRENT values immediately before writing its
+      // index entry, instead of trusting the value captured by the bulk
+      // scan above (eng-review fix). Registration already happened, so a
+      // concurrent /v1/mutate on this row runs its own async index write
+      // concurrently with backfill; without this re-read, backfill could
+      // clobber that fresher write with the stale value it scanned earlier
+      // (a wide window spanning the whole scan+loop). Re-reading narrows the
+      // hazard to a single read-then-write round trip — the same order of
+      // race the rest of the async index-maintenance path already accepts
+      // elsewhere, not a new or larger one. The row may have been deleted
+      // since the scan; skip it if so rather than indexing stale data.
+      const freshRes = await routeToShard(env, shardId, "/execute", {
+        sql: `SELECT ${selectCols} FROM ${safeTable} WHERE "${pkCol}" = ?`,
+        params: [row[pkCol]],
+        requestId: `create-index-backfill-refresh-${indexName}-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!freshRes.ok) {
+        return json(
+          { error: { code: "BACKFILL_SCAN_FAILED", message: `Failed to refresh row for partitionKey ${partitionKey} during backfill.` } },
+          500,
+        );
+      }
+      const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown>> };
+      const freshRow = freshBody.rows[0];
+      if (!freshRow) continue;
+
+      const indexKeyJson = JSON.stringify(columns.map((c) => freshRow[c] ?? null));
       const indexShardId = indexShardIdForKey(table, indexName, indexKeyJson, shardIds);
       const writeRes = await routeToShard(env, indexShardId, "/execute", {
         sql: `INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
