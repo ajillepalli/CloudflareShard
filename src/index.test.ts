@@ -245,6 +245,27 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(introspectBody.tables.map((t) => t.table)).toContain(table);
   });
 
+  it("regression (Codex-found): repeating the same failed /admin/create-table call twice actually drops the table on the second rollback, instead of replaying the first rollback's cached success", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "double_rollback_evt";
+    const schema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+
+    const firstFailed = await post("/admin/create-table", { table, schema, partitionKeyColumn: "nonexistent_col" }, AUTH());
+    expect(firstFailed.status).toBe(400);
+
+    // Same bad call again — the create requestId invalidation from the first
+    // rollback lets this genuinely recreate the table, but the rollback
+    // DROP's own requestId was previously stable/deterministic too, so this
+    // second rollback would replay the first rollback's cached "success"
+    // instead of actually dropping the table it just recreated.
+    const secondFailed = await post("/admin/create-table", { table, schema, partitionKeyColumn: "nonexistent_col" }, AUTH());
+    expect(secondFailed.status).toBe(400);
+
+    const introspect = await post("/admin/shard-stats", { shardId: "catalog-0-shard-0" }, AUTH());
+    const introspectBody = (await introspect.json()) as { tables: Array<{ table: string; rowCount: number }> };
+    expect(introspectBody.tables.map((t) => t.table)).not.toContain(table);
+  });
+
   it("/admin/create-table reports a shard-level failure when the schema fails to apply", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     // Missing PRIMARY KEY column type makes this a syntactically invalid CREATE TABLE.
