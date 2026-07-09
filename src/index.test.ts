@@ -1412,6 +1412,68 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
   });
 });
 
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+describe("Milestone 2 Chunk 7: benchmark — indexed /v1/mutate write latency and repair-debt backlog", () => {
+  it("indexed inserts stay within the regression bar of unindexed inserts (p50 latency), and accumulate zero repair-debt backlog", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c7_bench_plain_evt");
+    await createIndexTestTable("idx_c7_bench_indexed_evt");
+    await post("/admin/create-index", { indexName: "idx_c7_bench_by_v", table: "idx_c7_bench_indexed_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const ITERATIONS = 20;
+
+    const plainLatencies: number[] = [];
+    for (let i = 0; i < ITERATIONS; i++) {
+      const start = performance.now();
+      const res = await post("/v1/mutate", { op: "insert", table: "idx_c7_bench_plain_evt", tenantId, partitionKey: `plain-${i}`, values: { v: `val-${i}` } }, token);
+      plainLatencies.push(performance.now() - start);
+      expect(res.status).toBe(200);
+    }
+
+    const indexedLatencies: number[] = [];
+    for (let i = 0; i < ITERATIONS; i++) {
+      const start = performance.now();
+      const res = await post("/v1/mutate", { op: "insert", table: "idx_c7_bench_indexed_evt", tenantId, partitionKey: `indexed-${i}`, values: { v: `val-${i}` } }, token);
+      indexedLatencies.push(performance.now() - start);
+      expect(res.status).toBe(200);
+    }
+
+    const plainP50 = median(plainLatencies);
+    const indexedP50 = median(indexedLatencies);
+    // Regression bar (Milestone 2 design doc's Success Criterion 2,
+    // finalized here in Chunk 7): the async dispatch (ctx.waitUntil(), after
+    // the response is already prepared) means an indexed write's caller-
+    // observed latency SHOULD be indistinguishable from an unindexed one —
+    // the index-maintenance work happens after the response is on its way
+    // back. Generous absolute floor (25ms) alongside the percentage bar
+    // absorbs test-environment timing noise on a fast baseline without
+    // weakening the bar on a realistically-sized one.
+    const regressionMs = indexedP50 - plainP50;
+    const regressionPct = plainP50 > 0 ? (regressionMs / plainP50) * 100 : 0;
+    expect(regressionMs < 25 || regressionPct < 10).toBe(true);
+
+    // Repair-debt backlog: under normal (non-failing) conditions, every
+    // async index write should succeed on its first attempt — zero jobs
+    // should ever land in index_pending_jobs. A nonzero count here would
+    // mean the benchmark run itself is silently degrading, not just slow.
+    await pollIndexRows("idx_c7_bench_by_v", (r) => r.length === ITERATIONS);
+    for (const candidateShardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        const jobs = Array.from(state.storage.sql.exec("SELECT * FROM index_pending_jobs"));
+        expect(jobs).toHaveLength(0);
+      });
+    }
+  });
+});
+
 describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {
   it("/admin/tx-status requires an admin token", async () => {
     const res = await post("/admin/tx-status", { txId: "whatever" });
