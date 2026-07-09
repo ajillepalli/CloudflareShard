@@ -5,6 +5,13 @@ import { hashKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
 import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } from "./sql-safety";
+import {
+  compileMutation,
+  IDENTIFIER_RE,
+  UNSET_PARTITION_KEY_COLUMN,
+  validateMutation,
+  type StructuredMutation,
+} from "./structured-op";
 
 export { CatalogDO, ShardDO };
 
@@ -156,9 +163,28 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     table?: string;
     schema?: string;
     partitioning?: string;
+    partitionKeyColumn?: string;
   };
   if (!body.table || !body.schema) {
     return json({ error: "Missing table or schema." }, 400);
+  }
+  if (!body.partitionKeyColumn) {
+    return json(
+      {
+        error: {
+          code: "MISSING_PARTITION_KEY_COLUMN",
+          message: "Missing partitionKeyColumn.",
+          fix: "Provide the column name that holds each row's partition key.",
+        },
+      },
+      400,
+    );
+  }
+  if (!IDENTIFIER_RE.test(body.partitionKeyColumn)) {
+    return json(
+      { error: { code: "UNSAFE_IDENTIFIER", message: "partitionKeyColumn is not a valid identifier.", fix: "Use only letters, digits, and underscores, starting with a letter or underscore." } },
+      400,
+    );
   }
   if (!/^\s*create\s+table\b/i.test(body.schema)) {
     return json({ error: "schema must be a CREATE TABLE statement." }, 400);
@@ -179,20 +205,18 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     );
   }
 
-  const registerResults = await fanOutToAllCatalogs(
-    env,
-    "/register-table",
-    () => ({ table: body.table, partitioning: body.partitioning }),
-    request.headers.get("authorization") ?? undefined,
-  );
-  const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register table.");
-  if (registerFailed) return registerFailed;
-
   const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
   const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
   if (listFailed) return listFailed;
   const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+  if (shardIds.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet.", fix: "Call /admin/init first." } }, 400);
+  }
 
+  // Create on every shard BEFORE registering in table_rules — if anything
+  // below fails (shard execution, or the partitionKeyColumn/schema mismatch
+  // check), the table was never registered, so rollback is just dropping the
+  // physical tables, not also having to unregister catalog-level metadata.
   const shardResults = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId) => {
     const res = await routeToShard(env, shardId, "/execute", {
       sql: body.schema,
@@ -209,7 +233,106 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     );
   }
 
+  // Validate the declared partitionKeyColumn actually exists in the schema
+  // that was just applied, via SQLite's own PRAGMA table_info introspection
+  // on one representative shard (not a hand-rolled DDL parser — the same
+  // schema was applied identically to every shard, so one check suffices).
+  const introspectRes = await routeToShard(env, shardIds[0], "/execute", {
+    sql: `PRAGMA table_info("${body.table}")`,
+    requestId: `create-table-introspect-${body.table}-${Date.now()}`,
+    isMutation: false,
+  });
+  if (introspectRes.ok) {
+    const introspectBody = (await introspectRes.json()) as { rows?: Array<{ name: string }> };
+    const columns = (introspectBody.rows ?? []).map((c) => c.name);
+    if (!columns.includes(body.partitionKeyColumn)) {
+      await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, (shardId) =>
+        routeToShard(env, shardId, "/execute", {
+          sql: `DROP TABLE IF EXISTS "${body.table}"`,
+          requestId: `create-table-rollback-${body.table}-${shardId}`,
+          isMutation: true,
+        }),
+      );
+      return json(
+        {
+          error: {
+            code: "COLUMN_NOT_IN_SCHEMA",
+            message: `partitionKeyColumn ${body.partitionKeyColumn} does not exist on the created table ${body.table}.`,
+            fix: `Choose one of the schema's actual columns: ${columns.join(", ")}.`,
+          },
+        },
+        400,
+      );
+    }
+  }
+
+  const registerResults = await fanOutToAllCatalogs(
+    env,
+    "/register-table",
+    () => ({ table: body.table, partitioning: body.partitioning, partitionKeyColumn: body.partitionKeyColumn }),
+    request.headers.get("authorization") ?? undefined,
+  );
+  const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register table.");
+  if (registerFailed) return registerFailed;
+
   return json({ ok: true, table: body.table, shardsApplied: shardResults.length });
+}
+
+async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+  if (!body.table || !body.partitionKeyColumn) {
+    return json(
+      { error: { code: "MISSING_FIELDS", message: "Missing table or partitionKeyColumn.", fix: "Provide both table and partitionKeyColumn." } },
+      400,
+    );
+  }
+  if (!IDENTIFIER_RE.test(body.table) || !IDENTIFIER_RE.test(body.partitionKeyColumn)) {
+    return json(
+      { error: { code: "UNSAFE_IDENTIFIER", message: "table or partitionKeyColumn is not a valid identifier.", fix: "Use only letters, digits, and underscores, starting with a letter or underscore." } },
+      400,
+    );
+  }
+
+  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+  const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
+  if (listFailed) return listFailed;
+  const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+  if (shardIds.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet.", fix: "Call /admin/init first." } }, 400);
+  }
+
+  const introspectRes = await routeToShard(env, shardIds[0], "/execute", {
+    sql: `PRAGMA table_info("${body.table}")`,
+    requestId: `set-partition-key-column-introspect-${body.table}-${Date.now()}`,
+    isMutation: false,
+  });
+  if (!introspectRes.ok) {
+    return new Response(introspectRes.body, { status: introspectRes.status, headers: introspectRes.headers });
+  }
+  const introspectBody = (await introspectRes.json()) as { rows?: Array<{ name: string }> };
+  const columns = (introspectBody.rows ?? []).map((c) => c.name);
+  if (!columns.includes(body.partitionKeyColumn)) {
+    return json(
+      {
+        error: {
+          code: "COLUMN_NOT_IN_SCHEMA",
+          message: `Column ${body.partitionKeyColumn} does not exist on table ${body.table}.`,
+          fix: `Choose one of the table's actual columns: ${columns.join(", ")}.`,
+        },
+      },
+      400,
+    );
+  }
+
+  const results = await fanOutToAllCatalogs(
+    env,
+    "/set-partition-key-column",
+    () => body,
+    request.headers.get("authorization") ?? undefined,
+  );
+  const failed = firstCatalogFanOutFailure(results, "Failed to update partitionKeyColumn on one or more catalog shards.");
+  if (failed) return failed;
+  return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn });
 }
 
 async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Response> {
@@ -430,6 +553,66 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
   });
 }
 
+/** Single structured mutation, single-shard, non-transactional — routes like
+ * /v1/sql but through compileMutation() for structural row-ownership
+ * enforcement. An incremental, independently-testable deliverable that
+ * de-risks the DSL before Chunk 3 builds the coordinator on top of it. */
+async function handleV1Mutate(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as StructuredMutation & { requestId?: string };
+  if (!body.table || !body.tenantId || !body.partitionKey) {
+    return json({ error: "Missing required fields: table, tenantId, partitionKey." }, 400);
+  }
+
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+  const routeRes = await routeToCatalog(
+    env,
+    catalogShardId,
+    "/route",
+    { table: body.table, tenantId: body.tenantId, partitionKey: body.partitionKey },
+    request.headers.get("authorization") ?? undefined,
+  );
+  if (!routeRes.ok) {
+    return new Response(routeRes.body, { status: routeRes.status, headers: routeRes.headers });
+  }
+
+  const route = (await routeRes.json()) as {
+    shardId: string;
+    catalogShardCount: number | null;
+    partitionKeyColumn: string | null;
+  };
+
+  const currentCount = catalogShardCount(env);
+  if (route.catalogShardCount !== null && route.catalogShardCount !== currentCount) {
+    return json(
+      {
+        error: `Catalog shard count mismatch: cluster was initialized with ${route.catalogShardCount} catalog shards, but this Worker is configured for ${currentCount} (CATALOG_SHARD_COUNT).`,
+      },
+      409,
+    );
+  }
+
+  const partitionKeyColumn = route.partitionKeyColumn ?? UNSET_PARTITION_KEY_COLUMN;
+  const validation = validateMutation(body, partitionKeyColumn);
+  if (!validation.ok) {
+    return json({ error: { code: validation.code, message: validation.error, fix: "Check the request against the error message above." } }, validation.status);
+  }
+
+  const { sql, params } = compileMutation(body, partitionKeyColumn);
+  const requestId = body.requestId ?? crypto.randomUUID();
+  const shardRes = await routeToShard(env, route.shardId, "/execute", {
+    sql,
+    params,
+    requestId,
+    isMutation: true,
+  });
+  if (!shardRes.ok) {
+    return new Response(shardRes.body, { status: shardRes.status, headers: shardRes.headers });
+  }
+
+  const shardPayload = (await shardRes.json()) as { rowsAffected?: number };
+  return json({ ok: true, rowsAffected: shardPayload.rowsAffected ?? 0 });
+}
+
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
@@ -522,7 +705,9 @@ const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> 
   "/admin/audit-log": handleAdminAuditLog,
   "/admin/register-tenant": handleAdminRegisterTenant,
   "/admin/revoke-tenant": handleAdminRevokeTenant,
+  "/admin/set-partition-key-column": handleAdminSetPartitionKeyColumn,
   "/v1/sql": handleV1Sql,
+  "/v1/mutate": handleV1Mutate,
   "/v1/scatter": handleV1Scatter,
 };
 

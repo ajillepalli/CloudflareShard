@@ -6,7 +6,7 @@ describe("CatalogDO audit log", () => {
   it("records init, register-table, split-vbucket, and drain-shard as audit entries", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
-    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
 
     const res = await stub.fetch(post("/audit-log", {}, `Bearer ${env.ADMIN_TOKEN}`));
@@ -129,7 +129,7 @@ describe("CatalogDO split-vbucket", () => {
   it("reassigns a vbucket to a new shard and the new mapping is used for routing", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
-    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
     const token = await registerTenant(stub, "t1");
 
     const routeBefore = (await (
@@ -175,6 +175,14 @@ describe("CatalogDO input validation and lifecycle", () => {
     const stub = await freshCatalog();
     const res = await stub.fetch(post("/register-table", {}, `Bearer ${env.ADMIN_TOKEN}`));
     expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for /register-table with a missing partitionKeyColumn", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MISSING_PARTITION_KEY_COLUMN");
   });
 
   it("returns 400 for /route with missing fields", async () => {
@@ -240,7 +248,7 @@ describe("CatalogDO input validation and lifecycle", () => {
   it("/init with force:true wipes existing shard/vbucket state and re-initializes", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 64 }, `Bearer ${env.ADMIN_TOKEN}`));
-    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
 
     const res = await stub.fetch(
@@ -267,7 +275,9 @@ describe("CatalogDO input validation and lifecycle", () => {
 
   it("/list-tables returns registered tables", async () => {
     const stub = await freshCatalog();
-    await stub.fetch(post("/register-table", { table: "orders", partitioning: "hash" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(
+      post("/register-table", { table: "orders", partitioning: "hash", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
     const res = await stub.fetch(post("/list-tables", {}, `Bearer ${env.ADMIN_TOKEN}`));
     expect(res.status).toBe(200);
     const body = (await res.json()) as { tables: Array<{ table_name: string }> };
@@ -301,7 +311,7 @@ describe("CatalogDO routing", () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 4, totalVBuckets: 64 }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(
-      post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`),
+      post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`),
     );
     const token = await registerTenant(stub, "t1");
 
@@ -328,7 +338,7 @@ describe("CatalogDO routing", () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(
-      post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`),
+      post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`),
     );
     await stub.fetch(
       post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`),
@@ -370,7 +380,7 @@ describe("CatalogDO tenant authorization", () => {
   it("rotate:true issues a new token that invalidates the old one", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
-    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
 
     const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
     const { token: oldToken } = (await firstRes.json()) as { token: string };
@@ -396,7 +406,7 @@ describe("CatalogDO tenant authorization", () => {
   it("revoke-tenant invalidates the tenant's token", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
-    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
     const token = await registerTenant(stub, "t1");
 
     const revokeRes = await stub.fetch(post("/revoke-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
@@ -419,7 +429,7 @@ describe("CatalogDO tenant authorization", () => {
   it("/route 401s with a distinct error code for missing, wrong, and unregistered tokens", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
-    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
     await registerTenant(stub, "t1");
 
     const routeBody = { table: "events", tenantId: "t1", partitionKey: "p1" };
