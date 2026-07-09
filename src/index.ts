@@ -252,13 +252,30 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     const introspectBody = (await introspectRes.json()) as { rows?: Array<{ name: string }> };
     const columns = (introspectBody.rows ?? []).map((c) => c.name);
     if (!columns.includes(body.partitionKeyColumn)) {
-      await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, (shardId) =>
-        routeToShard(env, shardId, "/execute", {
+      // Unique per attempt (not a stable per-table key like the create
+      // requestId above): DROP TABLE IF EXISTS is already idempotent at the
+      // SQL level, and a stable rollback requestId would itself become a
+      // poisoned idempotency-cache entry on a second failed create-table
+      // attempt for the same table — the second rollback would replay the
+      // FIRST rollback's cached "success" instead of actually re-executing,
+      // leaving the just-recreated table behind despite the 400 response.
+      // crypto.randomUUID(), not Date.now(): two rollback attempts landing
+      // in the same millisecond would otherwise collide on the same key.
+      const rollbackAttemptId = crypto.randomUUID();
+      await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId) => {
+        await routeToShard(env, shardId, "/execute", {
           sql: `DROP TABLE IF EXISTS "${body.table}"`,
-          requestId: `create-table-rollback-${body.table}-${shardId}`,
+          requestId: `create-table-rollback-${body.table}-${shardId}-${rollbackAttemptId}`,
           isMutation: true,
-        }),
-      );
+        });
+        // Undo the idempotency-cache side effect together with the DDL: the
+        // "success" cached under the original create requestId is now a lie
+        // (the table it recorded creating no longer exists), so a retry must
+        // genuinely re-execute rather than replay that cached result.
+        await routeToShard(env, shardId, "/invalidate-request", {
+          requestId: `create-table-${body.table}-${shardId}`,
+        });
+      });
       return json(
         {
           error: {

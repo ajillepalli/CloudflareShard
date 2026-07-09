@@ -171,6 +171,107 @@ describe("CoordinatorDO /begin (2PC orchestration)", () => {
     expect(res.status).toBe(400);
   });
 
+  it("regression (Codex-found): retrying an in-flight txId with a different participant set is rejected, not silently resumed with the new data", async () => {
+    const txId = `tx-mismatch-inflight-${crypto.randomUUID()}`;
+    const shardA = `shard-a-${txId}`;
+    await createTable(shardA);
+
+    const coordinatorId = env.COORDINATOR.idFromName(txId);
+    const coordinator = env.COORDINATOR.get(coordinatorId);
+    // Seed a still-in-flight transaction directly (simulating a /begin call
+    // that started but never finished) with one operation_json payload...
+    await coordinator.fetch(post("/tx-status", { txId: "schema-warmup" }));
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      const originalParticipants = [{ shardId: shardA, intents: [{ sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["row-orig", "a"], tenantId: "t1", table: "t", partitionKey: "row-orig" }] }];
+      state.storage.sql.exec(
+        `INSERT INTO transactions (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at) VALUES (?, 'preparing', ?, ?, 'seeded-original-hash', ?, ?)`,
+        txId,
+        JSON.stringify([shardA]),
+        JSON.stringify(originalParticipants),
+        now,
+        now,
+      );
+    });
+
+    // ...then retry /begin with the SAME txId but a DIFFERENT mutation set —
+    // this must be rejected, not silently applied under the original txId.
+    const res = await coordinator.fetch(
+      post("/begin", {
+        txId,
+        participants: [{ shardId: shardA, intents: [{ sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["row-different", "z"], tenantId: "t1", table: "t", partitionKey: "row-different" }] }],
+      }),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TX_ID_REQUEST_MISMATCH");
+
+    const stubA = await freshShard(shardA);
+    const checkRes = await stubA.fetch(shardPost("/execute", { sql: "SELECT * FROM t WHERE id = ?", params: ["row-different"], requestId: "check-mismatch", isMutation: false }));
+    expect(((await checkRes.json()) as { rows: unknown[] }).rows).toHaveLength(0);
+  });
+
+  it("regression (Codex-found): retrying a COMMITTED txId with a different participant set is rejected, not returned as a stale success", async () => {
+    const txId = `tx-mismatch-committed-${crypto.randomUUID()}`;
+    const shardA = `shard-a-${txId}`;
+    await createTable(shardA);
+
+    const coordinatorId = env.COORDINATOR.idFromName(txId);
+    const coordinator = env.COORDINATOR.get(coordinatorId);
+    const originalParticipants = [{ shardId: shardA, intents: [{ sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["row-committed", "a"], tenantId: "t1", table: "t", partitionKey: "row-committed" }] }];
+    const first = await coordinator.fetch(post("/begin", { txId, participants: originalParticipants }));
+    expect(first.status).toBe(200);
+
+    const retryWithDifferentData = await coordinator.fetch(
+      post("/begin", {
+        txId,
+        participants: [{ shardId: shardA, intents: [{ sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["row-different-2", "z"], tenantId: "t1", table: "t", partitionKey: "row-different-2" }] }],
+      }),
+    );
+    expect(retryWithDifferentData.status).toBe(409);
+    const body = (await retryWithDifferentData.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TX_ID_REQUEST_MISMATCH");
+  });
+
+  it("regression (Codex-found): a transactions table from before operation_hash existed is migrated in place, not crashed on", async () => {
+    const txId = `tx-migration-${crypto.randomUUID()}`;
+    const coordinatorId = env.COORDINATOR.idFromName(txId);
+    const coordinator = env.COORDINATOR.get(coordinatorId);
+
+    // Simulate a pre-migration transactions table (no operation_hash column)
+    // by creating it directly, before ensureSchema() ever runs on this DO.
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(`
+        CREATE TABLE transactions (
+          tx_id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          participant_shards_json TEXT NOT NULL,
+          operation_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT
+        )
+      `);
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        "INSERT INTO transactions (tx_id, status, participant_shards_json, operation_json, created_at, updated_at) VALUES (?, 'preparing', '[]', '[]', ?, ?)",
+        txId,
+        now,
+        now,
+      );
+    });
+
+    // A /begin retry against this pre-migration row must not 500 — it should
+    // degrade to the same fail-closed mismatch rejection as any other
+    // content mismatch, since the backfilled operation_hash default ('')
+    // never equals a real hash.
+    const res = await coordinator.fetch(post("/begin", { txId, participants: [{ shardId: "irrelevant-shard", intents: [] }] }));
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TX_ID_REQUEST_MISMATCH");
+  });
+
   it("two different txIds land on two different CoordinatorDO instances and don't interfere", async () => {
     const txA = `tx-iso-a-${crypto.randomUUID()}`;
     const txB = `tx-iso-b-${crypto.randomUUID()}`;
