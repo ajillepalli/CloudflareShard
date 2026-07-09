@@ -12,8 +12,12 @@
 
 - Full ANSI SQL parser/planner.
 - Transparent cross-shard joins.
-- Strict global serializable transactions across shards.
 - Zero-downtime live data movement in first cut.
+
+Cross-shard transactional writes (2PC) were originally scoped out of the MVP (see prior
+revision) but were reclassified as a non-negotiable day-one requirement, alongside global
+secondary indexes, per the founder's explicit decision during product review — see
+Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
 
 ## 3) Components
 
@@ -102,6 +106,7 @@ POST /admin/register-table
 Request:
 - table string
 - partitioning string (optional, default hash)
+- partitionKeyColumn string (required — the column holding each row's partition key)
 
 Response:
 - ok
@@ -112,10 +117,23 @@ POST /admin/create-table
 Request:
 - table string
 - schema string (must be a `CREATE TABLE` statement whose table name matches `table`)
+- partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist)
 
 Response:
 - ok
 - table
+
+POST /admin/set-partition-key-column (ADMIN_TOKEN)
+Request:
+- table string
+- partitionKeyColumn string (validated via `PRAGMA table_info` against a live shard's schema)
+
+Response:
+- ok
+- table
+- partitionKeyColumn
+
+Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409.
 
 POST /admin/split-vbucket
 Request:
@@ -129,7 +147,26 @@ Response:
 - toShard
 - metadataVersion
 
-POST /v1/sql
+POST /admin/register-tenant (ADMIN_TOKEN)
+Request:
+- tenantId string
+- rotate boolean (optional — issues a new token for an already-registered tenant, invalidating the old one immediately)
+
+Response:
+- ok
+- tenantId
+- token string (plaintext, returned exactly once)
+
+POST /admin/revoke-tenant (ADMIN_TOKEN)
+Request:
+- tenantId string
+
+Response:
+- ok
+- tenantId
+- revoked boolean
+
+POST /v1/sql (tenant bearer token)
 Request:
 - sql string
 - params array (optional)
@@ -143,7 +180,58 @@ Response:
 - requestId
 - result (query or mutation payload)
 
-POST /v1/scatter
+POST /v1/mutate (tenant bearer token)
+Request (a single StructuredMutation — see structured-op.ts):
+- op string ("insert" | "update" | "delete" | "upsert")
+- table string
+- tenantId string
+- partitionKey string
+- where object (optional — additional predicates; never substitutes for the partition-key predicate, which is always injected)
+- values object (optional — required for insert/upsert; the partition-key column is always force-set here regardless of what's supplied)
+- conflictColumns array (optional, upsert only — defaults to [partitionKeyColumn])
+- requestId string (optional — shares /v1/sql's requestId-based idempotency contract)
+
+Response:
+- ok boolean
+- rowsAffected number
+
+Row-ownership is structural, not conditional: `compileMutation` always ANDs the partition-key predicate into `update`/`delete`'s `WHERE` clause and force-sets it in `insert`/`upsert`'s `values` — an absent `where` still only ever touches the one partitioned row/set, never the whole table. Rejected 409 (`PARTITION_KEY_COLUMN_UNSET`) against a table still carrying the `'__unset__'` sentinel.
+
+POST /v1/tx (tenant bearer token)
+Request:
+- mutations array of StructuredMutation (see /v1/mutate above), 1 or more, bounded to 8 distinct (tenantId, table, partitionKey) rows
+- requestId string (required — the transaction's idempotency key; a retry with the same requestId returns the prior outcome rather than re-running 2PC)
+
+Response (200, committed):
+- ok: true
+- txId string
+- status: "committed" (or "committed_pending_ack" if a commit acknowledgement from one or more shards is still outstanding and queued for alarm-driven retry — the transaction is durably committed either way, only the ack is pending)
+
+Response (409, aborted):
+- error { code: "TX_ABORTED", message, details } — prepare failed on at least one participant shard; every participant was rolled back (or had nothing to roll back, given /prepare's shadow-write design)
+
+Drives `CoordinatorDO`'s two-phase commit across every shard touched by the mutation set: each mutation is individually routed and validated (so a cross-tenant mutation in the same batch 401s the same way a lone `/v1/mutate` call would, with no separate check needed), grouped by shardId, then `/begin` fans out `/prepare` to all participants, aborts everyone on any failure, or fans out `/commit` on universal success.
+
+POST /admin/tx-status (ADMIN_TOKEN)
+Request:
+- txId string
+
+Response:
+- found boolean
+- status string (if found — preparing/prepared/committing/committed/aborted)
+
+POST /admin/tx-force-abort (ADMIN_TOKEN)
+Request:
+- txId string
+
+Response:
+- ok boolean
+- txId
+- status: "aborted"
+
+Manual escape hatch for a transaction stuck past a reasonable window (visible via `/admin/tx-status`) — aborts every participant shard and marks the transaction aborted. Rejects 409 if the transaction already committed.
+
+POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
 - sql string (SELECT only)
 - params array (optional)
@@ -180,9 +268,45 @@ This prevents duplicate writes after network retries and stops a reused requestI
 - Single-shard operations:
   - Strong, local ACID semantics.
 
-- Cross-shard operations (future):
-  - Saga mode default.
-  - Optional 2PC mode behind feature flag.
+- Cross-shard operations (Milestone 1 — Transaction Coordinator):
+  - Full 2PC is the only mode, not feature-flagged. Cross-shard transactional writes were
+    reclassified from "future, saga-first" to a non-negotiable day-one requirement (see
+    Section 2). A caller derives a `StructuredMutation` set; the coordinator resolves
+    participant shards and drives prepare/commit/abort across all of them atomically.
+  - Bounded to at most 8 participant shards per transaction.
+  - Requires the structured mutation contract (Section 7, `/v1/mutate`) and a mandatory
+    partition-key-column convention on every registered table — both shipped.
+  - **Shard-level primitives (implementation status: shipped and reachable via `/v1/tx`).**
+    Each `ShardDO` exposes internal `/prepare`, `/commit`, `/abort`, `/tx-status`, and
+    `/pending-intent-count` routes implementing the participant side of 2PC: `/prepare`
+    validates a mutation by executing it inside a transaction and forcing a rollback (so a
+    concurrent read never sees it), then durably records a lock + pending intent in a
+    separate transaction; `/commit` re-executes for real; `/abort` has nothing to undo,
+    since prepare never left anything applied. These are DO-binding-only, called from
+    `CoordinatorDO`, never directly by the Worker.
+  - **CoordinatorDO (Milestone 1 Chunk 3 — shipped).** One `CoordinatorDO` instance per
+    transaction (`env.COORDINATOR.idFromName(txId)`, no sharding — see the cost-model
+    decision in the milestone plan: Cloudflare DO billing has no per-instantiation cost, so
+    the simpler keying wins over a sharded pool at this project's realistic near-term scale).
+    `txId = sha256Hex([mutations[0].tenantId, requestId])`. `/begin` persists the
+    transaction and its participants, fans out `/prepare` to every participant shard, aborts
+    everyone on any failure, or fans out `/commit` on universal success. A commit
+    acknowledgement that fails to reach one or more shards is queued in `recovery_queue` and
+    retried via `alarm()` with exponential backoff — the transaction is already durably
+    committed at that point, so this only affects when the shard-side state catches up, not
+    correctness. `/v1/tx` (Section 7) is the public entry point.
+  - Raw `/v1/sql` and `/v1/mutate` mutations against a row locked by an in-flight
+    coordinated transaction reject 409 (`TX_PARTICIPANT_LOCKED`).
+  - **Draining interaction (Milestone 1 Chunk 4 — shipped).** A new transaction targeting an
+    already-draining shard is rejected 503 by `CatalogDO`'s existing `/route` check (shard
+    status must be `active`) — no new code needed there. The other direction — draining a
+    shard that has in-flight prepared 2PC intents — is handled in the Worker's
+    `handleAdminDrainShard`, not by adding a `SHARD` binding to `CatalogDO`: it calls the
+    target `ShardDO`'s `/pending-intent-count` first, and only proceeds to `CatalogDO`'s
+    `/drain-shard` if that count is 0; otherwise it rejects 409
+    (`SHARD_HAS_IN_FLIGHT_TRANSACTIONS`). This preserves the "Worker orchestrates, DOs don't
+    call each other directly" invariant. Relies on Chunk 3's recovery loop (bounded time) or
+    `/admin/tx-force-abort` (manual escape hatch) to unblock a stuck retry.
 
 ## 11) Rebalancing and Split (MVP)
 
@@ -221,8 +345,9 @@ Emit structured logs and counters for:
 
 ## 14) Security and Multi-tenancy
 
-- Require authenticated principal at Gateway.
-- Verify tenantId belongs to principal before route.
+- Require authenticated principal at Gateway — implemented via `tenant_auth` bearer tokens (`/admin/register-tenant`), checked in `CatalogDO.handleRoute` before any routing info is returned.
+- Verify tenantId belongs to principal before route — implemented: the caller's bearer token is hashed and compared against the claimed `tenantId`'s stored hash; missing/wrong/revoked tokens are all rejected with 401.
+- This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary — see README.md's "Tenant authorization" section for the operator/tenant distinction this milestone's distribution model assumes.
 - Enforce SQL policy allowlist in production (MVP currently permissive).
 
 ## 15) Migration Path to Production

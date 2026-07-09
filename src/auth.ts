@@ -1,3 +1,14 @@
+/** SHA-256 hex digest — used to store tenant tokens as a hash rather than
+ * plaintext, mirroring the collision-resistant hashing already used for
+ * shard-side idempotency (ShardDO.requestHash). */
+export async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 /** Constant-time comparison — avoids leaking token length/prefix match via response timing. */
 export function timingSafeEqual(a: string, b: string): boolean {
   const enc = new TextEncoder();
