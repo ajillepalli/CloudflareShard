@@ -53,6 +53,46 @@ describe("ShardDO idempotent mutation replay", () => {
     expect(countBody.rows[0].n).toBe(1);
   });
 
+  it("rejects a requestId reused with different sql/params instead of replaying a mismatched result", async () => {
+    const stub = await freshShard();
+
+    await stub.fetch(
+      post("/execute", {
+        sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)",
+        requestId: "req-schema",
+        isMutation: true,
+      }),
+    );
+
+    const first = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["1", "a"],
+        requestId: "req-shared",
+        isMutation: true,
+      }),
+    );
+    expect(first.status).toBe(200);
+
+    const mismatched = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["2", "b"],
+        requestId: "req-shared",
+        isMutation: true,
+      }),
+    );
+    expect(mismatched.status).toBe(409);
+    const body = (await mismatched.json()) as { error: string };
+    expect(body.error).toContain("different sql/params");
+
+    const countRes = await stub.fetch(
+      post("/execute", { sql: "SELECT COUNT(*) as n FROM t", requestId: "req-count", isMutation: false }),
+    );
+    const countBody = (await countRes.json()) as { rows: Array<{ n: number }> };
+    expect(countBody.rows[0].n).toBe(1);
+  });
+
   it("rolls back and does not record the request on a SQL error", async () => {
     const stub = await freshShard();
 

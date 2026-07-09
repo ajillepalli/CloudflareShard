@@ -180,6 +180,17 @@ export class CatalogDO extends DurableObject {
       catalogShardCount?: number;
     };
 
+    // Reject non-finite values before clamping — Math.max/min silently
+    // propagate NaN (e.g. a non-numeric JSON value), which would zero out
+    // the shard-creation loop below while the vbucket loop still assigns
+    // every vbucket to "shard-NaN", corrupting the cluster with a 200 OK.
+    if (body.numShards !== undefined && !Number.isFinite(body.numShards)) {
+      return json({ error: "numShards must be a finite number." }, 400);
+    }
+    if (body.totalVBuckets !== undefined && !Number.isFinite(body.totalVBuckets)) {
+      return json({ error: "totalVBuckets must be a finite number." }, 400);
+    }
+
     // Ceilings prevent a single admin call from creating a pathologically
     // large cluster that exhausts this DO's CPU/time budget mid-loop (the
     // shard/vbucket population loops below have no batching or rollback).

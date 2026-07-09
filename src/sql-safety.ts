@@ -24,8 +24,78 @@ function stripLeadingComments(sql: string): string {
   return s;
 }
 
+/** Scans forward from an opening '(' at `start` to the index just past its
+ * matching close paren, honoring quoted strings so a paren inside a string
+ * literal doesn't unbalance the count. Returns sql.length if unterminated. */
+function skipBalancedParens(sql: string, start: number): number {
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = start; i < sql.length; i += 1) {
+    const c = sql[i];
+    if (inSingle) {
+      if (c === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (c === '"') inDouble = false;
+      continue;
+    }
+    if (c === "'") inSingle = true;
+    else if (c === '"') inDouble = true;
+    else if (c === "(") depth += 1;
+    else if (c === ")") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return sql.length;
+}
+
+/** Skips past a leading "WITH [RECURSIVE] name [(cols)] AS (body) [, ...]"
+ * common-table-expression clause to reach the terminal statement (SELECT,
+ * INSERT, UPDATE, or DELETE — SQLite allows WITH before any of them). Without
+ * this, "WITH x AS (SELECT 1) DELETE FROM t" reads as a harmless SELECT
+ * because isMutation() only ever inspected the first keyword. Bails out
+ * (returns the input unchanged) on anything that doesn't match the expected
+ * CTE grammar — malformed input isn't valid SQL SQLite would execute as a
+ * mutation anyway, so it's safe to leave unclassified here. */
+function skipLeadingCte(sql: string): string {
+  if (!/^\s*with\b/i.test(sql)) return sql;
+  let s = sql.replace(/^\s*with\s+(recursive\s+)?/i, "");
+  for (;;) {
+    const idMatch = /^\s*("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|[A-Za-z_][A-Za-z0-9_]*)/.exec(s);
+    if (!idMatch) return sql;
+    s = s.slice(idMatch[0].length);
+
+    const afterId = s.replace(/^\s+/, "");
+    if (afterId.startsWith("(")) {
+      s = s.slice(s.length - afterId.length);
+      s = s.slice(skipBalancedParens(s, 0));
+    }
+
+    const asMatch = /^\s*as\s*/i.exec(s);
+    if (!asMatch) return sql;
+    s = s.slice(asMatch[0].length);
+
+    const beforeBody = s.replace(/^\s+/, "");
+    if (!beforeBody.startsWith("(")) return sql;
+    s = s.slice(s.length - beforeBody.length);
+    s = s.slice(skipBalancedParens(s, 0));
+
+    const commaMatch = /^\s*,\s*/.exec(s);
+    if (commaMatch) {
+      s = s.slice(commaMatch[0].length);
+      continue;
+    }
+    return s;
+  }
+}
+
 export function isMutation(sql: string): boolean {
-  return /^(insert|update|delete|replace|create|drop|alter)/i.test(stripLeadingComments(sql));
+  const afterComments = stripLeadingComments(sql);
+  const afterCte = stripLeadingComments(skipLeadingCte(afterComments));
+  return /^(insert|update|delete|replace|create|drop|alter)/i.test(afterCte);
 }
 
 function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {

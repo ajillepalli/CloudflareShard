@@ -209,6 +209,26 @@ describe("CatalogDO input validation and lifecycle", () => {
     expect(body.totalVBuckets).toBe(65536);
   });
 
+  it("/init rejects a non-numeric numShards instead of silently corrupting the cluster with shard-NaN (regression: Math.max/min propagate NaN)", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(
+      post("/init", { numShards: "not-a-number", totalVBuckets: 64, force: true }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("numShards");
+  });
+
+  it("/init rejects a non-numeric totalVBuckets", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(
+      post("/init", { numShards: 2, totalVBuckets: "lots", force: true }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("totalVBuckets");
+  });
+
   it("/init with force:true wipes existing shard/vbucket state and re-initializes", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 64 }, `Bearer ${env.ADMIN_TOKEN}`));
