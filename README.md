@@ -51,6 +51,7 @@ npm run deploy
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/init \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{"numShards":4,"totalVBuckets":256}'
 ```
 
@@ -62,6 +63,7 @@ so a single call can't provision an oversized, unrollbackable cluster.
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/register-table \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{"table":"events"}'
 ```
 
