@@ -2,7 +2,7 @@ import { CatalogDO } from "./catalog";
 import { ShardDO } from "./shard";
 import { CoordinatorDO } from "./coordinator";
 import { json } from "./http";
-import { hashKey } from "./hash";
+import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
 import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } from "./sql-safety";
@@ -358,6 +358,139 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
   return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn });
 }
 
+/** Milestone 2, Chunk 1. Registers a secondary index and backfills it against
+ * existing rows. Index entries live on a shard chosen by hashing
+ * (table, indexName, indexKeyJson) — independent of the base row's own
+ * shard (see the Milestone 2 design doc's index-placement decision) — so
+ * backfill writes each entry to its own computed shard, not the base row's
+ * shard. Single-pass, not chunked: acceptable for this milestone's stated
+ * pre-product scale (see design doc Premise 1); a very large table could hit
+ * a Worker CPU-time limit, a known simplification, not a silent bug. */
+async function handleAdminCreateIndex(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
+  if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
+    return json(
+      { error: { code: "MISSING_FIELDS", message: "Missing indexName, table, or columns.", fix: "Provide indexName, table, and a non-empty columns array." } },
+      400,
+    );
+  }
+  if (!IDENTIFIER_RE.test(body.indexName)) {
+    return json({ error: { code: "UNSAFE_IDENTIFIER", message: "indexName is not a valid identifier." } }, 400);
+  }
+  for (const col of body.columns) {
+    if (!IDENTIFIER_RE.test(col)) {
+      return json({ error: { code: "UNSAFE_IDENTIFIER", message: `Unsafe identifier in columns: ${col}` } }, 400);
+    }
+  }
+
+  // table_rules is fanned out identically to every catalog shard, so
+  // catalog-0's view is representative (same pattern as handleAdminListTables).
+  const tablesRes = await routeToCatalog(env, "catalog-0", "/list-tables", {}, request.headers.get("authorization") ?? undefined);
+  if (!tablesRes.ok) {
+    return new Response(tablesRes.body, { status: tablesRes.status, headers: tablesRes.headers });
+  }
+  const tablesBody = (await tablesRes.json()) as {
+    tables: Array<{ table_name: string; partition_key_column: string }>;
+  };
+  const tableInfo = tablesBody.tables.find((t) => t.table_name === body.table);
+  if (!tableInfo) {
+    return json(
+      { error: { code: "TABLE_NOT_REGISTERED", message: `Table ${body.table} is not registered.`, fix: "Call /admin/create-table first." } },
+      404,
+    );
+  }
+  if (tableInfo.partition_key_column === UNSET_PARTITION_KEY_COLUMN) {
+    return json(
+      { error: { code: "PARTITION_KEY_COLUMN_UNSET", message: `Table ${body.table} has not been upgraded with a partition key column.`, fix: "Call /admin/set-partition-key-column first." } },
+      409,
+    );
+  }
+  const pkCol = tableInfo.partition_key_column;
+
+  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+  const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
+  if (listFailed) return listFailed;
+  const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+  if (shardIds.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet.", fix: "Call /admin/init first." } }, 400);
+  }
+
+  // Validate the requested columns actually exist on the schema (mirrors
+  // handleAdminCreateTable's PRAGMA table_info check).
+  const introspectRes = await routeToShard(env, shardIds[0], "/execute", {
+    sql: `PRAGMA table_info("${body.table}")`,
+    requestId: `create-index-introspect-${body.indexName}-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (introspectRes.ok) {
+    const introspectBody = (await introspectRes.json()) as { rows?: Array<{ name: string }> };
+    const actualColumns = (introspectBody.rows ?? []).map((c) => c.name);
+    const missing = body.columns.filter((c) => !actualColumns.includes(c));
+    if (missing.length > 0) {
+      return json(
+        {
+          error: {
+            code: "COLUMN_NOT_IN_SCHEMA",
+            message: `Column(s) not in schema: ${missing.join(", ")}.`,
+            fix: `Choose from the table's actual columns: ${actualColumns.join(", ")}.`,
+          },
+        },
+        400,
+      );
+    }
+  }
+
+  // Backfill: scan every shard's existing rows for this table, compute each
+  // row's index entry, and write it to its own computed index shard.
+  const columns = body.columns;
+  const indexName = body.indexName;
+  const table = body.table;
+  for (const shardId of shardIds) {
+    const safeTable = `"${table}"`;
+    const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
+    const scanRes = await routeToShard(env, shardId, "/execute", {
+      sql: `SELECT ${selectCols} FROM ${safeTable}`,
+      requestId: `create-index-backfill-scan-${indexName}-${shardId}-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    if (!scanRes.ok) {
+      return json(
+        { error: { code: "BACKFILL_SCAN_FAILED", message: `Failed to scan shard ${shardId} for backfill.` } },
+        500,
+      );
+    }
+    const scanBody = (await scanRes.json()) as { rows: Array<Record<string, unknown>> };
+    for (const row of scanBody.rows) {
+      const partitionKey = String(row[pkCol]);
+      const indexKeyJson = JSON.stringify(columns.map((c) => row[c] ?? null));
+      const indexShardId = indexShardIdForKey(table, indexName, indexKeyJson, shardIds);
+      const writeRes = await routeToShard(env, indexShardId, "/execute", {
+        sql: `INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+        params: [table, indexName, indexKeyJson, partitionKey, shardId, new Date().toISOString()],
+        requestId: `create-index-backfill-write-${indexName}-${crypto.randomUUID()}`,
+        isMutation: true,
+      });
+      if (!writeRes.ok) {
+        return json(
+          { error: { code: "BACKFILL_WRITE_FAILED", message: `Failed to write index entry for partitionKey ${partitionKey}.` } },
+          500,
+        );
+      }
+    }
+  }
+
+  const registerResults = await fanOutToAllCatalogs(
+    env,
+    "/create-index",
+    () => ({ indexName, table, columns }),
+    request.headers.get("authorization") ?? undefined,
+  );
+  const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
+  if (registerFailed) return registerFailed;
+
+  return json({ ok: true, indexName, table, columns });
+}
+
 async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Response> {
   const payload = (await request.json()) as { catalogShardId?: string };
   if (!payload.catalogShardId) {
@@ -410,6 +543,19 @@ async function handleAdminListTables(request: Request, env: Env): Promise<Respon
     env,
     "catalog-0",
     "/list-tables",
+    {},
+    request.headers.get("authorization") ?? undefined,
+  );
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminListIndexes(request: Request, env: Env): Promise<Response> {
+  // index_rules are fanned out identically to every catalog shard by
+  // /admin/create-index, so catalog-0 is representative of all of them.
+  const res = await routeToCatalog(
+    env,
+    "catalog-0",
+    "/list-indexes",
     {},
     request.headers.get("authorization") ?? undefined,
   );
@@ -563,6 +709,7 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
     vbucket: number;
     metadataVersion: number;
     catalogShardCount: number | null;
+    indexNames?: string[];
   };
 
   const currentCount = catalogShardCount(env);
@@ -575,6 +722,24 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
     return json(
       {
         error: `Catalog shard count mismatch: cluster was initialized with ${route.catalogShardCount} catalog shards, but this Worker is configured for ${currentCount} (CATALOG_SHARD_COUNT). Changing this on a live cluster silently re-routes tenants to different catalog shards and orphans their data. Re-run /admin/init consistently or fix the CATALOG_SHARD_COUNT var.`,
+      },
+      409,
+    );
+  }
+
+  // Milestone 2: raw SQL bypasses every index-maintenance mechanism
+  // (neither /v1/mutate's async path nor /v1/tx's 2PC piggyback ever fires
+  // for a raw /execute call), so a mutation against a table carrying a
+  // registered index would silently desync it. Reject here, at the Worker
+  // layer — ShardDO has no CatalogDO access to check this itself.
+  if (mutating && route.indexNames && route.indexNames.length > 0) {
+    return json(
+      {
+        error: {
+          code: "TABLE_HAS_INDEX",
+          message: `Table ${body.table} has registered index(es) (${route.indexNames.join(", ")}) — raw /v1/sql mutations are not permitted against it.`,
+          fix: "Use /v1/mutate or /v1/tx instead, which maintain indexes correctly.",
+        },
       },
       409,
     );
@@ -895,6 +1060,8 @@ const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> 
   "/admin/register-tenant": handleAdminRegisterTenant,
   "/admin/revoke-tenant": handleAdminRevokeTenant,
   "/admin/set-partition-key-column": handleAdminSetPartitionKeyColumn,
+  "/admin/create-index": handleAdminCreateIndex,
+  "/admin/list-indexes": handleAdminListIndexes,
   "/admin/tx-status": handleAdminTxStatus,
   "/admin/tx-force-abort": handleAdminTxForceAbort,
   "/v1/sql": handleV1Sql,

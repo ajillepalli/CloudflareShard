@@ -552,6 +552,187 @@ describe("Worker /admin/set-partition-key-column", () => {
   });
 });
 
+/** ShardDO/CatalogDO storage isn't wiped by /admin/init's force:true (only
+ * catalog/shard/vbucket assignment resets — see the established pattern
+ * from the drain-shard and tenant-registration tests above). Each
+ * create-index test below uses its own dedicated table + index name rather
+ * than the shared "events" table, so backfill scans and index_rules
+ * registration never leak across tests. */
+async function createIndexTestTable(table: string): Promise<void> {
+  const res = await post(
+    "/admin/create-table",
+    { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+    AUTH(),
+  );
+  expect(res.status).toBe(200);
+}
+
+describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
+  it("requires an admin token", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_auth_evt");
+    const res = await post("/admin/create-index", { indexName: "idx_auth_by_v", table: "idx_auth_evt", columns: ["v"] });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects missing fields", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post("/admin/create-index", { indexName: "idx_missing_fields" }, AUTH());
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MISSING_FIELDS");
+  });
+
+  it("rejects unsafe identifiers", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_unsafe_evt");
+    const res = await post("/admin/create-index", { indexName: "bad; drop table x", table: "idx_unsafe_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNSAFE_IDENTIFIER");
+  });
+
+  it("rejects a table that isn't registered", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post("/admin/create-index", { indexName: "idx_ghost", table: "idx_nonexistent_table", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TABLE_NOT_REGISTERED");
+  });
+
+  it("rejects a column that doesn't exist on the table's schema", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_badcol_evt");
+    const res = await post("/admin/create-index", { indexName: "idx_badcol_by_ghost", table: "idx_badcol_evt", columns: ["nonexistent_col"] }, AUTH());
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("COLUMN_NOT_IN_SCHEMA");
+  });
+
+  it("creates an index, backfills pre-existing rows, and registers it", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_backfill_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Insert rows BEFORE the index exists — proves backfill actually indexes
+    // pre-existing data, not just future writes.
+    await post("/v1/mutate", { op: "insert", table: "idx_backfill_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await post("/v1/mutate", { op: "insert", table: "idx_backfill_evt", tenantId, partitionKey: "row-2", values: { v: "beta" } }, token);
+
+    const res = await post("/admin/create-index", { indexName: "idx_backfill_by_v", table: "idx_backfill_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; indexName: string; table: string; columns: string[] };
+    expect(body.ok).toBe(true);
+    expect(body.indexName).toBe("idx_backfill_by_v");
+
+    // With numShards=1, the index entry's computed shard is deterministically
+    // the one shard that exists — inspect __cf_indexes directly there.
+    const shardId = "catalog-0-shard-0";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+    await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec(
+          "SELECT table_name, index_name, index_key_json, partition_key, source_shard_id FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key ASC",
+          "idx_backfill_by_v",
+        ),
+      ) as Array<{ table_name: string; index_name: string; index_key_json: string; partition_key: string; source_shard_id: string }>;
+      expect(rows).toHaveLength(2);
+      expect(rows[0].partition_key).toBe("row-1");
+      expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+      expect(rows[0].source_shard_id).toBe(shardId);
+      expect(rows[1].partition_key).toBe("row-2");
+      expect(JSON.parse(rows[1].index_key_json)).toEqual(["beta"]);
+    });
+
+    const listRes = await post("/admin/list-indexes", {}, AUTH());
+    expect(listRes.status).toBe(200);
+    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string; table: string; columns: string[] }> };
+    expect(listBody.indexes.map((i) => i.indexName)).toContain("idx_backfill_by_v");
+  });
+
+  it("rejects a duplicate index name", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_dup_evt");
+    const first = await post("/admin/create-index", { indexName: "idx_dup_by_v", table: "idx_dup_evt", columns: ["v"] }, AUTH());
+    expect(first.status).toBe(200);
+    const second = await post("/admin/create-index", { indexName: "idx_dup_by_v", table: "idx_dup_evt", columns: ["v"] }, AUTH());
+    expect(second.status).toBe(409);
+    // firstCatalogFanOutFailure wraps the per-shard error under `details`,
+    // same shape as every other fanned-out admin route's failure response.
+    const body = (await second.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("INDEX_ALREADY_REGISTERED");
+  });
+
+  it("rejects an index on a table whose partitionKeyColumn hasn't been upgraded", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      { table: "legacy_idx_evt", schema: "CREATE TABLE IF NOT EXISTS legacy_idx_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    const id = env.CATALOG.idFromName("catalog-0");
+    const stub = env.CATALOG.get(id);
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'legacy_idx_evt'");
+    });
+
+    const res = await post("/admin/create-index", { indexName: "legacy_idx", table: "legacy_idx_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_COLUMN_UNSET");
+  });
+});
+
+describe("Worker /v1/sql raw mutation against an indexed table (Milestone 2 Chunk 1)", () => {
+  it("rejects a raw /v1/sql mutation against a table with a registered index", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_reject_evt");
+    const createIndexRes = await post("/admin/create-index", { indexName: "idx_reject_by_v", table: "idx_reject_evt", columns: ["v"] }, AUTH());
+    expect(createIndexRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO idx_reject_evt (id, v) VALUES (?, ?)", params: ["row-x", "x"], table: "idx_reject_evt", tenantId, partitionKey: "row-x" },
+      token,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TABLE_HAS_INDEX");
+  });
+
+  it("still allows a raw /v1/sql SELECT against a table with a registered index", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_select_evt");
+    await post("/admin/create-index", { indexName: "idx_select_by_v", table: "idx_select_evt", columns: ["v"] }, AUTH());
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post(
+      "/v1/sql",
+      { sql: "SELECT * FROM idx_select_evt WHERE id = ?", params: ["row-x"], table: "idx_select_evt", tenantId, partitionKey: "row-x" },
+      token,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("allows a raw /v1/sql mutation against a table with no registered index", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_noindex_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO idx_noindex_evt (id, v) VALUES (?, ?)", params: ["row-y", "y"], table: "idx_noindex_evt", tenantId, partitionKey: "row-y" },
+      token,
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
 /** Finds two partitionKey values that route to different shardIds under the
  * given tenant/table, by probing /v1/sql's route echo (established pattern:
  * see "routes different tenants" above). Needed to build genuine multi-shard

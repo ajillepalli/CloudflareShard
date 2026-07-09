@@ -135,6 +135,24 @@ Response:
 
 Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409.
 
+POST /admin/create-index (ADMIN_TOKEN) — Milestone 2, Chunk 1
+Request:
+- indexName string
+- table string (must already be registered with an upgraded `partitionKeyColumn`)
+- columns array of string (composite-capable — validates against the table's actual schema via `PRAGMA table_info`)
+
+Response:
+- ok
+- indexName
+- table
+- columns
+
+Registers a secondary index and backfills it against every existing row on every shard (single-pass, not chunked — see the Milestone 2 design doc's stated pre-product-scale simplification). Index entries live in each shard's internal `__cf_indexes` table, placed on a shard chosen by hashing `(table, indexName, indexKeyJson)` — independent of the base row's own shard, so a future index-query lookup resolves on one shard instead of scattering. Once any index is registered on a table, raw `/v1/sql` mutations against that table are rejected 409 (`TABLE_HAS_INDEX`) — raw SQL bypasses every index-maintenance mechanism, so it's blocked outright rather than silently desyncing the index; use `/v1/mutate` or `/v1/tx` instead (their own index-maintenance mechanisms are a later Milestone 2 chunk, not yet built).
+
+POST /admin/list-indexes (ADMIN_TOKEN) — Milestone 2, Chunk 1
+Response:
+- indexes: array of `{indexName, table, columns, createdAt}`
+
 POST /admin/split-vbucket
 Request:
 - vbucket number

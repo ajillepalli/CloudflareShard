@@ -3,7 +3,7 @@ import { json } from "./http";
 import { hashKey } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
-import { UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
+import { IDENTIFIER_RE, UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
 
 const ADMIN_GATED_ROUTES = new Set([
   "/status",
@@ -16,6 +16,8 @@ const ADMIN_GATED_ROUTES = new Set([
   "/register-tenant",
   "/revoke-tenant",
   "/set-partition-key-column",
+  "/create-index",
+  "/list-indexes",
 ]);
 
 export class CatalogDO extends DurableObject {
@@ -43,6 +45,8 @@ export class CatalogDO extends DurableObject {
       "/register-tenant": this.handleRegisterTenant.bind(this),
       "/revoke-tenant": this.handleRevokeTenant.bind(this),
       "/set-partition-key-column": this.handleSetPartitionKeyColumn.bind(this),
+      "/create-index": this.handleCreateIndex.bind(this),
+      "/list-indexes": this.handleListIndexes.bind(this),
     };
   }
 
@@ -116,6 +120,19 @@ export class CatalogDO extends DurableObject {
         token_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
         revoked_at TEXT
+      )
+    `);
+
+    // Milestone 2 (Index Service). One row per registered secondary index.
+    // No tenant scoping here — matches table_rules/base-table rows, which
+    // also carry no tenant_id (see docs/SPEC.md §14's documented trust
+    // model). columns_json is a JSON array to support composite indexes.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS index_rules (
+        index_name TEXT PRIMARY KEY,
+        table_name TEXT NOT NULL,
+        columns_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
       )
     `);
   }
@@ -364,6 +381,82 @@ export class CatalogDO extends DurableObject {
     return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn, metadataVersion: version });
   }
 
+  /** Registers index metadata only — does not touch physical shard data.
+   * The Worker orchestrates the physical side (creating __cf_indexes on
+   * every shard, running backfill) before calling this, mirroring how
+   * /admin/create-table applies the shard-level schema before registering
+   * in table_rules (src/index.ts's handleAdminCreateTable). */
+  private async handleCreateIndex(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
+    if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
+      return json(
+        {
+          error: {
+            code: "MISSING_FIELDS",
+            message: "Missing indexName, table, or columns.",
+            fix: "Provide indexName, table, and a non-empty columns array.",
+          },
+        },
+        400,
+      );
+    }
+    if (!IDENTIFIER_RE.test(body.indexName)) {
+      return json(
+        { error: { code: "UNSAFE_IDENTIFIER", message: "indexName is not a valid identifier." } },
+        400,
+      );
+    }
+    for (const col of body.columns) {
+      if (!IDENTIFIER_RE.test(col)) {
+        return json(
+          { error: { code: "UNSAFE_IDENTIFIER", message: `Unsafe identifier in columns: ${col}` } },
+          400,
+        );
+      }
+    }
+
+    const table = this.one<{ table_name: string }>("SELECT table_name FROM table_rules WHERE table_name = ?", body.table);
+    if (!table) {
+      return json(
+        { error: { code: "TABLE_NOT_REGISTERED", message: `Table ${body.table} is not registered.`, fix: "Call /admin/create-table first." } },
+        404,
+      );
+    }
+
+    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", body.indexName);
+    if (existing) {
+      return json(
+        { error: { code: "INDEX_ALREADY_REGISTERED", message: `Index ${body.indexName} is already registered.` } },
+        409,
+      );
+    }
+
+    this.audit("/create-index", { indexName: body.indexName, table: body.table, columns: body.columns });
+    this.sql.exec(
+      "INSERT INTO index_rules (index_name, table_name, columns_json, created_at) VALUES (?, ?, ?, ?)",
+      body.indexName,
+      body.table,
+      JSON.stringify(body.columns),
+      new Date().toISOString(),
+    );
+
+    return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
+  }
+
+  private async handleListIndexes(): Promise<Response> {
+    const indexes = this.many<{ index_name: string; table_name: string; columns_json: string; created_at: string }>(
+      "SELECT index_name, table_name, columns_json, created_at FROM index_rules ORDER BY index_name ASC",
+    );
+    return json({
+      indexes: indexes.map((i) => ({
+        indexName: i.index_name,
+        table: i.table_name,
+        columns: JSON.parse(i.columns_json) as string[],
+        createdAt: i.created_at,
+      })),
+    });
+  }
+
   /** Data-plane tenant auth check: does the caller's bearer token match the
    * hash on file for the claimed tenantId? A per-claimed-tenant check, not an
    * identity primitive — it answers "does this token match tenantId X" for a
@@ -578,12 +671,21 @@ export class CatalogDO extends DurableObject {
       );
     }
 
+    // Milestone 2: lets the Worker reject a raw /v1/sql mutation against a
+    // table carrying a registered index (ShardDO has no CatalogDO access to
+    // check this itself — see the Milestone 2 eng review's correction).
+    const indexNames = this.many<{ index_name: string }>(
+      "SELECT index_name FROM index_rules WHERE table_name = ?",
+      body.table,
+    ).map((r) => r.index_name);
+
     return json({
       shardId: mapped.shard_id,
       vbucket,
       metadataVersion: config.metadata_version,
       catalogShardCount: config.catalog_shard_count,
       partitionKeyColumn: mapped.partition_key_column,
+      indexNames,
     });
   }
 
@@ -625,8 +727,8 @@ export class CatalogDO extends DurableObject {
   }
 
   private async handleListTables(): Promise<Response> {
-    const tables = this.many<{ table_name: string; partitioning: string; created_at: string }>(
-      "SELECT table_name, partitioning, created_at FROM table_rules ORDER BY table_name ASC",
+    const tables = this.many<{ table_name: string; partitioning: string; partition_key_column: string; created_at: string }>(
+      "SELECT table_name, partitioning, partition_key_column, created_at FROM table_rules ORDER BY table_name ASC",
     );
     return json({ tables });
   }
