@@ -394,12 +394,16 @@ export class ShardDO extends DurableObject {
     const pendingIntentCount = this.one<{ n: number }>(
       "SELECT COUNT(DISTINCT coordinator_tx_id) AS n FROM pending_intents WHERE status = 'prepared'",
     );
+    const indexPendingJobCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_pending_jobs");
+    const indexEntryCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_indexes");
 
     return json({
       ok: true,
       tables: counts,
       idempotencyTableSize: idempotencyCount?.n ?? 0,
       pendingIntentCount: pendingIntentCount?.n ?? 0,
+      indexPendingJobCount: indexPendingJobCount?.n ?? 0,
+      indexEntryCount: indexEntryCount?.n ?? 0,
     });
   }
 
@@ -706,6 +710,10 @@ export class ShardDO extends DurableObject {
     const row = this.one<{ n: number }>(
       "SELECT COUNT(DISTINCT coordinator_tx_id) AS n FROM pending_intents WHERE status = 'prepared'",
     );
-    return json({ count: row?.n ?? 0 });
+    // Milestone 2, Chunk 5: reported alongside the 2PC pending-intent count
+    // (same route, not a new one) so the Worker's drain-shard check can
+    // block on either kind of unfinished work with one round-trip.
+    const indexJobRow = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_pending_jobs");
+    return json({ count: row?.n ?? 0, indexPendingJobCount: indexJobRow?.n ?? 0 });
   }
 }
