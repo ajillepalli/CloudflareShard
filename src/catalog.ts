@@ -426,10 +426,23 @@ export class CatalogDO extends DurableObject {
       );
     }
 
-    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", body.indexName);
+    // Idempotent on retry with the SAME table+columns — the Worker registers
+    // BEFORE backfilling (not after), specifically so a retry after a
+    // partial backfill failure can call this again rather than getting
+    // stuck behind a 409 for an index that's already (partially) there.
+    // Genuinely different table/columns for the same indexName is still a
+    // real conflict, not a retry.
+    const existing = this.one<{ table_name: string; columns_json: string }>(
+      "SELECT table_name, columns_json FROM index_rules WHERE index_name = ?",
+      body.indexName,
+    );
     if (existing) {
+      const sameDefinition = existing.table_name === body.table && existing.columns_json === JSON.stringify(body.columns);
+      if (sameDefinition) {
+        return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
+      }
       return json(
-        { error: { code: "INDEX_ALREADY_REGISTERED", message: `Index ${body.indexName} is already registered.` } },
+        { error: { code: "INDEX_ALREADY_REGISTERED", message: `Index ${body.indexName} is already registered with a different table/columns.` } },
         409,
       );
     }

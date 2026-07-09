@@ -658,12 +658,22 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     expect(listBody.indexes.map((i) => i.indexName)).toContain("idx_backfill_by_v");
   });
 
-  it("rejects a duplicate index name", async () => {
+  it("is idempotent: retrying the same indexName+table+columns succeeds instead of 409 (eng-review fix — needed so a caller can retry after a partial backfill failure)", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_dup_evt");
     const first = await post("/admin/create-index", { indexName: "idx_dup_by_v", table: "idx_dup_evt", columns: ["v"] }, AUTH());
     expect(first.status).toBe(200);
     const second = await post("/admin/create-index", { indexName: "idx_dup_by_v", table: "idx_dup_evt", columns: ["v"] }, AUTH());
+    expect(second.status).toBe(200);
+  });
+
+  it("rejects reusing an indexName with different table/columns as a genuine conflict", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_conflict_evt_a");
+    await createIndexTestTable("idx_conflict_evt_b");
+    const first = await post("/admin/create-index", { indexName: "idx_conflict_by_v", table: "idx_conflict_evt_a", columns: ["v"] }, AUTH());
+    expect(first.status).toBe(200);
+    const second = await post("/admin/create-index", { indexName: "idx_conflict_by_v", table: "idx_conflict_evt_b", columns: ["v"] }, AUTH());
     expect(second.status).toBe(409);
     // firstCatalogFanOutFailure wraps the per-shard error under `details`,
     // same shape as every other fanned-out admin route's failure response.
