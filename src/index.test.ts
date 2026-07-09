@@ -1,6 +1,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { hashKey } from "./hash";
+import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 
 function tenantForCatalogShard(catalogIndex: number, catalogShardCount: number): string {
@@ -506,6 +507,195 @@ describe("Worker /admin/set-partition-key-column", () => {
       token,
     );
     expect(unblockedRes.status).toBe(200);
+  });
+});
+
+/** Finds two partitionKey values that route to different shardIds under the
+ * given tenant/table, by probing /v1/sql's route echo (established pattern:
+ * see "routes different tenants" above). Needed to build genuine multi-shard
+ * /v1/tx test fixtures. */
+async function findPartitionKeyPairOnDifferentShards(token: string, tenantId: string, table: string): Promise<[string, string]> {
+  const seen = new Map<string, string>();
+  for (let i = 0; i < 200; i++) {
+    const partitionKey = `pk-${i}`;
+    const res = await post(
+      "/v1/sql",
+      { sql: "SELECT 1", table, tenantId, partitionKey },
+      token,
+    );
+    const body = (await res.json()) as { route: { shardId: string } };
+    seen.set(partitionKey, body.route.shardId);
+    const distinct = new Set(seen.values());
+    if (distinct.size > 1) {
+      const entries = Array.from(seen.entries());
+      const first = entries[0];
+      const second = entries.find(([, shardId]) => shardId !== first[1])!;
+      return [first[0], second[0]];
+    }
+  }
+  throw new Error("Could not find two partition keys on different shards.");
+}
+
+describe("Worker /v1/tx (cross-shard atomic transactions)", () => {
+  it("requires a tenant token", async () => {
+    await initCluster();
+    const res = await post("/v1/tx", { mutations: [{ op: "insert", table: "events", tenantId: "t1", partitionKey: "p1", values: { v: "a" } }], requestId: "req-1" });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects an empty mutations array", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const res = await post("/v1/tx", { mutations: [], requestId: "req-1" }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MISSING_MUTATIONS");
+  });
+
+  it("rejects a missing requestId", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const res = await post("/v1/tx", { mutations: [{ op: "insert", table: "events", tenantId: "t1", partitionKey: "p1", values: { v: "a" } }] }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MISSING_REQUEST_ID");
+  });
+
+  it("rejects a transaction touching more than 8 distinct rows, before any DO call", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const mutations = Array.from({ length: 9 }, (_, i) => ({
+      op: "insert" as const,
+      table: "events",
+      tenantId: "t1",
+      partitionKey: `too-many-${i}`,
+      values: { v: "x" },
+    }));
+    const res = await post("/v1/tx", { mutations, requestId: "req-many" }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TOO_MANY_PARTICIPANTS");
+  });
+
+  it("rejects a cross-tenant mutation in the same batch with 401 (via its own /route call, not a separate check)", async () => {
+    await initCluster();
+    const tokenA = await registerTenant("tx-cross-a");
+    await registerTenant("tx-cross-b");
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [
+          { op: "insert", table: "events", tenantId: "tx-cross-a", partitionKey: "p1", values: { v: "a" } },
+          { op: "insert", table: "events", tenantId: "tx-cross-b", partitionKey: "p2", values: { v: "b" } },
+        ],
+        requestId: "req-cross",
+      },
+      tokenA,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("commits atomically across two shards and both rows are visible afterward", async () => {
+    await initCluster(2, 16);
+    const token = await registerTenant("tx-happy");
+    const [pkA, pkB] = await findPartitionKeyPairOnDifferentShards(token, "tx-happy", "events");
+
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [
+          { op: "insert", table: "events", tenantId: "tx-happy", partitionKey: pkA, values: { v: "a" } },
+          { op: "insert", table: "events", tenantId: "tx-happy", partitionKey: pkB, values: { v: "b" } },
+        ],
+        requestId: "req-happy",
+      },
+      token,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; status: string };
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe("committed");
+
+    const checkA = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkA], table: "events", tenantId: "tx-happy", partitionKey: pkA }, token);
+    expect(((await checkA.json()) as { result: { rows: unknown[] } }).result.rows).toHaveLength(1);
+    const checkB = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkB], table: "events", tenantId: "tx-happy", partitionKey: pkB }, token);
+    expect(((await checkB.json()) as { result: { rows: unknown[] } }).result.rows).toHaveLength(1);
+  });
+
+  it("prepare failure on one shard rolls back all participants, leaving no trace", async () => {
+    await initCluster(2, 16);
+    const token = await registerTenant("tx-fail");
+    const [pkA, pkB] = await findPartitionKeyPairOnDifferentShards(token, "tx-fail", "events");
+
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [
+          { op: "insert", table: "events", tenantId: "tx-fail", partitionKey: pkA, values: { v: "a" } },
+          // "id" is the partitionKeyColumn, always force-set — but referencing
+          // a column that doesn't exist on "events" makes this shard's
+          // prepare fail with a genuine SQL error.
+          { op: "insert", table: "events", tenantId: "tx-fail", partitionKey: pkB, values: { nonexistent_col: "boom" } },
+        ],
+        requestId: "req-fail",
+      },
+      token,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TX_ABORTED");
+
+    const checkA = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkA], table: "events", tenantId: "tx-fail", partitionKey: pkA }, token);
+    expect(((await checkA.json()) as { result: { rows: unknown[] } }).result.rows).toHaveLength(0);
+  });
+
+  it("idempotent retry: re-POSTing the same requestId after commit returns the same committed result without double-applying", async () => {
+    await initCluster();
+    const token = await registerTenant("tx-idem");
+    const payload = {
+      mutations: [{ op: "insert", table: "events", tenantId: "tx-idem", partitionKey: "p-idem", values: { v: "a" } }],
+      requestId: "req-idem",
+    };
+    const first = await post("/v1/tx", payload, token);
+    expect(first.status).toBe(200);
+    const second = await post("/v1/tx", payload, token);
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as { status: string };
+    expect(secondBody.status).toBe("committed");
+
+    const countRes = await post("/v1/sql", { sql: "SELECT COUNT(*) as n FROM events WHERE id = ?", params: ["p-idem"], table: "events", tenantId: "tx-idem", partitionKey: "p-idem" }, token);
+    const countBody = (await countRes.json()) as { result: { rows: Array<{ n: number }> } };
+    expect(countBody.result.rows[0].n).toBe(1);
+  });
+});
+
+describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {
+  it("/admin/tx-status requires an admin token", async () => {
+    const res = await post("/admin/tx-status", { txId: "whatever" });
+    expect(res.status).toBe(401);
+  });
+
+  it("/admin/tx-force-abort requires an admin token", async () => {
+    const res = await post("/admin/tx-force-abort", { txId: "whatever" });
+    expect(res.status).toBe(401);
+  });
+
+  it("/admin/tx-status reports a committed transaction created via /v1/tx", async () => {
+    await initCluster();
+    const token = await registerTenant("tx-status-check");
+    const payload = {
+      mutations: [{ op: "insert", table: "events", tenantId: "tx-status-check", partitionKey: "p-status", values: { v: "a" } }],
+      requestId: "req-status",
+    };
+    const txRes = await post("/v1/tx", payload, token);
+    expect(txRes.status).toBe(200);
+
+    const txId = await sha256Hex(JSON.stringify(["tx-status-check", "req-status"]));
+    const statusRes = await post("/admin/tx-status", { txId }, AUTH());
+    expect(statusRes.status).toBe(200);
+    const statusBody = (await statusRes.json()) as { found: boolean; status: string };
+    expect(statusBody.found).toBe(true);
+    expect(statusBody.status).toBe("committed");
   });
 });
 
