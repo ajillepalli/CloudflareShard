@@ -88,11 +88,33 @@ curl -X POST http://127.0.0.1:8787/admin/create-table \
 The `schema`'s `CREATE TABLE` name must match `table` exactly — a mismatch is
 rejected with a 400 rather than silently creating a differently-named table.
 
-### 4) Insert data
+### 4) Register a tenant
+
+`/v1/sql` and `/v1/mutate` are data-plane routes and require a tenant bearer
+token, not `ADMIN_TOKEN` — this isolates apps/environments within one
+deployment (see "Tenant authorization" below). `/register-tenant` returns the
+plaintext token exactly once; store it.
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/register-tenant \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"tenantId":"t1"}'
+```
+
+Response: `{"ok":true,"tenantId":"t1","token":"<save this>"}`. Export it for
+the rest of this walkthrough:
+
+```bash
+export TENANT_TOKEN=<token from the response above>
+```
+
+### 5) Insert data
 
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/sql \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $TENANT_TOKEN" \
   -d '{
     "table":"events",
     "tenantId":"t1",
@@ -103,11 +125,12 @@ curl -X POST http://127.0.0.1:8787/v1/sql \
   }'
 ```
 
-### 5) Query same partition
+### 6) Query same partition
 
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/sql \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $TENANT_TOKEN" \
   -d '{
     "table":"events",
     "tenantId":"t1",
@@ -117,11 +140,15 @@ curl -X POST http://127.0.0.1:8787/v1/sql \
   }'
 ```
 
-### 6) Fan-out query (all shards)
+### 7) Fan-out query (all shards)
+
+`/v1/scatter` reads across every tenant indiscriminately, so it's an admin
+operation — it requires `ADMIN_TOKEN`, not a tenant token.
 
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/scatter \
   -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{
     "sql":"SELECT id, user_id, body FROM events",
     "params":[],
@@ -129,7 +156,7 @@ curl -X POST http://127.0.0.1:8787/v1/scatter \
   }'
 ```
 
-### 7) Move one vBucket to a new shard (manual split prototype)
+### 8) Move one vBucket to a new shard (manual split prototype)
 
 The cluster is partitioned across a fixed set of catalog shards (see
 "Catalog sharding" below); `vbucket` numbering is local to one catalog shard,
@@ -158,6 +185,27 @@ identifiers are local to one catalog shard.
 last 100 admin actions (`/init`, `/register-table`, `/split-vbucket`,
 `/drain-shard`) into one list sorted newest-first, tagged with the
 `catalogShardId` that logged each entry.
+
+## Tenant authorization
+
+`/v1/sql` and `/v1/mutate` require a tenant bearer token (`POST
+/admin/register-tenant {"tenantId": "..."}`, `ADMIN_TOKEN`-gated), separate
+from `ADMIN_TOKEN` itself. This isolates apps/environments *within* one
+deployment — it is not a multi-customer-SaaS boundary. In this project's
+current self-hosted distribution model, the deploying developer holds both
+the operator role (`ADMIN_TOKEN`) and every tenant role (`tenant_auth`
+tokens) — but the two are kept structurally distinct in the code so a future
+hosted layer (a genuinely separate operator) could be added without a
+rewrite.
+
+`POST /admin/register-tenant {"tenantId": "...", "rotate": true}` issues a
+new token for an already-registered tenant, invalidating the old one
+immediately (no grace period — a scheduled rotation can break in-flight
+callers with zero overlap window; a known limitation, not yet addressed).
+`POST /admin/revoke-tenant {"tenantId": "..."}` disables a tenant's access.
+
+`/v1/scatter` reads across every tenant indiscriminately, so it requires
+`ADMIN_TOKEN` rather than a tenant token.
 
 ## Known MVP limitations
 

@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { hashKey } from "./hash";
-import { checkAdminAuth } from "./auth";
+import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
 
 const ADMIN_GATED_ROUTES = new Set([
@@ -12,6 +12,8 @@ const ADMIN_GATED_ROUTES = new Set([
   "/register-table",
   "/split-vbucket",
   "/audit-log",
+  "/register-tenant",
+  "/revoke-tenant",
 ]);
 
 export class CatalogDO extends DurableObject {
@@ -36,6 +38,8 @@ export class CatalogDO extends DurableObject {
       "/audit-log": this.handleAuditLog.bind(this),
       "/drain-shard": this.handleDrainShard.bind(this),
       "/split-vbucket": this.handleSplitVbucket.bind(this),
+      "/register-tenant": this.handleRegisterTenant.bind(this),
+      "/revoke-tenant": this.handleRevokeTenant.bind(this),
     };
   }
 
@@ -92,6 +96,19 @@ export class CatalogDO extends DurableObject {
         endpoint TEXT NOT NULL,
         request_summary TEXT NOT NULL,
         created_at TEXT NOT NULL
+      )
+    `);
+
+    // Tenant data-plane authorization. Isolates apps/environments within one
+    // self-hosted deployment — not a multi-customer-SaaS boundary, since the
+    // operator (ADMIN_TOKEN holder) and tenants both belong to the same
+    // deploying developer in this milestone's distribution model.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tenant_auth (
+        tenant_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
       )
     `);
   }
@@ -285,6 +302,155 @@ export class CatalogDO extends DurableObject {
     return json({ ok: true, table: body.table, metadataVersion: version });
   }
 
+  /** Data-plane tenant auth check: does the caller's bearer token match the
+   * hash on file for the claimed tenantId? A per-claimed-tenant check, not an
+   * identity primitive — it answers "does this token match tenantId X" for a
+   * caller-supplied X, not "which tenant does this token belong to". */
+  private async checkTenantAuth(tenantId: string, request: Request): Promise<Response | null> {
+    const authHeader = request.headers.get("authorization");
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) {
+      return json(
+        {
+          error: {
+            code: "TENANT_TOKEN_MISSING",
+            message: "Missing tenant bearer token.",
+            fix: "Include 'authorization: Bearer <token>' from /register-tenant.",
+          },
+        },
+        401,
+      );
+    }
+
+    const row = this.one<{ token_hash: string; revoked_at: string | null }>(
+      "SELECT token_hash, revoked_at FROM tenant_auth WHERE tenant_id = ?",
+      tenantId,
+    );
+    if (!row) {
+      return json(
+        {
+          error: {
+            code: "TENANT_NOT_REGISTERED",
+            message: `Tenant ${tenantId} is not registered.`,
+            fix: "Call /register-tenant first.",
+          },
+        },
+        401,
+      );
+    }
+    if (row.revoked_at) {
+      return json(
+        {
+          error: {
+            code: "TENANT_TOKEN_REVOKED",
+            message: `Tenant ${tenantId}'s token has been revoked.`,
+            fix: "Call /register-tenant with rotate: true to get a new token.",
+          },
+        },
+        401,
+      );
+    }
+
+    const tokenHash = await sha256Hex(token);
+    if (!timingSafeEqual(tokenHash, row.token_hash)) {
+      return json(
+        {
+          error: {
+            code: "TENANT_TOKEN_INVALID",
+            message: "Invalid tenant token.",
+            fix: "Check the token, or re-register via /register-tenant.",
+          },
+        },
+        401,
+      );
+    }
+    return null;
+  }
+
+  private async handleRegisterTenant(request: Request): Promise<Response> {
+    const body = (await request.json()) as { tenantId?: string; rotate?: boolean };
+    if (!body.tenantId) {
+      return json(
+        { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
+        400,
+      );
+    }
+
+    const existing = this.one<{ tenant_id: string }>(
+      "SELECT tenant_id FROM tenant_auth WHERE tenant_id = ?",
+      body.tenantId,
+    );
+    if (existing && body.rotate !== true) {
+      return json(
+        {
+          error: {
+            code: "TENANT_ALREADY_REGISTERED",
+            message: `Tenant ${body.tenantId} is already registered.`,
+            fix: "Pass rotate: true to issue a new token for this tenant.",
+          },
+        },
+        409,
+      );
+    }
+
+    const token = crypto.randomUUID();
+    const tokenHash = await sha256Hex(token);
+
+    // Log only {tenantId, rotate} — never the token or its hash, unlike other
+    // audit() call sites in this file that log their full parsed body by
+    // convention. This one must not, since audit_log is durably persisted
+    // and readable via /admin/audit-log.
+    this.audit("/register-tenant", { tenantId: body.tenantId, rotate: body.rotate === true });
+
+    this.sql.exec(
+      `
+      INSERT OR REPLACE INTO tenant_auth (tenant_id, token_hash, created_at, revoked_at)
+      VALUES (?, ?, ?, NULL)
+      `,
+      body.tenantId,
+      tokenHash,
+      new Date().toISOString(),
+    );
+
+    return json({ ok: true, tenantId: body.tenantId, token });
+  }
+
+  private async handleRevokeTenant(request: Request): Promise<Response> {
+    const body = (await request.json()) as { tenantId?: string };
+    if (!body.tenantId) {
+      return json(
+        { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
+        400,
+      );
+    }
+
+    const existing = this.one<{ tenant_id: string }>(
+      "SELECT tenant_id FROM tenant_auth WHERE tenant_id = ?",
+      body.tenantId,
+    );
+    if (!existing) {
+      return json(
+        {
+          error: {
+            code: "TENANT_NOT_FOUND",
+            message: `Tenant ${body.tenantId} is not registered.`,
+            fix: "Call /register-tenant first.",
+          },
+        },
+        404,
+      );
+    }
+
+    this.audit("/revoke-tenant", { tenantId: body.tenantId });
+    this.sql.exec(
+      "UPDATE tenant_auth SET revoked_at = ? WHERE tenant_id = ?",
+      new Date().toISOString(),
+      body.tenantId,
+    );
+
+    return json({ ok: true, tenantId: body.tenantId, revoked: true });
+  }
+
   private async handleRoute(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       table: string;
@@ -295,6 +461,9 @@ export class CatalogDO extends DurableObject {
     if (!body.table || !body.tenantId || !body.partitionKey) {
       return json({ error: "Missing table, tenantId, or partitionKey" }, 400);
     }
+
+    const authError = await this.checkTenantAuth(body.tenantId, request);
+    if (authError) return authError;
 
     const config = this.one<{
       total_vbuckets: number;

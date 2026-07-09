@@ -58,7 +58,8 @@ describe("CatalogDO schema migration", () => {
     });
 
     // Any request runs ensureSchema(), which should now backfill the missing columns.
-    const res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }));
+    const token = await registerTenant(stub, "t1");
+    const res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token));
     expect(res.status).toBe(400); // cluster not initialized — but no crash from the migration
 
     await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
@@ -86,6 +87,12 @@ function post(path: string, body: unknown, authorization?: string) {
     headers,
     body: JSON.stringify(body),
   });
+}
+
+async function registerTenant(stub: Awaited<ReturnType<typeof freshCatalog>>, tenantId: string): Promise<string> {
+  const res = await stub.fetch(post("/register-tenant", { tenantId }, `Bearer ${env.ADMIN_TOKEN}`));
+  const body = (await res.json()) as { token: string };
+  return `Bearer ${body.token}`;
 }
 
 describe("CatalogDO auth gate", () => {
@@ -123,9 +130,10 @@ describe("CatalogDO split-vbucket", () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const token = await registerTenant(stub, "t1");
 
     const routeBefore = (await (
-      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }))
+      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
     ).json()) as { vbucket: number; shardId: string };
 
     const splitRes = await stub.fetch(
@@ -142,7 +150,7 @@ describe("CatalogDO split-vbucket", () => {
     expect(splitBody.fromShard).toBe(routeBefore.shardId);
 
     const routeAfter = (await (
-      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }))
+      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
     ).json()) as { shardId: string };
     expect(routeAfter.shardId).toBe("shard-new");
   });
@@ -282,8 +290,9 @@ describe("CatalogDO input validation and lifecycle", () => {
 describe("CatalogDO routing", () => {
   it("returns 400 when routing before /init", async () => {
     const stub = await freshCatalog();
+    const token = await registerTenant(stub, "t1");
     const res = await stub.fetch(
-      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }),
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token),
     );
     expect(res.status).toBe(400);
   });
@@ -294,19 +303,21 @@ describe("CatalogDO routing", () => {
     await stub.fetch(
       post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`),
     );
+    const token = await registerTenant(stub, "t1");
 
     const body = { table: "events", tenantId: "t1", partitionKey: "user-1" };
-    const first = await (await stub.fetch(post("/route", body))).json();
-    const second = await (await stub.fetch(post("/route", body))).json();
+    const first = await (await stub.fetch(post("/route", body, token))).json();
+    const second = await (await stub.fetch(post("/route", body, token))).json();
     expect(first).toEqual(second);
   });
 
   it("returns 400 when the table is not registered", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const token = await registerTenant(stub, "t1");
 
     const res = await stub.fetch(
-      post("/route", { table: "unregistered", tenantId: "t1", partitionKey: "p1" }),
+      post("/route", { table: "unregistered", tenantId: "t1", partitionKey: "p1" }, token),
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
@@ -322,10 +333,109 @@ describe("CatalogDO routing", () => {
     await stub.fetch(
       post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`),
     );
+    const token = await registerTenant(stub, "t1");
 
     const res = await stub.fetch(
-      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }),
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token),
     );
     expect(res.status).toBe(503);
+  });
+});
+
+describe("CatalogDO tenant authorization", () => {
+  it("rejects /register-tenant without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/register-tenant", { tenantId: "t1" }));
+    expect(res.status).toBe(401);
+  });
+
+  it("registers a tenant and returns a token exactly once", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; tenantId: string; token: string };
+    expect(body.ok).toBe(true);
+    expect(body.tenantId).toBe("t1");
+    expect(typeof body.token).toBe("string");
+    expect(body.token.length).toBeGreaterThan(0);
+  });
+
+  it("rejects re-registering an already-registered tenant without rotate:true", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const res = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(409);
+  });
+
+  it("rotate:true issues a new token that invalidates the old one", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: oldToken } = (await firstRes.json()) as { token: string };
+
+    const rotateRes = await stub.fetch(
+      post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    expect(rotateRes.status).toBe(200);
+    const { token: newToken } = (await rotateRes.json()) as { token: string };
+    expect(newToken).not.toBe(oldToken);
+
+    const oldTokenRes = await stub.fetch(
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${oldToken}`),
+    );
+    expect(oldTokenRes.status).toBe(401);
+
+    const newTokenRes = await stub.fetch(
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${newToken}`),
+    );
+    expect(newTokenRes.status).toBe(200);
+  });
+
+  it("revoke-tenant invalidates the tenant's token", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const token = await registerTenant(stub, "t1");
+
+    const revokeRes = await stub.fetch(post("/revoke-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(revokeRes.status).toBe(200);
+
+    const routeRes = await stub.fetch(
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token),
+    );
+    expect(routeRes.status).toBe(401);
+    const body = (await routeRes.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TENANT_TOKEN_REVOKED");
+  });
+
+  it("returns 404 revoking a tenant that was never registered", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/revoke-tenant", { tenantId: "ghost" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(404);
+  });
+
+  it("/route 401s with a distinct error code for missing, wrong, and unregistered tokens", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await registerTenant(stub, "t1");
+
+    const routeBody = { table: "events", tenantId: "t1", partitionKey: "p1" };
+
+    const missing = await stub.fetch(post("/route", routeBody));
+    expect(missing.status).toBe(401);
+    expect(((await missing.json()) as { error: { code: string } }).error.code).toBe("TENANT_TOKEN_MISSING");
+
+    const wrong = await stub.fetch(post("/route", routeBody, "Bearer not-the-real-token"));
+    expect(wrong.status).toBe(401);
+    expect(((await wrong.json()) as { error: { code: string } }).error.code).toBe("TENANT_TOKEN_INVALID");
+
+    const unregistered = await stub.fetch(
+      post("/route", { table: "events", tenantId: "never-registered", partitionKey: "p1" }, "Bearer whatever"),
+    );
+    expect(unregistered.status).toBe(401);
+    expect(((await unregistered.json()) as { error: { code: string } }).error.code).toBe("TENANT_NOT_REGISTERED");
   });
 });

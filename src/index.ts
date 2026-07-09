@@ -302,6 +302,32 @@ async function handleAdminAuditLog(request: Request, env: Env): Promise<Response
   return json({ entries });
 }
 
+async function handleAdminRegisterTenant(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { tenantId?: string; rotate?: boolean };
+  if (!body.tenantId) {
+    return json(
+      { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
+      400,
+    );
+  }
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+  const res = await routeToCatalog(env, catalogShardId, "/register-tenant", body, request.headers.get("authorization") ?? undefined);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminRevokeTenant(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { tenantId?: string };
+  if (!body.tenantId) {
+    return json(
+      { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
+      400,
+    );
+  }
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+  const res = await routeToCatalog(env, catalogShardId, "/revoke-tenant", body, request.headers.get("authorization") ?? undefined);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
 async function handleAdminShardStats(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { shardId: string };
   if (!body.shardId) {
@@ -342,11 +368,17 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
 
   const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
   const routeStart = Date.now();
-  const routeRes = await routeToCatalog(env, catalogShardId, "/route", {
-    table: body.table,
-    tenantId: body.tenantId,
-    partitionKey: body.partitionKey,
-  });
+  const routeRes = await routeToCatalog(
+    env,
+    catalogShardId,
+    "/route",
+    {
+      table: body.table,
+      tenantId: body.tenantId,
+      partitionKey: body.partitionKey,
+    },
+    request.headers.get("authorization") ?? undefined,
+  );
   const routeLookupMs = Date.now() - routeStart;
 
   if (!routeRes.ok) {
@@ -399,6 +431,15 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
+  // /v1/scatter reads across every tenant indiscriminately — that's inherently
+  // an admin/operator operation, not a data-plane one, so it requires
+  // ADMIN_TOKEN rather than a tenant token. The Worker's structural /admin/*
+  // gate doesn't cover this path (it's under /v1/, not /admin/), so this
+  // check is explicit rather than "for free" — the same class of bug that
+  // previously left /admin/shard-stats unauthenticated.
+  const scatterAuthError = requireAdminAuth(env, request);
+  if (scatterAuthError) return scatterAuthError;
+
   const body = (await request.json()) as { sql: string; params?: unknown[]; limit?: number };
 
   if (!body.sql) {
@@ -479,6 +520,8 @@ const ROUTES: Record<string, (request: Request, env: Env) => Promise<Response>> 
   "/admin/drain-shard": handleAdminDrainShard,
   "/admin/shard-stats": handleAdminShardStats,
   "/admin/audit-log": handleAdminAuditLog,
+  "/admin/register-tenant": handleAdminRegisterTenant,
+  "/admin/revoke-tenant": handleAdminRevokeTenant,
   "/v1/sql": handleV1Sql,
   "/v1/scatter": handleV1Scatter,
 };
