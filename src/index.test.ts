@@ -1088,6 +1088,133 @@ describe("Worker /v1/tx (cross-shard atomic transactions)", () => {
   });
 });
 
+describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () => {
+  it("insert via /v1/tx creates an index entry atomically with the base row", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c3_insert_evt");
+    await post("/admin/create-index", { indexName: "idx_c3_insert_by_v", table: "idx_c3_insert_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post(
+      "/v1/tx",
+      { mutations: [{ op: "insert", table: "idx_c3_insert_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }], requestId: "req-c3-insert" },
+      token,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; status: string };
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe("committed");
+
+    const rows = await pollIndexRows("idx_c3_insert_by_v", (r) => r.length === 1);
+    expect(rows[0].partition_key).toBe("row-1");
+    expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+  });
+
+  it("update via /v1/tx removes the old index entry and creates the new one atomically", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c3_update_evt");
+    await post("/admin/create-index", { indexName: "idx_c3_update_by_v", table: "idx_c3_update_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post(
+      "/v1/tx",
+      { mutations: [{ op: "insert", table: "idx_c3_update_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }], requestId: "req-c3-update-1" },
+      token,
+    );
+    await pollIndexRows("idx_c3_update_by_v", (r) => r.length === 1);
+
+    const res = await post(
+      "/v1/tx",
+      { mutations: [{ op: "update", table: "idx_c3_update_evt", tenantId, partitionKey: "row-1", values: { v: "beta" } }], requestId: "req-c3-update-2" },
+      token,
+    );
+    expect(res.status).toBe(200);
+
+    const rows = await pollIndexRows("idx_c3_update_by_v", (r) => r.length === 1 && JSON.parse(r[0].index_key_json)[0] === "beta");
+    expect(rows[0].partition_key).toBe("row-1");
+  });
+
+  it("prepare failure on one shard rolls back both the base row and the index entry (no torn state)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c3_fail_evt");
+    await post("/admin/create-index", { indexName: "idx_c3_fail_by_v", table: "idx_c3_fail_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // A second mutation in the same batch, against a nonexistent column,
+    // fails prepare on its own shard — the whole transaction (including the
+    // first mutation's base row AND its index-participant intent) must
+    // roll back, per Milestone 1's existing 2PC guarantee.
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [
+          { op: "insert", table: "idx_c3_fail_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } },
+          { op: "insert", table: "idx_c3_fail_evt", tenantId, partitionKey: "row-2", values: { nonexistent_col: "boom" } },
+        ],
+        requestId: "req-c3-fail",
+      },
+      token,
+    );
+    expect(res.status).toBe(409);
+
+    const checkRes = await post("/v1/sql", { sql: "SELECT * FROM idx_c3_fail_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_fail_evt", tenantId, partitionKey: "row-1" }, token);
+    const checkBody = (await checkRes.json()) as { result: { rows: unknown[] } };
+    expect(checkBody.result.rows).toHaveLength(0);
+
+    for (const candidateShardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        const rows = Array.from(state.storage.sql.exec("SELECT * FROM __cf_indexes WHERE index_name = ?", "idx_c3_fail_by_v"));
+        expect(rows).toHaveLength(0);
+      });
+    }
+  });
+
+  it("CRITICAL regression: a /v1/tx transaction that worked before an index existed still works once one does, not TOO_MANY_PARTICIPANTS", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 16, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c3_regress_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c3_regress_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // 8 distinct base-row mutations — exactly at MAX_TX_PARTICIPANT_KEYS.
+    // This already worked pre-index; registering an index must not push it
+    // over the cap just because index-participant intents ride along.
+    const mutations = Array.from({ length: 8 }, (_, i) => ({
+      op: "insert" as const,
+      table: "idx_c3_regress_evt",
+      tenantId,
+      partitionKey: `row-${i}`,
+      values: { v: `val-${i}` },
+    }));
+
+    const preIndexRes = await post("/v1/tx", { mutations, requestId: "req-c3-regress-pre" }, token);
+    expect(preIndexRes.status).toBe(200);
+
+    await post("/admin/create-index", { indexName: "idx_c3_regress_by_v", table: "idx_c3_regress_evt", columns: ["v"] }, AUTH());
+
+    const postIndexMutations = Array.from({ length: 8 }, (_, i) => ({
+      op: "insert" as const,
+      table: "idx_c3_regress_evt",
+      tenantId,
+      partitionKey: `row2-${i}`,
+      values: { v: `val2-${i}` },
+    }));
+    const postIndexRes = await post("/v1/tx", { mutations: postIndexMutations, requestId: "req-c3-regress-post" }, token);
+    expect(postIndexRes.status).toBe(200);
+    const postIndexBody = (await postIndexRes.json()) as { ok: boolean; status: string };
+    expect(postIndexBody.ok).toBe(true);
+    expect(postIndexBody.status).toBe("committed");
+  });
+});
+
 describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {
   it("/admin/tx-status requires an admin token", async () => {
     const res = await post("/admin/tx-status", { txId: "whatever" });

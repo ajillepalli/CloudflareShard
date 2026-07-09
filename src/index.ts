@@ -814,14 +814,42 @@ async function writeIndexEntryBestEffort(
   }
 }
 
-/** Computes and dispatches (via ctx.waitUntil, non-blocking) the __cf_indexes
- * writes needed after a base-row mutation succeeds. `beforeRow` is the row's
+type IndexDelta = { indexName: string; oldKeyJson: string | null; newKeyJson: string | null };
+
+/** Pure computation, shared by Chunk 2's async /v1/mutate path and Chunk 3's
+ * /v1/tx 2PC piggyback: for each registered index on the table, works out
+ * whether its __cf_indexes entry needs to change. `beforeRow` is the row's
  * state before the mutation (null for insert, where none exists yet) —
  * needed to remove a now-stale index entry on update/delete. `afterValues`
- * is the mutation's own body.values (insert/update; undefined for delete) —
- * merged over beforeRow to get each indexed column's new value, so update
- * doesn't need a second read-after-write: whatever wasn't in body.values is
- * unchanged from beforeRow. */
+ * is the mutation's own values (insert/update/upsert; undefined for delete)
+ * — merged over beforeRow to get each indexed column's new value, so this
+ * never needs a second read-after-write: whatever column isn't in the
+ * caller's values is unchanged from beforeRow. Returns only the indexes
+ * whose entry actually changes (oldKeyJson !== newKeyJson is always true in
+ * the returned deltas). */
+function computeIndexDeltas(
+  indexes: IndexDefinition[],
+  op: "insert" | "update" | "upsert" | "delete",
+  beforeRow: Record<string, unknown> | null,
+  afterValues: Record<string, unknown> | undefined,
+): IndexDelta[] {
+  const deltas: IndexDelta[] = [];
+  for (const index of indexes) {
+    const oldKeyJson = beforeRow ? JSON.stringify(index.columns.map((c) => beforeRow[c] ?? null)) : null;
+    const newKeyJson =
+      op === "delete"
+        ? null
+        : JSON.stringify(index.columns.map((c) => (afterValues && c in afterValues ? afterValues[c] : beforeRow?.[c] ?? null)));
+    if (oldKeyJson !== newKeyJson) {
+      deltas.push({ indexName: index.indexName, oldKeyJson, newKeyJson });
+    }
+  }
+  return deltas;
+}
+
+/** Computes and dispatches (via ctx.waitUntil, non-blocking) the __cf_indexes
+ * writes needed after a base-row mutation succeeds — see computeIndexDeltas
+ * for what "needed" means. */
 async function maintainIndexesAsync(
   env: Env,
   ctx: ExecutionContext,
@@ -840,39 +868,32 @@ async function maintainIndexesAsync(
   if (shardIds.length === 0) return;
 
   const now = new Date().toISOString();
-  for (const index of indexes) {
-    const oldKeyJson = beforeRow ? JSON.stringify(index.columns.map((c) => beforeRow[c] ?? null)) : null;
-    const newKeyJson =
-      op === "delete"
-        ? null
-        : JSON.stringify(index.columns.map((c) => (afterValues && c in afterValues ? afterValues[c] : beforeRow?.[c] ?? null)));
-
-    if (oldKeyJson === newKeyJson) continue; // no change for this index
-
-    if (oldKeyJson !== null) {
-      const oldShardId = indexShardIdForKey(table, index.indexName, oldKeyJson, shardIds);
-      const requestId = `index-delete-${index.indexName}-${crypto.randomUUID()}`;
+  const deltas = computeIndexDeltas(indexes, op, beforeRow, afterValues);
+  for (const delta of deltas) {
+    if (delta.oldKeyJson !== null) {
+      const oldShardId = indexShardIdForKey(table, delta.indexName, delta.oldKeyJson, shardIds);
+      const requestId = `index-delete-${delta.indexName}-${crypto.randomUUID()}`;
       ctx.waitUntil(
         writeIndexEntryBestEffort(
           env,
           baseShardId,
           oldShardId,
           "DELETE FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? AND partition_key = ?",
-          [table, index.indexName, oldKeyJson, partitionKey],
+          [table, delta.indexName, delta.oldKeyJson, partitionKey],
           requestId,
         ),
       );
     }
-    if (newKeyJson !== null) {
-      const newShardId = indexShardIdForKey(table, index.indexName, newKeyJson, shardIds);
-      const requestId = `index-write-${index.indexName}-${crypto.randomUUID()}`;
+    if (delta.newKeyJson !== null) {
+      const newShardId = indexShardIdForKey(table, delta.indexName, delta.newKeyJson, shardIds);
+      const requestId = `index-write-${delta.indexName}-${crypto.randomUUID()}`;
       ctx.waitUntil(
         writeIndexEntryBestEffort(
           env,
           baseShardId,
           newShardId,
           "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-          [table, index.indexName, newKeyJson, partitionKey, baseShardId, now],
+          [table, delta.indexName, delta.newKeyJson, partitionKey, baseShardId, now],
           requestId,
         ),
       );
@@ -998,7 +1019,17 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
  * individually routed (so cross-tenant mismatches 401 the same way a single
  * /route call would — no separate check needed) and validated/compiled with
  * its own table's partitionKeyColumn, then grouped by shardId into the
- * participant list /begin expects. */
+ * participant list /begin expects.
+ *
+ * Milestone 2, Chunk 3: when a mutation's table carries any registered
+ * index, its index-maintenance writes are piggybacked into the SAME 2PC
+ * transaction as extra participants — computed with computeIndexDeltas, the
+ * same pure logic Chunk 2's async /v1/mutate path uses, so both paths agree
+ * on what "the index changed" means. Deliberately does NOT count these
+ * synthetic index-participant keys against MAX_TX_PARTICIPANT_KEYS: that cap
+ * bounds the blast radius of what the CALLER asked to touch, and index
+ * maintenance is bookkeeping this system adds on the caller's behalf, not
+ * additional caller-requested scope. */
 async function handleV1Tx(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as StructuredOperation;
   if (!body.mutations || body.mutations.length === 0) {
@@ -1029,6 +1060,25 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
   const currentCount = catalogShardCount(env);
   const authorization = request.headers.get("authorization") ?? undefined;
 
+  // Lazily fetched once, only if some mutation's table turns out to carry a
+  // registered index — needed to compute indexShardIdForKey.
+  let shardIds: string[] | null = null;
+  async function ensureShardIds(): Promise<string[]> {
+    if (shardIds !== null) return shardIds;
+    const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+    shardIds = listResults.flatMap((r) => ((r.body as { shardIds?: string[] }).shardIds ?? []));
+    return shardIds;
+  }
+
+  function addIntent(shardId: string, intent: { sql: string; params: unknown[]; tenantId: string; table: string; partitionKey: string }): void {
+    const existing = compiledByShardId.get(shardId);
+    if (existing) {
+      existing.push(intent);
+    } else {
+      compiledByShardId.set(shardId, [intent]);
+    }
+  }
+
   for (const mutation of body.mutations) {
     if (!mutation.table || !mutation.tenantId || !mutation.partitionKey) {
       return json({ error: { code: "MISSING_FIELDS", message: "Each mutation requires table, tenantId, partitionKey." } }, 400);
@@ -1049,6 +1099,7 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
       shardId: string;
       catalogShardCount: number | null;
       partitionKeyColumn: string | null;
+      indexes?: IndexDefinition[];
     };
     if (route.catalogShardCount !== null && route.catalogShardCount !== currentCount) {
       return json(
@@ -1065,13 +1116,63 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
       return json({ error: { code: validation.code, message: validation.error, fix: "Check the request against the error message above." } }, validation.status);
     }
 
+    const indexes = route.indexes ?? [];
+    const indexedColumns = Array.from(new Set(indexes.flatMap((i) => i.columns)));
+
+    // Same pre-read rationale as Chunk 2's /v1/mutate: needed to remove a
+    // now-stale index entry on update/delete/upsert. Same known limitation
+    // too — this read happens before /begin acquires any row lock, so a
+    // concurrent write between the read and the 2PC prepare is possible;
+    // accepted here for consistency with the already-shipped /v1/mutate path.
+    let beforeRow: Record<string, unknown> | null = null;
+    if (indexedColumns.length > 0 && (mutation.op === "update" || mutation.op === "delete" || mutation.op === "upsert")) {
+      const safeTable = `"${mutation.table}"`;
+      const safePkCol = `"${partitionKeyColumn}"`;
+      const selectCols = indexedColumns.map((c) => `"${c}"`).join(", ");
+      const preReadRes = await routeToShard(env, route.shardId, "/execute", {
+        sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePkCol} = ?`,
+        params: [mutation.partitionKey],
+        requestId: `tx-index-preread-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (preReadRes.ok) {
+        const preReadBody = (await preReadRes.json()) as { rows?: Array<Record<string, unknown>> };
+        beforeRow = preReadBody.rows?.[0] ?? null;
+      }
+    }
+
     const { sql, params } = compileMutation(mutation, partitionKeyColumn);
-    const intent = { sql, params, tenantId: mutation.tenantId, table: mutation.table, partitionKey: mutation.partitionKey };
-    const existing = compiledByShardId.get(route.shardId);
-    if (existing) {
-      existing.push(intent);
-    } else {
-      compiledByShardId.set(route.shardId, [intent]);
+    addIntent(route.shardId, { sql, params, tenantId: mutation.tenantId, table: mutation.table, partitionKey: mutation.partitionKey });
+
+    if (indexes.length > 0) {
+      const deltas = computeIndexDeltas(indexes, mutation.op, beforeRow, mutation.op === "delete" ? undefined : mutation.values);
+      if (deltas.length > 0) {
+        const ids = await ensureShardIds();
+        const now = new Date().toISOString();
+        for (const delta of deltas) {
+          const syntheticTable = `__cf_indexes:${delta.indexName}`;
+          if (delta.oldKeyJson !== null) {
+            const oldShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.oldKeyJson, ids);
+            addIntent(oldShardId, {
+              sql: "DELETE FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? AND partition_key = ?",
+              params: [mutation.table, delta.indexName, delta.oldKeyJson, mutation.partitionKey],
+              tenantId: mutation.tenantId,
+              table: syntheticTable,
+              partitionKey: delta.oldKeyJson,
+            });
+          }
+          if (delta.newKeyJson !== null) {
+            const newShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.newKeyJson, ids);
+            addIntent(newShardId, {
+              sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+              params: [mutation.table, delta.indexName, delta.newKeyJson, mutation.partitionKey, route.shardId, now],
+              tenantId: mutation.tenantId,
+              table: syntheticTable,
+              partitionKey: delta.newKeyJson,
+            });
+          }
+        }
+      }
     }
   }
 
