@@ -117,7 +117,7 @@ POST /admin/create-table
 Request:
 - table string
 - schema string (must be a `CREATE TABLE` statement whose table name matches `table`)
-- partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist. The rollback also clears the create-table idempotency-cache entry on each shard via `/invalidate-request`, so a retry with a corrected `partitionKeyColumn` genuinely re-creates the table rather than replaying a stale cached "success" for a table that no longer exists)
+- partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist. The rollback also clears the create-table idempotency-cache entry on each shard via `/invalidate-request`, so a retry with a corrected `partitionKeyColumn` genuinely re-creates the table rather than replaying a stale cached "success" for a table that no longer exists. The rollback's own `DROP TABLE` requestId is unique per attempt, not a stable per-table key — otherwise a second failed retry for the same table would replay the *first* rollback's cached success and leave the just-recreated table behind despite returning 400)
 
 Response:
 - ok
@@ -301,7 +301,11 @@ This prevents duplicate writes after network retries and stops a reused requestI
     (`TX_ID_REQUEST_MISMATCH`) instead of silently resuming 2PC with the new data or replaying
     a stale "committed" for content that was never actually applied — mirrors `/v1/sql`'s
     existing `request_hash` mismatch rejection for the same class of bug (found by a Codex
-    review pass against the merged milestone).
+    review pass against the merged milestone). `CoordinatorDO`'s schema migration guard
+    (`ensureColumn`, the same pattern `catalog.ts`/`shard.ts` already use) backfills
+    `operation_hash` on a pre-existing `transactions` table rather than crashing — a
+    `/begin` retry against a pre-migration row degrades to the same fail-closed mismatch
+    rejection instead of a 500 (found by a second Codex pass against this fix itself).
   - A batch may legitimately contain multiple mutations against the same row (e.g. insert
     then update in one `/v1/tx` call — nothing caps mutation count, only distinct participant
     keys); `ShardDO./prepare` acquires each row lock with `INSERT OR IGNORE` rather than a

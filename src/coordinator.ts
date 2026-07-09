@@ -41,6 +41,13 @@ export class CoordinatorDO extends DurableObject {
     };
   }
 
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const existing = Array.from(this.sql.exec(`PRAGMA table_info(${table})`)) as Array<{ name: string }>;
+    if (!existing.some((col) => col.name === column)) {
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
   private ensureSchema(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS transactions (
@@ -55,6 +62,15 @@ export class CoordinatorDO extends DurableObject {
         last_error TEXT
       )
     `);
+    // Migration guard: a transactions table created before operation_hash
+    // existed won't get it from CREATE TABLE IF NOT EXISTS alone (a no-op
+    // once the table exists) — without this, /begin's SELECT below would
+    // throw "no such column" and 500 instead of degrading to the same
+    // fail-closed mismatch rejection applied_requests.request_hash already
+    // uses for pre-migration rows (shard.ts) — old rows compare against '',
+    // never match a real hash, and are rejected rather than silently
+    // trusted, but at least don't crash.
+    this.ensureColumn("transactions", "operation_hash", "TEXT NOT NULL DEFAULT ''");
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS transaction_participants (
         tx_id TEXT NOT NULL,

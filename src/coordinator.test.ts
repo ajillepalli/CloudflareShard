@@ -233,6 +233,45 @@ describe("CoordinatorDO /begin (2PC orchestration)", () => {
     expect(body.error.code).toBe("TX_ID_REQUEST_MISMATCH");
   });
 
+  it("regression (Codex-found): a transactions table from before operation_hash existed is migrated in place, not crashed on", async () => {
+    const txId = `tx-migration-${crypto.randomUUID()}`;
+    const coordinatorId = env.COORDINATOR.idFromName(txId);
+    const coordinator = env.COORDINATOR.get(coordinatorId);
+
+    // Simulate a pre-migration transactions table (no operation_hash column)
+    // by creating it directly, before ensureSchema() ever runs on this DO.
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(`
+        CREATE TABLE transactions (
+          tx_id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          participant_shards_json TEXT NOT NULL,
+          operation_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT
+        )
+      `);
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        "INSERT INTO transactions (tx_id, status, participant_shards_json, operation_json, created_at, updated_at) VALUES (?, 'preparing', '[]', '[]', ?, ?)",
+        txId,
+        now,
+        now,
+      );
+    });
+
+    // A /begin retry against this pre-migration row must not 500 — it should
+    // degrade to the same fail-closed mismatch rejection as any other
+    // content mismatch, since the backfilled operation_hash default ('')
+    // never equals a real hash.
+    const res = await coordinator.fetch(post("/begin", { txId, participants: [{ shardId: "irrelevant-shard", intents: [] }] }));
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TX_ID_REQUEST_MISMATCH");
+  });
+
   it("two different txIds land on two different CoordinatorDO instances and don't interfere", async () => {
     const txA = `tx-iso-a-${crypto.randomUUID()}`;
     const txB = `tx-iso-b-${crypto.randomUUID()}`;
