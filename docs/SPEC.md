@@ -255,6 +255,19 @@ Response:
 
 Manual escape hatch for a transaction stuck past a reasonable window (visible via `/admin/tx-status`) — aborts every participant shard and marks the transaction aborted. Rejects 409 if the transaction already committed.
 
+POST /v1/index-query (tenant bearer token) — Milestone 2, Chunk 4
+Request:
+- table string
+- indexName string
+- tenantId string
+- values object (a value for every column the index covers — exact full-tuple lookups only, leftmost-prefix not yet supported)
+- limit number (optional, default 20, capped at 100)
+
+Response:
+- rows: array of the matching base rows (full row data, not just partition keys)
+
+The first tenant-facing, non-partition-key query path this platform has — resolves in three hops (`CatalogDO` validates the tenant token and the index's columns, the computed index shard resolves matching `(partitionKey, sourceShardId)` pairs, each match's base row is read from its own shard), never `/v1/scatter`'s admin-only full-cluster fan-out. Because `/v1/mutate`'s index maintenance (Chunk 2) is async, a matched entry can be stale by the time it's read; the base row is re-verified against the queried tuple before being returned, so a stale delete/update is silently excluded — never surfaced as a wrong result. `/v1/scatter` remains the admin-only fallback for querying by a column that has no registered index; the two coexist rather than one deprecating the other.
+
 POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
 - sql string (SELECT only)
