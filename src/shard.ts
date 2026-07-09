@@ -1,11 +1,21 @@
 import { DurableObject } from "cloudflare:workers";
+import { json } from "./http";
+import { log } from "./log";
+import { isMutation } from "./sql-safety";
 
 type ExecutePayload = {
   sql: string;
   params?: unknown[];
   requestId: string;
-  isMutation: boolean;
+  /** Caller's classification, unused for the routing decision — ShardDO derives
+   * this itself from the SQL so a caller (or a caller-side classification bug)
+   * can't disguise a mutation as a read by sending isMutation: false. Kept only
+   * for logging/back-compat. */
+  isMutation?: boolean;
 };
+
+const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
@@ -13,16 +23,54 @@ export class ShardDO extends DurableObject {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    ctx.blockConcurrencyWhile(async () => {
+      if ((await ctx.storage.getAlarm()) === null) {
+        await ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+      }
+    });
+  }
+
+  async alarm(): Promise<void> {
+    this.ensureSchema();
+    const cutoff = new Date(Date.now() - APPLIED_REQUESTS_TTL_MS).toISOString();
+    this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
+    await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
   }
 
   private ensureSchema(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS applied_requests (
         request_id TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL DEFAULT '',
         result_json TEXT NOT NULL,
         applied_at TEXT NOT NULL
       )
     `);
+    this.ensureColumn("applied_requests", "request_hash", "TEXT NOT NULL DEFAULT ''");
+  }
+
+  /** Add a column if a table predating it doesn't have it yet — mirrors
+   * CatalogDO's migration guard for the same reason (CREATE TABLE IF NOT
+   * EXISTS doesn't retroactively alter already-provisioned tables). */
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const existing = Array.from(this.sql.exec(`PRAGMA table_info(${table})`)) as Array<{ name: string }>;
+    if (!existing.some((col) => col.name === column)) {
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  /** SHA-256 of the request's (sql, params) — detects a requestId reused with
+   * different content instead of silently replaying a stale cached result.
+   * Must be collision-resistant: a 32-bit hash (e.g. hashKey()) collides
+   * easily enough that a reused requestId with different content could pass
+   * this check undetected and silently serve a stale result instead of
+   * either rejecting or applying the new request. */
+  private async requestHash(sql: string, params: unknown[]): Promise<string> {
+    const data = new TextEncoder().encode(JSON.stringify({ sql, params }));
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
   }
 
   private one<T extends object>(sql: string, ...params: unknown[]): T | null {
@@ -38,16 +86,20 @@ export class ShardDO extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.handle(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("shard.unhandled_error", { path: new URL(request.url).pathname, message });
+      return json({ error: "Internal error." }, 500);
+    }
+  }
+
+  private async handle(request: Request): Promise<Response> {
     this.ensureSchema();
 
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
-
-    const json = (data: unknown, status = 200): Response =>
-      new Response(JSON.stringify(data, null, 2), {
-        status,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
 
     if (method !== "POST") {
       return json({ error: "Only POST allowed for shard endpoints." }, 405);
@@ -55,7 +107,7 @@ export class ShardDO extends DurableObject {
 
     if (url.pathname === "/stats") {
       const tables = this.rows(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('applied_requests', 'sqlite_sequence') ORDER BY name ASC",
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('applied_requests', 'sqlite_sequence') AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name ASC",
       ) as Array<{ name: string }>;
 
       const counts: Array<{ table: string; rowCount: number }> = [];
@@ -87,26 +139,34 @@ export class ShardDO extends DurableObject {
       return json({ error: "Missing sql or requestId" }, 400);
     }
 
+    const mutating = isMutation(payload.sql);
+
     try {
       const execStart = Date.now();
 
-      if (payload.isMutation) {
-        const prior = this.one<{ result_json: string }>(
-          "SELECT result_json FROM applied_requests WHERE request_id = ?",
+      if (mutating) {
+        const incomingHash = await this.requestHash(payload.sql, payload.params ?? []);
+        const prior = this.one<{ result_json: string; request_hash: string }>(
+          "SELECT result_json, request_hash FROM applied_requests WHERE request_id = ?",
           payload.requestId,
         );
         if (prior) {
+          if (prior.request_hash !== incomingHash) {
+            return json(
+              { error: "requestId was already used with different sql/params — refusing to replay a mismatched result." },
+              409,
+            );
+          }
           return json({ duplicated: true, ...(JSON.parse(prior.result_json) as object) });
         }
 
-        this.sql.exec("BEGIN");
-        try {
+        const result = this.ctx.storage.transactionSync(() => {
           this.sql.exec(payload.sql, ...(payload.params ?? []));
           const changedRow = this.one<{ count: number }>(
             "SELECT changes() AS count",
           );
 
-          const result = {
+          const txResult = {
             ok: true,
             type: "mutation",
             rowsAffected: changedRow?.count ?? 0,
@@ -115,19 +175,17 @@ export class ShardDO extends DurableObject {
 
           this.sql.exec(
             `
-            INSERT INTO applied_requests (request_id, result_json, applied_at)
-            VALUES (?, ?, ?)
+            INSERT INTO applied_requests (request_id, request_hash, result_json, applied_at)
+            VALUES (?, ?, ?, ?)
             `,
             payload.requestId,
-            JSON.stringify(result),
+            incomingHash,
+            JSON.stringify(txResult),
             new Date().toISOString(),
           );
-          this.sql.exec("COMMIT");
-          return json(result);
-        } catch (error) {
-          this.sql.exec("ROLLBACK");
-          throw error;
-        }
+          return txResult;
+        });
+        return json(result);
       }
 
       const rows = this.rows(payload.sql, ...(payload.params ?? []));
@@ -139,13 +197,9 @@ export class ShardDO extends DurableObject {
         rows,
       });
     } catch (error) {
-      return json(
-        {
-          error: "Shard execution failed",
-          details: error instanceof Error ? error.message : String(error),
-        },
-        400,
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      log("shard.execution_failed", { requestId: payload.requestId, isMutation: mutating, message });
+      return json({ error: "SQL execution failed." }, 400);
     }
   }
 }

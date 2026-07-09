@@ -3,6 +3,9 @@
 # ------------------------------
 node_modules/
 
+# graphify tool output (not part of the project)
+graphify-out/
+
 # ------------------------------
 # Build outputs
 # ------------------------------
