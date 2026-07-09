@@ -440,11 +440,32 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
     }
   }
 
-  // Backfill: scan every shard's existing rows for this table, compute each
-  // row's index entry, and write it to its own computed index shard.
   const columns = body.columns;
   const indexName = body.indexName;
   const table = body.table;
+
+  // Register BEFORE backfilling, not after (eng-review fix: registering
+  // last left a real gap, not just a staleness window — a row written
+  // between backfill's scan of its shard and registration would be missed
+  // by the scan AND never trigger Chunk 2's async maintenance, since
+  // route.indexes only includes already-registered indexes. Registering
+  // first means any concurrent write during backfill is already covered by
+  // Chunk 2's async path; backfill's own scan may then redundantly re-write
+  // the same row, which is harmless since __cf_indexes writes are already
+  // idempotent INSERT OR REPLACE). CatalogDO's /create-index is idempotent
+  // on the same table+columns specifically so a retry after a partial
+  // backfill failure below can call this endpoint again.
+  const registerResults = await fanOutToAllCatalogs(
+    env,
+    "/create-index",
+    () => ({ indexName, table, columns }),
+    request.headers.get("authorization") ?? undefined,
+  );
+  const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
+  if (registerFailed) return registerFailed;
+
+  // Backfill: scan every shard's existing rows for this table, compute each
+  // row's index entry, and write it to its own computed index shard.
   for (const shardId of shardIds) {
     const safeTable = `"${table}"`;
     const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
@@ -478,15 +499,6 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
       }
     }
   }
-
-  const registerResults = await fanOutToAllCatalogs(
-    env,
-    "/create-index",
-    () => ({ indexName, table, columns }),
-    request.headers.get("authorization") ?? undefined,
-  );
-  const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
-  if (registerFailed) return registerFailed;
 
   return json({ ok: true, indexName, table, columns });
 }
