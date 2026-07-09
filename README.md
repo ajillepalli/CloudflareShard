@@ -60,11 +60,16 @@ so a single call can't provision an oversized, unrollbackable cluster.
 
 ### 2) Register a logical table
 
+Every table requires a `partitionKeyColumn` — the column that holds each
+row's partition key. This is mandatory, not optional: it's what lets
+`/v1/mutate` and coordinated transactions (Milestone 1) structurally enforce
+that a mutation only ever touches the one row/partition it claims to.
+
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/register-table \
   -H "content-type: application/json" \
   -H "authorization: Bearer $ADMIN_TOKEN" \
-  -d '{"table":"events"}'
+  -d '{"table":"events","partitionKeyColumn":"id"}'
 ```
 
 ### 3) Create the table's schema (admin-mediated, applies to every shard)
@@ -81,12 +86,32 @@ curl -X POST http://127.0.0.1:8787/admin/create-table \
   -H "authorization: Bearer $ADMIN_TOKEN" \
   -d '{
     "table":"events",
-    "schema":"CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT, body TEXT, created_at TEXT)"
+    "schema":"CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT, body TEXT, created_at TEXT)",
+    "partitionKeyColumn":"id"
   }'
 ```
 
 The `schema`'s `CREATE TABLE` name must match `table` exactly — a mismatch is
 rejected with a 400 rather than silently creating a differently-named table.
+`partitionKeyColumn` is validated against the schema's actual columns (via
+`PRAGMA table_info`, not a hand-rolled parser) after the table is created on
+every shard — if it doesn't exist, the table is rolled back (dropped from
+every shard) and the call fails with a 400, rather than registering a table
+whose structured/transactional paths could never work.
+
+Tables registered before this validation existed (including anything live
+from `v1.0.0.0`) carry a `'__unset__'` sentinel and are rejected from
+`/v1/mutate` and coordinated transactions with a 409 until an operator runs:
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/set-partition-key-column \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"table":"events","partitionKeyColumn":"id"}'
+```
+
+Raw `/v1/sql` against an unupgraded table is unaffected — this gate only
+blocks the new structured paths.
 
 ### 4) Register a tenant
 
@@ -140,7 +165,32 @@ curl -X POST http://127.0.0.1:8787/v1/sql \
   }'
 ```
 
-### 7) Fan-out query (all shards)
+### 7) Structured mutation (row-owned, single-shard)
+
+`/v1/mutate` is an alternative to raw SQL for writes: instead of a SQL string,
+you describe the operation (`insert`/`update`/`delete`/`upsert`) and its
+target. The partition-key column is always forced into the affected row —
+`compileMutation` ANDs it into the `WHERE` clause for `update`/`delete` (even
+if you supply no `where` at all, it only ever touches the one partitioned
+row/set) and force-sets it in `values` for `insert`/`upsert`. This is what
+raw `/v1/sql` cannot guarantee, since it's a trust-based passthrough.
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/mutate \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $TENANT_TOKEN" \
+  -d '{
+    "op":"insert",
+    "table":"events",
+    "tenantId":"t1",
+    "partitionKey":"e1",
+    "values":{"user_id":"user-1","body":"hello","created_at":"2026-06-29T00:00:00Z"}
+  }'
+```
+
+Response: `{"ok":true,"rowsAffected":1}`.
+
+### 8) Fan-out query (all shards)
 
 `/v1/scatter` reads across every tenant indiscriminately, so it's an admin
 operation — it requires `ADMIN_TOKEN`, not a tenant token.
@@ -156,7 +206,7 @@ curl -X POST http://127.0.0.1:8787/v1/scatter \
   }'
 ```
 
-### 8) Move one vBucket to a new shard (manual split prototype)
+### 9) Move one vBucket to a new shard (manual split prototype)
 
 The cluster is partitioned across a fixed set of catalog shards (see
 "Catalog sharding" below); `vbucket` numbering is local to one catalog shard,

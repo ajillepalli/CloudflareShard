@@ -29,7 +29,11 @@ async function initCluster(numShards = 2, totalVBuckets = 16) {
   expect(res.status).toBe(200);
   const createRes = await post(
     "/admin/create-table",
-    { table: "events", schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, v TEXT)" },
+    {
+      table: "events",
+      schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, v TEXT)",
+      partitionKeyColumn: "id",
+    },
     AUTH(),
   );
   expect(createRes.status).toBe(200);
@@ -123,10 +127,22 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "events", schema: "DROP TABLE events" },
+      { table: "events", schema: "DROP TABLE events", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(400);
+  });
+
+  it("/admin/create-table requires partitionKeyColumn", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "events", schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY)" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("MISSING_PARTITION_KEY_COLUMN");
   });
 
   it("/admin/create-table requires an admin token", async () => {
@@ -142,7 +158,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY); DROP TABLE events" },
+      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY); DROP TABLE events", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(403);
@@ -152,7 +168,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY) attach database 'x' as y" },
+      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY) attach database 'x' as y", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(403);
@@ -167,7 +183,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "mismatch_regression_evt", schema: "CREATE TABLE mismatch_regression_orders (id TEXT PRIMARY KEY)" },
+      { table: "mismatch_regression_evt", schema: "CREATE TABLE mismatch_regression_orders (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(400);
@@ -180,10 +196,31 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "quoted_regression_evt", schema: 'CREATE TABLE IF NOT EXISTS "quoted_regression_evt" (id TEXT PRIMARY KEY)' },
+      { table: "quoted_regression_evt", schema: 'CREATE TABLE IF NOT EXISTS "quoted_regression_evt" (id TEXT PRIMARY KEY)', partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(200);
+  });
+
+  it("/admin/create-table rejects a partitionKeyColumn that doesn't exist in the created schema, rolling back the table", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "column_mismatch_evt", schema: "CREATE TABLE column_mismatch_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "nonexistent_col" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("COLUMN_NOT_IN_SCHEMA");
+
+    // Rolled back — /register-table for the same name should succeed cleanly,
+    // proving no orphaned physical table or catalog registration was left behind.
+    const registerRes = await post(
+      "/admin/register-table",
+      { table: "column_mismatch_evt", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
   });
 
   it("/admin/create-table reports a shard-level failure when the schema fails to apply", async () => {
@@ -191,7 +228,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     // Missing PRIMARY KEY column type makes this a syntactically invalid CREATE TABLE.
     const res = await post(
       "/admin/create-table",
-      { table: "broken", schema: "CREATE TABLE broken (id PRIMARY" },
+      { table: "broken", schema: "CREATE TABLE broken (id PRIMARY", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(400);
@@ -307,6 +344,168 @@ describe("Worker tenant authorization", () => {
       token,
     );
     expect(res.status).toBe(401);
+  });
+});
+
+describe("Worker /v1/mutate", () => {
+  it("requires a tenant token", async () => {
+    await initCluster();
+    const res = await post("/v1/mutate", { op: "insert", table: "events", tenantId: "t1", partitionKey: "p1", values: { v: "a" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("inserts a row, force-setting the partition-key column, and reports rowsAffected", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const res = await post(
+      "/v1/mutate",
+      { op: "insert", table: "events", tenantId: "t1", partitionKey: "row-1", values: { v: "hello" } },
+      token,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; rowsAffected: number };
+    expect(body.ok).toBe(true);
+    expect(body.rowsAffected).toBe(1);
+
+    const checkRes = await post(
+      "/v1/sql",
+      { sql: "SELECT id FROM events WHERE id = ?", params: ["row-1"], table: "events", tenantId: "t1", partitionKey: "row-1" },
+      token,
+    );
+    const checkBody = (await checkRes.json()) as { result: { rows: Array<{ id: string }> } };
+    expect(checkBody.result.rows).toHaveLength(1);
+  });
+
+  it("delete with no where still only scopes to the one partitioned row, never the whole table", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    await post("/v1/mutate", { op: "insert", table: "events", tenantId: "t1", partitionKey: "row-a", values: { v: "a" } }, token);
+    const tokenB = await registerTenant("t2");
+    await post("/v1/mutate", { op: "insert", table: "events", tenantId: "t2", partitionKey: "row-b", values: { v: "b" } }, tokenB);
+
+    const delRes = await post("/v1/mutate", { op: "delete", table: "events", tenantId: "t1", partitionKey: "row-a" }, token);
+    expect(delRes.status).toBe(200);
+    const delBody = (await delRes.json()) as { rowsAffected: number };
+    expect(delBody.rowsAffected).toBe(1);
+
+    // row-b (a different partition key, inserted under a different tenant/shard)
+    // must survive — the delete must not have touched the whole table.
+    const checkRes = await post(
+      "/v1/sql",
+      { sql: "SELECT id FROM events WHERE id = ?", params: ["row-b"], table: "events", tenantId: "t2", partitionKey: "row-b" },
+      tokenB,
+    );
+    const checkBody = (await checkRes.json()) as { result: { rows: Array<{ id: string }> } };
+    expect(checkBody.result.rows).toHaveLength(1);
+  });
+
+  it("rejects a caller-supplied partition-key value that conflicts with the declared partitionKey", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const res = await post(
+      "/v1/mutate",
+      { op: "insert", table: "events", tenantId: "t1", partitionKey: "row-1", values: { id: "different-value", v: "a" } },
+      token,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_CONFLICT");
+  });
+
+  it("rejects mutations against a table that hasn't been upgraded with a partition-key column", async () => {
+    // Directly seed a table_rules row still carrying the '__unset__' sentinel,
+    // simulating a table registered before this migration (e.g. live from v1.0.0.0).
+    // Must land on the SAME catalog shard the test's tenant routes to — the
+    // seed is per-catalog-shard, not cluster-wide.
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const id = env.CATALOG.idFromName("catalog-0");
+    const stub = env.CATALOG.get(id);
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at) VALUES (?, ?, ?, ?)",
+        "legacy_table",
+        "hash",
+        "__unset__",
+        new Date().toISOString(),
+      );
+    });
+
+    const token = await registerTenant(tenantId);
+    const res = await post(
+      "/v1/mutate",
+      { op: "insert", table: "legacy_table", tenantId, partitionKey: "p1", values: { v: "a" } },
+      token,
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_COLUMN_UNSET");
+  });
+});
+
+describe("Worker /admin/set-partition-key-column", () => {
+  it("requires an admin token", async () => {
+    await initCluster();
+    const res = await post("/admin/set-partition-key-column", { table: "events", partitionKeyColumn: "id" });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects a column that doesn't exist on the table", async () => {
+    await initCluster();
+    const res = await post(
+      "/admin/set-partition-key-column",
+      { table: "events", partitionKeyColumn: "nonexistent_col" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("COLUMN_NOT_IN_SCHEMA");
+  });
+
+  it("upgrades a sentinel-tagged table, unblocking /v1/mutate against it", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      { table: "upgrade_me", schema: "CREATE TABLE IF NOT EXISTS upgrade_me (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Force catalog-0 back to the sentinel to simulate a pre-Chunk-1 table —
+    // the test tenant must route to catalog-0 specifically, since this seed
+    // is per-catalog-shard, not cluster-wide.
+    const tenantId = tenantForCatalogShard(0, 4);
+    const id = env.CATALOG.idFromName("catalog-0");
+    const stub = env.CATALOG.get(id);
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'upgrade_me'",
+      );
+    });
+
+    const token = await registerTenant(tenantId);
+    const blockedRes = await post(
+      "/v1/mutate",
+      { op: "insert", table: "upgrade_me", tenantId, partitionKey: "p1", values: { v: "a" } },
+      token,
+    );
+    expect(blockedRes.status).toBe(409);
+
+    // /admin/set-partition-key-column fans out to every catalog shard, so
+    // this un-sticks catalog-0 regardless of which shard the tenant is on.
+    const upgradeRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "upgrade_me", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(upgradeRes.status).toBe(200);
+
+    const unblockedRes = await post(
+      "/v1/mutate",
+      { op: "insert", table: "upgrade_me", tenantId, partitionKey: "p1", values: { v: "a" } },
+      token,
+    );
+    expect(unblockedRes.status).toBe(200);
   });
 });
 

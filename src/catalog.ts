@@ -3,6 +3,7 @@ import { json } from "./http";
 import { hashKey } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
+import { UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
 
 const ADMIN_GATED_ROUTES = new Set([
   "/status",
@@ -14,6 +15,7 @@ const ADMIN_GATED_ROUTES = new Set([
   "/audit-log",
   "/register-tenant",
   "/revoke-tenant",
+  "/set-partition-key-column",
 ]);
 
 export class CatalogDO extends DurableObject {
@@ -40,6 +42,7 @@ export class CatalogDO extends DurableObject {
       "/split-vbucket": this.handleSplitVbucket.bind(this),
       "/register-tenant": this.handleRegisterTenant.bind(this),
       "/revoke-tenant": this.handleRevokeTenant.bind(this),
+      "/set-partition-key-column": this.handleSetPartitionKeyColumn.bind(this),
     };
   }
 
@@ -89,6 +92,10 @@ export class CatalogDO extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+    // Mandatory going forward (enforced in handleRegisterTable), but existing
+    // rows need a non-NULL default to backfill against — a bare NOT NULL with
+    // no default fails immediately on ALTER TABLE against a table with rows.
+    this.ensureColumn("table_rules", "partition_key_column", `TEXT NOT NULL DEFAULT '${UNSET_PARTITION_KEY_COLUMN}'`);
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -280,26 +287,81 @@ export class CatalogDO extends DurableObject {
     const body = (await request.json()) as {
       table: string;
       partitioning?: string;
+      partitionKeyColumn?: string;
     };
 
     if (!body.table) {
       return json({ error: "Missing table" }, 400);
     }
+    if (!body.partitionKeyColumn) {
+      return json(
+        {
+          error: {
+            code: "MISSING_PARTITION_KEY_COLUMN",
+            message: "Missing partitionKeyColumn.",
+            fix: "Provide the column name that holds each row's partition key.",
+          },
+        },
+        400,
+      );
+    }
 
-    this.audit("/register-table", { table: body.table, partitioning: body.partitioning });
+    this.audit("/register-table", {
+      table: body.table,
+      partitioning: body.partitioning,
+      partitionKeyColumn: body.partitionKeyColumn,
+    });
 
     this.sql.exec(
       `
-      INSERT OR REPLACE INTO table_rules (table_name, partitioning, created_at)
-      VALUES (?, ?, ?)
+      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at)
+      VALUES (?, ?, ?, ?)
       `,
       body.table,
       body.partitioning ?? "hash",
+      body.partitionKeyColumn,
       new Date().toISOString(),
     );
 
     const version = this.bumpMetadataVersion();
     return json({ ok: true, table: body.table, metadataVersion: version });
+  }
+
+  private async handleSetPartitionKeyColumn(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+    if (!body.table || !body.partitionKeyColumn) {
+      return json(
+        {
+          error: {
+            code: "MISSING_FIELDS",
+            message: "Missing table or partitionKeyColumn.",
+            fix: "Provide both table and partitionKeyColumn.",
+          },
+        },
+        400,
+      );
+    }
+
+    const existing = this.one<{ table_name: string }>(
+      "SELECT table_name FROM table_rules WHERE table_name = ?",
+      body.table,
+    );
+    if (!existing) {
+      return json(
+        { error: { code: "TABLE_NOT_REGISTERED", message: `Table ${body.table} is not registered.`, fix: "Call /register-table first." } },
+        404,
+      );
+    }
+
+    this.audit("/set-partition-key-column", { table: body.table, partitionKeyColumn: body.partitionKeyColumn });
+    this.sql.exec(
+      "UPDATE table_rules SET partition_key_column = ? WHERE table_name = ?",
+      body.partitionKeyColumn,
+      body.table,
+    );
+
+    const version = this.bumpMetadataVersion();
+    return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn, metadataVersion: version });
   }
 
   /** Data-plane tenant auth check: does the caller's bearer token match the
@@ -479,16 +541,23 @@ export class CatalogDO extends DurableObject {
     const composite = `${body.tenantId}:${body.table}:${body.partitionKey}`;
     const vbucket = hashKey(composite) % config.total_vbuckets;
 
-    const mapped = this.one<{ table_registered: string | null; shard_id: string; status: string }>(
+    const mapped = this.one<{
+      table_registered: string | null;
+      partition_key_column: string | null;
+      shard_id: string;
+      status: string;
+    }>(
       `
       SELECT
         (SELECT table_name FROM table_rules WHERE table_name = ?) AS table_registered,
+        (SELECT partition_key_column FROM table_rules WHERE table_name = ?) AS partition_key_column,
         vm.shard_id AS shard_id,
         s.status AS status
       FROM vbucket_map vm
       JOIN shards s ON s.shard_id = vm.shard_id
       WHERE vm.vbucket = ?
       `,
+      body.table,
       body.table,
       vbucket,
     );
@@ -514,6 +583,7 @@ export class CatalogDO extends DurableObject {
       vbucket,
       metadataVersion: config.metadata_version,
       catalogShardCount: config.catalog_shard_count,
+      partitionKeyColumn: mapped.partition_key_column,
     });
   }
 
