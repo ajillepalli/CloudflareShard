@@ -106,6 +106,7 @@ POST /admin/register-table
 Request:
 - table string
 - partitioning string (optional, default hash)
+- partitionKeyColumn string (required — the column holding each row's partition key)
 
 Response:
 - ok
@@ -116,10 +117,23 @@ POST /admin/create-table
 Request:
 - table string
 - schema string (must be a `CREATE TABLE` statement whose table name matches `table`)
+- partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist)
 
 Response:
 - ok
 - table
+
+POST /admin/set-partition-key-column (ADMIN_TOKEN)
+Request:
+- table string
+- partitionKeyColumn string (validated via `PRAGMA table_info` against a live shard's schema)
+
+Response:
+- ok
+- table
+- partitionKeyColumn
+
+Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409.
 
 POST /admin/split-vbucket
 Request:
@@ -165,6 +179,23 @@ Response:
 - route { shardId, vbucket, metadataVersion }
 - requestId
 - result (query or mutation payload)
+
+POST /v1/mutate (tenant bearer token)
+Request (a single StructuredMutation — see structured-op.ts):
+- op string ("insert" | "update" | "delete" | "upsert")
+- table string
+- tenantId string
+- partitionKey string
+- where object (optional — additional predicates; never substitutes for the partition-key predicate, which is always injected)
+- values object (optional — required for insert/upsert; the partition-key column is always force-set here regardless of what's supplied)
+- conflictColumns array (optional, upsert only — defaults to [partitionKeyColumn])
+- requestId string (optional — shares /v1/sql's requestId-based idempotency contract)
+
+Response:
+- ok boolean
+- rowsAffected number
+
+Row-ownership is structural, not conditional: `compileMutation` always ANDs the partition-key predicate into `update`/`delete`'s `WHERE` clause and force-sets it in `insert`/`upsert`'s `values` — an absent `where` still only ever touches the one partitioned row/set, never the whole table. Rejected 409 (`PARTITION_KEY_COLUMN_UNSET`) against a table still carrying the `'__unset__'` sentinel.
 
 POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
