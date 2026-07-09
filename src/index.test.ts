@@ -35,6 +35,17 @@ async function initCluster(numShards = 2, totalVBuckets = 16) {
   expect(createRes.status).toBe(200);
 }
 
+// rotate: true makes this idempotent across tests that share a catalog shard
+// (tenant_auth isn't wiped by /admin/init's force:true, unlike vbucket/shard
+// state) — a tenantId reused across test cases would otherwise 409 on the
+// second registration.
+async function registerTenant(tenantId: string): Promise<string> {
+  const res = await post("/admin/register-tenant", { tenantId, rotate: true }, AUTH());
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { token: string };
+  return `Bearer ${body.token}`;
+}
+
 describe("Worker multi-catalog-shard fan-out", () => {
   it("/admin/init initializes every catalog shard, not just one", async () => {
     const res = await post("/admin/init", { numShards: 2, totalVBuckets: 16, force: true }, AUTH());
@@ -79,13 +90,18 @@ describe("Worker multi-catalog-shard fan-out", () => {
     const tenants = Array.from({ length: 50 }, (_, i) => `tenant-${i}`);
     const routed = new Map<string, string>();
     for (const tenantId of tenants) {
-      const res = await post("/v1/sql", {
-        sql: "INSERT INTO events (id, v) VALUES (?, ?)",
-        params: [`row-${tenantId}`, "x"],
-        table: "events",
-        tenantId,
-        partitionKey: "p1",
-      });
+      const token = await registerTenant(tenantId);
+      const res = await post(
+        "/v1/sql",
+        {
+          sql: "INSERT INTO events (id, v) VALUES (?, ?)",
+          params: [`row-${tenantId}`, "x"],
+          table: "events",
+          tenantId,
+          partitionKey: "p1",
+        },
+        token,
+      );
       expect(res.status).toBe(200);
       const body = (await res.json()) as { route: { catalogShardId: string; shardId: string } };
       routed.set(tenantId, body.route.catalogShardId);
@@ -96,7 +112,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
 
   it("/v1/scatter merges shard lists across all catalog shards", async () => {
     await initCluster(2, 16);
-    const res = await post("/v1/scatter", { sql: "SELECT 1" });
+    const res = await post("/v1/scatter", { sql: "SELECT 1" }, AUTH());
     expect(res.status).toBe(200);
     const body = (await res.json()) as { observability: { shardCount: number } };
     // 2 shards per catalog x >=2 catalog shards
@@ -225,12 +241,17 @@ describe("Worker multi-catalog-shard fan-out", () => {
     });
 
     const tenantId = tenantForCatalogShard(0, 4);
-    const res = await post("/v1/sql", {
-      sql: "SELECT 1",
-      table: "events",
-      tenantId,
-      partitionKey: "p1",
-    });
+    const token = await registerTenant(tenantId);
+    const res = await post(
+      "/v1/sql",
+      {
+        sql: "SELECT 1",
+        table: "events",
+        tenantId,
+        partitionKey: "p1",
+      },
+      token,
+    );
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("mismatch");
@@ -245,6 +266,47 @@ describe("Worker multi-catalog-shard fan-out", () => {
       partitionKey: "p1",
     });
     expect(res.status).toBe(403);
+  });
+});
+
+describe("Worker tenant authorization", () => {
+  it("/admin/register-tenant requires an admin token", async () => {
+    const res = await post("/admin/register-tenant", { tenantId: "t1" });
+    expect(res.status).toBe(401);
+  });
+
+  it("/admin/register-tenant issues a token that /v1/sql accepts", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const res = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["1", "a"], table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("/v1/sql requires a tenant token (regression: data-plane had no auth at all)", async () => {
+    await initCluster();
+    const res = await post("/v1/sql", {
+      sql: "SELECT * FROM events",
+      table: "events",
+      tenantId: "t1",
+      partitionKey: "p1",
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("/admin/revoke-tenant invalidates a tenant's access via /v1/sql", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    await post("/admin/revoke-tenant", { tenantId: "t1" }, AUTH());
+    const res = await post(
+      "/v1/sql",
+      { sql: "SELECT * FROM events", table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(res.status).toBe(401);
   });
 });
 
@@ -320,49 +382,60 @@ describe("Worker /v1/sql input validation", () => {
 });
 
 describe("Worker /v1/scatter input validation and partial failure", () => {
+  it("requires an admin token (regression: scatter reads across every tenant indiscriminately)", async () => {
+    const res = await post("/v1/scatter", { sql: "SELECT 1" });
+    expect(res.status).toBe(401);
+  });
+
   it("returns 400 for missing sql", async () => {
-    const res = await post("/v1/scatter", {});
+    const res = await post("/v1/scatter", {}, AUTH());
     expect(res.status).toBe(400);
   });
 
   it("returns 400 for a mutating statement", async () => {
-    const res = await post("/v1/scatter", { sql: "INSERT INTO events (id) VALUES ('1')" });
+    const res = await post("/v1/scatter", { sql: "INSERT INTO events (id) VALUES ('1')" }, AUTH());
     expect(res.status).toBe(400);
   });
 
   it("regression: rejects a comment-prefixed mutation instead of executing it as a read", async () => {
     await initCluster();
-    const res = await post("/v1/scatter", { sql: "-- harmless\nDELETE FROM events" });
+    const res = await post("/v1/scatter", { sql: "-- harmless\nDELETE FROM events" }, AUTH());
     expect(res.status).toBe(400);
 
-    const res2 = await post("/v1/scatter", { sql: "/*x*/ UPDATE events SET v = 'pwned'" });
+    const res2 = await post("/v1/scatter", { sql: "/*x*/ UPDATE events SET v = 'pwned'" }, AUTH());
     expect(res2.status).toBe(400);
   });
 
   it("returns 403 for a dangerous non-mutation statement", async () => {
     // PRAGMA isn't classified as a mutation prefix, so it reaches the
     // isDangerous() deny-list check rather than the mutation-rejection check.
-    const res = await post("/v1/scatter", { sql: "PRAGMA table_info(events)" });
+    const res = await post("/v1/scatter", { sql: "PRAGMA table_info(events)" }, AUTH());
     expect(res.status).toBe(403);
   });
 
   it("returns 400 when params is not an array", async () => {
-    const res = await post("/v1/scatter", { sql: "SELECT 1", params: "nope" });
+    const res = await post("/v1/scatter", { sql: "SELECT 1", params: "nope" }, AUTH());
     expect(res.status).toBe(400);
   });
 
   it("caps results at the requested limit", async () => {
     await initCluster(1, 64);
     for (let i = 0; i < 5; i += 1) {
-      await post("/v1/sql", {
-        sql: "INSERT INTO events (id, v) VALUES (?, ?)",
-        params: [`id-${i}`, "x"],
-        table: "events",
-        tenantId: `tenant-${i}`,
-        partitionKey: "p1",
-      });
+      const tenantId = `tenant-${i}`;
+      const token = await registerTenant(tenantId);
+      await post(
+        "/v1/sql",
+        {
+          sql: "INSERT INTO events (id, v) VALUES (?, ?)",
+          params: [`id-${i}`, "x"],
+          table: "events",
+          tenantId,
+          partitionKey: "p1",
+        },
+        token,
+      );
     }
-    const res = await post("/v1/scatter", { sql: "SELECT id FROM events", limit: 2 });
+    const res = await post("/v1/scatter", { sql: "SELECT id FROM events", limit: 2 }, AUTH());
     expect(res.status).toBe(200);
     const body = (await res.json()) as { rows: unknown[] };
     expect(body.rows.length).toBeLessThanOrEqual(2);
