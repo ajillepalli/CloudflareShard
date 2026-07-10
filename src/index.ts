@@ -1139,7 +1139,16 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
     );
   }
 
+  const reservedError = rejectReservedRequestId(body.requestId);
+  if (reservedError) return reservedError;
   const requestId = body.requestId ?? crypto.randomUUID();
+  // Review Tier 1 #2: mid-migration, the SOURCE shard enqueues the mirror
+  // atomically with the write (passing mirrorTargetShardId here), so it's
+  // always counted by /mirror-pending-count — no best-effort ctx.waitUntil.
+  const mirrorTargetShardId =
+    mutating && route.targetShardId && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover")
+      ? route.targetShardId
+      : undefined;
   const shardStart = Date.now();
   const shardRes = await routeToShard(env, route.shardId, "/execute", {
     sql: body.sql,
@@ -1150,31 +1159,12 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
     table: body.table,
     partitionKey: body.partitionKey,
     vbucket: route.vbucket,
+    mirrorTargetShardId,
   });
   const shardExecuteMs = Date.now() - shardStart;
 
   if (!shardRes.ok) {
     return new Response(shardRes.body, { status: shardRes.status, headers: shardRes.headers });
-  }
-
-  // Milestone 3, Chunk 3: this vbucket is mid-migration — mirror the
-  // now-applied write to the target with the same requestId, after source
-  // success, never blocking or failing the client's response.
-  if (mutating && route.targetShardId && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover")) {
-    ctx.waitUntil(
-      mirrorWriteBestEffort(
-        env,
-        route.shardId,
-        route.targetShardId,
-        body.sql,
-        body.params ?? [],
-        requestId,
-        route.vbucket,
-        body.tenantId,
-        body.table,
-        body.partitionKey,
-      ),
-    );
   }
 
   const shardPayload = await shardRes.json();
@@ -1216,71 +1206,28 @@ function requireIndexedColumnsForInsert(
   };
 }
 
-/** Milestone 3, Chunk 3: mirrors an already-applied source write to the
- * migration target, best-effort — the client's write already succeeded on
- * the source (authoritative), so a mirror failure must never surface to the
- * client; it enqueues on the SOURCE shard's __cf_mirror_pending for
- * alarm-driven retry instead (the target may be the unreachable one).
- * Reuses the ORIGINAL requestId: the target's applied_requests dedupe makes
- * mirror + backfill + retry all safely re-appliable in any order.
- *
- * The mirrored payload carries the full routing context (tenantId/table/
- * partitionKey/vbucket) so the TARGET maintains __cf_row_owners for
- * mirrored rows too — without it, a row whose first appearance on the
- * target is a mirror (backfill hasn't reached it yet) would be invisible to
- * the cutover checksum's provenance-scoped row selection, forcing a
- * spurious mismatch/wipe/re-copy cycle. The vbucket in the payload is
- * harmless on the target: fences are per-shard, and the target never has
- * this vbucket fenced while it's the migration's destination (one migration
- * per vbucket). Never throws — runs inside ctx.waitUntil(). */
-async function mirrorWriteBestEffort(
-  env: Env,
-  sourceShardId: string,
-  targetShardId: string,
-  sql: string,
-  params: unknown[],
-  requestId: string,
-  vbucket: number,
-  tenantId?: string,
-  table?: string,
-  partitionKey?: string,
-): Promise<void> {
-  try {
-    const res = await routeToShard(env, targetShardId, "/execute", {
-      sql,
-      params,
-      requestId,
-      isMutation: true,
-      tenantId,
-      table,
-      partitionKey,
-      vbucket,
-    });
-    if (res.ok) return;
-    throw new Error(`target shard responded ${res.status}`);
-  } catch (error) {
-    log("worker.mirror_write_failed_enqueuing_retry", {
-      sourceShardId,
-      targetShardId,
-      requestId,
-      vbucket,
-      message: error instanceof Error ? error.message : String(error),
-    });
-    try {
-      await routeToShard(env, sourceShardId, "/enqueue-mirror-job", { targetShardId, sql, params, requestId, vbucket });
-    } catch (enqueueError) {
-      // Source shard itself unreachable for the enqueue — logged, not
-      // swallowed silently. Chunk 4's cutover checksum (step 3) is the
-      // backstop that catches a mirror lost this way before any flip.
-      log("worker.mirror_job_enqueue_failed", {
-        sourceShardId,
-        targetShardId,
-        requestId,
-        vbucket,
-        message: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
-      });
-    }
+/** Review Tier 1 #5: the reserved requestId namespace ShardDO uses for its
+ * internal mirror deliveries. A client that could supply a requestId in this
+ * namespace could pre-poison the future target shard's applied_requests with
+ * a colliding entry and permanently block a mirror's dedupe — stalling
+ * cutover forever — so the gateway rejects any client requestId starting with
+ * it. */
+const RESERVED_REQUEST_ID_PREFIX = "__cf:";
+
+function rejectReservedRequestId(requestId: string | undefined): Response | null {
+  if (requestId !== undefined && requestId.startsWith(RESERVED_REQUEST_ID_PREFIX)) {
+    return json(
+      {
+        error: {
+          code: "RESERVED_REQUEST_ID",
+          message: `requestId must not start with the reserved prefix "${RESERVED_REQUEST_ID_PREFIX}".`,
+          fix: "Use a different requestId.",
+        },
+      },
+      400,
+    );
   }
+  return null;
 }
 
 /** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
@@ -1531,8 +1478,16 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
     }
   }
 
+  const reservedError = rejectReservedRequestId(body.requestId);
+  if (reservedError) return reservedError;
   const { sql, params } = compileMutation(body, partitionKeyColumn);
   const requestId = body.requestId ?? crypto.randomUUID();
+  // Review Tier 1 #2: mid-migration, the SOURCE shard enqueues the mirror
+  // atomically with the write.
+  const mirrorTargetShardId =
+    route.targetShardId && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover")
+      ? route.targetShardId
+      : undefined;
   const shardRes = await routeToShard(env, route.shardId, "/execute", {
     sql,
     params,
@@ -1542,6 +1497,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
     table: body.table,
     partitionKey: body.partitionKey,
     vbucket: route.vbucket,
+    mirrorTargetShardId,
   });
   if (!shardRes.ok) {
     return new Response(shardRes.body, { status: shardRes.status, headers: shardRes.headers });
@@ -1549,26 +1505,6 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
 
   const shardPayload = (await shardRes.json()) as { rowsAffected?: number };
   const rowsAffected = shardPayload.rowsAffected ?? 0;
-
-  // Milestone 3, Chunk 3: this vbucket is mid-migration — mirror the
-  // now-applied compiled statement to the target with the same requestId,
-  // after source success, never blocking or failing the client's response.
-  if (route.targetShardId && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover")) {
-    ctx.waitUntil(
-      mirrorWriteBestEffort(
-        env,
-        route.shardId,
-        route.targetShardId,
-        sql,
-        params,
-        requestId,
-        route.vbucket,
-        body.tenantId,
-        body.table,
-        body.partitionKey,
-      ),
-    );
-  }
 
   // Eng-review fix: only maintain the index if the mutation actually
   // changed a row. A StructuredMutation's optional `where` can narrow
@@ -1621,6 +1557,8 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
   if (!body.requestId) {
     return json({ error: { code: "MISSING_REQUEST_ID", message: "Missing requestId.", fix: "Provide a client-generated requestId for idempotent retries." } }, 400);
   }
+  const reservedError = rejectReservedRequestId(body.requestId);
+  if (reservedError) return reservedError;
 
   const distinctKeys = new Set(body.mutations.map((m) => participantKey(m)));
   if (distinctKeys.size > MAX_TX_PARTICIPANT_KEYS) {

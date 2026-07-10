@@ -2224,25 +2224,42 @@ describe("Worker dual-write mirroring during migration (Milestone 3, Chunk 3)", 
       const sourceRows = (await shardExecute(sourceShardId, "SELECT v FROM m3_mirror_evt WHERE id = ?", ["row-m1"])).rows;
       expect(sourceRows).toHaveLength(1);
 
-      // Mirror lands on the target (async, via ctx.waitUntil).
-      await pollShardRows(targetShardId, "SELECT v FROM m3_mirror_evt WHERE id = ?", ["row-m1"], (r) => r.length === 1);
+      // Review Tier 1 #2: the mirror is enqueued ATOMICALLY with the source
+      // write, so it's counted the instant the write returns — before any
+      // delivery attempt. This is what makes cutover's drain-to-zero gate
+      // correct.
+      const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+      const mirrorCount = async () =>
+        ((await (
+          await sourceStub.fetch(
+            new Request("https://shard.internal/mirror-pending-count", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ vbucket }),
+            }),
+          )
+        ).json()) as { count: number }).count;
+      expect(await mirrorCount()).toBe(1);
 
-      // Same requestId on the target: replaying it dedupes.
-      const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
-      const replay = await targetStub.fetch(
-        new Request("https://shard.internal/execute", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            sql: `INSERT INTO "m3_mirror_evt" ("v", "id") VALUES (?, ?)`,
-            params: ["alpha", "row-m1"],
-            requestId,
-            isMutation: true,
-          }),
-        }),
-      );
-      const replayBody = (await replay.json()) as { duplicated?: boolean };
-      expect(replayBody.duplicated).toBe(true);
+      // Drive the source alarm to deliver the mirror; the target gets it and
+      // the job drains to zero.
+      await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+        state.storage.sql.exec("UPDATE __cf_mirror_pending SET next_attempt_at = ?", new Date(Date.now() - 1).toISOString());
+        await instance.alarm();
+      });
+      expect(await mirrorCount()).toBe(0);
+
+      const targetRows = (await shardExecute(targetShardId, "SELECT v FROM m3_mirror_evt WHERE id = ?", ["row-m1"])).rows;
+      expect(targetRows).toHaveLength(1);
+
+      // Idempotent: re-running the alarm (queue already empty) leaves exactly
+      // one row on the target — the delivered mirror wrote under an
+      // unforgeable derived requestId, so redelivery dedupes.
+      await runInDurableObject(sourceStub, async (instance: ShardDO) => {
+        await instance.alarm();
+      });
+      const targetRowsAgain = (await shardExecute(targetShardId, "SELECT v FROM m3_mirror_evt WHERE id = ?", ["row-m1"])).rows;
+      expect(targetRowsAgain).toHaveLength(1);
     } finally {
       await setMigrationState(vbucket, "none", null);
     }
@@ -2361,15 +2378,109 @@ describe("Worker dual-write mirroring during migration (Milestone 3, Chunk 3)", 
       );
       expect(txRes.status).toBe(200);
 
-      // Coordinator mirrors post-commit, awaited inside /begin — the target
-      // copy should be there as soon as /v1/tx returns.
+      // Source stayed authoritative and has it immediately.
+      const sourceRows = (await shardExecute(sourceShardId, "SELECT v FROM m3_txmirror_evt WHERE id = ?", ["row-tx1"])).rows;
+      expect(sourceRows).toHaveLength(1);
+
+      // Review Tier 1 #2: the committed intent's mirror is enqueued
+      // atomically on the SOURCE shard inside handleCommit (no longer a
+      // synchronous coordinator round trip) — counted, then delivered by the
+      // source alarm.
+      const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+      await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+        state.storage.sql.exec("UPDATE __cf_mirror_pending SET next_attempt_at = ?", new Date(Date.now() - 1).toISOString());
+        await instance.alarm();
+      });
+
       const targetRows = (await shardExecute(targetShardId, "SELECT v FROM m3_txmirror_evt WHERE id = ?", ["row-tx1"])).rows;
       expect(targetRows).toHaveLength(1);
       expect(targetRows[0].v).toBe("gamma");
+    } finally {
+      await setMigrationState(vbucket, "none", null);
+    }
+  });
 
-      // Source stayed authoritative and has it too.
-      const sourceRows = (await shardExecute(sourceShardId, "SELECT v FROM m3_txmirror_evt WHERE id = ?", ["row-tx1"])).rows;
-      expect(sourceRows).toHaveLength(1);
+  // Review "add missing tests": a /v1/tx whose mirror target is unreachable
+  // must still commit; the mirror lands in __cf_mirror_pending on the source
+  // and drains via alarm retry once the target recovers.
+  it("a /v1/tx commit whose mirror target is unreachable still commits; the mirror enqueues on the source and drains via alarm once the target recovers", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m3_txmirrfail_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const vbucket = hashKey(`${tenantId}:m3_txmirrfail_evt:row-txf`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    // Drop the table on the target so the mirror INSERT fails until restored.
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await targetStub.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sql: 'DROP TABLE IF EXISTS "m3_txmirrfail_evt"', requestId: `drop-${crypto.randomUUID()}`, isMutation: true }),
+      }),
+    );
+
+    await setMigrationState(vbucket, "backfilling", targetShardId);
+    try {
+      const txRes = await post(
+        "/v1/tx",
+        {
+          mutations: [{ op: "insert", table: "m3_txmirrfail_evt", tenantId, partitionKey: "row-txf", values: { v: "delta" } }],
+          requestId: `tx-mirrfail-${crypto.randomUUID()}`,
+        },
+        token,
+      );
+      // Commit succeeded despite the doomed mirror.
+      expect(txRes.status).toBe(200);
+
+      const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+      const mirrorCount = async () =>
+        ((await (
+          await sourceStub.fetch(
+            new Request("https://shard.internal/mirror-pending-count", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ vbucket }),
+            }),
+          )
+        ).json()) as { count: number }).count;
+      expect(await mirrorCount()).toBe(1);
+
+      // First alarm: delivery fails (table missing), job stays queued.
+      await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+        state.storage.sql.exec("UPDATE __cf_mirror_pending SET next_attempt_at = ?", new Date(Date.now() - 1).toISOString());
+        await instance.alarm();
+      });
+      expect(await mirrorCount()).toBe(1);
+
+      // Restore the target table; next alarm drains the queue.
+      await targetStub.fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: "CREATE TABLE IF NOT EXISTS m3_txmirrfail_evt (id TEXT PRIMARY KEY, v TEXT)",
+            requestId: `recreate-${crypto.randomUUID()}`,
+            isMutation: true,
+          }),
+        }),
+      );
+      await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+        state.storage.sql.exec("UPDATE __cf_mirror_pending SET next_attempt_at = ?", new Date(Date.now() - 1).toISOString());
+        await instance.alarm();
+      });
+      expect(await mirrorCount()).toBe(0);
+
+      const targetRows = (await shardExecute(targetShardId, "SELECT v FROM m3_txmirrfail_evt WHERE id = ?", ["row-txf"])).rows;
+      expect(targetRows).toHaveLength(1);
+      expect(targetRows[0].v).toBe("delta");
     } finally {
       await setMigrationState(vbucket, "none", null);
     }
@@ -2433,9 +2544,12 @@ async function purgeUnattributedRows(): Promise<void> {
 }
 
 describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () => {
+  // 30s hook budget: purgeUnattributedRows fans out list-tables + per-shard
+  // deletes, and per-request latency in the workers pool compounds over this
+  // long test file (an environment property — see vitest.config.ts note).
   beforeEach(async () => {
     await purgeUnattributedRows();
-  });
+  }, 30000);
 
   it("criterion 1: a row written before migration is readable via /v1/sql with the same partitionKey after its vbucket migrates, and the source copy is gone", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
@@ -2628,7 +2742,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     expect(replayRes.status).toBe(200);
     const replayBody = (await replayRes.json()) as { result: { duplicated?: boolean } };
     expect(replayBody.result.duplicated).toBe(true);
-  }, 60000);
+  }, 150000);
 
   it("criterion 6: abort before the map flip leaves the source's checksum untouched and the target with zero rows and zero provenance for the vbucket", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());

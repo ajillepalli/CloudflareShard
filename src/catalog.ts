@@ -1620,10 +1620,17 @@ export class CatalogDO extends DurableObject {
       const fenceRes = await this.callShard(source, "/fence-vbucket", { vbucket: m.vbucket });
       if (!fenceRes.ok) throw new Error(`fence-vbucket failed on ${source}: ${fenceRes.status}`);
 
-      // Step 2: source's mirror queue for this vbucket must reach zero.
-      const mirrorRes = await this.callShard(source, "/mirror-pending-count", { vbucket: m.vbucket });
-      if (!mirrorRes.ok) throw new Error(`mirror-pending-count failed on ${source}: ${mirrorRes.status}`);
-      const mirrorDepth = ((await mirrorRes.json()) as { count: number }).count;
+      // Step 2: the source's mirror queue for this vbucket must reach zero.
+      // ACTIVELY drive the drain (review Tier 1 #2) rather than passively
+      // wait on the source shard's alarm cadence — /drain-mirror-jobs
+      // attempts every queued mirror now and reports how many remain
+      // (unreachable targets stay, retried next tick). Now that mirrors are
+      // enqueued atomically with the write, this count includes every
+      // outstanding mirror, so once it's zero no slow mirror can still land
+      // on the target after the flip.
+      const mirrorRes = await this.callShard(source, "/drain-mirror-jobs", { vbucket: m.vbucket });
+      if (!mirrorRes.ok) throw new Error(`drain-mirror-jobs failed on ${source}: ${mirrorRes.status}`);
+      const mirrorDepth = ((await mirrorRes.json()) as { remaining: number }).remaining;
       if (mirrorDepth > 0) {
         return true; // poll again next tick
       }

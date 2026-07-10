@@ -330,12 +330,6 @@ export class CoordinatorDO extends DurableObject {
         );
       });
       await this.ensureAlarmScheduled(Date.now());
-      // Mirror even on the pending-ack path: the commit DECISION is durable
-      // (status='committed' above), so the mirrored content can never be for
-      // a transaction that ends up aborted — a participant that hasn't
-      // acked yet will still be driven to the same committed outcome by the
-      // recovery queue.
-      await this.mirrorCommittedIntents(txId, participants);
       return json({ ok: true, txId, status: "committed_pending_ack" });
     }
 
@@ -343,79 +337,7 @@ export class CoordinatorDO extends DurableObject {
       this.sql.exec("UPDATE transactions SET status = 'committed', updated_at = ? WHERE tx_id = ?", new Date().toISOString(), txId);
     });
 
-    await this.mirrorCommittedIntents(txId, participants);
-
     return json({ ok: true, txId, status: "committed" });
-  }
-
-  /** Milestone 3, Chunk 3: after the commit decision is durable, mirrors
-   * every committed intent whose vbucket is mid-migration to that
-   * migration's target shard. Failures never affect the transaction's
-   * outcome (it's already committed) — they enqueue on the intent's SOURCE
-   * shard's __cf_mirror_pending for alarm-driven retry, exactly like the
-   * gateway's own mirror path for /v1/sql and /v1/mutate.
-   *
-   * requestId is derived deterministically from (txId, source shard,
-   * intent seq) rather than "the original requestId" verbatim — a /v1/tx
-   * intent has no per-statement requestId of its own (2PC applies intents
-   * via pending_intents, not /execute), and reusing the transaction-level
-   * requestId for MULTIPLE intents on the same target would make the
-   * second intent collide with the first's applied_requests entry and be
-   * rejected as a mismatched replay. Deterministic derivation preserves
-   * exactly the property the spec's requestId-reuse rule exists for:
-   * mirror + retry + re-mirror of the same intent always dedupe to one
-   * application on the target. */
-  private async mirrorCommittedIntents(txId: string, participants: BeginParticipant[]): Promise<void> {
-    for (const p of participants) {
-      for (let seq = 0; seq < p.intents.length; seq += 1) {
-        const intent = p.intents[seq];
-        if (!intent.mirrorTargetShardId || intent.vbucket === undefined) continue;
-        const requestId = `${txId}:mirror:${p.shardId}:${seq}`;
-        try {
-          // Full routing context so the target maintains __cf_row_owners for
-          // the mirrored row too — see the gateway's mirrorWriteBestEffort
-          // for why (cutover checksum scopes rows by provenance).
-          const res = await this.callShard(intent.mirrorTargetShardId, "/execute", {
-            sql: intent.sql,
-            params: intent.params ?? [],
-            requestId,
-            isMutation: true,
-            tenantId: intent.tenantId,
-            table: intent.table,
-            partitionKey: intent.partitionKey,
-            vbucket: intent.vbucket,
-          });
-          if (!res.ok) throw new Error(`target shard responded ${res.status}`);
-        } catch (error) {
-          log("coordinator.mirror_write_failed_enqueuing_retry", {
-            txId,
-            sourceShardId: p.shardId,
-            targetShardId: intent.mirrorTargetShardId,
-            requestId,
-            message: error instanceof Error ? error.message : String(error),
-          });
-          try {
-            await this.callShard(p.shardId, "/enqueue-mirror-job", {
-              targetShardId: intent.mirrorTargetShardId,
-              sql: intent.sql,
-              params: intent.params ?? [],
-              requestId,
-              vbucket: intent.vbucket,
-            });
-          } catch (enqueueError) {
-            // Source unreachable for the enqueue too — logged; Chunk 4's
-            // cutover checksum is the backstop before any flip.
-            log("coordinator.mirror_job_enqueue_failed", {
-              txId,
-              sourceShardId: p.shardId,
-              targetShardId: intent.mirrorTargetShardId,
-              requestId,
-              message: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
-            });
-          }
-        }
-      }
-    }
   }
 
   /** Manual escape hatch for a transaction stuck past a reasonable window —
