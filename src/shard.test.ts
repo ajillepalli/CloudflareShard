@@ -811,6 +811,80 @@ describe("ShardDO __cf_mirror_pending dual-write retry queue (Milestone 3, Chunk
     expect(forV2.count).toBe(1);
     expect(total.count).toBe(2);
   });
+
+  // Review Tier 1 #3: a mirror delivered via the retry queue must carry
+  // routing context so the TARGET writes its own __cf_row_owners provenance —
+  // otherwise a row whose first appearance on the target is a mirror is
+  // invisible to the cutover checksum's provenance-scoped selection.
+  it("a mirror delivered via retry writes __cf_row_owners provenance on the target (routing context forwarded)", async () => {
+    const sourceStub = await freshShard();
+    const targetShardName = `mirror-prov-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardName));
+    await targetStub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+
+    await sourceStub.fetch(
+      post("/enqueue-mirror-job", {
+        targetShardId: targetShardName,
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["prov-row", "x"],
+        requestId: "__cf:mirror:test",
+        vbucket: 12,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "prov-row",
+      }),
+    );
+    await runInDurableObject(sourceStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    // The target has the base row AND its provenance entry.
+    await runInDurableObject(targetStub, async (_i: ShardDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT tenant_id, vbucket FROM __cf_row_owners WHERE table_name = ? AND partition_key = ?", "t", "prov-row"),
+      ) as Array<{ tenant_id: string; vbucket: number }>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].tenant_id).toBe("tenant-1");
+      expect(rows[0].vbucket).toBe(12);
+    });
+  });
+
+  // Review Tier 1 #2: /drain-mirror-jobs actively delivers every queued
+  // mirror for a vbucket and reports how many remain (cutover uses this
+  // rather than passively waiting on the source's alarm cadence).
+  it("/drain-mirror-jobs delivers all of a vbucket's queued mirrors now and reports remaining", async () => {
+    const sourceStub = await freshShard();
+    const targetShardName = `mirror-drain-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardName));
+    await targetStub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+    for (let i = 0; i < 3; i += 1) {
+      await sourceStub.fetch(
+        post("/enqueue-mirror-job", {
+          targetShardId: targetShardName,
+          sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+          params: [`d-${i}`, "x"],
+          requestId: `__cf:mirror:d-${i}`,
+          vbucket: 20,
+          tenantId: "tenant-1",
+          table: "t",
+          partitionKey: `d-${i}`,
+        }),
+      );
+    }
+
+    const drainRes = await sourceStub.fetch(post("/drain-mirror-jobs", { vbucket: 20 }));
+    expect(drainRes.status).toBe(200);
+    expect(((await drainRes.json()) as { remaining: number }).remaining).toBe(0);
+
+    const count = (await (await targetStub.fetch(post("/execute", { sql: "SELECT COUNT(*) AS n FROM t", requestId: "c", isMutation: false }))).json()) as {
+      rows: Array<{ n: number }>;
+    };
+    expect(count.rows[0].n).toBe(3);
+  });
 });
 
 describe("ShardDO migration fence and export/import (Milestone 3, Chunk 4)", () => {
