@@ -27,6 +27,26 @@ type ExecutePayload = {
    * (see docs/SPEC.md §14's trust-model limitation: the row's own columns
    * carry no tenant identity). */
   vbucket?: number;
+  /** Milestone 3, Chunk 4 (review Tier 1 #2/#3): when set, this write's
+   * vbucket is mid-migration and must be mirrored to this target shard. The
+   * source shard enqueues a __cf_mirror_pending row for it ATOMICALLY inside
+   * the same transaction that applies the write — so an in-flight mirror is
+   * always counted by /mirror-pending-count and cutover's drain-to-zero gate
+   * can't flip while a mirror is merely slow. */
+  mirrorTargetShardId?: string;
+  /** Milestone 3 (review Tier 1 #3): set on a mirrored write delivered to the
+   * TARGET shard — skips the fence/lock checks (the source already vetted
+   * both) while still writing __cf_row_owners provenance on the target so a
+   * row whose first target appearance is a mirror is visible to the cutover
+   * checksum's provenance-scoped selection. */
+  isMirror?: boolean;
+  /** Milestone 3 (review Tier 1 #5): the ORIGINAL client requestId a mirror
+   * corresponds to. The mirror APPLIES under an unforgeable derived id (so a
+   * forged pre-existing entry can't livelock it), but ALSO records an
+   * INSERT-OR-IGNORE applied_requests entry under this client id — so a
+   * client that replays its requestId AFTER the vbucket flipped to this
+   * target still dedupes (cross-migration idempotency, criterion 2). */
+  clientRequestId?: string;
 };
 
 type PrepareIntent = {
@@ -43,7 +63,33 @@ type PrepareIntent = {
    * commit time. */
   vbucket?: number;
   op?: "insert" | "update" | "delete" | "upsert";
+  /** Milestone 3 (review Tier 1 #2): when set, this intent's vbucket is
+   * mid-migration; handleCommit enqueues a mirror job for it atomically with
+   * the commit. */
+  mirrorTargetShardId?: string;
 };
+
+/** A committed 2PC intent as read back from pending_intents for apply. */
+type CommittableIntent = {
+  intent_seq: number;
+  sql: string;
+  params_json: string;
+  status: string;
+  table_name: string | null;
+  partition_key: string | null;
+  tenant_id: string | null;
+  vbucket: number | null;
+  op: string | null;
+  mirror_target_shard_id: string | null;
+};
+
+/** Milestone 3 (review Tier 1 #5): requestIds ShardDO generates for its own
+ * internal replication (mirror deliveries) live under this reserved prefix.
+ * The gateway rejects any CLIENT-supplied requestId that starts with it, so a
+ * tenant can never pre-poison the future target shard's applied_requests with
+ * a colliding id and permanently block a mirror's dedupe (which would stall
+ * cutover forever). */
+const RESERVED_REQUEST_ID_PREFIX = "__cf:";
 
 const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
@@ -102,6 +148,7 @@ export class ShardDO extends DurableObject {
       "/enqueue-index-job": this.handleEnqueueIndexJob.bind(this),
       "/enqueue-mirror-job": this.handleEnqueueMirrorJob.bind(this),
       "/mirror-pending-count": this.handleMirrorPendingCount.bind(this),
+      "/drain-mirror-jobs": this.handleDrainMirrorJobs.bind(this),
       "/migrate-export": this.handleMigrateExport.bind(this),
       "/migrate-import": this.handleMigrateImport.bind(this),
       "/migrate-checksum": this.handleMigrateChecksum.bind(this),
@@ -234,69 +281,165 @@ export class ShardDO extends DurableObject {
    * its own (faster, uncapped-attempt) backoff cadence — Chunk 4's cutover
    * gates on this queue reaching zero for the migrating vbucket, so a job
    * here must eventually land, never give up. */
+  /** Delivers one mirror job to its target and, on success, deletes it. On
+   * failure, applies exponential backoff to next_attempt_at. Returns true on
+   * delivery success. Shared by the alarm loop (respects next_attempt_at)
+   * and CatalogDO's cutover-driven drain (forces every job for a vbucket). */
+  private async deliverMirrorJob(job: {
+    job_id: number;
+    target_shard_id: string;
+    sql: string;
+    params_json: string;
+    request_id: string;
+    vbucket: number;
+    tenant_id: string | null;
+    table_name: string | null;
+    partition_key: string | null;
+    client_request_id: string | null;
+    attempt_count: number;
+  }): Promise<boolean> {
+    try {
+      const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
+      const stub = this.shardEnv.SHARD.get(id);
+      const res = await stub.fetch("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // Review Tier 1 #3: forward routing context so the target writes its
+        // own __cf_row_owners provenance (without it a mirror-first row is
+        // invisible to the cutover checksum's provenance INNER JOIN,
+        // spuriously mismatching -> wipe/re-copy livelock). isMirror skips
+        // the target's fence/lock checks — the source already vetted both.
+        body: JSON.stringify({
+          sql: job.sql,
+          params: JSON.parse(job.params_json),
+          requestId: job.request_id,
+          isMutation: true,
+          isMirror: true,
+          tenantId: job.tenant_id ?? undefined,
+          table: job.table_name ?? undefined,
+          partitionKey: job.partition_key ?? undefined,
+          vbucket: job.vbucket,
+          clientRequestId: job.client_request_id ?? undefined,
+        }),
+      });
+      if (res.ok) {
+        this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
+        return true;
+      }
+      throw new Error(`shard responded ${res.status}`);
+    } catch (error) {
+      const attemptCount = job.attempt_count + 1;
+      const delay = Math.min(MIRROR_JOB_MAX_DELAY_MS, MIRROR_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
+      this.sql.exec(
+        "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+        attemptCount,
+        new Date(Date.now() + delay).toISOString(),
+        job.job_id,
+      );
+      log("shard.mirror_job_retry_failed", {
+        jobId: job.job_id,
+        targetShardId: job.target_shard_id,
+        attemptCount,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  private mirrorJobColumns =
+    "job_id, target_shard_id, sql, params_json, request_id, vbucket, tenant_id, table_name, partition_key, client_request_id, attempt_count";
+
   private async processMirrorPendingJobs(): Promise<number | null> {
-    const due = this.many<{
-      job_id: number;
-      target_shard_id: string;
-      sql: string;
-      params_json: string;
-      request_id: string;
-      attempt_count: number;
-    }>(
-      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM __cf_mirror_pending WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?",
+    const due = this.many<Parameters<ShardDO["deliverMirrorJob"]>[0]>(
+      `SELECT ${this.mirrorJobColumns} FROM __cf_mirror_pending WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?`,
       new Date().toISOString(),
       MIRROR_JOB_BATCH_SIZE,
     );
-
     for (const job of due) {
-      try {
-        const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
-        const stub = this.shardEnv.SHARD.get(id);
-        const res = await stub.fetch("https://shard.internal/execute", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            sql: job.sql,
-            params: JSON.parse(job.params_json),
-            requestId: job.request_id,
-            isMutation: true,
-          }),
-        });
-        if (res.ok) {
-          this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
-          continue;
-        }
-        throw new Error(`shard responded ${res.status}`);
-      } catch (error) {
-        const attemptCount = job.attempt_count + 1;
-        const delay = Math.min(MIRROR_JOB_MAX_DELAY_MS, MIRROR_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
-        this.sql.exec(
-          "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
-          attemptCount,
-          new Date(Date.now() + delay).toISOString(),
-          job.job_id,
-        );
-        log("shard.mirror_job_retry_failed", {
-          jobId: job.job_id,
-          targetShardId: job.target_shard_id,
-          attemptCount,
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
+      await this.deliverMirrorJob(job);
     }
-
     const next = this.one<{ next_attempt_at: string }>(
       "SELECT next_attempt_at FROM __cf_mirror_pending ORDER BY next_attempt_at ASC LIMIT 1",
     );
     return next ? new Date(next.next_attempt_at).getTime() : null;
   }
 
-  /** Called by the Worker (after a source write to a migrating vbucket
-   * fails to mirror) or by CoordinatorDO (after a 2PC commit whose intent
-   * targets a migrating vbucket fails to mirror) — records it for
-   * alarm-driven retry. Always lives on the SOURCE shard (this shard, the
-   * one that's authoritative during migration), not the target, mirroring
-   * handleEnqueueIndexJob's "lives on the write's origin" placement. */
+  /** Milestone 3 (review Tier 1 #2): CatalogDO's cutover step 2 calls this to
+   * ACTIVELY drain a vbucket's mirror queue rather than passively waiting for
+   * the source shard's alarm cadence — it attempts every queued job for the
+   * vbucket now (ignoring next_attempt_at) and returns how many remain. Only
+   * jobs whose target is genuinely unreachable stay behind, to be retried on
+   * the next cutover tick. */
+  private async handleDrainMirrorJobs(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    const jobs = this.many<Parameters<ShardDO["deliverMirrorJob"]>[0]>(
+      `SELECT ${this.mirrorJobColumns} FROM __cf_mirror_pending WHERE vbucket = ? ORDER BY job_id ASC`,
+      body.vbucket,
+    );
+    for (const job of jobs) {
+      await this.deliverMirrorJob(job);
+    }
+    const remaining = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_mirror_pending WHERE vbucket = ?", body.vbucket);
+    return json({ remaining: remaining?.n ?? 0 });
+  }
+
+  /** Milestone 3 (review Tier 1 #5): the unforgeable requestId a mirror is
+   * delivered to the target under. Reserved-prefixed (a tenant can't forge
+   * it — the gateway rejects client requestIds starting with the prefix) and
+   * keyed on the row identity plus the original client requestId, so retries
+   * of the same write dedupe on the target while two genuinely different
+   * writes (even cross-tenant with a colliding client requestId) never do. */
+  private mirrorRequestId(tenantId: string, table: string, partitionKey: string, originalRequestId: string): string {
+    return `${RESERVED_REQUEST_ID_PREFIX}mirror:${JSON.stringify([tenantId, table, partitionKey, originalRequestId])}`;
+  }
+
+  /** Inserts a durable mirror job. MUST be called inside the same
+   * transactionSync that applies the source write (handleExecute /
+   * handleCommit), so the mirror is recorded atomically with the write and
+   * can never be lost-yet-uncounted. Delivery is alarm-driven
+   * (processMirrorPendingJobs), delete-on-success. */
+  private enqueueMirrorJob(job: {
+    targetShardId: string;
+    sql: string;
+    params: unknown[];
+    requestId: string;
+    vbucket: number;
+    tenantId: string;
+    table: string;
+    partitionKey: string;
+    clientRequestId?: string;
+  }): void {
+    const now = new Date().toISOString();
+    this.sql.exec(
+      "INSERT INTO __cf_mirror_pending (target_shard_id, sql, params_json, request_id, vbucket, tenant_id, table_name, partition_key, client_request_id, next_attempt_at, attempt_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+      job.targetShardId,
+      job.sql,
+      JSON.stringify(job.params),
+      job.requestId,
+      job.vbucket,
+      job.tenantId,
+      job.table,
+      job.partitionKey,
+      job.clientRequestId ?? null,
+      now,
+      now,
+    );
+  }
+
+  private async scheduleMirrorAlarmSoon(): Promise<void> {
+    const retrySoon = Date.now() + MIRROR_JOB_BASE_DELAY_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > retrySoon) {
+      await this.ctx.storage.setAlarm(retrySoon);
+    }
+  }
+
+  /** Internal/test route: enqueue a mirror job directly. Production writes
+   * enqueue atomically via enqueueMirrorJob inside their own transaction;
+   * this route exists for direct testing of the retry loop. */
   private async handleEnqueueMirrorJob(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       targetShardId?: string;
@@ -304,33 +447,34 @@ export class ShardDO extends DurableObject {
       params?: unknown[];
       requestId?: string;
       vbucket?: number;
+      tenantId?: string;
+      table?: string;
+      partitionKey?: string;
     };
     if (!body.targetShardId || !body.sql || !body.requestId || body.vbucket === undefined) {
       return json({ error: "Missing targetShardId, sql, requestId, or vbucket" }, 400);
     }
-    const now = new Date().toISOString();
-    this.sql.exec(
-      "INSERT INTO __cf_mirror_pending (target_shard_id, sql, params_json, request_id, vbucket, next_attempt_at, attempt_count, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-      body.targetShardId,
-      body.sql,
-      JSON.stringify(body.params ?? []),
-      body.requestId,
-      body.vbucket,
-      now,
-      now,
-    );
-    const retrySoon = Date.now() + MIRROR_JOB_BASE_DELAY_MS;
-    const existingAlarm = await this.ctx.storage.getAlarm();
-    if (existingAlarm === null || existingAlarm > retrySoon) {
-      await this.ctx.storage.setAlarm(retrySoon);
-    }
+    this.enqueueMirrorJob({
+      targetShardId: body.targetShardId,
+      sql: body.sql,
+      params: body.params ?? [],
+      requestId: body.requestId,
+      vbucket: body.vbucket,
+      tenantId: body.tenantId ?? "",
+      table: body.table ?? "",
+      partitionKey: body.partitionKey ?? "",
+    });
+    await this.scheduleMirrorAlarmSoon();
     return json({ ok: true });
   }
 
-  /** Milestone 3, Chunk 4 will poll this from CatalogDO's cutover
-   * orchestration ("source drains __cf_mirror_pending for that vbucket to
-   * zero") — scoped to one vbucket so cutover isn't blocked by unrelated
-   * mirror debt for a different, non-migrating vbucket on the same shard. */
+  /** Polled by CatalogDO's cutover orchestration ("source drains
+   * __cf_mirror_pending for that vbucket to zero" before the map flip) —
+   * scoped to one vbucket so cutover isn't blocked by unrelated mirror debt
+   * for a different, non-migrating vbucket on the same shard. Now that
+   * mirrors are enqueued atomically with the write (review Tier 1 #2), this
+   * count includes every outstanding mirror, so the drain-to-zero gate is
+   * correct rather than blind to in-flight ones. */
   private async handleMirrorPendingCount(request: Request): Promise<Response> {
     const body = (await request.json()) as { vbucket?: number };
     const row =
@@ -742,32 +886,14 @@ export class ShardDO extends DurableObject {
       try {
         const decision = await this.queryCoordinatorDecision(coordinatorTxId);
         if (decision === "committed") {
-          const intents = this.many<{
-            sql: string;
-            params_json: string;
-            table_name: string | null;
-            partition_key: string | null;
-            tenant_id: string | null;
-            vbucket: number | null;
-            op: string | null;
-          }>(
-            "SELECT sql, params_json, table_name, partition_key, tenant_id, vbucket, op FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
+          const intents = this.many<CommittableIntent>(
+            "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op, mirror_target_shard_id FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
             coordinatorTxId,
           );
-          this.ctx.storage.transactionSync(() => {
-            for (const intent of intents) {
-              this.sql.exec(intent.sql, ...(JSON.parse(intent.params_json) as unknown[]));
-              if (intent.op && intent.vbucket !== null && intent.table_name && intent.partition_key && intent.tenant_id) {
-                this.writeOrDeleteProvenance(intent.sql, intent.table_name, intent.partition_key, intent.tenant_id, intent.vbucket);
-              }
-            }
-            this.sql.exec(
-              "UPDATE pending_intents SET status = 'committed', resolved_at = ? WHERE coordinator_tx_id = ?",
-              new Date().toISOString(),
-              coordinatorTxId,
-            );
-            this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", coordinatorTxId);
-          });
+          // Same apply-and-mirror path as handleCommit (review Tier 1 #2) so
+          // a recovery-driven commit mirrors identically.
+          const enqueuedMirror = this.applyCommittedIntents(coordinatorTxId, intents);
+          if (enqueuedMirror) await this.scheduleMirrorAlarmSoon();
         } else if (decision === "aborted" || decision === "not_found") {
           this.ctx.storage.transactionSync(() => {
             this.sql.exec("DELETE FROM pending_intents WHERE coordinator_tx_id = ?", coordinatorTxId);
@@ -855,6 +981,9 @@ export class ShardDO extends DurableObject {
     this.ensureColumn("pending_intents", "partition_key", "TEXT");
     this.ensureColumn("pending_intents", "vbucket", "INTEGER");
     this.ensureColumn("pending_intents", "op", "TEXT");
+    // Review Tier 1 #2: which target (if any) a committed base-row intent
+    // must be mirrored to, enqueued atomically with the commit.
+    this.ensureColumn("pending_intents", "mirror_target_shard_id", "TEXT");
 
     // Milestone 3, Chunk 0. One row per (table_name, partition_key) currently
     // owned by a base row on THIS shard, recording the logical (tenantId,
@@ -923,11 +1052,17 @@ export class ShardDO extends DurableObject {
       )
     `);
 
-    // Milestone 3, Chunk 3: retry queue for a dual-write mirror (source ->
-    // target during an active vbucket migration) that failed on its first
-    // attempt. Lives on the SOURCE shard (the authoritative one during
-    // migration, and the write's origin), not the target. Chunk 4's cutover
-    // polls this to zero (scoped by vbucket) before flipping vbucket_map.
+    // Milestone 3, Chunk 3 (redesigned per review Tier 1 #2/#3): durable
+    // record of a dual-write mirror (source -> target during an active
+    // vbucket migration). Lives on the SOURCE shard and is now inserted
+    // ATOMICALLY inside the write's own transaction (handleExecute /
+    // handleCommit), delivered by the alarm, and deleted only on delivery
+    // success — so /mirror-pending-count reflects EVERY outstanding mirror,
+    // including one merely in flight, and cutover's drain-to-zero gate is
+    // correct (an insert-on-failure-only queue silently missed slow mirrors,
+    // which then double-applied after the map flip). tenant_id/table_name/
+    // partition_key are carried so the retry delivery can write the target's
+    // __cf_row_owners provenance (#3).
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS __cf_mirror_pending (
         job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -936,11 +1071,19 @@ export class ShardDO extends DurableObject {
         params_json     TEXT NOT NULL,
         request_id      TEXT NOT NULL,
         vbucket         INTEGER NOT NULL,
+        tenant_id       TEXT,
+        table_name      TEXT,
+        partition_key   TEXT,
+        client_request_id TEXT,
         next_attempt_at TEXT NOT NULL,
         attempt_count   INTEGER NOT NULL DEFAULT 0,
         created_at      TEXT NOT NULL
       )
     `);
+    this.ensureColumn("__cf_mirror_pending", "tenant_id", "TEXT");
+    this.ensureColumn("__cf_mirror_pending", "table_name", "TEXT");
+    this.ensureColumn("__cf_mirror_pending", "partition_key", "TEXT");
+    this.ensureColumn("__cf_mirror_pending", "client_request_id", "TEXT");
 
     // Milestone 3, Chunk 4: cutover write fence. A data write whose payload
     // vbucket appears here is rejected 409 VBUCKET_FENCED (retryable) —
@@ -1075,6 +1218,7 @@ export class ShardDO extends DurableObject {
     }
 
     const mutating = isMutation(payload.sql);
+    let enqueuedMirror = false;
 
     try {
       const execStart = Date.now();
@@ -1100,31 +1244,26 @@ export class ShardDO extends DurableObject {
         // harmless (returns the cached result) and must not be turned into
         // a spurious 409 by the fence; the fence only blocks NEW writes.
         // Only fires for a payload that carries its vbucket (i.e. routed
-        // gateway traffic) — a mirrored write deliberately omits vbucket so
-        // the target never fences traffic the source already vetted.
-        if (payload.vbucket !== undefined) {
+        // gateway traffic). A mirrored write (isMirror) is exempt: it's a
+        // committed source write being replicated to the migration TARGET,
+        // which never fences its own destination vbucket, and the source
+        // already enforced the fence at write time.
+        if (payload.vbucket !== undefined && !payload.isMirror) {
           const fenced = this.one<{ vbucket: number }>(
             "SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = ?",
             payload.vbucket,
           );
           if (fenced) {
-            return json(
-              {
-                error: {
-                  code: "VBUCKET_FENCED",
-                  message: `vbucket ${payload.vbucket} is fenced for migration cutover on this shard.`,
-                  fix: "Retry — the fence lifts when the migration's map flip completes, and the retry will route to the new shard.",
-                },
-              },
-              409,
-            );
+            return this.fencedResponse(payload.vbucket);
           }
         }
 
         // Raw /v1/sql must respect row locks too — but this only closes the
         // hole for an honestly-labeled caller (see NOT in Scope: nothing
-        // verifies the SQL text itself only touches this one row).
-        if (payload.tenantId && payload.table && payload.partitionKey) {
+        // verifies the SQL text itself only touches this one row). A mirror
+        // is exempt: it's a committed source write, not a fresh client
+        // write, and the target holds no 2PC lock for this row.
+        if (payload.tenantId && payload.table && payload.partitionKey && !payload.isMirror) {
           const lockKeyValue = rowKey(payload.tenantId, payload.table, payload.partitionKey);
           const lockRow = this.one<{ coordinator_tx_id: string }>(
             "SELECT coordinator_tx_id FROM row_locks WHERE lock_key = ?",
@@ -1167,6 +1306,25 @@ export class ShardDO extends DurableObject {
             new Date().toISOString(),
           );
 
+          // Review Tier 1 #5: a mirror applies under an unforgeable derived
+          // requestId (payload.requestId above) but also records the ORIGINAL
+          // client requestId, INSERT OR IGNORE, so a client replaying its
+          // requestId AFTER this vbucket flips to this target still dedupes
+          // (cross-migration idempotency). IGNORE (not REPLACE) so a genuine
+          // pre-existing entry for a different write that happens to share the
+          // requestId — a client-requestId collision, the documented §14-class
+          // limitation — is never clobbered; the mirrored row itself already
+          // landed under the derived id regardless.
+          if (payload.isMirror && payload.clientRequestId) {
+            this.sql.exec(
+              `INSERT OR IGNORE INTO applied_requests (request_id, request_hash, result_json, applied_at) VALUES (?, ?, ?, ?)`,
+              payload.clientRequestId,
+              incomingHash,
+              JSON.stringify(txResult),
+              new Date().toISOString(),
+            );
+          }
+
           // Milestone 3, Chunk 0: track row provenance for /v1/sql and
           // /v1/mutate writes (both land here — /v1/mutate compiles its
           // StructuredMutation to SQL and calls this same /execute route).
@@ -1182,10 +1340,30 @@ export class ShardDO extends DurableObject {
               payload.tenantId,
               payload.vbucket,
             );
+
+            // Review Tier 1 #2: if this vbucket is mid-migration, record the
+            // mirror ATOMICALLY with the write (not best-effort after it), so
+            // it's always counted by /mirror-pending-count. A mirrored write
+            // itself (isMirror) is never re-mirrored.
+            if (payload.mirrorTargetShardId && !payload.isMirror) {
+              enqueuedMirror = true;
+              this.enqueueMirrorJob({
+                targetShardId: payload.mirrorTargetShardId,
+                sql: payload.sql,
+                params: payload.params ?? [],
+                requestId: this.mirrorRequestId(payload.tenantId, payload.table, payload.partitionKey, payload.requestId),
+                vbucket: payload.vbucket,
+                tenantId: payload.tenantId,
+                table: payload.table,
+                partitionKey: payload.partitionKey,
+                clientRequestId: payload.requestId,
+              });
+            }
           }
 
           return txResult;
         });
+        if (enqueuedMirror) await this.scheduleMirrorAlarmSoon();
         return json(result);
       }
 
@@ -1202,6 +1380,22 @@ export class ShardDO extends DurableObject {
       log("shard.execution_failed", { requestId: payload.requestId, isMutation: mutating, message });
       return json({ error: "SQL execution failed." }, 400);
     }
+  }
+
+  /** Shared 409 VBUCKET_FENCED response (review Tier 3 DRY) — the identical
+   * retryable rejection used by both the /execute write path and 2PC prepare
+   * when a write targets a vbucket fenced for cutover. */
+  private fencedResponse(vbucket: number): Response {
+    return json(
+      {
+        error: {
+          code: "VBUCKET_FENCED",
+          message: `vbucket ${vbucket} is fenced for migration cutover on this shard.`,
+          fix: "Retry — the fence lifts when the migration's map flip completes, and the retry will route to the new shard.",
+        },
+      },
+      409,
+    );
   }
 
   /** Milestone 3, Chunk 0: writes (insert/update/upsert) or deletes (delete)
@@ -1257,16 +1451,7 @@ export class ShardDO extends DurableObject {
       if (intent.vbucket === undefined) continue;
       const fenced = this.one<{ vbucket: number }>("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = ?", intent.vbucket);
       if (fenced) {
-        return json(
-          {
-            error: {
-              code: "VBUCKET_FENCED",
-              message: `vbucket ${intent.vbucket} is fenced for migration cutover on this shard.`,
-              fix: "Retry — the fence lifts when the migration's map flip completes, and the retry will route to the new shard.",
-            },
-          },
-          409,
-        );
+        return this.fencedResponse(intent.vbucket);
       }
     }
 
@@ -1337,8 +1522,8 @@ export class ShardDO extends DurableObject {
         );
         this.sql.exec(
           `
-          INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, tenant_id, table_name, partition_key, vbucket, op)
-          VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, tenant_id, table_name, partition_key, vbucket, op, mirror_target_shard_id)
+          VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?)
           `,
           coordinatorTxId,
           i,
@@ -1351,6 +1536,7 @@ export class ShardDO extends DurableObject {
           intent.partitionKey,
           intent.vbucket ?? null,
           intent.op ?? null,
+          intent.mirrorTargetShardId ?? null,
         );
       });
     });
@@ -1365,18 +1551,8 @@ export class ShardDO extends DurableObject {
     }
     const coordinatorTxId = body.coordinatorTxId;
 
-    const intents = this.many<{
-      intent_seq: number;
-      sql: string;
-      params_json: string;
-      status: string;
-      table_name: string | null;
-      partition_key: string | null;
-      tenant_id: string | null;
-      vbucket: number | null;
-      op: string | null;
-    }>(
-      "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
+    const intents = this.many<CommittableIntent>(
+      "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op, mirror_target_shard_id FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
       coordinatorTxId,
     );
     if (intents.length === 0) {
@@ -1393,6 +1569,20 @@ export class ShardDO extends DurableObject {
       return json({ error: { code: "ALREADY_ABORTED", message: "This transaction was already aborted on this shard." } }, 409);
     }
 
+    const enqueuedMirror = this.applyCommittedIntents(coordinatorTxId, intents);
+    if (enqueuedMirror) await this.scheduleMirrorAlarmSoon();
+
+    return json({ ok: true });
+  }
+
+  /** Applies a committed transaction's intents to the real tables, updates
+   * provenance, enqueues any mirror jobs (atomically, review Tier 1 #2),
+   * marks the intents committed, and releases the locks — all in one
+   * transactionSync. Shared by handleCommit and the alarm's stale-intent
+   * recovery sweep so both paths mirror identically. Returns whether any
+   * mirror job was enqueued (the caller re-arms the alarm). */
+  private applyCommittedIntents(coordinatorTxId: string, intents: CommittableIntent[]): boolean {
+    let enqueuedMirror = false;
     this.ctx.storage.transactionSync(() => {
       for (const intent of intents) {
         this.sql.exec(intent.sql, ...(JSON.parse(intent.params_json) as unknown[]));
@@ -1402,6 +1592,21 @@ export class ShardDO extends DurableObject {
         // transaction never does, so it's skipped here automatically.
         if (intent.op && intent.vbucket !== null && intent.table_name && intent.partition_key && intent.tenant_id) {
           this.writeOrDeleteProvenance(intent.sql, intent.table_name, intent.partition_key, intent.tenant_id, intent.vbucket);
+          // Review Tier 1 #2: a migrating vbucket's committed intent enqueues
+          // its mirror atomically with the commit.
+          if (intent.mirror_target_shard_id) {
+            enqueuedMirror = true;
+            this.enqueueMirrorJob({
+              targetShardId: intent.mirror_target_shard_id,
+              sql: intent.sql,
+              params: JSON.parse(intent.params_json) as unknown[],
+              requestId: `${RESERVED_REQUEST_ID_PREFIX}mirror:tx:${JSON.stringify([coordinatorTxId, intent.intent_seq])}`,
+              vbucket: intent.vbucket,
+              tenantId: intent.tenant_id,
+              table: intent.table_name,
+              partitionKey: intent.partition_key,
+            });
+          }
         }
       }
       this.sql.exec(
@@ -1411,8 +1616,7 @@ export class ShardDO extends DurableObject {
       );
       this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", coordinatorTxId);
     });
-
-    return json({ ok: true });
+    return enqueuedMirror;
   }
 
   private async handleAbort(request: Request): Promise<Response> {
