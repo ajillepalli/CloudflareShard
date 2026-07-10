@@ -5,7 +5,7 @@ import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
-import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } from "./sql-safety";
+import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableWrite, isMutation } from "./sql-safety";
 import {
   compileMutation,
   IDENTIFIER_RE,
@@ -1037,6 +1037,27 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
 
   if (isDangerous(body.sql)) {
     return json({ error: "SQL statement not permitted." }, 403);
+  }
+
+  // Tenant SQL must never write ShardDO's internal bookkeeping tables. The
+  // routed shard executes body.sql verbatim, and body.table (used only for
+  // routing) says nothing about what table the SQL text touches — so a write
+  // like `DELETE FROM __cf_fenced_vbuckets` sent with table:"events" would
+  // otherwise pass every gate and run, lifting a cutover fence or forging
+  // provenance from the data plane. Reject at the tenant boundary; the
+  // internal DO routes that legitimately write these tables call /execute
+  // directly, never through here.
+  if (isInternalTableWrite(body.sql)) {
+    return json(
+      {
+        error: {
+          code: "INTERNAL_TABLE_WRITE_FORBIDDEN",
+          message: "Writes to internal system tables are not permitted.",
+          fix: "Target one of your own registered tables.",
+        },
+      },
+      403,
+    );
   }
 
   if (body.params !== undefined && !assertParamsArray(body.params)) {
