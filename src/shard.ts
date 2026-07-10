@@ -355,8 +355,6 @@ export class ShardDO extends DurableObject {
     // (table, indexName, indexKeyJson) — independent of the base row's own
     // shard, so /v1/index-query resolves a lookup on one shard rather than
     // scattering (see the Milestone 2 design doc's index-placement decision).
-    // No tenant_id column — matches base table rows, which also carry no
-    // tenant_id physically (docs/SPEC.md §14's documented trust model).
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS __cf_indexes (
         table_name TEXT NOT NULL,
@@ -368,6 +366,18 @@ export class ShardDO extends DurableObject {
         PRIMARY KEY (table_name, index_name, index_key_json, partition_key)
       )
     `);
+    // Milestone 3, Chunk 2 (index-topology v2): the logical tenant identity
+    // that owns the entry's base row — this is what lets hydration re-route
+    // to the base row's CURRENT shard (vbucket = hashKey(tenant_id:table:
+    // partition_key) % total_vbuckets -> vbucket_map -> shard) instead of
+    // following the physical source_shard_id snapshot above, which goes
+    // stale the moment the base row migrates to a different shard.
+    // source_shard_id itself is left in place, unread by any new code path,
+    // per the additive-migration convention (never drop columns). Default
+    // '' only matters for a pre-Chunk-2 __cf_indexes row; such an index must
+    // be recreated via the documented /admin/drop-index + /admin/create-index
+    // upgrade flow to get real tenant_id values.
+    this.ensureColumn("__cf_indexes", "tenant_id", "TEXT NOT NULL DEFAULT ''");
 
     // Milestone 2, Chunk 2: retry queue for a best-effort index write that
     // failed on its first attempt from the Worker's ctx.waitUntil() call.

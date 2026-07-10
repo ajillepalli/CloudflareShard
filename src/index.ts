@@ -456,10 +456,15 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   // idempotent INSERT OR REPLACE). CatalogDO's /create-index is idempotent
   // on the same table+columns specifically so a retry after a partial
   // backfill failure below can call this endpoint again.
+  // Milestone 3, Chunk 2: shardIds IS this index's pinned placement ring —
+  // captured here, at creation time, and sent to CatalogDO to persist as
+  // index_rules.placement_ring_json. Every later placement computation for
+  // this index (write-path maintenance, /v1/index-query, this backfill loop
+  // itself) must reuse this exact array for the index's entire lifetime.
   const registerResults = await fanOutToAllCatalogs(
     env,
     "/create-index",
-    () => ({ indexName, table, columns }),
+    () => ({ indexName, table, columns, placementRing: shardIds }),
     request.headers.get("authorization") ?? undefined,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
@@ -496,9 +501,15 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
       // race the rest of the async index-maintenance path already accepts
       // elsewhere, not a new or larger one. The row may have been deleted
       // since the scan; skip it if so rather than indexing stale data.
+      //
+      // Milestone 3, Chunk 2: also joins __cf_row_owners (Chunk 0) for this
+      // row's tenant_id — index-topology v2 needs the OWNING tenant identity
+      // to re-route hydration reads at query time (vbucket =
+      // hashKey(tenant_id:table:partition_key) % total_vbuckets), since the
+      // base row's own columns carry no tenant identity (docs/SPEC.md §14).
       const freshRes = await routeToShard(env, shardId, "/execute", {
-        sql: `SELECT ${selectCols} FROM ${safeTable} WHERE "${pkCol}" = ?`,
-        params: [row[pkCol]],
+        sql: `SELECT ${selectCols}, ro.tenant_id AS __cf_tenant_id FROM ${safeTable} b LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b."${pkCol}" WHERE b."${pkCol}" = ?`,
+        params: [table, row[pkCol]],
         requestId: `create-index-backfill-refresh-${indexName}-${crypto.randomUUID()}`,
         isMutation: false,
       });
@@ -508,15 +519,35 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
           500,
         );
       }
-      const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown>> };
+      const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown> & { __cf_tenant_id: string | null }> };
       const freshRow = freshBody.rows[0];
       if (!freshRow) continue;
+
+      // No __cf_row_owners entry for this row — it predates Milestone 3
+      // Chunk 0's provenance tracking (or Chunk 1's re-attribution hasn't
+      // run yet) and its tenant identity can't be safely recovered here.
+      // Rejecting rather than guessing/defaulting to '' keeps a bad tenant_id
+      // from ever landing in __cf_indexes, where it would silently misroute
+      // hydration forever instead of failing loudly once, up front.
+      if (!freshRow.__cf_tenant_id) {
+        return json(
+          {
+            error: {
+              code: "PROVENANCE_MISSING_FOR_INDEX",
+              message: `Row ${partitionKey} on shard ${shardId}, table ${table} has no row-provenance entry (__cf_row_owners) — its tenant identity can't be determined for index placement.`,
+              fix: "Run /admin/backfill-provenance for this shard, then retry /admin/create-index (idempotent on registration and on already-written entries).",
+            },
+          },
+          409,
+        );
+      }
+      const tenantId = freshRow.__cf_tenant_id;
 
       const indexKeyJson = JSON.stringify(columns.map((c) => freshRow[c] ?? null));
       const indexShardId = indexShardIdForKey(table, indexName, indexKeyJson, shardIds);
       const writeRes = await routeToShard(env, indexShardId, "/execute", {
-        sql: `INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-        params: [table, indexName, indexKeyJson, partitionKey, shardId, new Date().toISOString()],
+        sql: `INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        params: [table, indexName, indexKeyJson, partitionKey, shardId, tenantId, new Date().toISOString()],
         requestId: `create-index-backfill-write-${indexName}-${crypto.randomUUID()}`,
         isMutation: true,
       });
@@ -628,6 +659,18 @@ async function handleAdminDropIndex(request: Request, env: Env): Promise<Respons
     return json({ error: "Missing indexName" }, 400);
   }
 
+  // Milestone 3, Chunk 2: fetch this index's pinned placement ring BEFORE
+  // unregistering (the ring lives on index_rules, which /drop-index deletes)
+  // — the ring may contain a shard no longer in the live active set (e.g.
+  // one later evacuated by Chunk 5's drain), so cleanup below targets the
+  // UNION of the pinned ring and the current live set rather than only
+  // whichever set happens to include every shard the index ever touched.
+  const existingListRes = await routeToCatalog(env, "catalog-0", "/list-indexes", {}, request.headers.get("authorization") ?? undefined);
+  const existingList = existingListRes.ok
+    ? ((await existingListRes.json()) as { indexes: Array<{ indexName: string; placementRing?: string[] }> })
+    : { indexes: [] };
+  const pinnedRing = existingList.indexes.find((i) => i.indexName === body.indexName)?.placementRing ?? [];
+
   const unregisterResults = await fanOutToAllCatalogs(
     env,
     "/drop-index",
@@ -640,7 +683,8 @@ async function handleAdminDropIndex(request: Request, env: Env): Promise<Respons
   const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
   const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
   if (listFailed) return listFailed;
-  const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+  const liveShardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+  const shardIds = Array.from(new Set([...liveShardIds, ...pinnedRing]));
 
   const cleanupResults = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId) => {
     const res = await routeToShard(env, shardId, "/execute", {
@@ -892,7 +936,11 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
   });
 }
 
-type IndexDefinition = { indexName: string; columns: string[] };
+/** `ring` is the index's pinned placement_ring_json (captured once at
+ * /admin/create-index) — see hash.ts's indexShardIdForKey doc comment. Every
+ * caller that resolves an index-shard placement must use THIS array, never
+ * a freshly fetched live shard list. */
+type IndexDefinition = { indexName: string; columns: string[]; ring: string[] };
 
 /** Eng-review fix (Codex-found): an insert/upsert that omits an indexed
  * column and lets SQLite fill a column DEFAULT would otherwise get indexed
@@ -1029,6 +1077,7 @@ async function maintainIndexesAsync(
   ctx: ExecutionContext,
   table: string,
   baseShardId: string,
+  tenantId: string,
   partitionKey: string,
   indexes: IndexDefinition[],
   op: "insert" | "update" | "upsert" | "delete",
@@ -1037,15 +1086,19 @@ async function maintainIndexesAsync(
 ): Promise<void> {
   if (indexes.length === 0) return;
 
-  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
-  const shardIds = listResults.flatMap((r) => ((r.body as { shardIds?: string[] }).shardIds ?? []));
-  if (shardIds.length === 0) return;
+  // Milestone 3, Chunk 2: each index's placement ring is its own PINNED
+  // placement_ring_json (route.indexes already carries it), not a freshly
+  // fetched live shard list — removes the /list-shards fan-out this used to
+  // do on every mutation against an indexed table.
+  const ringByIndex = new Map(indexes.map((i) => [i.indexName, i.ring]));
 
   const now = new Date().toISOString();
   const deltas = computeIndexDeltas(indexes, op, beforeRow, afterValues);
   for (const delta of deltas) {
+    const ring = ringByIndex.get(delta.indexName) ?? [];
+    if (ring.length === 0) continue; // no pinned ring recorded — nothing safe to write to
     if (delta.oldKeyJson !== null) {
-      const oldShardId = indexShardIdForKey(table, delta.indexName, delta.oldKeyJson, shardIds);
+      const oldShardId = indexShardIdForKey(table, delta.indexName, delta.oldKeyJson, ring);
       const requestId = `index-delete-${delta.indexName}-${crypto.randomUUID()}`;
       ctx.waitUntil(
         writeIndexEntryBestEffort(
@@ -1059,15 +1112,15 @@ async function maintainIndexesAsync(
       );
     }
     if (delta.newKeyJson !== null) {
-      const newShardId = indexShardIdForKey(table, delta.indexName, delta.newKeyJson, shardIds);
+      const newShardId = indexShardIdForKey(table, delta.indexName, delta.newKeyJson, ring);
       const requestId = `index-write-${delta.indexName}-${crypto.randomUUID()}`;
       ctx.waitUntil(
         writeIndexEntryBestEffort(
           env,
           baseShardId,
           newShardId,
-          "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-          [table, delta.indexName, delta.newKeyJson, partitionKey, baseShardId, now],
+          "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [table, delta.indexName, delta.newKeyJson, partitionKey, baseShardId, tenantId, now],
           requestId,
         ),
       );
@@ -1193,6 +1246,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
         ctx,
         body.table,
         route.shardId,
+        body.tenantId,
         body.partitionKey,
         indexes,
         body.op,
@@ -1257,16 +1311,6 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
   >();
   const currentCount = catalogShardCount(env);
   const authorization = request.headers.get("authorization") ?? undefined;
-
-  // Lazily fetched once, only if some mutation's table turns out to carry a
-  // registered index — needed to compute indexShardIdForKey.
-  let shardIds: string[] | null = null;
-  async function ensureShardIds(): Promise<string[]> {
-    if (shardIds !== null) return shardIds;
-    const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
-    shardIds = listResults.flatMap((r) => ((r.body as { shardIds?: string[] }).shardIds ?? []));
-    return shardIds;
-  }
 
   function addIntent(
     shardId: string,
@@ -1405,12 +1449,17 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     if (indexes.length > 0) {
       const deltas = computeIndexDeltas(indexes, mutation.op, beforeRow, mutation.op === "delete" ? undefined : mutation.values);
       if (deltas.length > 0) {
-        const ids = await ensureShardIds();
+        // Milestone 3, Chunk 2: each index's placement ring is its own
+        // PINNED placement_ring_json (already on route.indexes), never a
+        // freshly fetched live shard list.
+        const ringByIndex = new Map(indexes.map((i) => [i.indexName, i.ring]));
         const now = new Date().toISOString();
         for (const delta of deltas) {
+          const ring = ringByIndex.get(delta.indexName) ?? [];
+          if (ring.length === 0) continue; // no pinned ring recorded — nothing safe to write to
           const syntheticTable = `__cf_indexes:${delta.indexName}`;
           if (delta.oldKeyJson !== null) {
-            const oldShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.oldKeyJson, ids);
+            const oldShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.oldKeyJson, ring);
             addIntent(oldShardId, {
               sql: "DELETE FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? AND partition_key = ?",
               params: [mutation.table, delta.indexName, delta.oldKeyJson, mutation.partitionKey],
@@ -1420,10 +1469,10 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
             });
           }
           if (delta.newKeyJson !== null) {
-            const newShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.newKeyJson, ids);
+            const newShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.newKeyJson, ring);
             addIntent(newShardId, {
-              sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-              params: [mutation.table, delta.indexName, delta.newKeyJson, mutation.partitionKey, route.shardId, now],
+              sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              params: [mutation.table, delta.indexName, delta.newKeyJson, mutation.partitionKey, route.shardId, mutation.tenantId, now],
               tenantId: mutation.tenantId,
               table: syntheticTable,
               partitionKey: delta.newKeyJson,
@@ -1540,7 +1589,7 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   if (!lookupRes.ok) {
     return new Response(lookupRes.body, { status: lookupRes.status, headers: lookupRes.headers });
   }
-  const lookupBody = (await lookupRes.json()) as { columns: string[]; partitionKeyColumn: string };
+  const lookupBody = (await lookupRes.json()) as { columns: string[]; partitionKeyColumn: string; ring: string[] };
   const missing = lookupBody.columns.filter((c) => !(c in (body.values as Record<string, unknown>)));
   if (missing.length > 0) {
     return json(
@@ -1555,16 +1604,18 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     );
   }
 
-  const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
-  const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
-  if (listFailed) return listFailed;
-  const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
-  if (shardIds.length === 0) {
-    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet." } }, 400);
+  // Milestone 3, Chunk 2: this index's PINNED placement ring
+  // (index_rules.placement_ring_json, captured once at /admin/create-index)
+  // — never a freshly fetched live shard list, so /admin/split-vbucket or
+  // /admin/drain-shard changing the active shard set never moves where an
+  // already-written index entry is found.
+  const ring = lookupBody.ring;
+  if (ring.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "This index has no recorded placement ring." } }, 400);
   }
 
   const indexKeyJson = JSON.stringify(lookupBody.columns.map((c) => (body.values as Record<string, unknown>)[c] ?? null));
-  const indexShardId = indexShardIdForKey(body.table, body.indexName, indexKeyJson, shardIds);
+  const indexShardId = indexShardIdForKey(body.table, body.indexName, indexKeyJson, ring);
 
   const safeTable = `"${body.table}"`;
   const safePkCol = `"${lookupBody.partitionKeyColumn}"`;
@@ -1585,7 +1636,7 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   while (rows.length < limit && offset < rawScanCap) {
     const batchLimit = Math.min(limit, rawScanCap - offset);
     const indexRes = await routeToShard(env, indexShardId, "/execute", {
-      sql: "SELECT partition_key, source_shard_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ? OFFSET ?",
+      sql: "SELECT partition_key, tenant_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ? OFFSET ?",
       params: [body.table, body.indexName, indexKeyJson, batchLimit, offset],
       requestId: `index-query-lookup-${crypto.randomUUID()}`,
       isMutation: false,
@@ -1593,7 +1644,7 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     if (!indexRes.ok) {
       return new Response(indexRes.body, { status: indexRes.status, headers: indexRes.headers });
     }
-    const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; source_shard_id: string }> };
+    const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; tenant_id: string }> };
     const matches = indexBody.rows ?? [];
     if (matches.length === 0) break; // index exhausted
 
@@ -1604,9 +1655,30 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     // ORDER BY partition_key ASC from the query above), so the sequential
     // push-until-limit loop below still yields a stable, deterministic
     // result across repeated calls.
+    //
+    // Milestone 3, Chunk 2: re-routes to the base row's CURRENT shard at
+    // read time via the entry's recorded tenant_id (vbucket = hashKey
+    // (tenant_id:table:partition_key) % total_vbuckets -> vbucket_map ->
+    // shard, computed by CatalogDO's existing /route) — rather than
+    // following the entry's static source_shard_id snapshot, which goes
+    // stale the instant the base row migrates to a different shard. A
+    // /route failure (including an auth mismatch, if tenant_id somehow
+    // diverges from the querying tenant) is treated the same as an
+    // unreachable shard: skip this match rather than fail the whole query.
     const hydrated = await Promise.all(
       matches.map(async (match): Promise<Record<string, unknown> | null> => {
-        const rowRes = await routeToShard(env, match.source_shard_id, "/execute", {
+        const rowCatalogShardId = catalogShardIdForTenant(env, match.tenant_id);
+        const rerouteRes = await routeToCatalog(
+          env,
+          rowCatalogShardId,
+          "/route",
+          { table: body.table, tenantId: match.tenant_id, partitionKey: match.partition_key },
+          request.headers.get("authorization") ?? undefined,
+        );
+        if (!rerouteRes.ok) return null; // couldn't resolve the base row's current shard — skip
+        const rerouteBody = (await rerouteRes.json()) as { shardId: string };
+
+        const rowRes = await routeToShard(env, rerouteBody.shardId, "/execute", {
           sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
           params: [match.partition_key],
           requestId: `index-query-hydrate-${crypto.randomUUID()}`,
