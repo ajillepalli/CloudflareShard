@@ -1004,7 +1004,7 @@ async function handleAdminShardStats(request: Request, env: Env): Promise<Respon
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
-async function handleV1Sql(request: Request, env: Env): Promise<Response> {
+async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = (await request.json()) as SqlRequest;
   if (!body.sql || !body.table || !body.tenantId) {
     return json({ error: "Missing required fields: sql, table, tenantId." }, 400);
@@ -1058,6 +1058,8 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
     metadataVersion: number;
     catalogShardCount: number | null;
     indexNames?: string[];
+    migrationStatus?: string;
+    targetShardId?: string;
   };
 
   const currentCount = catalogShardCount(env);
@@ -1111,6 +1113,15 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
     return new Response(shardRes.body, { status: shardRes.status, headers: shardRes.headers });
   }
 
+  // Milestone 3, Chunk 3: this vbucket is mid-migration — mirror the
+  // now-applied write to the target with the same requestId, after source
+  // success, never blocking or failing the client's response.
+  if (mutating && route.targetShardId && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover")) {
+    ctx.waitUntil(
+      mirrorWriteBestEffort(env, route.shardId, route.targetShardId, body.sql, body.params ?? [], requestId, route.vbucket),
+    );
+  }
+
   const shardPayload = await shardRes.json();
   return json({
     route: { ...route, catalogShardId },
@@ -1148,6 +1159,57 @@ function requireIndexedColumnsForInsert(
     message: `insert/upsert on an indexed table must explicitly supply every indexed column: missing ${missing.join(", ")}.`,
     fix: "Provide a value for every indexed column — relying on a SQL DEFAULT for an indexed column isn't supported, since the index entry is computed from the values you supply, not read back from the stored row.",
   };
+}
+
+/** Milestone 3, Chunk 3: mirrors an already-applied source write to the
+ * migration target, best-effort — the client's write already succeeded on
+ * the source (authoritative), so a mirror failure must never surface to the
+ * client; it enqueues on the SOURCE shard's __cf_mirror_pending for
+ * alarm-driven retry instead (the target may be the unreachable one).
+ * Reuses the ORIGINAL requestId: the target's applied_requests dedupe makes
+ * mirror + backfill + retry all safely re-appliable in any order. The
+ * mirrored payload deliberately omits routing context (tenantId/table/
+ * partitionKey/vbucket): the target must not enforce row locks or the
+ * Chunk 4 fence against mirrored traffic (the source already enforced
+ * both), and the target's own provenance for this row comes from Chunk 4's
+ * /migrate-import, not from this mirror. Never throws — runs inside
+ * ctx.waitUntil(). */
+async function mirrorWriteBestEffort(
+  env: Env,
+  sourceShardId: string,
+  targetShardId: string,
+  sql: string,
+  params: unknown[],
+  requestId: string,
+  vbucket: number,
+): Promise<void> {
+  try {
+    const res = await routeToShard(env, targetShardId, "/execute", { sql, params, requestId, isMutation: true });
+    if (res.ok) return;
+    throw new Error(`target shard responded ${res.status}`);
+  } catch (error) {
+    log("worker.mirror_write_failed_enqueuing_retry", {
+      sourceShardId,
+      targetShardId,
+      requestId,
+      vbucket,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    try {
+      await routeToShard(env, sourceShardId, "/enqueue-mirror-job", { targetShardId, sql, params, requestId, vbucket });
+    } catch (enqueueError) {
+      // Source shard itself unreachable for the enqueue — logged, not
+      // swallowed silently. Chunk 4's cutover checksum (step 3) is the
+      // backstop that catches a mirror lost this way before any flip.
+      log("worker.mirror_job_enqueue_failed", {
+        sourceShardId,
+        targetShardId,
+        requestId,
+        vbucket,
+        message: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+      });
+    }
+  }
 }
 
 /** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
@@ -1345,6 +1407,8 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
     catalogShardCount: number | null;
     partitionKeyColumn: string | null;
     indexes?: IndexDefinition[];
+    migrationStatus?: string;
+    targetShardId?: string;
   };
 
   const currentCount = catalogShardCount(env);
@@ -1415,6 +1479,13 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
   const shardPayload = (await shardRes.json()) as { rowsAffected?: number };
   const rowsAffected = shardPayload.rowsAffected ?? 0;
 
+  // Milestone 3, Chunk 3: this vbucket is mid-migration — mirror the
+  // now-applied compiled statement to the target with the same requestId,
+  // after source success, never blocking or failing the client's response.
+  if (route.targetShardId && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover")) {
+    ctx.waitUntil(mirrorWriteBestEffort(env, route.shardId, route.targetShardId, sql, params, requestId, route.vbucket));
+  }
+
   // Eng-review fix: only maintain the index if the mutation actually
   // changed a row. A StructuredMutation's optional `where` can narrow
   // update/delete beyond the partitionKey (compileMutation ANDs it in), but
@@ -1481,33 +1552,27 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     );
   }
 
-  const compiledByShardId = new Map<
-    string,
-    Array<{
-      sql: string;
-      params: unknown[];
-      tenantId: string;
-      table: string;
-      partitionKey: string;
-      vbucket?: number;
-      op?: "insert" | "update" | "delete" | "upsert";
-    }>
-  >();
+  type TxIntent = {
+    sql: string;
+    params: unknown[];
+    tenantId: string;
+    table: string;
+    partitionKey: string;
+    vbucket?: number;
+    op?: "insert" | "update" | "delete" | "upsert";
+    /** Milestone 3, Chunk 3: set when this intent's vbucket is mid-migration
+     * — CoordinatorDO mirrors the committed intent to this target shard
+     * post-commit (enqueuing on the source's __cf_mirror_pending on
+     * failure). Never set on a synthetic __cf_indexes intent: index entries
+     * are placed by pinned ring, not vbucket_map, so they never migrate via
+     * this machinery. */
+    mirrorTargetShardId?: string;
+  };
+  const compiledByShardId = new Map<string, TxIntent[]>();
   const currentCount = catalogShardCount(env);
   const authorization = request.headers.get("authorization") ?? undefined;
 
-  function addIntent(
-    shardId: string,
-    intent: {
-      sql: string;
-      params: unknown[];
-      tenantId: string;
-      table: string;
-      partitionKey: string;
-      vbucket?: number;
-      op?: "insert" | "update" | "delete" | "upsert";
-    },
-  ): void {
+  function addIntent(shardId: string, intent: TxIntent): void {
     const existing = compiledByShardId.get(shardId);
     if (existing) {
       existing.push(intent);
@@ -1552,6 +1617,8 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
       catalogShardCount: number | null;
       partitionKeyColumn: string | null;
       indexes?: IndexDefinition[];
+      migrationStatus?: string;
+      targetShardId?: string;
     };
     if (route.catalogShardCount !== null && route.catalogShardCount !== currentCount) {
       return json(
@@ -1620,6 +1687,8 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     const beforeRow: Record<string, unknown> | null = matched ? rawRow : null;
 
     const { sql, params } = compileMutation(mutation, partitionKeyColumn);
+    const migrating =
+      route.targetShardId !== undefined && (route.migrationStatus === "backfilling" || route.migrationStatus === "cutover");
     addIntent(route.shardId, {
       sql,
       params,
@@ -1628,6 +1697,7 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
       partitionKey: mutation.partitionKey,
       vbucket: route.vbucket,
       op: mutation.op,
+      ...(migrating ? { mirrorTargetShardId: route.targetShardId } : {}),
     });
 
     if (indexes.length > 0) {

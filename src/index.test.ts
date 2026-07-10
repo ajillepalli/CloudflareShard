@@ -2096,6 +2096,232 @@ describe("Worker /admin/backfill-provenance and /admin/set-row-owner (Milestone 
   });
 });
 
+/** Runs a SQL statement against one shard directly via its /execute route. */
+async function shardExecute(shardId: string, sql: string, params: unknown[] = []): Promise<{ status: number; rows: Array<Record<string, unknown>> }> {
+  const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+  const res = await shardStub.fetch(
+    new Request("https://shard.internal/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sql, params, requestId: `test-exec-${crypto.randomUUID()}`, isMutation: undefined }),
+    }),
+  );
+  const body = (await res.json()) as { rows?: Array<Record<string, unknown>> };
+  return { status: res.status, rows: body.rows ?? [] };
+}
+
+/** Polls a shard-side SELECT until the predicate matches — mirror writes run
+ * in ctx.waitUntil() after the client response, so tests can't assert
+ * synchronously. */
+async function pollShardRows(
+  shardId: string,
+  sql: string,
+  params: unknown[],
+  predicate: (rows: Array<Record<string, unknown>>) => boolean,
+): Promise<Array<Record<string, unknown>>> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const { rows } = await shardExecute(shardId, sql, params);
+    if (predicate(rows)) return rows;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`pollShardRows timed out on shard ${shardId}: ${sql}`);
+}
+
+/** Marks a vbucket as migrating directly on catalog-0's vbucket_map — the
+ * state Chunk 4's /admin/migrate-vbucket sets through orchestration. */
+async function setMigrationState(vbucket: number, status: string, targetShardId: string | null): Promise<void> {
+  const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    state.storage.sql.exec(
+      "UPDATE vbucket_map SET migration_status = ?, target_shard_id = ? WHERE vbucket = ?",
+      status,
+      targetShardId,
+      vbucket,
+    );
+  });
+}
+
+describe("Worker dual-write mirroring during migration (Milestone 3, Chunk 3)", () => {
+  it("a /v1/mutate write to a backfilling vbucket lands on both source and target with the same requestId, and the client write is authoritative on source", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m3_mirror_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const vbucket = hashKey(`${tenantId}:m3_mirror_evt:row-m1`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    await setMigrationState(vbucket, "backfilling", targetShardId);
+    try {
+      const requestId = `mirror-req-${crypto.randomUUID()}`;
+      const res = await post(
+        "/v1/mutate",
+        { op: "insert", table: "m3_mirror_evt", tenantId, partitionKey: "row-m1", values: { v: "alpha" }, requestId },
+        token,
+      );
+      expect(res.status).toBe(200);
+
+      // Authoritative copy is on the source, synchronously.
+      const sourceRows = (await shardExecute(sourceShardId, "SELECT v FROM m3_mirror_evt WHERE id = ?", ["row-m1"])).rows;
+      expect(sourceRows).toHaveLength(1);
+
+      // Mirror lands on the target (async, via ctx.waitUntil).
+      await pollShardRows(targetShardId, "SELECT v FROM m3_mirror_evt WHERE id = ?", ["row-m1"], (r) => r.length === 1);
+
+      // Same requestId on the target: replaying it dedupes.
+      const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+      const replay = await targetStub.fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: `INSERT INTO "m3_mirror_evt" ("v", "id") VALUES (?, ?)`,
+            params: ["alpha", "row-m1"],
+            requestId,
+            isMutation: true,
+          }),
+        }),
+      );
+      const replayBody = (await replay.json()) as { duplicated?: boolean };
+      expect(replayBody.duplicated).toBe(true);
+    } finally {
+      await setMigrationState(vbucket, "none", null);
+    }
+  });
+
+  it("criterion 9 shape: a failed mirror write never fails the client write; it lands in __cf_mirror_pending on the source and drains via alarm retry once the target recovers", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m3_mirrfail_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const vbucket = hashKey(`${tenantId}:m3_mirrfail_evt:row-mf`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    // "Kill" the target for this table: drop it there, so the mirrored
+    // INSERT fails on every attempt until the table is restored.
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await targetStub.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sql: 'DROP TABLE IF EXISTS "m3_mirrfail_evt"', requestId: `drop-${crypto.randomUUID()}`, isMutation: true }),
+      }),
+    );
+
+    await setMigrationState(vbucket, "backfilling", targetShardId);
+    try {
+      const res = await post(
+        "/v1/mutate",
+        { op: "insert", table: "m3_mirrfail_evt", tenantId, partitionKey: "row-mf", values: { v: "beta" } },
+        token,
+      );
+      // The client write succeeded despite the doomed mirror.
+      expect(res.status).toBe(200);
+
+      // The failed mirror is durably queued on the SOURCE shard.
+      const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+      let queued = 0;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const countRes = await sourceStub.fetch(
+          new Request("https://shard.internal/mirror-pending-count", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ vbucket }),
+          }),
+        );
+        queued = ((await countRes.json()) as { count: number }).count;
+        if (queued === 1) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(queued).toBe(1);
+
+      // Target recovers (table restored); alarm drains the queue.
+      await targetStub.fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: "CREATE TABLE IF NOT EXISTS m3_mirrfail_evt (id TEXT PRIMARY KEY, v TEXT)",
+            requestId: `recreate-${crypto.randomUUID()}`,
+            isMutation: true,
+          }),
+        }),
+      );
+      await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+        // Force the job due now (its first retry is 1s out).
+        state.storage.sql.exec("UPDATE __cf_mirror_pending SET next_attempt_at = ?", new Date(Date.now() - 1).toISOString());
+        await instance.alarm();
+      });
+
+      const drained = await sourceStub.fetch(
+        new Request("https://shard.internal/mirror-pending-count", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ vbucket }),
+        }),
+      );
+      expect(((await drained.json()) as { count: number }).count).toBe(0);
+
+      const targetRows = (await shardExecute(targetShardId, "SELECT v FROM m3_mirrfail_evt WHERE id = ?", ["row-mf"])).rows;
+      expect(targetRows).toHaveLength(1);
+      expect(targetRows[0].v).toBe("beta");
+    } finally {
+      await setMigrationState(vbucket, "none", null);
+    }
+  });
+
+  it("a /v1/tx commit whose vbucket is migrating mirrors the committed intent to the target post-commit (tx-during-migration)", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m3_txmirror_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const vbucket = hashKey(`${tenantId}:m3_txmirror_evt:row-tx1`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    await setMigrationState(vbucket, "backfilling", targetShardId);
+    try {
+      const txRes = await post(
+        "/v1/tx",
+        {
+          mutations: [{ op: "insert", table: "m3_txmirror_evt", tenantId, partitionKey: "row-tx1", values: { v: "gamma" } }],
+          requestId: `tx-mirror-${crypto.randomUUID()}`,
+        },
+        token,
+      );
+      expect(txRes.status).toBe(200);
+
+      // Coordinator mirrors post-commit, awaited inside /begin — the target
+      // copy should be there as soon as /v1/tx returns.
+      const targetRows = (await shardExecute(targetShardId, "SELECT v FROM m3_txmirror_evt WHERE id = ?", ["row-tx1"])).rows;
+      expect(targetRows).toHaveLength(1);
+      expect(targetRows[0].v).toBe("gamma");
+
+      // Source stayed authoritative and has it too.
+      const sourceRows = (await shardExecute(sourceShardId, "SELECT v FROM m3_txmirror_evt WHERE id = ?", ["row-tx1"])).rows;
+      expect(sourceRows).toHaveLength(1);
+    } finally {
+      await setMigrationState(vbucket, "none", null);
+    }
+  });
+});
+
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);

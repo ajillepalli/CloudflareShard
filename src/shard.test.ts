@@ -695,6 +695,124 @@ describe("ShardDO 2PC: TTL sweep queries the coordinator, never unilaterally abo
 
 });
 
+describe("ShardDO __cf_mirror_pending dual-write retry queue (Milestone 3, Chunk 3)", () => {
+  it("a job enqueued via /enqueue-mirror-job is retried against the target and cleared by alarm(), applying the write there under the original requestId", async () => {
+    const sourceStub = await freshShard();
+    const targetShardName = `mirror-target-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardName));
+
+    // Target needs the table to exist for the mirrored INSERT to apply.
+    await targetStub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+
+    const enqueueRes = await sourceStub.fetch(
+      post("/enqueue-mirror-job", {
+        targetShardId: targetShardName,
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["mirrored-row", "x"],
+        requestId: "req-mirror-original",
+        vbucket: 7,
+      }),
+    );
+    expect(enqueueRes.status).toBe(200);
+
+    const countBefore = await (await sourceStub.fetch(post("/mirror-pending-count", { vbucket: 7 }))).json();
+    expect((countBefore as { count: number }).count).toBe(1);
+
+    await runInDurableObject(sourceStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    const countAfter = await (await sourceStub.fetch(post("/mirror-pending-count", { vbucket: 7 }))).json();
+    expect((countAfter as { count: number }).count).toBe(0);
+
+    const checkRes = await targetStub.fetch(
+      post("/execute", { sql: "SELECT v FROM t WHERE id = ?", params: ["mirrored-row"], requestId: "req-mirror-check", isMutation: false }),
+    );
+    const checkBody = (await checkRes.json()) as { rows: Array<{ v: string }> };
+    expect(checkBody.rows).toHaveLength(1);
+
+    // The write landed under the ORIGINAL requestId: replaying it on the
+    // target dedupes rather than re-executing (the idempotency contract
+    // that makes mirror + backfill + retry safely re-appliable).
+    const replay = await targetStub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["mirrored-row", "x"], requestId: "req-mirror-original", isMutation: true }),
+    );
+    const replayBody = (await replay.json()) as { duplicated: boolean };
+    expect(replayBody.duplicated).toBe(true);
+  });
+
+  it("a mirror job whose target keeps failing stays queued with attempt_count incremented and exponential backoff from 1s, never dropped", async () => {
+    const sourceStub = await freshShard();
+    // Target shard exists but the table doesn't — the mirrored INSERT will
+    // fail with a SQL error (400) on every attempt.
+    const targetShardName = `mirror-failing-${crypto.randomUUID()}`;
+
+    await sourceStub.fetch(
+      post("/enqueue-mirror-job", {
+        targetShardId: targetShardName,
+        sql: "INSERT INTO missing_table (id) VALUES (?)",
+        params: ["never-lands"],
+        requestId: "req-mirror-fail",
+        vbucket: 3,
+      }),
+    );
+
+    await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+      await instance.alarm();
+      const jobs = Array.from(
+        state.storage.sql.exec("SELECT attempt_count, next_attempt_at FROM __cf_mirror_pending WHERE request_id = ?", "req-mirror-fail"),
+      ) as Array<{ attempt_count: number; next_attempt_at: string }>;
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].attempt_count).toBe(1);
+      // First retry delay = MIRROR_JOB_BASE_DELAY_MS * 2^0 = 1s.
+      const delayMs = new Date(jobs[0].next_attempt_at).getTime() - Date.now();
+      expect(delayMs).toBeGreaterThan(0);
+      expect(delayMs).toBeLessThanOrEqual(1000 + 250);
+
+      // Force it due again and re-run: attempt 2, delay doubles to 2s.
+      state.storage.sql.exec(
+        "UPDATE __cf_mirror_pending SET next_attempt_at = ? WHERE request_id = ?",
+        new Date(Date.now() - 1).toISOString(),
+        "req-mirror-fail",
+      );
+      await instance.alarm();
+      const jobs2 = Array.from(
+        state.storage.sql.exec("SELECT attempt_count, next_attempt_at FROM __cf_mirror_pending WHERE request_id = ?", "req-mirror-fail"),
+      ) as Array<{ attempt_count: number; next_attempt_at: string }>;
+      expect(jobs2).toHaveLength(1);
+      expect(jobs2[0].attempt_count).toBe(2);
+      const delay2Ms = new Date(jobs2[0].next_attempt_at).getTime() - Date.now();
+      expect(delay2Ms).toBeGreaterThan(1000);
+      expect(delay2Ms).toBeLessThanOrEqual(2000 + 250);
+    });
+  });
+
+  it("/enqueue-mirror-job requires targetShardId, sql, requestId, and vbucket", async () => {
+    const stub = await freshShard();
+    const res = await stub.fetch(post("/enqueue-mirror-job", { targetShardId: "t", sql: "SELECT 1", requestId: "r" }));
+    expect(res.status).toBe(400);
+  });
+
+  it("/mirror-pending-count scopes by vbucket so one vbucket's mirror debt doesn't block another's cutover", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/enqueue-mirror-job", { targetShardId: "t1", sql: "SELECT 1", params: [], requestId: "r1", vbucket: 1 }),
+    );
+    await stub.fetch(
+      post("/enqueue-mirror-job", { targetShardId: "t1", sql: "SELECT 1", params: [], requestId: "r2", vbucket: 2 }),
+    );
+
+    const forV1 = (await (await stub.fetch(post("/mirror-pending-count", { vbucket: 1 }))).json()) as { count: number };
+    const forV2 = (await (await stub.fetch(post("/mirror-pending-count", { vbucket: 2 }))).json()) as { count: number };
+    const total = (await (await stub.fetch(post("/mirror-pending-count", {}))).json()) as { count: number };
+    expect(forV1.count).toBe(1);
+    expect(forV2.count).toBe(1);
+    expect(total.count).toBe(2);
+  });
+});
+
 describe("ShardDO row provenance (Milestone 3, Chunk 0)", () => {
   async function createTable(stub: Awaited<ReturnType<typeof freshShard>>) {
     await stub.fetch(

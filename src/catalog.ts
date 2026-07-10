@@ -97,6 +97,21 @@ export class CatalogDO extends DurableObject {
         updated_at TEXT NOT NULL
       )
     `);
+    // Milestone 3, Chunk 3: per-vbucket migration state machine
+    // (none|backfilling|cutover) plus the migration's target shard. While
+    // status != 'none', /route returns {targetShardId, migrationStatus}
+    // alongside the authoritative source shardId, and the gateway mirrors
+    // every write to the target after source success (same requestId — the
+    // target's applied_requests dedupe makes mirror + backfill + retry all
+    // safely re-appliable in any order). Reads stay on source until Chunk
+    // 4's cutover flips shard_id.
+    this.ensureColumn("vbucket_map", "migration_status", "TEXT NOT NULL DEFAULT 'none'");
+    this.ensureColumn("vbucket_map", "target_shard_id", "TEXT");
+    // Chunk 4's status endpoint reports rowsCopied/startedAt; kept on the
+    // same row rather than a separate migrations table — one migration per
+    // vbucket at a time is an invariant (409 MIGRATION_IN_PROGRESS).
+    this.ensureColumn("vbucket_map", "migration_rows_copied", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("vbucket_map", "migration_started_at", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS table_rules (
@@ -793,13 +808,17 @@ export class CatalogDO extends DurableObject {
       partition_key_column: string | null;
       shard_id: string;
       status: string;
+      migration_status: string;
+      target_shard_id: string | null;
     }>(
       `
       SELECT
         (SELECT table_name FROM table_rules WHERE table_name = ?) AS table_registered,
         (SELECT partition_key_column FROM table_rules WHERE table_name = ?) AS partition_key_column,
         vm.shard_id AS shard_id,
-        s.status AS status
+        s.status AS status,
+        vm.migration_status AS migration_status,
+        vm.target_shard_id AS target_shard_id
       FROM vbucket_map vm
       JOIN shards s ON s.shard_id = vm.shard_id
       WHERE vm.vbucket = ?
@@ -848,6 +867,14 @@ export class CatalogDO extends DurableObject {
       partitionKeyColumn: mapped.partition_key_column,
       indexNames: indexes.map((i) => i.indexName),
       indexes,
+      // Milestone 3, Chunk 3: while this vbucket is migrating, the gateway
+      // applies every write to the source (shardId above — still
+      // authoritative) and then mirrors it to targetShardId with the same
+      // requestId. 'none' status omits both fields, keeping the pre-M3
+      // response shape byte-identical for non-migrating vbuckets.
+      ...(mapped.migration_status !== "none" && mapped.target_shard_id
+        ? { migrationStatus: mapped.migration_status, targetShardId: mapped.target_shard_id }
+        : {}),
     });
   }
 
