@@ -20,6 +20,8 @@ const ADMIN_GATED_ROUTES = new Set([
   "/list-indexes",
   "/drop-index",
   "/mark-index-ready",
+  "/list-tenants",
+  "/vbucket-map",
 ]);
 
 export class CatalogDO extends DurableObject {
@@ -52,6 +54,8 @@ export class CatalogDO extends DurableObject {
       "/lookup-index": this.handleLookupIndex.bind(this),
       "/drop-index": this.handleDropIndex.bind(this),
       "/mark-index-ready": this.handleMarkIndexReady.bind(this),
+      "/list-tenants": this.handleListTenants.bind(this),
+      "/vbucket-map": this.handleVbucketMap.bind(this),
     };
   }
 
@@ -852,6 +856,31 @@ export class CatalogDO extends DurableObject {
       "SELECT shard_id FROM shards WHERE status = 'active' ORDER BY shard_id ASC",
     );
     return json({ shardIds: shards.map((s) => s.shard_id) });
+  }
+
+  /** Milestone 3, Chunk 1: candidate tenant identities for this catalog
+   * shard's row-provenance re-attribution — /admin/backfill-provenance tries
+   * every one of these against every unattributed row's hash to find which
+   * tenant(s) could have written it. Returns tenantId only, never
+   * token_hash — this route exists purely to enumerate identities, not to
+   * authenticate anything. */
+  private async handleListTenants(): Promise<Response> {
+    const tenants = this.many<{ tenant_id: string }>("SELECT tenant_id FROM tenant_auth ORDER BY tenant_id ASC");
+    return json({ tenantIds: tenants.map((t) => t.tenant_id) });
+  }
+
+  /** Milestone 3, Chunk 1: the full vbucket -> shard_id map for this catalog
+   * shard, plus total_vbuckets — /admin/backfill-provenance and
+   * /admin/set-row-owner fetch this once per catalog shard (rather than one
+   * round trip per candidate tenant per row) to test "does this candidate
+   * tenant's hash land on this specific shard" locally. */
+  private async handleVbucketMap(): Promise<Response> {
+    const config = this.one<{ total_vbuckets: number }>("SELECT total_vbuckets FROM cluster_config WHERE singleton = 1");
+    if (!config) {
+      return json({ error: "Cluster not initialized. Call /admin/init first." }, 400);
+    }
+    const rows = this.many<{ vbucket: number; shard_id: string }>("SELECT vbucket, shard_id FROM vbucket_map ORDER BY vbucket ASC");
+    return json({ totalVBuckets: config.total_vbuckets, map: rows.map((r) => ({ vbucket: r.vbucket, shardId: r.shard_id })) });
   }
 
   private async handleStatus(): Promise<Response> {
