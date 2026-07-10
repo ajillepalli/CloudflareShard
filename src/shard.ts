@@ -68,7 +68,14 @@ const INTERNAL_TABLES = new Set([
   "index_pending_jobs",
   "__cf_row_owners",
   "__cf_mirror_pending",
+  "__cf_fenced_vbuckets",
 ]);
+
+// Milestone 3, Chunk 4: page size shared by /migrate-export and
+// /migrate-checksum — the spec's checksum definition is "streamed in the
+// same 500-row pages", so both sides paging identically is part of the
+// contract, not a tunable.
+const MIGRATE_PAGE_SIZE = 500;
 
 /** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
  * to force a rollback — distinguishes "validation succeeded, roll back on
@@ -79,6 +86,12 @@ export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly shardEnv: Cloudflare.Env;
   private readonly routes: Record<string, (request: Request) => Promise<Response>>;
+  /** ensureSchema() is idempotent but not free (a dozen-plus DDL/PRAGMA
+   * statements) — running it once per in-memory instance instead of once
+   * per request is safe because the schema lives in durable storage: a
+   * fresh instance (new isolate) re-runs it on its first request, and
+   * nothing ever drops these tables mid-lifetime. */
+  private schemaEnsured = false;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -96,6 +109,16 @@ export class ShardDO extends DurableObject {
       "/enqueue-index-job": this.handleEnqueueIndexJob.bind(this),
       "/enqueue-mirror-job": this.handleEnqueueMirrorJob.bind(this),
       "/mirror-pending-count": this.handleMirrorPendingCount.bind(this),
+      "/migrate-export": this.handleMigrateExport.bind(this),
+      "/migrate-import": this.handleMigrateImport.bind(this),
+      "/migrate-checksum": this.handleMigrateChecksum.bind(this),
+      "/migrate-checksums": this.handleMigrateChecksums.bind(this),
+      "/vbucket-tables": this.handleVbucketTables.bind(this),
+      "/fence-vbucket": this.handleFenceVbucket.bind(this),
+      "/unfence-vbucket": this.handleUnfenceVbucket.bind(this),
+      "/delete-vbucket-rows": this.handleDeleteVbucketRows.bind(this),
+      "/unattributed-count": this.handleUnattributedCount.bind(this),
+      "/purge-mirror-jobs": this.handlePurgeMirrorJobs.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -322,6 +345,325 @@ export class ShardDO extends DurableObject {
     return json({ count: row?.n ?? 0 });
   }
 
+  /** Milestone 3, Chunk 4: canonical row JSON for export/checksum —
+   * JSON.stringify of the row object with keys sorted lexicographically.
+   * Both source and target run this identical code, which is what makes the
+   * per-table content checksums comparable across shards. */
+  private canonicalRowJson(row: Record<string, unknown>): string {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(row).sort()) {
+      sorted[key] = row[key];
+    }
+    return JSON.stringify(sorted);
+  }
+
+  private async sha256HexOf(input: string): Promise<string> {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  /** Milestone 3, Chunk 4 (internal, driven by CatalogDO's migration
+   * orchestration). One page of a migrating vbucket's rows for one table,
+   * selected via __cf_row_owners (the only place a row's vbucket identity
+   * exists), keyed after `afterPartitionKey` for stable cursor paging. */
+  private async handleMigrateExport(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      vbucket?: number;
+      table?: string;
+      partitionKeyColumn?: string;
+      afterPartitionKey?: string;
+      limit?: number;
+    };
+    if (body.vbucket === undefined || !body.table || !body.partitionKeyColumn) {
+      return json({ error: "Missing vbucket, table, or partitionKeyColumn" }, 400);
+    }
+    const limit = Math.min(MIGRATE_PAGE_SIZE, Math.max(1, body.limit ?? MIGRATE_PAGE_SIZE));
+    const safeTable = body.table.replace(/"/g, '""');
+    const safePk = body.partitionKeyColumn.replace(/"/g, '""');
+
+    let raw: Array<Record<string, unknown>> = [];
+    try {
+      raw = this.many<Record<string, unknown>>(
+        `
+        SELECT b.*, ro.partition_key AS __cf_export_pk, ro.tenant_id AS __cf_export_tenant
+        FROM __cf_row_owners ro
+        JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
+        WHERE ro.table_name = ? AND ro.vbucket = ? AND ro.partition_key > ?
+        ORDER BY ro.partition_key ASC
+        LIMIT ?
+        `,
+        body.table,
+        body.vbucket,
+        body.afterPartitionKey ?? "",
+        limit,
+      );
+    } catch (error) {
+      // The table isn't physically present on this shard (registered in
+      // table_rules but never created here) — nothing to export for it.
+      log("shard.migrate_export_table_missing", { table: body.table, message: error instanceof Error ? error.message : String(error) });
+      return json({ rows: [] });
+    }
+
+    const rows = raw.map((r) => {
+      const { __cf_export_pk, __cf_export_tenant, ...rest } = r;
+      return { partitionKey: String(__cf_export_pk), tenantId: String(__cf_export_tenant), row: rest };
+    });
+    return json({ rows });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): applies one exported batch — base rows
+   * via INSERT OR REPLACE (idempotent, so a re-pushed page is harmless) plus
+   * each row's provenance, in one transaction. */
+  private async handleMigrateImport(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      vbucket?: number;
+      table?: string;
+      rows?: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
+    };
+    if (body.vbucket === undefined || !body.table || !body.rows) {
+      return json({ error: "Missing vbucket, table, or rows" }, 400);
+    }
+    const table = body.table;
+    const vbucket = body.vbucket;
+    const rows = body.rows;
+    const safeTable = table.replace(/"/g, '""');
+    const now = new Date().toISOString();
+
+    try {
+      this.ctx.storage.transactionSync(() => {
+        for (const entry of rows) {
+          const columns = Object.keys(entry.row);
+          if (columns.length === 0) continue;
+          const columnSql = columns.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+          const placeholders = columns.map(() => "?").join(", ");
+          this.sql.exec(
+            `INSERT OR REPLACE INTO "${safeTable}" (${columnSql}) VALUES (${placeholders})`,
+            ...columns.map((c) => entry.row[c]),
+          );
+          this.sql.exec(
+            `
+            INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (table_name, partition_key) DO UPDATE SET tenant_id = excluded.tenant_id, vbucket = excluded.vbucket, updated_at = excluded.updated_at
+            `,
+            table,
+            entry.partitionKey,
+            entry.tenantId,
+            vbucket,
+            now,
+          );
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("shard.migrate_import_failed", { table, vbucket, message });
+      return json({ error: { code: "MIGRATE_IMPORT_FAILED", message: "Failed to apply the imported batch.", fix: "Ensure the table schema exists on the target shard, then retry." } }, 500);
+    }
+    return json({ ok: true, imported: rows.length });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): per-table content checksum for one
+   * vbucket's rows — sha256 over the concatenation of (partition_key,
+   * canonical row JSON) ordered by partition key, read in the same 500-row
+   * pages /migrate-export uses. Cutover's step-3 verify compares source and
+   * target digests per table before any flip. */
+  private async computeVbucketTableChecksum(
+    vbucket: number,
+    table: string,
+    partitionKeyColumn: string,
+  ): Promise<{ checksum: string; rowCount: number }> {
+    const safeTable = table.replace(/"/g, '""');
+    const safePk = partitionKeyColumn.replace(/"/g, '""');
+
+    const parts: string[] = [];
+    let rowCount = 0;
+    let afterPk = "";
+    for (;;) {
+      let page: Array<Record<string, unknown>> = [];
+      try {
+        page = this.many<Record<string, unknown>>(
+          `
+          SELECT b.*, ro.partition_key AS __cf_export_pk
+          FROM __cf_row_owners ro
+          JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
+          WHERE ro.table_name = ? AND ro.vbucket = ? AND ro.partition_key > ?
+          ORDER BY ro.partition_key ASC
+          LIMIT ?
+          `,
+          table,
+          vbucket,
+          afterPk,
+          MIGRATE_PAGE_SIZE,
+        );
+      } catch {
+        // Table not physically present on this shard — checksum of an empty
+        // row set, identical on any other shard where it's also absent.
+        break;
+      }
+      if (page.length === 0) break;
+      for (const r of page) {
+        const { __cf_export_pk, ...rest } = r;
+        parts.push(`${String(__cf_export_pk)}${this.canonicalRowJson(rest)}`);
+        rowCount += 1;
+      }
+      afterPk = String(page[page.length - 1].__cf_export_pk);
+      if (page.length < MIGRATE_PAGE_SIZE) break;
+    }
+
+    const checksum = await this.sha256HexOf(parts.join(""));
+    return { checksum, rowCount };
+  }
+
+  private async handleMigrateChecksum(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number; table?: string; partitionKeyColumn?: string };
+    if (body.vbucket === undefined || !body.table || !body.partitionKeyColumn) {
+      return json({ error: "Missing vbucket, table, or partitionKeyColumn" }, 400);
+    }
+    return json(await this.computeVbucketTableChecksum(body.vbucket, body.table, body.partitionKeyColumn));
+  }
+
+  /** Batched variant of /migrate-checksum: one round trip computes every
+   * registered table's per-table checksum for the vbucket — the cutover
+   * verify still compares each registered table individually (the spec's
+   * step-3 rule), it just doesn't pay a DO subrequest per table to do it. */
+  private async handleMigrateChecksums(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number; tables?: Array<{ table: string; partitionKeyColumn: string }> };
+    if (body.vbucket === undefined || !body.tables) {
+      return json({ error: "Missing vbucket or tables" }, 400);
+    }
+    const checksums: Record<string, { checksum: string; rowCount: number }> = {};
+    for (const t of body.tables) {
+      checksums[t.table] = await this.computeVbucketTableChecksum(body.vbucket, t.table, t.partitionKeyColumn);
+    }
+    return json({ checksums });
+  }
+
+  /** Which tables actually own rows of this vbucket on this shard —
+   * backfill only needs to export those; every other registered table has
+   * nothing to page through here. */
+  private async handleVbucketTables(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    const rows = this.many<{ table_name: string }>(
+      "SELECT DISTINCT table_name FROM __cf_row_owners WHERE vbucket = ? ORDER BY table_name ASC",
+      body.vbucket,
+    );
+    return json({ tables: rows.map((r) => r.table_name) });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): cutover step 1 — from this instant,
+   * any NEW data write whose payload vbucket matches is rejected 409
+   * VBUCKET_FENCED. Idempotent (INSERT OR REPLACE) so the catalog can
+   * re-assert the fence on every cutover tick. */
+  private async handleFenceVbucket(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    this.sql.exec(
+      "INSERT OR REPLACE INTO __cf_fenced_vbuckets (vbucket, fenced_at) VALUES (?, ?)",
+      body.vbucket,
+      new Date().toISOString(),
+    );
+    return json({ ok: true, vbucket: body.vbucket });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): lifts the cutover fence — step 5 after
+   * a successful flip, or any abort path. Idempotent. */
+  private async handleUnfenceVbucket(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    this.sql.exec("DELETE FROM __cf_fenced_vbuckets WHERE vbucket = ?", body.vbucket);
+    return json({ ok: true, vbucket: body.vbucket });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): removes one vbucket's base rows and
+   * provenance from this shard — cutover step 5 on the source after a
+   * successful flip, or the target wipe on abort/checksum mismatch. Also
+   * clears any queued mirror jobs for the vbucket (an aborted migration's
+   * unsent mirrors must not fire later against a target that was wiped). */
+  private async handleDeleteVbucketRows(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number; tables?: Array<{ table: string; partitionKeyColumn: string }> };
+    if (body.vbucket === undefined || !body.tables) {
+      return json({ error: "Missing vbucket or tables" }, 400);
+    }
+    const vbucket = body.vbucket;
+    const tables = body.tables;
+    this.ctx.storage.transactionSync(() => {
+      for (const t of tables) {
+        const safeTable = t.table.replace(/"/g, '""');
+        const safePk = t.partitionKeyColumn.replace(/"/g, '""');
+        try {
+          this.sql.exec(
+            `DELETE FROM "${safeTable}" WHERE "${safePk}" IN (SELECT partition_key FROM __cf_row_owners WHERE table_name = ? AND vbucket = ?)`,
+            t.table,
+            vbucket,
+          );
+        } catch {
+          // Table not physically present here — nothing to delete.
+        }
+        this.sql.exec("DELETE FROM __cf_row_owners WHERE table_name = ? AND vbucket = ?", t.table, vbucket);
+      }
+      this.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = ?", vbucket);
+    });
+    return json({ ok: true, vbucket });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): drops every queued-but-unsent mirror
+   * job for one vbucket — called on the SOURCE whenever the migration's
+   * target is wiped (abort, or a cutover checksum mismatch). Without this,
+   * a stale queued mirror would later fire against the wiped ex-target and
+   * recreate rows there with no provenance (junk that would then trip that
+   * shard's own provenance gate). Any content a purged job carried is not
+   * lost: the source stayed authoritative, so the next backfill pass (or
+   * nothing, on a full abort) re-derives the target's state from it. */
+  private async handlePurgeMirrorJobs(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    this.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = ?", body.vbucket);
+    return json({ ok: true, vbucket: body.vbucket });
+  }
+
+  /** Milestone 3, Chunk 4 (internal): how many rows across the given
+   * registered tables have no __cf_row_owners entry on this shard — the
+   * migration provenance gate (409 VBUCKET_PROVENANCE_INCOMPLETE names this
+   * count). Shard-wide by necessity: an unattributed row's vbucket is
+   * exactly the thing that's unknown. */
+  private async handleUnattributedCount(request: Request): Promise<Response> {
+    const body = (await request.json()) as { tables?: Array<{ table: string; partitionKeyColumn: string }> };
+    if (!body.tables) {
+      return json({ error: "Missing tables" }, 400);
+    }
+    let total = 0;
+    for (const t of body.tables) {
+      const safeTable = t.table.replace(/"/g, '""');
+      const safePk = t.partitionKeyColumn.replace(/"/g, '""');
+      try {
+        const row = this.one<{ n: number }>(
+          `
+          SELECT COUNT(*) AS n FROM "${safeTable}" b
+          LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b."${safePk}"
+          WHERE ro.partition_key IS NULL
+          `,
+          t.table,
+        );
+        total += row?.n ?? 0;
+      } catch {
+        // Table not physically present on this shard — zero rows, attributed
+        // or otherwise.
+      }
+    }
+    return json({ count: total });
+  }
+
   /** A participant that voted "prepared" cannot independently decide to
    * abort — the coordinator may already have collected every participant's
    * vote and told some of them to commit, so an unprompted local abort here
@@ -409,6 +751,8 @@ export class ShardDO extends DurableObject {
   }
 
   private ensureSchema(): void {
+    if (this.schemaEnsured) return;
+    this.schemaEnsured = true;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS applied_requests (
         request_id TEXT PRIMARY KEY,
@@ -536,6 +880,18 @@ export class ShardDO extends DurableObject {
         next_attempt_at TEXT NOT NULL,
         attempt_count   INTEGER NOT NULL DEFAULT 0,
         created_at      TEXT NOT NULL
+      )
+    `);
+
+    // Milestone 3, Chunk 4: cutover write fence. A data write whose payload
+    // vbucket appears here is rejected 409 VBUCKET_FENCED (retryable) —
+    // enforced at the data (this shard-side check), not at routing, so a
+    // write that resolved its route BEFORE the fence and physically arrives
+    // AFTER it is still caught.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_fenced_vbuckets (
+        vbucket   INTEGER PRIMARY KEY,
+        fenced_at TEXT NOT NULL
       )
     `);
   }
@@ -680,6 +1036,32 @@ export class ShardDO extends DurableObject {
           return json({ duplicated: true, ...(JSON.parse(prior.result_json) as object) });
         }
 
+        // Milestone 3, Chunk 4: cutover write fence. Checked AFTER the
+        // dedupe lookup above — a replay of an already-applied write is
+        // harmless (returns the cached result) and must not be turned into
+        // a spurious 409 by the fence; the fence only blocks NEW writes.
+        // Only fires for a payload that carries its vbucket (i.e. routed
+        // gateway traffic) — a mirrored write deliberately omits vbucket so
+        // the target never fences traffic the source already vetted.
+        if (payload.vbucket !== undefined) {
+          const fenced = this.one<{ vbucket: number }>(
+            "SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = ?",
+            payload.vbucket,
+          );
+          if (fenced) {
+            return json(
+              {
+                error: {
+                  code: "VBUCKET_FENCED",
+                  message: `vbucket ${payload.vbucket} is fenced for migration cutover on this shard.`,
+                  fix: "Retry — the fence lifts when the migration's map flip completes, and the retry will route to the new shard.",
+                },
+              },
+              409,
+            );
+          }
+        }
+
         // Raw /v1/sql must respect row locks too — but this only closes the
         // hole for an honestly-labeled caller (see NOT in Scope: nothing
         // verifies the SQL text itself only touches this one row).
@@ -805,6 +1187,28 @@ export class ShardDO extends DurableObject {
     );
     if (existing.length > 0) {
       return json({ ok: true, prepared: existing.length });
+    }
+
+    // Milestone 3, Chunk 4: cutover write fence — a 2PC prepare is a NEW
+    // write (nothing is durably recorded for this txId yet, per the
+    // idempotency check above), so an intent targeting a fenced vbucket is
+    // rejected outright. The coordinator aborts the whole transaction and
+    // the client's retry re-routes post-flip.
+    for (const intent of intents) {
+      if (intent.vbucket === undefined) continue;
+      const fenced = this.one<{ vbucket: number }>("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = ?", intent.vbucket);
+      if (fenced) {
+        return json(
+          {
+            error: {
+              code: "VBUCKET_FENCED",
+              message: `vbucket ${intent.vbucket} is fenced for migration cutover on this shard.`,
+              fix: "Retry — the fence lifts when the migration's map flip completes, and the retry will route to the new shard.",
+            },
+          },
+          409,
+        );
+      }
     }
 
     const lockKeys = intents.map((intent) => rowKey(intent.tenantId, intent.table, intent.partitionKey));

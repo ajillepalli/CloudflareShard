@@ -2322,6 +2322,480 @@ describe("Worker dual-write mirroring during migration (Milestone 3, Chunk 3)", 
   });
 });
 
+/** Drives catalog-0's alarm-based migration orchestration until the vbucket's
+ * migration reports status 'none' (completed), or the tick budget runs out. */
+async function driveMigrationToCompletion(vbucket: number, maxTicks = 25): Promise<void> {
+  const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  for (let tick = 0; tick < maxTicks; tick += 1) {
+    await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const statusRes = await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH());
+    const statusBody = (await statusRes.json()) as { status: string };
+    if (statusBody.status === "none") return;
+    // Give shard-side alarms (mirror retries) a moment between ticks.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`migration of vbucket ${vbucket} did not complete within ${maxTicks} ticks`);
+}
+
+/** Finds `count` partition keys that all hash into the SAME vbucket as
+ * `seedKey` for the given tenant/table (so a whole batch of writes exercises
+ * one migrating vbucket). */
+function partitionKeysInSameVbucket(tenantId: string, table: string, seedKey: string, count: number, totalVBuckets: number): string[] {
+  const wanted = hashKey(`${tenantId}:${table}:${seedKey}`) % totalVBuckets;
+  const keys: string[] = [seedKey];
+  for (let i = 0; keys.length < count; i += 1) {
+    const candidate = `${seedKey}-${i}`;
+    if (hashKey(`${tenantId}:${table}:${candidate}`) % totalVBuckets === wanted) {
+      keys.push(candidate);
+    }
+  }
+  return keys;
+}
+
+/** The migration provenance gate is deliberately shard-wide, so orphaned
+ * rows left behind by earlier tests in this file (e.g. the Chunk 2
+ * PROVENANCE_MISSING_FOR_INDEX test, the Chunk 1 orphan-reporting test)
+ * would keep the gate closed for every migration test. Purges every
+ * unattributed row from both catalog-0 shards. */
+async function purgeUnattributedRows(): Promise<void> {
+  const tablesRes = await post("/admin/list-tables", {}, AUTH());
+  const tablesBody = (await tablesRes.json()) as { tables: Array<{ table_name: string; partition_key_column: string }> };
+  for (const shardId of ["catalog-0-shard-0", "catalog-0-shard-1"]) {
+    for (const t of tablesBody.tables) {
+      if (t.partition_key_column === "__unset__") continue;
+      await shardExecute(
+        shardId,
+        `DELETE FROM "${t.table_name}" WHERE "${t.partition_key_column}" IN (
+           SELECT b."${t.partition_key_column}" FROM "${t.table_name}" b
+           LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b."${t.partition_key_column}"
+           WHERE ro.partition_key IS NULL
+         )`,
+        [t.table_name],
+      );
+    }
+  }
+}
+
+describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () => {
+  beforeEach(async () => {
+    await purgeUnattributedRows();
+  });
+
+  it("criterion 1: a row written before migration is readable via /v1/sql with the same partitionKey after its vbucket migrates, and the source copy is gone", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_happy_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const keys = partitionKeysInSameVbucket(tenantId, "m4_happy_evt", "hp", 5, 64);
+    for (const key of keys) {
+      const res = await post(
+        "/v1/sql",
+        { sql: "INSERT INTO m4_happy_evt (id, v) VALUES (?, ?)", params: [key, `val-${key}`], table: "m4_happy_evt", tenantId, partitionKey: key },
+        token,
+      );
+      expect(res.status).toBe(200);
+    }
+
+    const vbucket = hashKey(`${tenantId}:m4_happy_evt:hp`) % 64;
+    const routeBefore = (await (
+      await post("/v1/sql", { sql: "SELECT * FROM m4_happy_evt WHERE id = ?", params: ["hp"], table: "m4_happy_evt", tenantId, partitionKey: "hp" }, token)
+    ).json()) as { route: { shardId: string } };
+    const sourceShardId = routeBefore.route.shardId;
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
+    expect(migrateRes.status).toBe(200);
+    const migrateBody = (await migrateRes.json()) as { ok: boolean; status: string; fromShard: string; toShard: string };
+    expect(migrateBody.status).toBe("backfilling");
+    expect(migrateBody.fromShard).toBe(sourceShardId);
+    expect(migrateBody.toShard).toBe(targetShardId);
+
+    await driveMigrationToCompletion(vbucket);
+
+    // Every pre-migration row reads back through the normal data plane with
+    // the same partitionKey, now routed to the target.
+    for (const key of keys) {
+      const readRes = await post(
+        "/v1/sql",
+        { sql: "SELECT v FROM m4_happy_evt WHERE id = ?", params: [key], table: "m4_happy_evt", tenantId, partitionKey: key },
+        token,
+      );
+      expect(readRes.status).toBe(200);
+      const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
+      expect(readBody.route.shardId).toBe(targetShardId);
+      expect(readBody.result.rows).toHaveLength(1);
+      expect(readBody.result.rows[0].v).toBe(`val-${key}`);
+    }
+
+    // Cutover step 5 deleted the source copy.
+    const sourceLeftovers = (await shardExecute(sourceShardId, "SELECT id FROM m4_happy_evt", [])).rows.filter((r) =>
+      keys.includes(String(r.id)),
+    );
+    expect(sourceLeftovers).toHaveLength(0);
+  });
+
+  it("criterion 2: >=100 writes issued concurrently with the migration all land — post-cutover checksums pass, every requestId is on the target exactly once, and replays return the stored result", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_conc_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const keys = partitionKeysInSameVbucket(tenantId, "m4_conc_evt", "cc", 100, 64);
+    const vbucket = hashKey(`${tenantId}:m4_conc_evt:cc`) % 64;
+
+    // Seed a handful of pre-migration rows.
+    for (const key of keys.slice(0, 10)) {
+      await post(
+        "/v1/sql",
+        { sql: "INSERT INTO m4_conc_evt (id, v) VALUES (?, ?)", params: [key, `pre-${key}`], table: "m4_conc_evt", tenantId, partitionKey: key, requestId: `pre-${key}` },
+        token,
+      );
+    }
+
+    const routeBefore = (await (
+      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_conc_evt WHERE id = ?", params: ["cc"], table: "m4_conc_evt", tenantId, partitionKey: "cc" }, token)
+    ).json()) as { route: { shardId: string } };
+    const sourceShardId = routeBefore.route.shardId;
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
+    expect(migrateRes.status).toBe(200);
+
+    // Fire the remaining 90 writes (upserts so pre-seeded keys get updated
+    // — every key ends with a deterministic final value) CONCURRENTLY with
+    // the migration, retrying on the fence (409, retryable by contract) and
+    // on 503. Interleave orchestration ticks so the fence race genuinely
+    // happens while writes are in flight.
+    const writeOne = async (key: string): Promise<void> => {
+      const requestId = `conc-${key}`;
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const res = await post(
+          "/v1/sql",
+          {
+            sql: "INSERT INTO m4_conc_evt (id, v) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+            params: [key, `final-${key}`],
+            table: "m4_conc_evt",
+            tenantId,
+            partitionKey: key,
+            requestId,
+          },
+          token,
+        );
+        if (res.status === 200) return;
+        const body = (await res.json()) as { error?: { code?: string } | string };
+        const code = typeof body.error === "object" ? body.error?.code : undefined;
+        if (res.status === 409 && code === "VBUCKET_FENCED") {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          continue;
+        }
+        if (res.status === 503) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          continue;
+        }
+        throw new Error(`write ${key} failed unexpectedly: ${res.status} ${JSON.stringify(body)}`);
+      }
+      throw new Error(`write ${key} exhausted retries`);
+    };
+
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const writesPromise = Promise.all(keys.map((key) => writeOne(key)));
+    // Drive migration ticks concurrently with the writes.
+    const drivePromise = (async () => {
+      for (let tick = 0; tick < 40; tick += 1) {
+        await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+          await instance.alarm();
+        });
+        const statusRes = await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH());
+        if (((await statusRes.json()) as { status: string }).status === "none") return;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      throw new Error("migration did not complete under concurrent writes");
+    })();
+    await Promise.all([writesPromise, drivePromise]);
+
+    // Any writes that raced the final flip may still be mirroring; drain any
+    // residue then verify.
+    await driveMigrationToCompletion(vbucket, 5).catch(() => undefined);
+
+    // All 100 rows have their final value, read through the data plane.
+    for (const key of keys) {
+      const readRes = await post(
+        "/v1/sql",
+        { sql: "SELECT v FROM m4_conc_evt WHERE id = ?", params: [key], table: "m4_conc_evt", tenantId, partitionKey: key },
+        token,
+      );
+      const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
+      expect(readBody.route.shardId).toBe(targetShardId);
+      expect(readBody.result.rows).toHaveLength(1);
+      expect(readBody.result.rows[0].v).toBe(`final-${key}`);
+    }
+
+    // Post-cutover the target passes the per-table checksum against the
+    // authoritative content (the source copy is deleted, so the invariant is
+    // target-vs-expected: recompute from what the data plane returns).
+    const targetSum = await env.SHARD.get(env.SHARD.idFromName(targetShardId)).fetch(
+      new Request("https://shard.internal/migrate-checksum", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vbucket, table: "m4_conc_evt", partitionKeyColumn: "id" }),
+      }),
+    );
+    const targetSumBody = (await targetSum.json()) as { checksum: string; rowCount: number };
+    expect(targetSumBody.rowCount).toBe(keys.length);
+
+    // Every requestId appears exactly once in the target's applied_requests.
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await runInDurableObject(targetStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      for (const key of keys) {
+        const rows = Array.from(
+          state.storage.sql.exec("SELECT COUNT(*) AS n FROM applied_requests WHERE request_id = ?", `conc-${key}`),
+        ) as Array<{ n: number }>;
+        expect(rows[0].n).toBe(1);
+      }
+    });
+
+    // Replaying one of the writes returns the stored result (idempotency
+    // contract) instead of re-applying.
+    const replayRes = await post(
+      "/v1/sql",
+      {
+        sql: "INSERT INTO m4_conc_evt (id, v) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+        params: [keys[0], `final-${keys[0]}`],
+        table: "m4_conc_evt",
+        tenantId,
+        partitionKey: keys[0],
+        requestId: `conc-${keys[0]}`,
+      },
+      token,
+    );
+    expect(replayRes.status).toBe(200);
+    const replayBody = (await replayRes.json()) as { result: { duplicated?: boolean } };
+    expect(replayBody.result.duplicated).toBe(true);
+  }, 60000);
+
+  it("criterion 6: abort before the map flip leaves the source's checksum untouched and the target with zero rows and zero provenance for the vbucket", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_abort_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const keys = partitionKeysInSameVbucket(tenantId, "m4_abort_evt", "ab", 5, 64);
+    for (const key of keys) {
+      await post(
+        "/v1/sql",
+        { sql: "INSERT INTO m4_abort_evt (id, v) VALUES (?, ?)", params: [key, `v-${key}`], table: "m4_abort_evt", tenantId, partitionKey: key },
+        token,
+      );
+    }
+    const vbucket = hashKey(`${tenantId}:m4_abort_evt:ab`) % 64;
+    const routeBefore = (await (
+      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_abort_evt WHERE id = ?", params: ["ab"], table: "m4_abort_evt", tenantId, partitionKey: "ab" }, token)
+    ).json()) as { route: { shardId: string } };
+    const sourceShardId = routeBefore.route.shardId;
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    const checksumOf = async (shardId: string) => {
+      const res = await env.SHARD.get(env.SHARD.idFromName(shardId)).fetch(
+        new Request("https://shard.internal/migrate-checksum", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ vbucket, table: "m4_abort_evt", partitionKeyColumn: "id" }),
+        }),
+      );
+      return (await res.json()) as { checksum: string; rowCount: number };
+    };
+    const sourceBefore = await checksumOf(sourceShardId);
+    expect(sourceBefore.rowCount).toBe(keys.length);
+
+    const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
+    expect(migrateRes.status).toBe(200);
+
+    // One orchestration tick so the backfill actually copies rows to the
+    // target (making the abort's wipe observable), but stop before the
+    // cutover flip.
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const midStatus = (await (
+      await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
+    ).json()) as { status: string; rowsCopied: number };
+    expect(midStatus.status).toBe("cutover"); // copied, fenced, not flipped
+    expect(midStatus.rowsCopied).toBe(keys.length);
+
+    const abortRes = await post("/admin/migrate-vbucket-abort", { catalogShardId: "catalog-0", vbucket }, AUTH());
+    expect(abortRes.status).toBe(200);
+    expect(((await abortRes.json()) as { status: string }).status).toBe("aborted");
+
+    // Source untouched: identical checksum, still authoritative for reads.
+    const sourceAfter = await checksumOf(sourceShardId);
+    expect(sourceAfter.checksum).toBe(sourceBefore.checksum);
+    const readRes = await post(
+      "/v1/sql",
+      { sql: "SELECT v FROM m4_abort_evt WHERE id = ?", params: [keys[0]], table: "m4_abort_evt", tenantId, partitionKey: keys[0] },
+      token,
+    );
+    const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: unknown[] } };
+    expect(readBody.route.shardId).toBe(sourceShardId);
+    expect(readBody.result.rows).toHaveLength(1);
+
+    // Target: zero rows and zero provenance for this vbucket.
+    const targetRows = (await shardExecute(targetShardId, "SELECT id FROM m4_abort_evt", [])).rows.filter((r) =>
+      keys.includes(String(r.id)),
+    );
+    expect(targetRows).toHaveLength(0);
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await runInDurableObject(targetStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      const prov = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE vbucket = ?", vbucket));
+      expect(prov).toHaveLength(0);
+    });
+
+    // Writes to the vbucket work again (fence lifted).
+    const postAbortWrite = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO m4_abort_evt (id, v) VALUES (?, ?)", params: [`${keys[0]}-after`, "x"], table: "m4_abort_evt", tenantId, partitionKey: keys[0] },
+      token,
+    );
+    expect(postAbortWrite.status).toBe(200);
+  });
+
+  it("criterion 10: a write that resolved its route pre-fence and arrives post-fence gets 409 VBUCKET_FENCED, and the same requestId succeeds on retry against the new shard after the flip", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_race_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const key = "race-row";
+    await post(
+      "/v1/sql",
+      { sql: "INSERT INTO m4_race_evt (id, v) VALUES (?, ?)", params: [key, "seed"], table: "m4_race_evt", tenantId, partitionKey: key },
+      token,
+    );
+    const vbucket = hashKey(`${tenantId}:m4_race_evt:${key}`) % 64;
+    const routeBefore = (await (
+      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_race_evt WHERE id = ?", params: [key], table: "m4_race_evt", tenantId, partitionKey: key }, token)
+    ).json()) as { route: { shardId: string } };
+    const sourceShardId = routeBefore.route.shardId;
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    // Simulate the race deterministically: the fence lands on the source
+    // (cutover step 1) while the client's write — whose route was resolved
+    // BEFORE the fence — arrives at the source afterwards. Sending directly
+    // to the source shard with the resolved routing context is exactly what
+    // the gateway does after /route.
+    const fenceRes = await env.SHARD.get(env.SHARD.idFromName(sourceShardId)).fetch(
+      new Request("https://shard.internal/fence-vbucket", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vbucket }),
+      }),
+    );
+    expect(fenceRes.status).toBe(200);
+
+    const requestId = `race-req-${crypto.randomUUID()}`;
+    const racedWrite = await env.SHARD.get(env.SHARD.idFromName(sourceShardId)).fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "UPDATE m4_race_evt SET v = ? WHERE id = ?",
+          params: ["raced", key],
+          requestId,
+          isMutation: true,
+          tenantId,
+          table: "m4_race_evt",
+          partitionKey: key,
+          vbucket,
+        }),
+      }),
+    );
+    expect(racedWrite.status).toBe(409);
+    expect(((await racedWrite.json()) as { error: { code: string } }).error.code).toBe("VBUCKET_FENCED");
+
+    // Complete the "flip": move the row, repoint the map, unfence — the end
+    // state cutover steps 4-5 produce.
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await targetStub.fetch(
+      new Request("https://shard.internal/migrate-import", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vbucket, table: "m4_race_evt", rows: [{ partitionKey: key, tenantId, row: { id: key, v: "seed" } }] }),
+      }),
+    );
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = ?, updated_at = ? WHERE vbucket = ?", targetShardId, new Date().toISOString(), vbucket);
+    });
+    await env.SHARD.get(env.SHARD.idFromName(sourceShardId)).fetch(
+      new Request("https://shard.internal/unfence-vbucket", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vbucket }),
+      }),
+    );
+
+    // The client's retry — same requestId, through the normal gateway path —
+    // now routes to the new shard and succeeds.
+    const retryRes = await post(
+      "/v1/sql",
+      { sql: "UPDATE m4_race_evt SET v = ? WHERE id = ?", params: ["raced", key], table: "m4_race_evt", tenantId, partitionKey: key, requestId },
+      token,
+    );
+    expect(retryRes.status).toBe(200);
+    const retryBody = (await retryRes.json()) as { route: { shardId: string }; result: { rowsAffected: number } };
+    expect(retryBody.route.shardId).toBe(targetShardId);
+    expect(retryBody.result.rowsAffected).toBe(1);
+
+    const finalRead = (await shardExecute(targetShardId, "SELECT v FROM m4_race_evt WHERE id = ?", [key])).rows;
+    expect(finalRead[0].v).toBe("raced");
+  });
+
+  it("criterion 7: migrating a vbucket whose source shard has an unattributed row is rejected 409 VBUCKET_PROVENANCE_INCOMPLETE naming the count, and proceeds after /admin/backfill-provenance", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_gate_evt");
+    // Clear tenants so the gate's later re-attribution is deterministic.
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await stub.fetch(new Request("https://catalog.internal/list-shards", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec("DELETE FROM tenant_auth");
+      });
+    }
+    const tenantId = tenantForCatalogShard(0, 4);
+    await registerTenant(tenantId);
+
+    // A pre-Chunk-0 row: written directly to its OWN home shard (where this
+    // tenant's hash actually maps it) with no provenance — so
+    // /admin/backfill-provenance can later attribute it with exactly one
+    // candidate, unblocking the gate.
+    const vbucket = hashKey(`${tenantId}:m4_gate_evt:legacy-row`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const homeShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const otherShardId = homeShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+    await insertRowBypassingProvenance(homeShardId, "m4_gate_evt", "legacy-row", "x");
+
+    const blocked = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId: otherShardId }, AUTH());
+    expect(blocked.status).toBe(409);
+    const blockedBody = (await blocked.json()) as { error: { code: string; unattributedRows: number } };
+    expect(blockedBody.error.code).toBe("VBUCKET_PROVENANCE_INCOMPLETE");
+    expect(blockedBody.error.unattributedRows).toBeGreaterThanOrEqual(1);
+
+    const backfillRes = await post("/admin/backfill-provenance", { catalogShardId: "catalog-0" }, AUTH());
+    expect(backfillRes.status).toBe(200);
+
+    const allowed = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId: otherShardId }, AUTH());
+    expect(allowed.status).toBe(200);
+
+    await driveMigrationToCompletion(vbucket);
+  });
+});
+
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);

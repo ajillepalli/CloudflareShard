@@ -372,11 +372,18 @@ export class CoordinatorDO extends DurableObject {
         if (!intent.mirrorTargetShardId || intent.vbucket === undefined) continue;
         const requestId = `${txId}:mirror:${p.shardId}:${seq}`;
         try {
+          // Full routing context so the target maintains __cf_row_owners for
+          // the mirrored row too — see the gateway's mirrorWriteBestEffort
+          // for why (cutover checksum scopes rows by provenance).
           const res = await this.callShard(intent.mirrorTargetShardId, "/execute", {
             sql: intent.sql,
             params: intent.params ?? [],
             requestId,
             isMutation: true,
+            tenantId: intent.tenantId,
+            table: intent.table,
+            partitionKey: intent.partitionKey,
+            vbucket: intent.vbucket,
           });
           if (!res.ok) throw new Error(`target shard responded ${res.status}`);
         } catch (error) {
