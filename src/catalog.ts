@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
-import { hashKey } from "./hash";
+import { hashKey, pickRingSubstitute } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
 import { IDENTIFIER_RE, UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
@@ -25,6 +25,7 @@ const ADMIN_GATED_ROUTES = new Set([
   "/migrate-vbucket",
   "/migrate-vbucket-status",
   "/migrate-vbucket-abort",
+  "/drain-shard-status",
 ]);
 
 // Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
@@ -87,6 +88,8 @@ export class CatalogDO extends DurableObject {
       "/migrate-vbucket": this.handleMigrateVbucket.bind(this),
       "/migrate-vbucket-status": this.handleMigrateVbucketStatus.bind(this),
       "/migrate-vbucket-abort": this.handleMigrateVbucketAbort.bind(this),
+      "/drain-shard-status": this.handleDrainShardStatus.bind(this),
+      "/update-index-ring": this.handleUpdateIndexRing.bind(this),
     };
   }
 
@@ -173,6 +176,13 @@ export class CatalogDO extends DurableObject {
     // rows need a non-NULL default to backfill against — a bare NOT NULL with
     // no default fails immediately on ALTER TABLE against a table with rows.
     this.ensureColumn("table_rules", "partition_key_column", `TEXT NOT NULL DEFAULT '${UNSET_PARTITION_KEY_COLUMN}'`);
+    // Milestone 3, Chunk 5: the table's CREATE TABLE statement, captured at
+    // /admin/create-table — a shard created mid-life (split target) has none
+    // of the tables that were fanned out at create-table time, so migration
+    // backfill applies this to the target before importing. Nullable: a
+    // table registered before this column existed simply can't be
+    // auto-provisioned on new shards (operator applies schema manually).
+    this.ensureColumn("table_rules", "schema_sql", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -398,6 +408,7 @@ export class CatalogDO extends DurableObject {
       table: string;
       partitioning?: string;
       partitionKeyColumn?: string;
+      schemaSql?: string;
     };
 
     if (!body.table) {
@@ -424,13 +435,14 @@ export class CatalogDO extends DurableObject {
 
     this.sql.exec(
       `
-      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at)
-      VALUES (?, ?, ?, ?)
+      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql)
+      VALUES (?, ?, ?, ?, ?)
       `,
       body.table,
       body.partitioning ?? "hash",
       body.partitionKeyColumn,
       new Date().toISOString(),
+      body.schemaSql ?? null,
     );
 
     const version = this.bumpMetadataVersion();
@@ -1009,6 +1021,17 @@ export class CatalogDO extends DurableObject {
     });
   }
 
+  /** Milestone 3, Chunk 5 (drain v2): marking a shard draining now also
+   * kicks off full evacuation — every vbucket mapped to it is migrated off
+   * sequentially via Chunk 4's primitive, then any index whose pinned
+   * placement ring contains it gets the shard substituted out (deterministic
+   * rule: the active shard not already in that ring with the smallest
+   * hashKey(indexName + ":" + shardId), entries copied before the ring
+   * repoints, source copies deleted after). Both loops run from this
+   * catalog's alarm; /drain-shard-status exposes progress. The old blanket
+   * SHARD_DRAIN_BLOCKED_BY_INDEXES 409 stays removed (Chunk 2): pinned
+   * rings make draining a non-ring shard trivially safe, and ring
+   * evacuation now covers the rest. */
   private async handleDrainShard(request: Request): Promise<Response> {
     const body = (await request.json()) as { shardId: string };
     if (!body.shardId) {
@@ -1023,21 +1046,263 @@ export class CatalogDO extends DurableObject {
       return json({ error: `Shard ${body.shardId} not found` }, 404);
     }
 
-    // Milestone 3, Chunk 2: index placement now hashes over each index's own
-    // PINNED placement_ring_json (captured once at /admin/create-index),
-    // never the live active shard set — so draining a shard no longer
-    // silently orphans __cf_indexes entries for indexes that don't happen to
-    // include the draining shard in their ring. The previous blanket 409
-    // here (SHARD_DRAIN_BLOCKED_BY_INDEXES) is removed. Draining a shard
-    // that a ring DOES contain still needs care — that's Chunk 5's ring
-    // evacuation (drain migrates every vbucket off first, then substitutes
-    // this shard out of any ring containing it before finishing).
+    // Ring-evacuation feasibility, BEFORE durably marking anything:
+    // rejecting up front beats discovering mid-drain (from an alarm with no
+    // caller to answer to) that the evacuation can't finish. Candidates are
+    // gathered CLUSTER-wide (rings span every catalog shard's pool, and an
+    // index's ring pins ALL shards active at its creation — the only viable
+    // substitutes are shards added afterwards, e.g. by a split). A shard
+    // that still owns vbuckets but has no local migration target is NOT
+    // rejected here: marking it draining (503 for new work) without moving
+    // data yet is exactly the pre-M3 behavior, and the vbucket loop resumes
+    // as soon as capacity exists.
+    const indexRules = this.many<{ index_name: string; placement_ring_json: string }>(
+      "SELECT index_name, placement_ring_json FROM index_rules",
+    );
+    const ringsContaining = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(body.shardId));
+    if (ringsContaining.length > 0) {
+      const clusterActive = await this.clusterActiveShards(body.shardId);
+      for (const rule of ringsContaining) {
+        const ring = JSON.parse(rule.placement_ring_json) as string[];
+        const candidates = clusterActive.filter((s) => !ring.includes(s));
+        if (candidates.length === 0) {
+          return json(
+            {
+              error: {
+                code: "RING_EVACUATION_NO_CANDIDATE",
+                message: `Index ${rule.index_name}'s placement ring contains ${body.shardId} and no active shard outside that ring exists to substitute in.`,
+                fix: "Add an active shard (/admin/split-vbucket) or drop and recreate the index, then retry the drain.",
+              },
+            },
+            409,
+          );
+        }
+      }
+    }
+
     this.audit("/drain-shard", { shardId: body.shardId });
 
     this.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", body.shardId);
 
     const version = this.bumpMetadataVersion();
-    return json({ ok: true, shardId: body.shardId, metadataVersion: version });
+
+    // Kick the evacuation loop; re-calling /drain-shard on an
+    // already-draining shard is an idempotent way to re-arm it.
+    const soon = Date.now() + MIGRATION_TICK_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > soon) {
+      await this.ctx.storage.setAlarm(soon);
+    }
+
+    return json({ ok: true, shardId: body.shardId, metadataVersion: version, evacuationStarted: true });
+  }
+
+  /** Milestone 3, Chunk 5 (POST /drain-shard-status {shardId}). */
+  private async handleDrainShardStatus(request: Request): Promise<Response> {
+    const body = (await request.json()) as { shardId?: string };
+    if (!body.shardId) {
+      return json({ error: "Missing shardId" }, 400);
+    }
+    const shard = this.one<{ status: string }>("SELECT status FROM shards WHERE shard_id = ?", body.shardId);
+    if (!shard) {
+      return json({ error: `Shard ${body.shardId} not found` }, 404);
+    }
+    const vbucketsRemaining = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM vbucket_map WHERE shard_id = ?", body.shardId)?.n ?? 0;
+    const ringsRemaining = this.many<{ placement_ring_json: string }>("SELECT placement_ring_json FROM index_rules").filter((r) =>
+      (JSON.parse(r.placement_ring_json) as string[]).includes(body.shardId!),
+    ).length;
+    const status =
+      shard.status !== "draining"
+        ? shard.status
+        : vbucketsRemaining > 0
+          ? "migrating-vbuckets"
+          : ringsRemaining > 0
+            ? "evacuating-rings"
+            : "complete";
+    return json({ shardId: body.shardId, vbucketsRemaining, ringsRemaining, status });
+  }
+
+  /** Milestone 3, Chunk 5: the union of active shard ids across EVERY
+   * catalog shard (self + siblings via each one's /list-shards) — ring
+   * evacuation needs cluster-wide candidates because placement rings span
+   * all catalogs' shard pools, while this CatalogDO's own `shards` table
+   * only knows its own. */
+  private async clusterActiveShards(excludeShardId: string): Promise<string[]> {
+    const own = this.many<{ shard_id: string }>(
+      "SELECT shard_id FROM shards WHERE status = 'active' AND shard_id != ? ORDER BY shard_id ASC",
+      excludeShardId,
+    ).map((s) => s.shard_id);
+    const all = new Set(own);
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue; // self, already counted
+      try {
+        const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+        const res = await stub.fetch("https://catalog.internal/list-shards", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        if (!res.ok) continue;
+        const body = (await res.json()) as { shardIds: string[] };
+        for (const s of body.shardIds) {
+          if (s !== excludeShardId) all.add(s);
+        }
+      } catch {
+        // A sibling being unreachable narrows the candidate pool; it never
+        // invents a wrong substitute.
+      }
+    }
+    return Array.from(all).sort();
+  }
+
+  /** Milestone 3, Chunk 5 (internal, catalog-to-catalog): repoints one
+   * index's pinned placement ring — the draining catalog fans a completed
+   * ring substitution to every sibling catalog shard, since index_rules is
+   * replicated identically to all of them. DO-binding-only route, no admin
+   * gate: it's never exposed through the Worker, the same trust model every
+   * ShardDO internal route already uses. */
+  private async handleUpdateIndexRing(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string; ring?: string[] };
+    if (!body.indexName || !body.ring) {
+      return json({ error: "Missing indexName or ring" }, 400);
+    }
+    this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(body.ring), body.indexName);
+    return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Milestone 3, Chunk 5: one drain-orchestration step for one draining
+   * shard, called from alarm(). Returns true while more ticks are needed.
+   *
+   * Phase 1 — vbuckets: migrate every vbucket mapped to the draining shard
+   * off it, strictly sequentially (one in-flight migration at a time),
+   * targets rotated deterministically across the remaining active shards.
+   * Phase 2 — rings: for each index whose pinned ring contains the shard,
+   * substitute deterministically (pickRingSubstitute), copy the draining
+   * shard's entries for that index to the substitute, repoint the ring on
+   * every catalog shard, then delete the source copies. */
+  private async advanceDrain(shardId: string): Promise<boolean> {
+    const vbuckets = this.many<{ vbucket: number; migration_status: string }>(
+      "SELECT vbucket, migration_status FROM vbucket_map WHERE shard_id = ? ORDER BY vbucket ASC",
+      shardId,
+    );
+    if (vbuckets.length > 0) {
+      if (vbuckets.some((v) => v.migration_status !== "none")) {
+        return true; // sequential: the in-flight migration advances via the migration loop
+      }
+      const activeOthers = this.many<{ shard_id: string }>(
+        "SELECT shard_id FROM shards WHERE status = 'active' AND shard_id != ? ORDER BY shard_id ASC",
+        shardId,
+      ).map((s) => s.shard_id);
+      if (activeOthers.length === 0) {
+        // Nowhere to move data within this catalog's pool — behave like the
+        // pre-M3 drain (marked draining, no data moved) rather than spinning
+        // the alarm forever. Re-calling /admin/drain-shard after adding
+        // capacity resumes the evacuation.
+        log("catalog.drain_stalled_no_target", { shardId, vbucketsRemaining: vbuckets.length });
+        return false;
+      }
+      const next = vbuckets[0].vbucket;
+      const target = activeOthers[next % activeOthers.length];
+      const started = await this.startMigration(next, target, "/drain-shard-migrate");
+      if (started instanceof Response) {
+        log("catalog.drain_migration_start_rejected", { shardId, vbucket: next, status: started.status });
+        return true; // retried next tick (e.g. provenance gate — operator fixes, drain resumes)
+      }
+      // Advance it immediately — a quiet vbucket completes this same tick.
+      const row = this.one<MigrationRow>(
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE vbucket = ?",
+        next,
+      );
+      if (row && row.migration_status !== "none") {
+        await this.advanceMigration(row);
+      }
+      return true;
+    }
+
+    // Phase 2: ring evacuation.
+    const indexRules = this.many<{ index_name: string; placement_ring_json: string }>(
+      "SELECT index_name, placement_ring_json FROM index_rules ORDER BY index_name ASC",
+    );
+    let remaining = false;
+    const ringsToEvacuate = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(shardId));
+    const clusterActive = ringsToEvacuate.length > 0 ? await this.clusterActiveShards(shardId) : [];
+    for (const rule of ringsToEvacuate) {
+      const ring = JSON.parse(rule.placement_ring_json) as string[];
+      const pos = ring.indexOf(shardId);
+      if (pos === -1) continue;
+
+      const substitute = pickRingSubstitute(rule.index_name, clusterActive.filter((s) => !ring.includes(s)));
+      if (substitute === null) {
+        // The pre-check in handleDrainShard normally prevents this; the
+        // active set may have shrunk since. Leave the ring untouched (reads
+        // keep working against the draining shard) and report via status —
+        // returning false, not true, so the alarm doesn't spin on a
+        // condition only operator action (adding capacity) can change.
+        log("catalog.ring_evacuation_no_candidate", { shardId, indexName: rule.index_name });
+        continue;
+      }
+
+      // Copy this index's entries from the draining shard to the substitute
+      // BEFORE repointing the ring — a reader mid-window still resolves
+      // against the draining shard, which still has everything.
+      let afterRowid = 0;
+      for (;;) {
+        const exportRes = await this.callShard(shardId, "/index-entries-export", { indexName: rule.index_name, afterRowid, limit: 500 });
+        if (!exportRes.ok) throw new Error(`index-entries-export failed on ${shardId}: ${exportRes.status}`);
+        const rows = ((await exportRes.json()) as { rows: Array<{ rowid: number }> }).rows;
+        if (rows.length === 0) break;
+        const importRes = await this.callShard(substitute, "/index-entries-import", { rows });
+        if (!importRes.ok) throw new Error(`index-entries-import failed on ${substitute}: ${importRes.status}`);
+        afterRowid = rows[rows.length - 1].rowid;
+        if (rows.length < 500) break;
+      }
+
+      // Substitute at the SAME ring position — every other entry's
+      // placement is untouched.
+      const newRing = [...ring];
+      newRing[pos] = substitute;
+
+      // Repoint the ring on this catalog and every sibling (index_rules is
+      // replicated identically to all catalog shards). Self is updated
+      // locally — never via a DO self-fetch.
+      this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), rule.index_name);
+      const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+        "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+      );
+      const siblingCount = config?.catalog_shard_count ?? 0;
+      for (let i = 0; i < siblingCount; i += 1) {
+        const siblingId = `catalog-${i}`;
+        if (config?.catalog_shard_id === siblingId) continue; // already updated locally
+        const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+        const res = await stub.fetch("https://catalog.internal/update-index-ring", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ indexName: rule.index_name, ring: newRing }),
+        });
+        if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
+      }
+
+      // Now delete the source copies.
+      const deleteRes = await this.callShard(shardId, "/execute", {
+        sql: "DELETE FROM __cf_indexes WHERE index_name = ?",
+        params: [rule.index_name],
+        requestId: `ring-evacuate-${rule.index_name}-${shardId}-${crypto.randomUUID()}`,
+        isMutation: true,
+      });
+      if (!deleteRes.ok) {
+        // Ring already repointed — stale rows on the draining shard are
+        // unreachable garbage, not a correctness problem. Log and move on.
+        log("catalog.ring_evacuation_source_cleanup_failed", { shardId, indexName: rule.index_name });
+      }
+
+      this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos });
+    }
+    return remaining;
   }
 
   /** Milestone 3, Chunk 4: /admin/split-vbucket keeps its name and request
@@ -1094,12 +1359,12 @@ export class CatalogDO extends DurableObject {
 
   /** Registered tables eligible for migration — a table still carrying the
    * UNSET sentinel can't be exported (no partition-key column to page on). */
-  private migratableTables(): Array<{ table: string; partitionKeyColumn: string }> {
-    return this.many<{ table_name: string; partition_key_column: string }>(
-      "SELECT table_name, partition_key_column FROM table_rules ORDER BY table_name ASC",
+  private migratableTables(): Array<{ table: string; partitionKeyColumn: string; schemaSql: string | null }> {
+    return this.many<{ table_name: string; partition_key_column: string; schema_sql: string | null }>(
+      "SELECT table_name, partition_key_column, schema_sql FROM table_rules ORDER BY table_name ASC",
     )
       .filter((t) => t.partition_key_column !== UNSET_PARTITION_KEY_COLUMN)
-      .map((t) => ({ table: t.table_name, partitionKeyColumn: t.partition_key_column }));
+      .map((t) => ({ table: t.table_name, partitionKeyColumn: t.partition_key_column, schemaSql: t.schema_sql }));
   }
 
   /** Shared migration-start guard + state transition for /split-vbucket and
@@ -1227,6 +1492,22 @@ export class CatalogDO extends DurableObject {
           anyActive = true;
         }
       }
+
+      // Milestone 3, Chunk 5: drive shard drains (vbucket evacuation, then
+      // ring evacuation) for every draining shard.
+      const draining = this.many<{ shard_id: string }>("SELECT shard_id FROM shards WHERE status = 'draining' ORDER BY shard_id ASC");
+      for (const d of draining) {
+        try {
+          const stillActive = await this.advanceDrain(d.shard_id);
+          anyActive = anyActive || stillActive;
+        } catch (error) {
+          log("catalog.drain_tick_failed", {
+            shardId: d.shard_id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          anyActive = true;
+        }
+      }
     } finally {
       this.migrationTickInFlight = false;
     }
@@ -1269,6 +1550,19 @@ export class CatalogDO extends DurableObject {
 
       let copied = 0;
       for (const t of exportTables) {
+        // A shard created mid-life (e.g. a split target) has none of the
+        // tables that were fanned out at /admin/create-table time — apply
+        // the captured schema first, under the same stable requestId
+        // create-table itself uses per (table, shard), so it dedupes with
+        // any earlier application instead of double-executing.
+        if (t.schemaSql) {
+          const schemaRes = await this.callShard(target, "/execute", {
+            sql: t.schemaSql,
+            requestId: `create-table-${t.table}-${target}`,
+            isMutation: true,
+          });
+          if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
+        }
         let afterPk = "";
         for (;;) {
           const exportRes = await this.callShard(source, "/migrate-export", {
@@ -1312,7 +1606,12 @@ export class CatalogDO extends DurableObject {
       }
       const fenceRes = await this.callShard(source, "/fence-vbucket", { vbucket: m.vbucket });
       if (!fenceRes.ok) throw new Error(`fence-vbucket failed on ${source}: ${fenceRes.status}`);
-      return true;
+      // Attempt the cutover immediately in the same tick — for a quiet
+      // vbucket (empty mirror queue, checksums already equal) the whole
+      // migration completes in one pass; a busy one just returns true from
+      // the cutover branch and polls again next tick. Chunk 5's sequential
+      // shard drain leans on this so N vbuckets don't take 2N ticks.
+      return this.advanceMigration({ ...m, migration_status: "cutover" });
     }
 
     if (m.migration_status === "cutover") {
@@ -1452,43 +1751,59 @@ export class CatalogDO extends DurableObject {
     if (body.vbucket === undefined) {
       return json({ error: "Missing vbucket" }, 400);
     }
-    const row = this.one<MigrationRow>(
-      "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE vbucket = ?",
-      body.vbucket,
-    );
-    if (!row) {
-      return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+
+    // Take the same latch the orchestration ticks use: an in-flight tick
+    // interleaves with this handler at await points, and a tick's cutover
+    // branch re-asserts the fence — racing that with the unfence below
+    // could leave a permanent fence on an aborted migration. Waiting the
+    // tick out (they're short) makes abort-vs-tick strictly sequential.
+    while (this.migrationTickInFlight) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    if (row.migration_status === "none" || !row.target_shard_id) {
-      return json(
-        {
-          error: {
-            code: "MIGRATION_ALREADY_COMMITTED",
-            message: `vbucket ${body.vbucket} has no active migration — it either already committed (map flipped) or was never started.`,
-            fix: "A committed migration is reversed by migrating the vbucket back with /admin/migrate-vbucket.",
-          },
-        },
-        409,
+    this.migrationTickInFlight = true;
+    try {
+      const row = this.one<MigrationRow>(
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE vbucket = ?",
+        body.vbucket,
       );
+      if (!row) {
+        return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+      }
+      if (row.migration_status === "none" || !row.target_shard_id) {
+        return json(
+          {
+            error: {
+              code: "MIGRATION_ALREADY_COMMITTED",
+              message: `vbucket ${body.vbucket} has no active migration — it either already committed (map flipped) or was never started.`,
+              fix: "A committed migration is reversed by migrating the vbucket back with /admin/migrate-vbucket.",
+            },
+          },
+          409,
+        );
+      }
+
+      this.audit("/migrate-vbucket-abort", { vbucket: body.vbucket, fromShard: row.shard_id, toShard: row.target_shard_id });
+
+      const tables = this.migratableTables();
+      // Clear the migration state FIRST — any tick that starts after the
+      // latch releases sees status 'none' and leaves the vbucket alone.
+      this.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, updated_at = ? WHERE vbucket = ?",
+        new Date().toISOString(),
+        body.vbucket,
+      );
+      await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
+      // Purge queued-but-unsent mirrors before wiping the target — a stale
+      // mirror firing after the wipe would recreate unattributed junk there.
+      await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
+      const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
+      if (!wipeRes.ok) {
+        return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
+      }
+
+      return json({ ok: true, vbucket: body.vbucket, status: "aborted" });
+    } finally {
+      this.migrationTickInFlight = false;
     }
-
-    this.audit("/migrate-vbucket-abort", { vbucket: body.vbucket, fromShard: row.shard_id, toShard: row.target_shard_id });
-
-    const tables = this.migratableTables();
-    await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
-    // Purge queued-but-unsent mirrors before wiping the target — a stale
-    // mirror firing after the wipe would recreate unattributed junk there.
-    await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
-    const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
-    if (!wipeRes.ok) {
-      return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
-    }
-    this.sql.exec(
-      "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, updated_at = ? WHERE vbucket = ?",
-      new Date().toISOString(),
-      body.vbucket,
-    );
-
-    return json({ ok: true, vbucket: body.vbucket, status: "aborted" });
   }
 }

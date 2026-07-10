@@ -119,6 +119,8 @@ export class ShardDO extends DurableObject {
       "/delete-vbucket-rows": this.handleDeleteVbucketRows.bind(this),
       "/unattributed-count": this.handleUnattributedCount.bind(this),
       "/purge-mirror-jobs": this.handlePurgeMirrorJobs.bind(this),
+      "/index-entries-export": this.handleIndexEntriesExport.bind(this),
+      "/index-entries-import": this.handleIndexEntriesImport.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -613,6 +615,70 @@ export class ShardDO extends DurableObject {
       this.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = ?", vbucket);
     });
     return json({ ok: true, vbucket });
+  }
+
+  /** Milestone 3, Chunk 5 (internal, driven by CatalogDO's drain
+   * orchestration): one page of this shard's __cf_indexes rows for one
+   * index, cursored by rowid — ring evacuation copies a draining shard's
+   * entries to its deterministic substitute. */
+  private async handleIndexEntriesExport(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string; afterRowid?: number; limit?: number };
+    if (!body.indexName) {
+      return json({ error: "Missing indexName" }, 400);
+    }
+    const limit = Math.min(MIGRATE_PAGE_SIZE, Math.max(1, body.limit ?? MIGRATE_PAGE_SIZE));
+    const rows = this.many<{
+      rowid: number;
+      table_name: string;
+      index_name: string;
+      index_key_json: string;
+      partition_key: string;
+      source_shard_id: string;
+      tenant_id: string;
+      updated_at: string;
+    }>(
+      "SELECT rowid, table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at FROM __cf_indexes WHERE index_name = ? AND rowid > ? ORDER BY rowid ASC LIMIT ?",
+      body.indexName,
+      body.afterRowid ?? 0,
+      limit,
+    );
+    return json({ rows });
+  }
+
+  /** Milestone 3, Chunk 5 (internal): applies one exported page of index
+   * entries — INSERT OR REPLACE, idempotent, so re-pushed pages are
+   * harmless. */
+  private async handleIndexEntriesImport(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      rows?: Array<{
+        table_name: string;
+        index_name: string;
+        index_key_json: string;
+        partition_key: string;
+        source_shard_id: string;
+        tenant_id: string;
+        updated_at: string;
+      }>;
+    };
+    if (!body.rows) {
+      return json({ error: "Missing rows" }, 400);
+    }
+    const rows = body.rows;
+    this.ctx.storage.transactionSync(() => {
+      for (const r of rows) {
+        this.sql.exec(
+          "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          r.table_name,
+          r.index_name,
+          r.index_key_json,
+          r.partition_key,
+          r.source_shard_id,
+          r.tenant_id,
+          r.updated_at,
+        );
+      }
+    });
+    return json({ ok: true, imported: rows.length });
   }
 
   /** Milestone 3, Chunk 4 (internal): drops every queued-but-unsent mirror

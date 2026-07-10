@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hashKey, indexShardIdForKey } from "./hash";
+import { hashKey, indexShardIdForKey, pickRingSubstitute } from "./hash";
 
 describe("hashKey", () => {
   it("is deterministic for the same input", () => {
@@ -100,5 +100,21 @@ describe("indexShardIdForKey", () => {
       expect(pinnedRing).toContain(resolved);
       void liveShardsAfterGrowth; // documents the scenario; deliberately unused by the call above
     }
+  });
+});
+
+describe("pickRingSubstitute (Milestone 3, Chunk 5)", () => {
+  it("picks the candidate with the smallest hashKey(indexName + ':' + shardId), deterministically and order-independently", () => {
+    const candidates = ["shard-a", "shard-b", "shard-c", "shard-d"];
+    const expected = candidates.reduce((best, s) =>
+      hashKey(`idx_x:${s}`) < hashKey(`idx_x:${best}`) ? s : best,
+    );
+    expect(pickRingSubstitute("idx_x", candidates)).toBe(expected);
+    expect(pickRingSubstitute("idx_x", [...candidates].reverse())).toBe(expected);
+    expect(pickRingSubstitute("idx_x", candidates)).toBe(pickRingSubstitute("idx_x", candidates));
+  });
+
+  it("returns null when no candidate exists", () => {
+    expect(pickRingSubstitute("idx_x", [])).toBeNull();
   });
 });
