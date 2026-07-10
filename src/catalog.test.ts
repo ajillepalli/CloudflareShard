@@ -173,7 +173,13 @@ describe("CatalogDO auth gate", () => {
 });
 
 describe("CatalogDO split-vbucket", () => {
-  it("reassigns a vbucket to a new shard and the new mapping is used for routing", async () => {
+  // Milestone 3, Chunk 4 update: /split-vbucket no longer repoints
+  // vbucket_map immediately (the pre-M3 behavior this test used to assert —
+  // which stranded every row already on the source). It now creates the
+  // target shard and starts a real migration; routing flips only when the
+  // fenced cutover completes. Same request shape; response gains
+  // migrationStarted: true.
+  it("starts a migration to the new shard, and routing flips there once the migration's cutover completes", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
@@ -191,15 +197,37 @@ describe("CatalogDO split-vbucket", () => {
       ),
     );
     expect(splitRes.status).toBe(200);
-    const splitBody = (await splitRes.json()) as { ok: boolean; fromShard: string; toShard: string };
+    const splitBody = (await splitRes.json()) as { ok: boolean; fromShard: string; toShard: string; migrationStarted: boolean };
     expect(splitBody.ok).toBe(true);
     expect(splitBody.toShard).toBe("shard-new");
     expect(splitBody.fromShard).toBe(routeBefore.shardId);
+    expect(splitBody.migrationStarted).toBe(true);
+
+    // The map is NOT flipped yet — the source stays authoritative while the
+    // migration runs.
+    const routeDuring = (await (
+      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
+    ).json()) as { shardId: string; migrationStatus?: string; targetShardId?: string };
+    expect(routeDuring.shardId).toBe(routeBefore.shardId);
+    expect(routeDuring.migrationStatus).toBe("backfilling");
+    expect(routeDuring.targetShardId).toBe("shard-new");
+
+    // Drive the alarm-based orchestration to completion (backfill pass ->
+    // cutover: fence, mirror drain, checksum, flip, unfence, source delete).
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await stub.fetch(post("/migrate-vbucket-status", { vbucket: routeBefore.vbucket }, `Bearer ${env.ADMIN_TOKEN}`));
+      const statusBody = (await statusRes.json()) as { status: string };
+      if (statusBody.status === "none") break;
+    }
 
     const routeAfter = (await (
       await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
-    ).json()) as { shardId: string };
+    ).json()) as { shardId: string; migrationStatus?: string };
     expect(routeAfter.shardId).toBe("shard-new");
+    expect(routeAfter.migrationStatus).toBeUndefined();
   });
 
   it("returns 400 for a negative or non-integer vbucket", async () => {
@@ -596,5 +624,58 @@ describe("CatalogDO migration state on vbucket_map (Milestone 3, Chunk 3)", () =
       expect(rows[0].migration_status).toBe("none");
       expect(rows[0].target_shard_id).toBeNull();
     });
+  });
+});
+
+describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
+  it("migrate-vbucket: none -> backfilling; a second migrate is 409 MIGRATION_IN_PROGRESS; abort returns to none and a fresh migrate is accepted", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const start = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-mig-a" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(start.status).toBe(200);
+    const startBody = (await start.json()) as { ok: boolean; status: string; fromShard: string; toShard: string };
+    expect(startBody.status).toBe("backfilling");
+    expect(startBody.toShard).toBe("shard-mig-a");
+
+    const dup = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-mig-b" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(dup.status).toBe(409);
+    expect(((await dup.json()) as { error: { code: string } }).error.code).toBe("MIGRATION_IN_PROGRESS");
+
+    const statusRes = await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const statusBody = (await statusRes.json()) as { status: string; fromShard: string; toShard: string; rowsCopied: number; mirrorQueueDepth: number; startedAt: string };
+    expect(statusBody.status).toBe("backfilling");
+    expect(statusBody.toShard).toBe("shard-mig-a");
+    expect(typeof statusBody.rowsCopied).toBe("number");
+    expect(typeof statusBody.mirrorQueueDepth).toBe("number");
+    expect(statusBody.startedAt).toBeTruthy();
+
+    const abort = await stub.fetch(post("/migrate-vbucket-abort", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(abort.status).toBe(200);
+    expect(((await abort.json()) as { status: string }).status).toBe("aborted");
+
+    const statusAfter = await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(((await statusAfter.json()) as { status: string }).status).toBe("none");
+
+    // Aborting again: nothing active -> 409 MIGRATION_ALREADY_COMMITTED.
+    const abortAgain = await stub.fetch(post("/migrate-vbucket-abort", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(abortAgain.status).toBe(409);
+    expect(((await abortAgain.json()) as { error: { code: string } }).error.code).toBe("MIGRATION_ALREADY_COMMITTED");
+
+    // A fresh migration is accepted after the abort.
+    const restart = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-mig-c" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(restart.status).toBe(200);
+  });
+
+  it("migrate-vbucket rejects an unmapped vbucket 404 and a target equal to the source 400", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const unmapped = await stub.fetch(post("/migrate-vbucket", { vbucket: 9999 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(unmapped.status).toBe(404);
+
+    const sameShard = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(sameShard.status).toBe(400);
   });
 });
