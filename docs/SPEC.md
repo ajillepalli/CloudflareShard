@@ -37,6 +37,14 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
   - Owns one SQLite database.
   - Executes SQL statements serially.
   - Maintains idempotency table for at-least-once retries.
+  - Milestone 1: participant side of 2PC (`/prepare`/`/commit`/`/abort`, row locks) — see Section 10.
+  - Milestone 2: internal `__cf_indexes` table and `index_pending_jobs` retry queue for secondary-index maintenance — see Section 7.
+
+- CoordinatorDO (Milestone 1 — transaction coordinator)
+  - One instance per transaction (`env.COORDINATOR.idFromName(txId)`, no sharding).
+  - Drives two-phase commit across every `ShardDO` a `/v1/tx` call touches: `/begin` fans out `/prepare`, aborts everyone on any failure, or fans out `/commit` on universal success.
+  - Durably records the transaction and its participants; a commit acknowledgement that fails to reach a shard is retried via its own `alarm()` with exponential backoff (`recovery_queue`) rather than blocking the caller.
+  - See Section 10 for the full protocol.
 
 ## 4) Logical Data Partitioning
 
@@ -63,6 +71,8 @@ Table: cluster_config
 - total_vbuckets INTEGER NOT NULL
 - metadata_version INTEGER NOT NULL DEFAULT 1
 - initialized_at TEXT NOT NULL
+- catalog_shard_id TEXT (nullable — the catalog shard this instance is; null on a non-catalog-sharded deploy)
+- catalog_shard_count INTEGER (nullable — total catalog shard count at init time, checked on every route for a mismatch)
 
 Table: shards
 - shard_id TEXT PRIMARY KEY
@@ -78,16 +88,100 @@ Table: vbucket_map
 Table: table_rules
 - table_name TEXT PRIMARY KEY
 - partitioning TEXT NOT NULL (hash for MVP)
+- partition_key_column TEXT NOT NULL (Milestone 1 — defaults to the `'__unset__'` sentinel for tables registered before this column existed; see `/admin/set-partition-key-column` in Section 7)
 - created_at TEXT NOT NULL
 
-## 6) Shard Schema
+Table: audit_log
+- id INTEGER PRIMARY KEY AUTOINCREMENT
+- endpoint TEXT NOT NULL
+- request_summary TEXT NOT NULL (JSON)
+- created_at TEXT NOT NULL
+
+Table: tenant_auth (Milestone 1 Chunk 0 — data-plane tenant authorization)
+- tenant_id TEXT PRIMARY KEY
+- token_hash TEXT NOT NULL
+- created_at TEXT NOT NULL
+- revoked_at TEXT (nullable)
+
+Table: index_rules (Milestone 2 — secondary index registry)
+- index_name TEXT PRIMARY KEY
+- table_name TEXT NOT NULL
+- columns_json TEXT NOT NULL (JSON array — composite-capable)
+- status TEXT NOT NULL DEFAULT 'building' ('building' until backfill completes, then 'ready' — see Section 7's `/admin/create-index`)
+- created_at TEXT NOT NULL
+
+## 6) Shard and Coordinator Schema
+
+### ShardDO
 
 Table: applied_requests
 - request_id TEXT PRIMARY KEY
+- request_hash TEXT NOT NULL DEFAULT '' (Section 9's idempotency-replay-mismatch check)
 - result_json TEXT NOT NULL
 - applied_at TEXT NOT NULL
 
+Table: pending_intents (Milestone 1 — 2PC participant state)
+- coordinator_tx_id TEXT NOT NULL
+- intent_seq INTEGER NOT NULL
+- sql TEXT NOT NULL
+- params_json TEXT NOT NULL
+- status TEXT NOT NULL (prepared, committed, aborted)
+- lock_keys_json TEXT NOT NULL
+- prepared_at TEXT NOT NULL
+- resolved_at TEXT (nullable)
+- PRIMARY KEY (coordinator_tx_id, intent_seq)
+
+Table: row_locks (Milestone 1 — held for the duration of an in-flight coordinated transaction)
+- lock_key TEXT PRIMARY KEY (see `rowKey()`/`participantKey()` in `structured-op.ts`)
+- coordinator_tx_id TEXT NOT NULL
+- acquired_at TEXT NOT NULL
+
+Table: __cf_indexes (Milestone 2 — internal, physical secondary-index storage)
+- table_name TEXT NOT NULL
+- index_name TEXT NOT NULL
+- index_key_json TEXT NOT NULL
+- partition_key TEXT NOT NULL
+- source_shard_id TEXT NOT NULL
+- updated_at TEXT NOT NULL
+- PRIMARY KEY (table_name, index_name, index_key_json, partition_key)
+
+Table: index_pending_jobs (Milestone 2 — async index-write retry queue, lives on the base shard)
+- job_id INTEGER PRIMARY KEY AUTOINCREMENT
+- target_shard_id TEXT NOT NULL
+- sql TEXT NOT NULL
+- params_json TEXT NOT NULL
+- request_id TEXT NOT NULL
+- next_attempt_at TEXT NOT NULL
+- attempt_count INTEGER NOT NULL DEFAULT 0
+- created_at TEXT NOT NULL
+
 Application tables are created by tenant SQL statements routed to target shards.
+
+### CoordinatorDO (Milestone 1)
+
+Table: transactions
+- tx_id TEXT PRIMARY KEY
+- status TEXT NOT NULL (preparing, prepared, committing, committed, aborted)
+- participant_shards_json TEXT NOT NULL
+- operation_json TEXT NOT NULL
+- operation_hash TEXT NOT NULL DEFAULT '' (retry-mismatch detection — see Section 10)
+- created_at TEXT NOT NULL
+- updated_at TEXT NOT NULL
+- attempt_count INTEGER NOT NULL DEFAULT 0
+- last_error TEXT (nullable)
+
+Table: transaction_participants
+- tx_id TEXT NOT NULL
+- shard_id TEXT NOT NULL
+- phase_status TEXT NOT NULL
+- updated_at TEXT NOT NULL
+- PRIMARY KEY (tx_id, shard_id)
+
+Table: recovery_queue (commit acknowledgements still outstanding, retried via `alarm()`)
+- tx_id TEXT PRIMARY KEY
+- action TEXT NOT NULL
+- next_attempt_at TEXT NOT NULL
+- attempt_count INTEGER NOT NULL DEFAULT 0
 
 ## 7) Public HTTP API (Gateway Worker)
 
@@ -101,6 +195,21 @@ Response:
 - ok boolean
 - numShards
 - totalVBuckets
+
+POST /admin/status (ADMIN_TOKEN)
+Response:
+- initialized boolean (true only if every catalog shard reports initialized)
+- catalogShardCount
+- shards { total, active, draining } — summed across every catalog shard
+- catalogs: array of `{catalogShardId, initialized, shards}`, one entry per catalog shard
+
+Fans out to every catalog shard and aggregates — a cluster-wide health check, not scoped to one catalog shard.
+
+POST /admin/list-tables (ADMIN_TOKEN)
+Response:
+- tables: array of `{table_name, partitioning, partition_key_column, created_at}`
+
+`table_rules` is fanned out identically to every catalog shard by `/admin/register-table`/`/admin/create-table`, so `catalog-0`'s view is representative of the whole cluster — this route reads only that one catalog shard rather than fanning out.
 
 POST /admin/register-table
 Request:
@@ -189,6 +298,7 @@ Benchmark — Milestone 2, Chunk 7 (finalizes the design doc's Success Criterion
 
 POST /admin/split-vbucket
 Request:
+- catalogShardId string (required — vbucket numbering is local to one catalog shard, see Section 8)
 - vbucket number
 - newShardId string (optional)
 
@@ -198,6 +308,38 @@ Response:
 - fromShard
 - toShard
 - metadataVersion
+
+Rejects 409 `SPLIT_BLOCKED_BY_INDEXES` while any secondary index is registered cluster-wide — see the `/admin/create-index` section above.
+
+POST /admin/drain-shard (ADMIN_TOKEN)
+Request:
+- catalogShardId string (required — shard ownership is scoped to a catalog shard)
+- shardId string
+
+Response:
+- ok
+- shardId
+- metadataVersion
+
+Marks a shard `draining` in `vbucket_map`'s owning catalog shard, so `CatalogDO.handleRoute` stops routing new base-row traffic to it (a new `/v1/tx`/`/v1/sql` write against an already-draining shard is rejected 503). Rejected 409 first by two Worker-level pre-checks against the target `ShardDO` — `SHARD_HAS_IN_FLIGHT_TRANSACTIONS` if any 2PC intent is still prepared, then `SHARD_HAS_PENDING_INDEX_JOBS` if any async index-write retry is still queued — and then, if both are clear, by `CatalogDO` itself with `SHARD_DRAIN_BLOCKED_BY_INDEXES` if any secondary index is registered cluster-wide. See Section 10 for the full 2PC/index interaction.
+
+POST /admin/shard-stats (ADMIN_TOKEN)
+Request:
+- shardId string
+
+Response (proxied from `ShardDO./stats`):
+- ok
+- tables: array of `{table, rowCount}` (application tables only — internal tables like `applied_requests`/`pending_intents`/`row_locks`/`__cf_indexes`/`index_pending_jobs` are excluded)
+- idempotencyTableSize
+- pendingIntentCount (distinct in-flight 2PC transactions touching this shard)
+- indexPendingJobCount (Milestone 2 — queued async index-write retries)
+- indexEntryCount (Milestone 2 — total `__cf_indexes` rows on this shard)
+
+POST /admin/audit-log (ADMIN_TOKEN)
+Response:
+- entries: array of `{catalogShardId, endpoint, request, createdAt}`, newest first
+
+Fans out to every catalog shard's own `audit_log` table (`/init`, `/register-table`, `/split-vbucket`, `/drain-shard`, `/create-index`, `/drop-index`, ... every admin mutation each `CatalogDO` records) and merges the last 100 entries per shard into one globally-sorted list.
 
 POST /admin/register-tenant (ADMIN_TOKEN)
 Request:
@@ -426,6 +568,8 @@ v1 automated safe split flow (planned):
 - Writes must be single-shard and require partitionKey.
 - Reads without partitionKey are rejected on /v1/sql.
 - Fan-out reads allowed only through /v1/scatter and should be capped.
+- `/v1/mutate`/`/v1/tx` (Milestone 1) are structured alternatives to raw `/v1/sql` writes — row ownership is structural (the partition-key predicate is always injected), not caller-trust-based. `/v1/tx` additionally bounds a single call to 8 distinct participant rows.
+- `/v1/index-query` (Milestone 2) is the one non-partition-key, non-admin read path: exact full-tuple lookups against a registered secondary index, capped at `limit` (default 20, max 100). No leftmost-prefix or range support yet — see Section 7's Open Questions notes in the index-service entries above.
 
 ## 13) Observability (required for production)
 
@@ -448,6 +592,6 @@ Emit structured logs and counters for:
 
 - Replace permissive SQL with parsed/validated subset.
 - Add query planner and local pre-aggregation for scatter reads.
-- Add global secondary index service.
-- Add automated split controller and background mover.
+- ~~Add global secondary index service.~~ Done (Milestone 2) — non-unique, composite-capable, with hybrid sync/async consistency. Unique-index support and leftmost-prefix/range queries remain open (`TODOS.md`).
+- Add automated split controller and background mover — note the Milestone 2 constraint this interacts with: `/admin/split-vbucket` currently rejects while any index is registered (Section 7), so an automated split controller will need to account for that, not just vbucket/shard mechanics.
 - Add backups and restore drills per shard.

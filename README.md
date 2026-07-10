@@ -11,12 +11,17 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 - Scatter read endpoint for fan-out SELECT.
 - Manual vBucket reassignment for basic rebalancing.
 - Mutation idempotency via requestId, rejecting replay with a mismatched SQL/params pair instead of returning a stale result.
+- Cross-shard atomic transactions (`/v1/tx`) via a two-phase-commit coordinator (Milestone 1).
+- Cross-shard secondary indexes (`/admin/create-index`, `/v1/index-query`) with sync (2PC) and async write-path maintenance (Milestone 2).
 
 ## Project layout
 
 - `src/index.ts`: Gateway worker router and public API.
-- `src/catalog.ts`: Catalog durable object (metadata, routing, map changes).
-- `src/shard.ts`: Shard durable object (SQLite execution + idempotency).
+- `src/catalog.ts`: Catalog durable object (metadata, routing, map changes, tenant auth, index registry).
+- `src/shard.ts`: Shard durable object (SQLite execution, idempotency, 2PC participant, secondary-index storage).
+- `src/coordinator.ts`: Transaction coordinator durable object (two-phase commit for `/v1/tx`).
+- `src/structured-op.ts`: The structured mutation DSL (`/v1/mutate`/`/v1/tx`'s row-owned write contract).
+- `src/hash.ts`: Deterministic hashing for vbucket/shard and secondary-index-shard placement.
 - `docs/SPEC.md`: Concrete architecture and protocol spec.
 
 ## Prerequisites
@@ -257,6 +262,61 @@ curl -X POST http://127.0.0.1:8787/admin/split-vbucket \
   -d '{"catalogShardId":"catalog-0","vbucket":42,"newShardId":"shard-hotfix-1"}'
 ```
 
+Rejected 409 while any secondary index is registered cluster-wide (see step 11
+below) — index-shard placement hashes over the active shard set, so a split
+would silently orphan existing index entries.
+
+### 11) Create a secondary index (Milestone 2)
+
+Any registered table can get a secondary index on one or more columns
+(composite-capable). Backfills every existing row on every shard, then flips
+the index to queryable once backfill fully completes.
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/create-index \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"indexName":"events_by_user_id","table":"events","columns":["user_id"]}'
+```
+
+Once any index exists on a table, raw `/v1/sql` mutations against that table
+are rejected 409 (`TABLE_HAS_INDEX`) — raw SQL bypasses index maintenance
+entirely, so use `/v1/mutate` or `/v1/tx` (steps 7-8) instead. Both keep the
+index in sync automatically: `/v1/mutate` asynchronously (after the response
+is already on its way back), `/v1/tx` atomically as part of the same 2PC
+transaction as the base row.
+
+### 12) Query by a non-partition-key column (Milestone 2)
+
+`/v1/index-query` is the first tenant-facing read path that doesn't require a
+`partitionKey` — an exact full-tuple lookup against a registered index. It's
+still asynchronously maintained on the `/v1/mutate` path, so a matched row is
+re-verified against the queried value before being returned (a stale match is
+silently excluded, never surfaced as a wrong result).
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/index-query \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $TENANT_TOKEN" \
+  -d '{"table":"events","indexName":"events_by_user_id","tenantId":"t1","values":{"user_id":"user-1"}}'
+```
+
+Response: `{"rows": [...]}` — full row data for every match, up to `limit`
+(default 20, max 100).
+
+### 13) List or drop an index
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/list-indexes \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" -d '{}'
+
+curl -X POST http://127.0.0.1:8787/admin/drop-index \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"indexName":"events_by_user_id"}'
+```
+
 ## Catalog sharding
 
 The cluster is partitioned across a fixed, well-known set of catalog shards
@@ -280,6 +340,13 @@ if any are still prepared — retry once they resolve (Chunk 3's recovery loop
 bounds how long that takes), or use `/admin/tx-force-abort` to unstick one
 manually. A shard that's already draining rejects any *new* `/v1/tx`/`/v1/sql`
 write with 503.
+
+Both `/admin/drain-shard` and `/admin/split-vbucket` (Milestone 2) also reject
+409 while any secondary index is registered cluster-wide
+(`SHARD_DRAIN_BLOCKED_BY_INDEXES` / `SPLIT_BLOCKED_BY_INDEXES`) — index-shard
+placement hashes over the active shard set, so either operation would
+silently orphan existing `__cf_indexes` entries. Drop all indexes first,
+drain/split, then recreate them.
 
 ## Tenant authorization
 
@@ -307,12 +374,14 @@ callers with zero overlap window; a known limitation, not yet addressed).
 - No SQL parser or policy sandboxing yet.
 - No automatic backfill/dual-write during split.
 - Cross-shard transactions (`/v1/tx`) are bounded to 8 participant rows.
-- Global secondary indexes are not implemented.
+- Secondary indexes (Milestone 2) are non-unique only — no `UNIQUE` constraint enforcement yet (`TODOS.md`).
+- `/v1/index-query` supports exact full-tuple lookups only — no leftmost-prefix or range queries on composite indexes yet.
+- `/admin/drain-shard`/`/admin/split-vbucket` are blocked outright while any secondary index is registered, rather than migrating index placement — see `TODOS.md`'s index-topology entry.
 
 ## Next production steps
 
 1. ~~Add authenticated tenant authorization in Gateway.~~ Done (Milestone 1 Chunk 0).
 2. Introduce SQL allowlist/parser and bounded query plans.
-3. Add automated split controller with backfill and dual-write cutover.
-4. Add index service and query planner enhancements.
+3. Add automated split controller with backfill and dual-write cutover — note it needs to account for the drain/split-vs-index block above, not just vbucket/shard mechanics.
+4. ~~Add index service and query planner enhancements.~~ Done (Milestone 2) — secondary indexes with sync/async consistency; leftmost-prefix/range queries and unique-index support remain open.
 5. Add observability and SLO alerting per shard and per route.
