@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { log } from "./log";
-import { isDeleteStatement, isMutation } from "./sql-safety";
+import { INTERNAL_TABLE_NAMES, isDeleteStatement, isMutation } from "./sql-safety";
 import { rowKey } from "./structured-op";
 
 type ExecutePayload = {
@@ -59,23 +59,16 @@ const MIRROR_JOB_BASE_DELAY_MS = 1000;
 const MIRROR_JOB_MAX_DELAY_MS = 60000;
 const MIRROR_JOB_BATCH_SIZE = 20;
 
-const INTERNAL_TABLES = new Set([
-  "applied_requests",
-  "sqlite_sequence",
-  "pending_intents",
-  "row_locks",
-  "__cf_indexes",
-  "index_pending_jobs",
-  "__cf_row_owners",
-  "__cf_mirror_pending",
-  "__cf_fenced_vbuckets",
-]);
+// Single source of truth in sql-safety.ts (INTERNAL_TABLE_NAMES), so the
+// tenant-facing internal-table write guard and this /stats filter can't drift.
+const INTERNAL_TABLES = new Set<string>(INTERNAL_TABLE_NAMES);
 
 // Milestone 3, Chunk 4: page size shared by /migrate-export and
 // /migrate-checksum — the spec's checksum definition is "streamed in the
 // same 500-row pages", so both sides paging identically is part of the
-// contract, not a tunable.
-const MIGRATE_PAGE_SIZE = 500;
+// contract, not a tunable. Re-exported so catalog.ts's backfill/evacuation
+// loops use the identical constant (a clamp mismatch would silently drop rows).
+export const MIGRATE_PAGE_SIZE = 500;
 
 /** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
  * to force a rollback — distinguishes "validation succeeded, roll back on

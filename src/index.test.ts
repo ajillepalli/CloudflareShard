@@ -389,6 +389,60 @@ describe("Worker tenant authorization", () => {
     );
     expect(res.status).toBe(401);
   });
+
+  // Review Tier 1 #1: a tenant routes by a registered table but sends SQL that
+  // writes an internal bookkeeping table — must be rejected 403 before it can
+  // reach the shard and lift a fence / forge provenance / purge the mirror
+  // queue from the data plane.
+  it("rejects a /v1/sql DML/DELETE/INSERT/UPDATE against each internal table with 403, even when routed via a registered table", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+    const internalTables = [
+      "__cf_fenced_vbuckets",
+      "__cf_row_owners",
+      "__cf_mirror_pending",
+      "__cf_indexes",
+      "applied_requests",
+      "pending_intents",
+      "row_locks",
+      "index_pending_jobs",
+    ];
+    const statements = (t: string) => [
+      `DELETE FROM ${t}`,
+      `INSERT INTO ${t} (x) VALUES (1)`,
+      `UPDATE ${t} SET x = 1`,
+      `DELETE FROM "${t}" WHERE 1=1`,
+    ];
+    for (const t of internalTables) {
+      for (const sql of statements(t)) {
+        const res = await post(
+          "/v1/sql",
+          { sql, table: "events", tenantId: "t1", partitionKey: "p1" },
+          token,
+        );
+        expect(res.status, `${sql} should be 403`).toBe(403);
+        const body = (await res.json()) as { error: { code?: string } | string };
+        const code = typeof body.error === "object" ? body.error.code : undefined;
+        expect(code).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
+      }
+    }
+
+    // A comment-obfuscated leading keyword can't smuggle it past the guard.
+    const obfuscated = await post(
+      "/v1/sql",
+      { sql: "-- harmless\nDELETE FROM __cf_fenced_vbuckets", table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(obfuscated.status).toBe(403);
+
+    // A normal write to the tenant's own table still works.
+    const ok = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["ok-1", "x"], table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(ok.status).toBe(200);
+  });
 });
 
 describe("Worker /v1/mutate", () => {

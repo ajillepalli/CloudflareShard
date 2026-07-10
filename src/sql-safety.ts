@@ -110,6 +110,62 @@ export function isDeleteStatement(sql: string): boolean {
   return /^delete/i.test(afterCte);
 }
 
+/** The internal bookkeeping tables ShardDO owns — tenant SQL must never write
+ * to any of these (lifting a cutover fence, forging/deleting row provenance,
+ * or purging the mirror queue from the data plane would all be catastrophic).
+ * Kept here (not only in shard.ts) so the tenant-facing gate can reject a
+ * write against them without importing DO code; shard.ts imports this same
+ * set for its INTERNAL_TABLES so the two can't drift. */
+export const INTERNAL_TABLE_NAMES = [
+  "applied_requests",
+  "sqlite_sequence",
+  "pending_intents",
+  "row_locks",
+  "__cf_indexes",
+  "index_pending_jobs",
+  "__cf_row_owners",
+  "__cf_mirror_pending",
+  "__cf_fenced_vbuckets",
+] as const;
+
+const INTERNAL_TABLE_SET = new Set<string>(INTERNAL_TABLE_NAMES);
+
+/** Extracts the write-target table name of an INSERT/REPLACE/UPDATE/DELETE
+ * statement (comments + a leading CTE stripped first, mirroring isMutation),
+ * unquoting `"x"`/`` `x` ``/`[x]`. Returns null if the statement isn't a
+ * recognizable single-table DML write. Only the write target matters for the
+ * internal-table guard: a subquery that merely *reads* an internal table
+ * doesn't mutate it. */
+function mutationTargetTable(sql: string): string | null {
+  const afterComments = stripLeadingComments(sql);
+  const s = stripLeadingComments(skipLeadingCte(afterComments));
+  const ident = `("([^"]+)"|\`([^\`]+)\`|\\[([^\\]]+)\\]|([A-Za-z_][A-Za-z0-9_]*))`;
+  const patterns = [
+    new RegExp(`^\\s*insert(?:\\s+or\\s+\\w+)?\\s+into\\s+${ident}`, "i"),
+    new RegExp(`^\\s*replace\\s+into\\s+${ident}`, "i"),
+    new RegExp(`^\\s*update(?:\\s+or\\s+\\w+)?\\s+${ident}`, "i"),
+    new RegExp(`^\\s*delete\\s+from\\s+${ident}`, "i"),
+  ];
+  for (const re of patterns) {
+    const m = re.exec(s);
+    if (m) return m[2] ?? m[3] ?? m[4] ?? m[5] ?? null;
+  }
+  return null;
+}
+
+/** True if `sql` is a mutation whose write target is one of ShardDO's internal
+ * tables (or any `__cf_`/`sqlite_`-prefixed name, for forward-safety against a
+ * table added later). The tenant-facing `/v1/sql` gate rejects these 403 —
+ * the raw-execute path is otherwise reachable with an arbitrary SQL string,
+ * and `body.table` (used only for routing) says nothing about what table the
+ * SQL text actually touches. */
+export function isInternalTableWrite(sql: string): boolean {
+  const target = mutationTargetTable(sql);
+  if (target === null) return false;
+  const lower = target.toLowerCase();
+  return INTERNAL_TABLE_SET.has(target) || lower.startsWith("__cf_") || lower.startsWith("sqlite_");
+}
+
 function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {
   const s = sql.trim().toLowerCase();
   const noTrailingSemicolon = s.replace(/;\s*$/, "");
