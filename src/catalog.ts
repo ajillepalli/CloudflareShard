@@ -1474,7 +1474,10 @@ export class CatalogDO extends DurableObject {
     let anyActive = false;
     try {
       const migrating = this.many<MigrationRow>(
-        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE migration_status != 'none' ORDER BY vbucket ASC",
+        // Review Tier 1 #4: the alarm's migration loop drives only active
+        // migrations ('backfilling'/'cutover'); an 'aborting' row is finished
+        // by a retried /admin/migrate-vbucket-abort, not here.
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE migration_status IN ('backfilling', 'cutover') ORDER BY vbucket ASC",
       );
       for (const m of migrating) {
         try {
@@ -1752,7 +1755,15 @@ export class CatalogDO extends DurableObject {
    * authoritative, so aborting is purely: wipe the target's copy of this
    * vbucket (rows + provenance), lift the fence, clear the migration state.
    * After the flip there is nothing left to abort (the source copy is
-   * deleted); rolling back is a fresh migration in the other direction. */
+   * deleted); rolling back is a fresh migration in the other direction.
+   *
+   * Review Tier 1 #4: cleanup transitions the row to an intermediate
+   * 'aborting' status (target_shard_id retained) BEFORE unfence/purge/wipe,
+   * and only clears to 'none' after all three succeed. A crash or failure
+   * mid-cleanup leaves the row 'aborting', not 'none' — so a retried abort
+   * RESUMES the (idempotent) cleanup and lifts the fence, instead of
+   * returning 409 MIGRATION_ALREADY_COMMITTED and stranding the source
+   * fenced forever. */
   private async handleMigrateVbucketAbort(request: Request): Promise<Response> {
     const body = (await request.json()) as { vbucket?: number };
     if (body.vbucket === undefined) {
@@ -1776,6 +1787,9 @@ export class CatalogDO extends DurableObject {
       if (!row) {
         return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
       }
+      // 'none' means the migration already committed (map flipped) or never
+      // started; there's nothing to abort. An 'aborting' row is a previously
+      // interrupted abort — resume its cleanup below rather than reject.
       if (row.migration_status === "none" || !row.target_shard_id) {
         return json(
           {
@@ -1792,21 +1806,35 @@ export class CatalogDO extends DurableObject {
       this.audit("/migrate-vbucket-abort", { vbucket: body.vbucket, fromShard: row.shard_id, toShard: row.target_shard_id });
 
       const tables = this.migratableTables();
-      // Clear the migration state FIRST — any tick that starts after the
-      // latch releases sees status 'none' and leaves the vbucket alone.
+      // Move to the intermediate 'aborting' state (keeping target_shard_id) —
+      // survives a crash so a retry knows the target to finish wiping. The
+      // alarm's migration loop ignores 'aborting' the same as 'none'.
+      if (row.migration_status !== "aborting") {
+        this.sql.exec(
+          "UPDATE vbucket_map SET migration_status = 'aborting', updated_at = ? WHERE vbucket = ?",
+          new Date().toISOString(),
+          body.vbucket,
+        );
+      }
+      // Cleanup, all idempotent so a resumed abort re-runs it safely:
+      // unfence the source, purge its queued-but-unsent mirrors (a stale
+      // mirror firing after the wipe would recreate unattributed junk on the
+      // target), then wipe the target's copy.
+      await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
+      await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
+      const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
+      if (!wipeRes.ok) {
+        // Leave the row 'aborting' (fence already lifted above) — a retried
+        // abort resumes and completes the wipe.
+        return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
+      }
+
+      // Cleanup fully succeeded — only now clear to 'none'.
       this.sql.exec(
         "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, updated_at = ? WHERE vbucket = ?",
         new Date().toISOString(),
         body.vbucket,
       );
-      await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
-      // Purge queued-but-unsent mirrors before wiping the target — a stale
-      // mirror firing after the wipe would recreate unattributed junk there.
-      await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
-      const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
-      if (!wipeRes.ok) {
-        return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
-      }
 
       return json({ ok: true, vbucket: body.vbucket, status: "aborted" });
     } finally {
