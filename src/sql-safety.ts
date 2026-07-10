@@ -98,6 +98,18 @@ export function isMutation(sql: string): boolean {
   return /^(insert|update|delete|replace|create|drop|alter)/i.test(afterCte);
 }
 
+/** Milestone 3, Chunk 0: does this statement's leading keyword classify it as
+ * a DELETE? Used by ShardDO to decide whether a successful write should
+ * remove (delete) or upsert (insert/update/replace) the row's
+ * `__cf_row_owners` provenance entry — derived from the SQL text itself, the
+ * same "ShardDO classifies its own writes" philosophy isMutation() already
+ * uses, rather than trusting a caller-supplied hint. */
+export function isDeleteStatement(sql: string): boolean {
+  const afterComments = stripLeadingComments(sql);
+  const afterCte = stripLeadingComments(skipLeadingCte(afterComments));
+  return /^delete/i.test(afterCte);
+}
+
 function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {
   const s = sql.trim().toLowerCase();
   const noTrailingSemicolon = s.replace(/;\s*$/, "");

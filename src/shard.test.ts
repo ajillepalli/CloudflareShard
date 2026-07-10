@@ -694,3 +694,175 @@ describe("ShardDO 2PC: TTL sweep queries the coordinator, never unilaterally abo
   });
 
 });
+
+describe("ShardDO row provenance (Milestone 3, Chunk 0)", () => {
+  async function createTable(stub: Awaited<ReturnType<typeof freshShard>>) {
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+  }
+
+  async function provenanceRows(stub: Awaited<ReturnType<typeof freshShard>>, table: string, partitionKey: string) {
+    return runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      return Array.from(
+        state.storage.sql.exec(
+          "SELECT table_name, partition_key, tenant_id, vbucket FROM __cf_row_owners WHERE table_name = ? AND partition_key = ?",
+          table,
+          partitionKey,
+        ),
+      ) as Array<{ table_name: string; partition_key: string; tenant_id: string; vbucket: number }>;
+    });
+  }
+
+  it("an insert with full routing context writes a __cf_row_owners entry", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["row-1", "a"],
+        requestId: "req-prov-1",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-1",
+        vbucket: 42,
+      }),
+    );
+    expect(res.status).toBe(200);
+
+    const rows = await provenanceRows(stub, "t", "row-1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].tenant_id).toBe("tenant-1");
+    expect(rows[0].vbucket).toBe(42);
+  });
+
+  it("a delete with full routing context removes the __cf_row_owners entry", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["row-2", "a"],
+        requestId: "req-prov-2",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-2",
+        vbucket: 7,
+      }),
+    );
+    expect(await provenanceRows(stub, "t", "row-2")).toHaveLength(1);
+
+    await stub.fetch(
+      post("/execute", {
+        sql: "DELETE FROM t WHERE id = ?",
+        params: ["row-2"],
+        requestId: "req-prov-3",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-2",
+        vbucket: 7,
+      }),
+    );
+    expect(await provenanceRows(stub, "t", "row-2")).toHaveLength(0);
+  });
+
+  it("an update with full routing context keeps a single provenance entry (no duplicate row)", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["row-3", "a"],
+        requestId: "req-prov-4",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-3",
+        vbucket: 1,
+      }),
+    );
+    await stub.fetch(
+      post("/execute", {
+        sql: "UPDATE t SET v = ? WHERE id = ?",
+        params: ["b", "row-3"],
+        requestId: "req-prov-5",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-3",
+        vbucket: 1,
+      }),
+    );
+    const rows = await provenanceRows(stub, "t", "row-3");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].vbucket).toBe(1);
+  });
+
+  it("a write missing routing context (e.g. schema DDL) does not write provenance", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    const res = await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id, v) VALUES ('row-4', 'x')", requestId: "req-prov-6", isMutation: true }),
+    );
+    expect(res.status).toBe(200);
+    expect(await provenanceRows(stub, "t", "row-4")).toHaveLength(0);
+  });
+
+  it("a mutation whose where clause matches nothing (0 rows affected) does not write provenance", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "UPDATE t SET v = ? WHERE id = ?",
+        params: ["never-lands", "no-such-row"],
+        requestId: "req-prov-7",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "no-such-row",
+        vbucket: 3,
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await provenanceRows(stub, "t", "no-such-row")).toHaveLength(0);
+  });
+
+  it("a 2PC-committed base-row intent writes provenance, but a piggybacked synthetic intent without op/vbucket does not", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+
+    const commitRes = await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: "tx-prov-1",
+        intents: [
+          {
+            sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+            params: ["row-5", "a"],
+            tenantId: "tenant-1",
+            table: "t",
+            partitionKey: "row-5",
+            vbucket: 9,
+            op: "insert",
+          },
+          {
+            // Mirrors a synthetic __cf_indexes-maintenance intent: no op/vbucket.
+            sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+            params: ["row-6", "b"],
+            tenantId: "tenant-1",
+            table: "t",
+            partitionKey: "row-6",
+          },
+        ],
+      }),
+    );
+    expect(commitRes.status).toBe(200);
+    await stub.fetch(post("/commit", { coordinatorTxId: "tx-prov-1" }));
+
+    expect(await provenanceRows(stub, "t", "row-5")).toHaveLength(1);
+    expect(await provenanceRows(stub, "t", "row-6")).toHaveLength(0);
+  });
+});
