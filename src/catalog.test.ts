@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { CatalogDO } from "./catalog";
+import { hashKey } from "./hash";
 
 describe("CatalogDO audit log", () => {
   it("records init, register-table, split-vbucket, and drain-shard as audit entries", async () => {
@@ -677,5 +678,116 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
 
     const sameShard = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
     expect(sameShard.status).toBe(400);
+  });
+});
+
+describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
+  it("substitutes a drained shard out of an index's pinned ring deterministically (smallest hashKey(indexName + ':' + shardId) among out-of-ring active shards), copying entries before repointing and deleting source copies after", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Pin an index ring containing ONLY shard-0, directly (create-index
+    // would pin all three shards, leaving no candidate).
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_evac_by_v",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      // Reassign shard-0's vbuckets elsewhere so the drain goes straight to
+      // ring evacuation (phase 2) without vbucket migrations.
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+    });
+
+    // Seed an index entry on the shard being drained.
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shard0.fetch(
+      new Request("https://shard.internal/index-entries-import", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          rows: [
+            {
+              table_name: "events",
+              index_name: "idx_evac_by_v",
+              index_key_json: JSON.stringify(["alpha"]),
+              partition_key: "row-1",
+              source_shard_id: "shard-1",
+              tenant_id: "t1",
+              updated_at: new Date().toISOString(),
+            },
+          ],
+        }),
+      }),
+    );
+
+    const drainRes = await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(drainRes.status).toBe(200);
+
+    // Drive the evacuation.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    // The spec's deterministic rule, computed independently here: candidates
+    // are the active shards not already in the ring.
+    const candidates = ["shard-1", "shard-2"];
+    const expected = candidates.reduce((best, s) =>
+      hashKey(`idx_evac_by_v:${s}`) < hashKey(`idx_evac_by_v:${best}`) ? s : best,
+    );
+
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = ?", "idx_evac_by_v"),
+      ) as Array<{ placement_ring_json: string }>;
+      expect(JSON.parse(rows[0].placement_ring_json)).toEqual([expected]);
+    });
+
+    // Entry copied to the substitute; source copy deleted.
+    const substituteStub = env.SHARD.get(env.SHARD.idFromName(expected));
+    await runInDurableObject(substituteStub, async (_instance2: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idx_evac_by_v"));
+      expect(rows).toHaveLength(1);
+    });
+    await runInDurableObject(shard0, async (_instance2: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idx_evac_by_v"));
+      expect(rows).toHaveLength(0);
+    });
+
+    const statusRes = await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const statusBody = (await statusRes.json()) as { vbucketsRemaining: number; ringsRemaining: number; status: string };
+    expect(statusBody.vbucketsRemaining).toBe(0);
+    expect(statusBody.ringsRemaining).toBe(0);
+    expect(statusBody.status).toBe("complete");
+  });
+
+  it("rejects the drain 409 RING_EVACUATION_NO_CANDIDATE when every active shard is already in the index's ring", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_nocand_by_v",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0", "shard-1"]),
+      );
+    });
+
+    const drainRes = await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(drainRes.status).toBe(409);
+    const body = (await drainRes.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("RING_EVACUATION_NO_CANDIDATE");
+
+    // The shard was never marked draining — the rejection happened before
+    // any durable state change.
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT status FROM shards WHERE shard_id = 'shard-0'")) as Array<{ status: string }>;
+      expect(rows[0].status).toBe("active");
+    });
   });
 });

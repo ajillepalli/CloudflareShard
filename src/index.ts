@@ -293,7 +293,10 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
   const registerResults = await fanOutToAllCatalogs(
     env,
     "/register-table",
-    () => ({ table: body.table, partitioning: body.partitioning, partitionKeyColumn: body.partitionKeyColumn }),
+    // schemaSql: Milestone 3, Chunk 5 — captured so migration backfill can
+    // provision this table on a shard created after this fan-out ran (e.g.
+    // a split target).
+    () => ({ table: body.table, partitioning: body.partitioning, partitionKeyColumn: body.partitionKeyColumn, schemaSql: body.schema }),
     request.headers.get("authorization") ?? undefined,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register table.");
@@ -609,6 +612,8 @@ function makeCatalogMigrationForwarder(path: string): (request: Request, env: En
 const handleAdminMigrateVbucket = makeCatalogMigrationForwarder("/migrate-vbucket");
 const handleAdminMigrateVbucketStatus = makeCatalogMigrationForwarder("/migrate-vbucket-status");
 const handleAdminMigrateVbucketAbort = makeCatalogMigrationForwarder("/migrate-vbucket-abort");
+// Milestone 3, Chunk 5: progress of a shard drain's two evacuation loops.
+const handleAdminDrainShardStatus = makeCatalogMigrationForwarder("/drain-shard-status");
 
 async function handleAdminStatus(request: Request, env: Env): Promise<Response> {
   const authorization = request.headers.get("authorization") ?? undefined;
@@ -2124,6 +2129,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/migrate-vbucket": handleAdminMigrateVbucket,
   "/admin/migrate-vbucket-status": handleAdminMigrateVbucketStatus,
   "/admin/migrate-vbucket-abort": handleAdminMigrateVbucketAbort,
+  "/admin/drain-shard-status": handleAdminDrainShardStatus,
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
