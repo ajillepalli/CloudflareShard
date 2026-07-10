@@ -135,6 +135,58 @@ Response:
 
 Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409.
 
+POST /admin/create-index (ADMIN_TOKEN) — Milestone 2, Chunk 1
+Request:
+- indexName string
+- table string (must already be registered with an upgraded `partitionKeyColumn`)
+- columns array of string (composite-capable — validates against the table's actual schema via `PRAGMA table_info`)
+
+Response:
+- ok
+- indexName
+- table
+- columns
+
+Registers a secondary index and backfills it against every existing row on every shard (single-pass, not chunked — see the Milestone 2 design doc's stated pre-product-scale simplification). Index entries live in each shard's internal `__cf_indexes` table, placed on a shard chosen by hashing `(table, indexName, indexKeyJson)` — independent of the base row's own shard, so a future index-query lookup resolves on one shard instead of scattering. Once any index is registered on a table, raw `/v1/sql` mutations against that table are rejected 409 (`TABLE_HAS_INDEX`) — raw SQL bypasses every index-maintenance mechanism, so it's blocked outright rather than silently desyncing the index; use `/v1/mutate` or `/v1/tx` instead. `/v1/mutate`'s async maintenance is live as of Chunk 2 below; `/v1/tx`'s 2PC-piggyback maintenance is live as of Chunk 3.
+
+The index is registered in `CatalogDO` *before* the backfill scan runs, not after — a row written between the two would otherwise be missed by the scan and never trigger async maintenance either, leaving it permanently unindexed. Registering first means any concurrent write during backfill is already covered by the live async/2PC maintenance path; backfill's own writes are redundant-but-idempotent (`INSERT OR REPLACE`) in that case. To avoid backfill clobbering a concurrent write's fresher data with the value it captured in its initial bulk scan, backfill re-reads each row immediately before writing its index entry rather than trusting the scanned snapshot — this narrows the staleness window to a single read-then-write round trip, the same order of hazard the async maintenance path already accepts elsewhere, not a new or larger one.
+
+**`building` / `ready` status (eng-review fix).** `index_rules.status` starts `'building'` the moment `CatalogDO` registers the index (before backfill runs) and flips to `'ready'` only once the Worker's backfill loop has fully completed on every shard (`CatalogDO./mark-index-ready`, the last step of `/admin/create-index`). Write-path maintenance (`/v1/mutate` async, `/v1/tx` piggyback) is **not** gated on status — it's live from the moment of registration, which is what makes registering before backfill correct. Only the read path is gated: `/lookup-index` (and therefore `/v1/index-query`) rejects a `'building'` index with 425 `INDEX_BUILDING`, rather than silently returning partial results for rows backfill hasn't reached yet. If backfill fails partway, the index stays `'building'` forever until a retried `/admin/create-index` call (idempotent, per above) succeeds all the way through.
+
+**Draining and splitting are both blocked while any index exists (eng-review fix).** Index-shard placement (`indexShardIdForKey`) hashes over the globally *active* shard set, recomputed fresh on every read/write — unlike base-row routing, which uses a persistent vbucket-to-shard mapping unaffected by shard-count changes. Both draining a shard (shrinking the active set) and `/admin/split-vbucket` (growing it — a split always inserts a new `active` shard) change the hash modulo for nearly every existing index key, silently orphaning `__cf_indexes` entries with no migration path. `CatalogDO./drain-shard` rejects 409 `SHARD_DRAIN_BLOCKED_BY_INDEXES`, and `CatalogDO./split-vbucket` rejects 409 `SPLIT_BLOCKED_BY_INDEXES` (Codex-found — the original fix only covered drain), if any index is registered cluster-wide (checked via `index_rules`, which is fanned out identically to every catalog shard, via a shared `blockIfIndexesExist` helper). Drop all indexes first, drain/split, then recreate them — backfill will then use the post-change shard set.
+
+**Non-unique only (Milestone 2, Chunk 7 — decided, not a gap).** Every registered index is non-unique: multiple base rows may share the same indexed-column value(s), and `__cf_indexes` writes use `INSERT OR REPLACE` with no constraint check. Unique-index support (rejecting a write that would violate uniqueness, which needs either a real `UNIQUE` constraint at the index-shard level or explicit pre-check-plus-lock coordination to close the race between two concurrent writes both claiming to be first) was scoped out of Milestone 2 entirely — no chunk in the plan allocated space to build it, consistent with this milestone's own founding premise (Chunk 1's Demand Evidence: no validated need exists yet for even the general-purpose composite-index scope this milestone already ships ahead of demand). Tracked in `TODOS.md` as a future increment if real usage ever calls for it.
+
+POST /admin/list-indexes (ADMIN_TOKEN) — Milestone 2, Chunk 1
+Response:
+- indexes: array of `{indexName, table, columns, status, createdAt}` (`status` is `'building'` or `'ready'` — see below)
+
+POST /admin/drop-index (ADMIN_TOKEN) — Milestone 2, Chunk 6
+Request:
+- indexName string
+
+Response:
+- ok
+- indexName
+- warning string (only present if physical cleanup failed on one or more shards — the index is still unregistered and unqueryable either way)
+
+Unregisters the index in `CatalogDO` (fanned to every catalog shard) *before* fanning out physical `__cf_indexes` row cleanup — so `/v1/index-query` and raw `/v1/sql` mutations against the table both see the index as gone (404 / no longer blocked, respectively) immediately, even while physical cleanup is still in flight across shards. A write already in progress when the drop runs may still land one last `__cf_indexes` row after cleanup passes over it — a known, accepted eventual-consistency window for this rare admin operation, not a linearizability guarantee this milestone makes.
+
+`/v1/mutate` async index maintenance — Milestone 2, Chunk 2 (no new route; extends the existing `/v1/mutate` handler)
+When the target table has any registered index, `handleV1Mutate` computes the resulting `__cf_indexes` deltas and dispatches them via the Worker's own `ctx.waitUntil()` — after the base row's write has already succeeded and the response is on its way back to the caller, so this never adds latency to the base write. For `update`/`delete`/`upsert` (which may hit the `ON CONFLICT UPDATE` path), the row's prior indexed-column values are read once before the mutation runs, so removing a now-stale index entry doesn't need a second read-after-write — whatever column wasn't in the caller's `values` is taken from that pre-read. If the best-effort write to the computed index shard fails, it's recorded via `ShardDO./enqueue-index-job` on the *base* shard (not the index shard, which may be the one that's unreachable) and retried by that shard's own `alarm()` with exponential backoff (`index_pending_jobs` table) — the same recovery-queue pattern `CoordinatorDO` already uses for 2PC. A write to a table with no registered index pays none of this cost. **Eng-review fix:** maintenance only dispatches if the base write's own `rowsAffected > 0` — a `StructuredMutation`'s optional `where` can narrow `update`/`delete` beyond the `partitionKey`, and a `where` that matches nothing must not still delete/rewrite the row's index entry based on a beforeRow snapshot that describes a row nothing actually touched.
+
+`/v1/tx` index piggyback — Milestone 2, Chunk 3 (no new route; extends the existing `/v1/tx` handler)
+When a mutation's table carries any registered index, its `__cf_indexes` deltas (same `computeIndexDeltas` logic Chunk 2 uses, so both write paths agree on what "the index changed" means) are added to the *same* 2PC transaction as extra participants — `CoordinatorDO./begin` sees them as ordinary intents with a synthetic lock key (`table` = `"__cf_indexes:" + indexName`, `partitionKey` = the index key JSON), so the base row and every index entry it affects commit or abort atomically, with no separate consistency model to reason about. These synthetic index-participant keys do **not** count against `MAX_TX_PARTICIPANT_KEYS` — that cap bounds what the caller asked to touch; index maintenance is bookkeeping this system adds on the caller's behalf, not additional caller-requested scope. A transaction that worked before a table had any index keeps working once one is added.
+
+**Zero-row `update`/`delete` fix (eng-review).** Unlike `/v1/mutate`, `/v1/tx`'s index-delta participants must be decided *before* `/begin` runs — before the base mutation has executed at all, so there's no `rowsAffected` to gate on the way Chunk 2's path does. Instead, the pre-read that produces `beforeRow` now filters by the exact same predicate `compileMutation` will use (`mutationWhereClause`, shared by both) — partition key AND any caller-supplied `where` — so a `where` that won't match correctly comes back with `beforeRow = null` instead of a real row's stale snapshot. `computeIndexDeltas` treats a null `beforeRow` on `update` as a hard no-op (no delta at all): without this, a null `beforeRow` is ambiguous between "insert, no prior row can exist yet" (where a new entry should legitimately be written from `afterValues`) and "update whose predicate matched nothing" (where nothing happened and nothing should be written) — conflating the two would synthesize a phantom `__cf_indexes` entry for a base-row change that never occurred. A phantom entry is asymmetric with the original bug it replaces: `/v1/index-query`'s staleness re-check (below) always filters it back out at read time, so it can never cause a wrong-answer or a live row to vanish — at most it's a harmless orphan row, the same class of residual accepted for the backfill-vs-concurrent-write race above. `delete` was never at risk of this: its `newKeyJson` is unconditionally `null` regardless of `beforeRow`.
+
+**Indexed columns must be explicit on insert/upsert (eng-review fix, Codex-found).** An insert/upsert that omits an indexed column and relies on a SQL `DEFAULT` would otherwise get indexed as `null` instead of whatever SQLite actually assigns — `computeIndexDeltas` has no way to know the real stored value without reading the row back, and reading back after the write isn't an option for `/v1/tx` (the index delta is a 2PC participant decided *before* `/begin`, so there is no "after the write" moment to read from without breaking the atomicity guarantee the piggyback exists to provide). Both `/v1/mutate` and `/v1/tx` therefore reject an insert/upsert on an indexed table 400 `INDEXED_COLUMN_REQUIRES_VALUE` if any indexed column is missing from `values` — turning a silent wrong-index into an explicit, immediate error, and keeping both write paths behaving identically rather than one silently working around it and the other not.
+
+**Same-row multi-mutation tracking within one `/v1/tx` call (eng-review fix, Codex-found).** Each mutation's `beforeRow` pre-read hits the real database, which only reflects what's already committed — never what an *earlier mutation in the same batch* is about to do, since `/begin` hasn't run yet when these pre-reads happen. Without accounting for this, two mutations on the same row in one `/v1/tx` call (e.g. insert `v='a'` then update `v='b'`) could compute the second mutation's delta against a stale or nonexistent prior state, silently losing the index entry for the row's actual final value. `handleV1Tx` now tracks a simulated per-row state (`Map` keyed the same way as `rowKey()`/`participantKey()`) seeded from the first real pre-read for each row and updated in place as each mutation in the batch is processed — mirroring how SQLite itself sees each statement's effects within the same transaction (later statements observe earlier ones' writes). A later mutation's `where` is matched against the simulated state the same way the database would evaluate it against the real row once `/begin` actually runs the batch in order.
+
+Benchmark — Milestone 2, Chunk 7 (finalizes the design doc's Success Criterion 2)
+`src/index.test.ts`'s "benchmark" describe block measures p50 latency for indexed vs. unindexed `/v1/mutate` inserts and asserts the regression stays under a bar combining an absolute floor (25ms, absorbing test-environment timing noise on an already-fast baseline) and a percentage cap (10%). It also asserts zero rows ever land in `index_pending_jobs` across a clean run — the "repair-debt backlog" half of the criterion — since a nonzero count under non-failure conditions would mean the async dispatch itself is silently degrading, not just slow. Because index maintenance is dispatched via `ctx.waitUntil()` *after* the response is already prepared (Chunk 2), the expected result is that indexed writes are indistinguishable from unindexed ones on the caller-observed path; this benchmark exists to catch a regression if that property is ever accidentally broken (e.g. an future change that awaits the index write before responding), not because a real difference is expected today.
+
 POST /admin/split-vbucket
 Request:
 - vbucket number
@@ -231,6 +283,21 @@ Response:
 
 Manual escape hatch for a transaction stuck past a reasonable window (visible via `/admin/tx-status`) — aborts every participant shard and marks the transaction aborted. Rejects 409 if the transaction already committed.
 
+POST /v1/index-query (tenant bearer token) — Milestone 2, Chunk 4
+Request:
+- table string
+- indexName string
+- tenantId string
+- values object (a value for every column the index covers — exact full-tuple lookups only, leftmost-prefix not yet supported)
+- limit number (optional, default 20, capped at 100)
+
+Response:
+- rows: array of the matching base rows (full row data, not just partition keys)
+
+The first tenant-facing, non-partition-key query path this platform has — resolves in three hops (`CatalogDO` validates the tenant token and the index's columns, the computed index shard resolves matching `(partitionKey, sourceShardId)` pairs, each match's base row is read from its own shard), never `/v1/scatter`'s admin-only full-cluster fan-out. Because `/v1/mutate`'s index maintenance (Chunk 2) is async, a matched entry can be stale by the time it's read; the base row is re-verified against the queried tuple before being returned, so a stale delete/update is silently excluded — never surfaced as a wrong result. Rejects 425 `INDEX_BUILDING` if the index hasn't finished its initial backfill yet (see the `building`/`ready` status note in the `/admin/create-index` section above). `/v1/scatter` remains the admin-only fallback for querying by a column that has no registered index; the two coexist rather than one deprecating the other.
+
+**Paging past stale entries (eng-review fix).** `limit` no longer bounds the raw `__cf_indexes` scan directly — it used to apply `LIMIT` before the staleness re-check ran, so a run of stale entries sorted first could starve out live matches that exist further down the index, silently under-filling or emptying a result even though enough live rows exist. Raw entries are now paged (ordered by `partition_key` for a stable cursor) and re-verified batch by batch until `limit` verified rows are collected or the index is exhausted, bounded by a `limit * 5` raw-scan cap so a pathologically stale index (e.g. after a delete burst whose async cleanup hasn't caught up) can't make one query scan unboundedly. Within each batch, every match's hydrate read is dispatched concurrently (`Promise.all`) rather than one round trip at a time — each match is an independent read (different partition keys, potentially different shards), and `Promise.all` preserves the batch's `partition_key` order so the result stays deterministic across repeated calls.
+
 POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
 - sql string (SELECT only)
@@ -323,6 +390,17 @@ This prevents duplicate writes after network retries and stops a reused requestI
     (`SHARD_HAS_IN_FLIGHT_TRANSACTIONS`). This preserves the "Worker orchestrates, DOs don't
     call each other directly" invariant. Relies on Chunk 3's recovery loop (bounded time) or
     `/admin/tx-force-abort` (manual escape hatch) to unblock a stuck retry.
+  - **Index-shard drain interaction (Milestone 2 Chunk 5 — shipped).** Index-shard placement
+    (`indexShardIdForKey`) is a pure hash over the current shard pool, independent of
+    `vbucket_map`/`shards.status` — draining a shard in the catalog sense doesn't stop the
+    underlying `ShardDO` instance or its `alarm()` from continuing to exist and run. The real
+    risk is an operator draining a shard ahead of decommissioning it while that shard still
+    has unresolved `index_pending_jobs` (Chunk 2's retry queue) — silently letting those keep
+    retrying against a shard the catalog no longer routes traffic to. `handleAdminDrainShard`
+    now also checks `/pending-intent-count`'s (extended) `indexPendingJobCount` field and
+    rejects 409 (`SHARD_HAS_PENDING_INDEX_JOBS`) if it's nonzero, mirroring the 2PC
+    in-flight-transaction check exactly. `/admin/shard-stats` also reports
+    `indexPendingJobCount` and `indexEntryCount` for observability.
 
 ## 11) Rebalancing and Split (MVP)
 

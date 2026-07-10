@@ -2,6 +2,18 @@
 
 ## Architecture
 
+### Unique-index support for the Index Service
+
+**What:** Support rejecting a write that would violate a declared uniqueness constraint on a registered index, instead of today's non-unique-only model (`__cf_indexes` uses `INSERT OR REPLACE`, no constraint check).
+
+**Why:** Deliberately scoped out of Milestone 2 entirely (Chunk 7) — no chunk in that plan allocated space to build it. Real uniqueness enforcement needs either a `UNIQUE` constraint at the index-shard level or explicit pre-check-plus-lock coordination to close the race between two concurrent writes both claiming to be first; both are genuine design work, not a small addition.
+
+**Context:** Milestone 2 itself shipped ahead of validated demand (see its design doc's Demand Evidence — no named user or query exists yet). Building uniqueness enforcement on top of an already-ahead-of-demand feature would compound that, not reduce it. Revisit once a real adopter's schema actually needs a unique secondary index (e.g. "email must be unique per tenant").
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** A real adopter's use case — not committed work.
+
 ### Re-evaluate CoordinatorDO keying against real transaction volume
 
 **What:** Confirm one-DO-per-transaction (`env.COORDINATOR.idFromName(txId)`, no sharding) stays the right choice once real transaction volume exists, or re-introduce a sharded pool (`coordinator-${hash(txId) % N}`) if cold-start latency becomes a measurable problem at scale.
@@ -18,7 +30,7 @@
 
 **What:** Decide whether the raw-SQL mutation path and the new structured-mutation DSL (`/v1/mutate`, `/v1/tx`) should coexist long-term, or whether raw SQL mutations should be deprecated/admin-only once the structured path covers the common cases.
 
-**Why:** Codex flagged that two first-class write paths with different row-ownership guarantees (raw SQL: trust-based; structured: enforced) is a non-auditable correctness story and a security-footgun risk — a caller could always fall back to the weaker path.
+**Why:** Codex flagged that two first-class write paths with different row-ownership guarantees (raw SQL: trust-based; structured: enforced) is a non-auditable correctness story and a security-footgun risk — a caller could always fall back to the weaker path. Milestone 2's `/plan-eng-review` added a third reason: raw `/v1/sql` mutations bypass every index-maintenance mechanism entirely, silently desyncing any index on a table they touch — Milestone 2's Chunk 1 closes this specific hole with a 409 rejection, but it's the same underlying dual-write-path problem surfacing again.
 
 **Context:** Milestone 2 (Index Service) will also depend on structured mutations for index maintenance, which may tip the balance toward deprecating raw SQL mutations entirely. Not urgent for Milestone 1 since raw `/v1/sql` isn't used for coordinated transactions, but worth deciding before the dual-path pattern calcifies into tenant-facing API surface people build against.
 
@@ -61,6 +73,18 @@
 **Effort:** L
 **Priority:** P3
 **Depends on:** Milestone 1 (Transaction Coordinator) and Milestone 2 (Index Service).
+
+### Index-entry topology: physical source_shard_id vs. logical identity + read-time routing
+
+**What:** Decide whether `__cf_indexes` entries store the physical `source_shard_id` they were written on (current Milestone 2 design), or store logical identity `(tenantId, table, partitionKey)` and resolve the owning shard at read time instead.
+
+**Why:** Storing `source_shard_id` bakes topology into the data — every split, drain, or backfill has to rewrite index entries just because placement changed. The logical-identity alternative avoids that rewrite cost at the price of an extra routing hop on every index query. Flagged by an independent Codex outside-voice pass during Milestone 2's `/plan-eng-review`.
+
+**Context:** Real enough to matter once splits start happening on a table with a live index, but deciding now (before Chunk 2/5 implementation experience exists) would be premature — noted as an Open Question in the Milestone 2 design doc for those chunks to weigh directly, not deferred past Milestone 2 entirely. **Update (post-implementation `/plan-eng-review`, 2026-07-09):** the branch-diff eng-review pass confirmed the concrete failure this topology choice risks — index-shard placement (`indexShardIdForKey`) hashes over the *active* shard list, recomputed fresh on every read/write, so draining a shard changes the hash divisor for nearly every existing index key and orphans `__cf_indexes` entries written under the old shard count. Milestone 2 shipped the cheap mitigation (`CatalogDO./drain-shard` now rejects 409 `SHARD_DRAIN_BLOCKED_BY_INDEXES` while any index is registered cluster-wide) rather than resolving the topology question itself — this TODO is still open and now has a concrete trigger: revisit once draining a cluster that also needs live indexes is an actual requirement, not just a hypothetical.
+
+**Effort:** S (a design decision, not implementation work itself)
+**Priority:** P3
+**Depends on:** Milestone 2 Chunks 2 and 5 (async maintenance, drain interaction).
 
 ### Cross-tenant/cross-shard analytics aggregation
 

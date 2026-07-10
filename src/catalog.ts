@@ -3,7 +3,7 @@ import { json } from "./http";
 import { hashKey } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
-import { UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
+import { IDENTIFIER_RE, UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
 
 const ADMIN_GATED_ROUTES = new Set([
   "/status",
@@ -16,6 +16,10 @@ const ADMIN_GATED_ROUTES = new Set([
   "/register-tenant",
   "/revoke-tenant",
   "/set-partition-key-column",
+  "/create-index",
+  "/list-indexes",
+  "/drop-index",
+  "/mark-index-ready",
 ]);
 
 export class CatalogDO extends DurableObject {
@@ -43,6 +47,11 @@ export class CatalogDO extends DurableObject {
       "/register-tenant": this.handleRegisterTenant.bind(this),
       "/revoke-tenant": this.handleRevokeTenant.bind(this),
       "/set-partition-key-column": this.handleSetPartitionKeyColumn.bind(this),
+      "/create-index": this.handleCreateIndex.bind(this),
+      "/list-indexes": this.handleListIndexes.bind(this),
+      "/lookup-index": this.handleLookupIndex.bind(this),
+      "/drop-index": this.handleDropIndex.bind(this),
+      "/mark-index-ready": this.handleMarkIndexReady.bind(this),
     };
   }
 
@@ -116,6 +125,28 @@ export class CatalogDO extends DurableObject {
         token_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
         revoked_at TEXT
+      )
+    `);
+
+    // Milestone 2 (Index Service). One row per registered secondary index.
+    // No tenant scoping here — matches table_rules/base-table rows, which
+    // also carry no tenant_id (see docs/SPEC.md §14's documented trust
+    // model). columns_json is a JSON array to support composite indexes.
+    // status starts 'building' (set the moment the Worker registers, before
+    // backfill runs) and flips to 'ready' only once backfill has fully
+    // completed (see handleMarkIndexReady) — /lookup-index (and therefore
+    // /v1/index-query) rejects reads against a 'building' index rather than
+    // silently returning partial results for rows backfill hasn't reached
+    // yet. Write-path maintenance (async /v1/mutate, /v1/tx piggyback) is
+    // NOT gated on status — it's supposed to be live from the moment of
+    // registration, that's what makes registering before backfill correct.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS index_rules (
+        index_name TEXT PRIMARY KEY,
+        table_name TEXT NOT NULL,
+        columns_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'building',
+        created_at TEXT NOT NULL
       )
     `);
   }
@@ -364,6 +395,194 @@ export class CatalogDO extends DurableObject {
     return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn, metadataVersion: version });
   }
 
+  /** Registers index metadata only — does not touch physical shard data.
+   * The Worker orchestrates the physical side (creating __cf_indexes on
+   * every shard, running backfill) before calling this, mirroring how
+   * /admin/create-table applies the shard-level schema before registering
+   * in table_rules (src/index.ts's handleAdminCreateTable). */
+  private async handleCreateIndex(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
+    if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
+      return json(
+        {
+          error: {
+            code: "MISSING_FIELDS",
+            message: "Missing indexName, table, or columns.",
+            fix: "Provide indexName, table, and a non-empty columns array.",
+          },
+        },
+        400,
+      );
+    }
+    if (!IDENTIFIER_RE.test(body.indexName)) {
+      return json(
+        { error: { code: "UNSAFE_IDENTIFIER", message: "indexName is not a valid identifier." } },
+        400,
+      );
+    }
+    for (const col of body.columns) {
+      if (!IDENTIFIER_RE.test(col)) {
+        return json(
+          { error: { code: "UNSAFE_IDENTIFIER", message: `Unsafe identifier in columns: ${col}` } },
+          400,
+        );
+      }
+    }
+
+    const table = this.one<{ table_name: string }>("SELECT table_name FROM table_rules WHERE table_name = ?", body.table);
+    if (!table) {
+      return json(
+        { error: { code: "TABLE_NOT_REGISTERED", message: `Table ${body.table} is not registered.`, fix: "Call /admin/create-table first." } },
+        404,
+      );
+    }
+
+    // Idempotent on retry with the SAME table+columns — the Worker registers
+    // BEFORE backfilling (not after), specifically so a retry after a
+    // partial backfill failure can call this again rather than getting
+    // stuck behind a 409 for an index that's already (partially) there.
+    // Genuinely different table/columns for the same indexName is still a
+    // real conflict, not a retry.
+    const existing = this.one<{ table_name: string; columns_json: string }>(
+      "SELECT table_name, columns_json FROM index_rules WHERE index_name = ?",
+      body.indexName,
+    );
+    if (existing) {
+      const sameDefinition = existing.table_name === body.table && existing.columns_json === JSON.stringify(body.columns);
+      if (sameDefinition) {
+        return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
+      }
+      return json(
+        { error: { code: "INDEX_ALREADY_REGISTERED", message: `Index ${body.indexName} is already registered with a different table/columns.` } },
+        409,
+      );
+    }
+
+    this.audit("/create-index", { indexName: body.indexName, table: body.table, columns: body.columns });
+    this.sql.exec(
+      "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at) VALUES (?, ?, ?, 'building', ?)",
+      body.indexName,
+      body.table,
+      JSON.stringify(body.columns),
+      new Date().toISOString(),
+    );
+
+    return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
+  }
+
+  /** Shared by handleMarkIndexReady and handleDropIndex — both need to
+   * confirm an index is registered before acting, and return the identical
+   * 404 shape if it isn't. Returns null (not a Response) when found, so
+   * callers can `if (!existing) return ...` on a real row without an extra
+   * unwrap. */
+  private requireIndexRule(indexName: string): { found: true } | { found: false; response: Response } {
+    const existing = this.one<{ index_name: string }>("SELECT index_name FROM index_rules WHERE index_name = ?", indexName);
+    if (!existing) {
+      return {
+        found: false,
+        response: json({ error: { code: "INDEX_NOT_REGISTERED", message: `Index ${indexName} is not registered.` } }, 404),
+      };
+    }
+    return { found: true };
+  }
+
+  /** Eng-review fix: flips an index from 'building' to 'ready' once the
+   * Worker's backfill loop has fully completed. Called as the last step of
+   * /admin/create-index, after every shard has been scanned and every row's
+   * __cf_indexes entry written — before this, /lookup-index (and therefore
+   * /v1/index-query) rejects reads against the index rather than silently
+   * returning partial results for rows backfill hasn't reached yet. */
+  private async handleMarkIndexReady(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName." } }, 400);
+    }
+    const rule = this.requireIndexRule(body.indexName);
+    if (!rule.found) return rule.response;
+    this.sql.exec("UPDATE index_rules SET status = 'ready' WHERE index_name = ?", body.indexName);
+    return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Milestone 2, Chunk 6. Unregisters the index — the Worker calls this
+   * BEFORE fanning out physical __cf_indexes cleanup, so any /v1/index-query
+   * or /lookup-index call that starts after this returns sees the index as
+   * gone immediately (404 INDEX_NOT_REGISTERED), even while physical
+   * cleanup is still in flight across shards. A write already in progress
+   * when this runs may still land one last __cf_indexes row after physical
+   * cleanup passes over it — a known, accepted eventual-consistency window,
+   * not a correctness gap this milestone closes (DROP INDEX is a rare admin
+   * operation, not a hot path). */
+  private async handleDropIndex(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName." } }, 400);
+    }
+    const rule = this.requireIndexRule(body.indexName);
+    if (!rule.found) return rule.response;
+    this.audit("/drop-index", { indexName: body.indexName });
+    this.sql.exec("DELETE FROM index_rules WHERE index_name = ?", body.indexName);
+    return json({ ok: true, indexName: body.indexName });
+  }
+
+  private async handleListIndexes(): Promise<Response> {
+    const indexes = this.many<{ index_name: string; table_name: string; columns_json: string; status: string; created_at: string }>(
+      "SELECT index_name, table_name, columns_json, status, created_at FROM index_rules ORDER BY index_name ASC",
+    );
+    return json({
+      indexes: indexes.map((i) => ({
+        indexName: i.index_name,
+        table: i.table_name,
+        columns: JSON.parse(i.columns_json) as string[],
+        status: i.status,
+        createdAt: i.created_at,
+      })),
+    });
+  }
+
+  /** Milestone 2, Chunk 4. Tenant-auth-gated (not admin-gated, unlike
+   * /list-indexes) — /v1/index-query is a tenant-facing data-plane route, so
+   * this checks the caller's token the same way /route does, without
+   * requiring a partitionKey (nothing to route to a specific row yet —
+   * that's what the index lookup itself resolves). */
+  private async handleLookupIndex(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string; indexName?: string; tenantId?: string };
+    if (!body.table || !body.indexName || !body.tenantId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing table, indexName, or tenantId." } }, 400);
+    }
+    const authError = await this.checkTenantAuth(body.tenantId, request);
+    if (authError) return authError;
+
+    const index = this.one<{ columns_json: string; partition_key_column: string; status: string }>(
+      `
+      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status
+      FROM index_rules ir
+      JOIN table_rules tr ON tr.table_name = ir.table_name
+      WHERE ir.index_name = ? AND ir.table_name = ?
+      `,
+      body.indexName,
+      body.table,
+    );
+    if (!index) {
+      return json(
+        { error: { code: "INDEX_NOT_REGISTERED", message: `Index ${body.indexName} is not registered on table ${body.table}.` } },
+        404,
+      );
+    }
+    if (index.status !== "ready") {
+      return json(
+        {
+          error: {
+            code: "INDEX_BUILDING",
+            message: `Index ${body.indexName} is still backfilling and not yet queryable.`,
+            fix: "Retry once /admin/create-index for this index has returned successfully.",
+          },
+        },
+        425,
+      );
+    }
+    return json({ columns: JSON.parse(index.columns_json) as string[], partitionKeyColumn: index.partition_key_column });
+  }
+
   /** Data-plane tenant auth check: does the caller's bearer token match the
    * hash on file for the claimed tenantId? A per-claimed-tenant check, not an
    * identity primitive — it answers "does this token match tenantId X" for a
@@ -578,12 +797,25 @@ export class CatalogDO extends DurableObject {
       );
     }
 
+    // Milestone 2: lets the Worker reject a raw /v1/sql mutation against a
+    // table carrying a registered index (ShardDO has no CatalogDO access to
+    // check this itself — see the Milestone 2 eng review's correction), and
+    // lets /v1/mutate's async index maintenance (Chunk 2) know which columns
+    // each registered index actually covers.
+    const indexRows = this.many<{ index_name: string; columns_json: string }>(
+      "SELECT index_name, columns_json FROM index_rules WHERE table_name = ?",
+      body.table,
+    );
+    const indexes = indexRows.map((r) => ({ indexName: r.index_name, columns: JSON.parse(r.columns_json) as string[] }));
+
     return json({
       shardId: mapped.shard_id,
       vbucket,
       metadataVersion: config.metadata_version,
       catalogShardCount: config.catalog_shard_count,
       partitionKeyColumn: mapped.partition_key_column,
+      indexNames: indexes.map((i) => i.indexName),
+      indexes,
     });
   }
 
@@ -625,8 +857,8 @@ export class CatalogDO extends DurableObject {
   }
 
   private async handleListTables(): Promise<Response> {
-    const tables = this.many<{ table_name: string; partitioning: string; created_at: string }>(
-      "SELECT table_name, partitioning, created_at FROM table_rules ORDER BY table_name ASC",
+    const tables = this.many<{ table_name: string; partitioning: string; partition_key_column: string; created_at: string }>(
+      "SELECT table_name, partitioning, partition_key_column, created_at FROM table_rules ORDER BY table_name ASC",
     );
     return json({ tables });
   }
@@ -658,12 +890,42 @@ export class CatalogDO extends DurableObject {
       return json({ error: `Shard ${body.shardId} not found` }, 404);
     }
 
+    // Eng-review fix: index-shard placement (indexShardIdForKey) hashes over
+    // the globally active shard set, recomputed fresh on every read/write —
+    // unlike base-row routing, which uses a persistent vbucket->shard
+    // mapping unaffected by shard-count changes. Draining a shard changes
+    // that active set, which changes the hash modulo for nearly every
+    // existing index key, silently orphaning __cf_indexes entries with no
+    // migration path.
+    const drainBlocked = this.blockIfIndexesExist(
+      "SHARD_DRAIN_BLOCKED_BY_INDEXES",
+      "Cannot drain a shard while any secondary index is registered — draining would silently orphan existing index entries.",
+      "Drop all registered indexes (/admin/drop-index) first, drain the shard, then recreate the indexes so backfill uses the post-drain shard set.",
+    );
+    if (drainBlocked) return drainBlocked;
+
     this.audit("/drain-shard", { shardId: body.shardId });
 
     this.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", body.shardId);
 
     const version = this.bumpMetadataVersion();
     return json({ ok: true, shardId: body.shardId, metadataVersion: version });
+  }
+
+  /** Eng-review fix (Codex-found): index-shard placement hashes over the
+   * active shard set — /split-vbucket grows that set by inserting a new
+   * 'active' shard (below), the same hazard /drain-shard's block exists for,
+   * just via growth instead of shrinkage. Shared with handleDrainShard so
+   * both active-shard-count-changing operations get the identical guard. */
+  private blockIfIndexesExist(code: string, message: string, fix: string): Response | null {
+    // index_rules is fanned out identically to every catalog shard by
+    // /create-index, so this catalog shard's row count is representative of
+    // whether ANY index exists cluster-wide.
+    const anyIndex = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_rules");
+    if ((anyIndex?.n ?? 0) > 0) {
+      return json({ error: { code, message, fix } }, 409);
+    }
+    return null;
   }
 
   private async handleSplitVbucket(request: Request): Promise<Response> {
@@ -683,6 +945,13 @@ export class CatalogDO extends DurableObject {
     if (!existingMap) {
       return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
     }
+
+    const splitBlocked = this.blockIfIndexesExist(
+      "SPLIT_BLOCKED_BY_INDEXES",
+      "Cannot split a vbucket while any secondary index is registered — splitting adds a new active shard, changing index-shard placement and orphaning existing index entries.",
+      "Drop all registered indexes (/admin/drop-index) first, split, then recreate the indexes so backfill uses the post-split shard set.",
+    );
+    if (splitBlocked) return splitBlocked;
 
     this.audit("/split-vbucket", { vbucket: body.vbucket, newShardId: body.newShardId, fromShard: existingMap.shard_id });
 

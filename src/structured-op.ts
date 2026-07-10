@@ -114,6 +114,27 @@ export function validateMutation(m: StructuredMutation, partitionKeyColumn: stri
   return { ok: true };
 }
 
+/** Shared WHERE-clause builder for update/delete: the partition-key predicate
+ * unconditionally ANDed first, then any caller-supplied `where` predicates.
+ * compileMutation's update/delete cases build their SQL from this, and index
+ * maintenance's pre-read (index.ts) must filter by the SAME predicate before
+ * computing a beforeRow-based index delta — otherwise a `where` that doesn't
+ * match (0 rows actually affected) would still see a beforeRow snapshot and
+ * wrongly delete/rewrite that row's index entry for a mutation that never
+ * actually touched it. One function, used by both call sites, so they can't
+ * drift apart. */
+export function mutationWhereClause(m: StructuredMutation, partitionKeyColumn: string): { sql: string; params: unknown[] } {
+  const pkCol = `"${partitionKeyColumn}"`;
+  const whereConditions = [`${pkCol} = ?`];
+  const whereParams: unknown[] = [m.partitionKey];
+  for (const [key, value] of Object.entries(m.where ?? {})) {
+    if (key === partitionKeyColumn) continue;
+    whereConditions.push(`"${key}" = ?`);
+    whereParams.push(value);
+  }
+  return { sql: whereConditions.join(" AND "), params: whereParams };
+}
+
 /** Compiles a validated StructuredMutation to parameterized SQL — never
  * string-concatenates caller-supplied values, only column identifiers already
  * checked against IDENTIFIER_RE by validateMutation. Row-ownership is
@@ -124,7 +145,6 @@ export function compileMutation(m: StructuredMutation, partitionKeyColumn: strin
     throw new Error(`Unsafe table identifier: ${m.table}`);
   }
   const table = `"${m.table}"`;
-  const pkCol = `"${partitionKeyColumn}"`;
 
   switch (m.op) {
     case "insert": {
@@ -158,34 +178,17 @@ export function compileMutation(m: StructuredMutation, partitionKeyColumn: strin
       const setColumns = Object.keys(values).filter((c) => c !== partitionKeyColumn);
       const setClause = setColumns.map((c) => `"${c}" = ?`).join(", ");
       const setParams = setColumns.map((c) => values[c]);
-
-      // The partition-key predicate is unconditionally ANDed in first —
-      // caller-supplied `where` narrows further but can never substitute for
-      // it, and an absent `where` still only ever touches this one row/set.
-      const whereConditions = [`${pkCol} = ?`];
-      const whereParams: unknown[] = [m.partitionKey];
-      for (const [key, value] of Object.entries(m.where ?? {})) {
-        if (key === partitionKeyColumn) continue;
-        whereConditions.push(`"${key}" = ?`);
-        whereParams.push(value);
-      }
-
+      const where = mutationWhereClause(m, partitionKeyColumn);
       return {
-        sql: `UPDATE ${table} SET ${setClause} WHERE ${whereConditions.join(" AND ")}`,
-        params: [...setParams, ...whereParams],
+        sql: `UPDATE ${table} SET ${setClause} WHERE ${where.sql}`,
+        params: [...setParams, ...where.params],
       };
     }
     case "delete": {
-      const whereConditions = [`${pkCol} = ?`];
-      const whereParams: unknown[] = [m.partitionKey];
-      for (const [key, value] of Object.entries(m.where ?? {})) {
-        if (key === partitionKeyColumn) continue;
-        whereConditions.push(`"${key}" = ?`);
-        whereParams.push(value);
-      }
+      const where = mutationWhereClause(m, partitionKeyColumn);
       return {
-        sql: `DELETE FROM ${table} WHERE ${whereConditions.join(" AND ")}`,
-        params: whereParams,
+        sql: `DELETE FROM ${table} WHERE ${where.sql}`,
+        params: where.params,
       };
     }
   }
