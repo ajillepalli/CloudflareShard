@@ -2887,6 +2887,130 @@ describe("Milestone 2 Chunk 7: benchmark — indexed /v1/mutate write latency an
   }, 20000);
 });
 
+describe("Milestone 3 Chunk 6: migration benchmark (observational — no pass/fail thresholds)", () => {
+  it("records backfill throughput, cutover fence-window duration, and peak mirror-queue depth under sustained writes", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m6_bench_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // 80 pre-migration rows plus 30 sustained-write keys, all in one vbucket.
+    const seedKeys = partitionKeysInSameVbucket(tenantId, "m6_bench_evt", "bm", 80, 64);
+    const vbucket = hashKey(`${tenantId}:m6_bench_evt:bm`) % 64;
+    for (const key of seedKeys) {
+      await post(
+        "/v1/sql",
+        { sql: "INSERT INTO m6_bench_evt (id, v) VALUES (?, ?)", params: [key, "seed"], table: "m6_bench_evt", tenantId, partitionKey: key },
+        token,
+      );
+    }
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    const migrationStart = Date.now();
+    let firstFenceAt: number | null = null;
+    let firstPostFenceSuccessAt: number | null = null;
+    let peakMirrorDepth = 0;
+
+    const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
+    expect(migrateRes.status).toBe(200);
+
+    // Sustained writes (30 upserts against migrating keys) — retried on the
+    // fence, timestamping the fence window.
+    const writesPromise = (async () => {
+      for (const key of seedKeys.slice(0, 30)) {
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const res = await post(
+            "/v1/sql",
+            {
+              sql: "INSERT INTO m6_bench_evt (id, v) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+              params: [key, "live"],
+              table: "m6_bench_evt",
+              tenantId,
+              partitionKey: key,
+              requestId: `bench-${key}`,
+            },
+            token,
+          );
+          if (res.status === 200) {
+            if (firstFenceAt !== null && firstPostFenceSuccessAt === null) firstPostFenceSuccessAt = Date.now();
+            break;
+          }
+          const body = (await res.json()) as { error?: { code?: string } | string };
+          const code = typeof body.error === "object" ? body.error?.code : undefined;
+          if ((res.status === 409 && code === "VBUCKET_FENCED") || res.status === 503) {
+            if (res.status === 409 && firstFenceAt === null) firstFenceAt = Date.now();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            continue;
+          }
+          throw new Error(`benchmark write failed: ${res.status} ${JSON.stringify(body)}`);
+        }
+      }
+    })();
+
+    const drivePromise = (async () => {
+      for (let tick = 0; tick < 60; tick += 1) {
+        await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+          await instance.alarm();
+        });
+        const depthRes = await env.SHARD.get(env.SHARD.idFromName(sourceShardId)).fetch(
+          new Request("https://shard.internal/mirror-pending-count", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ vbucket }),
+          }),
+        );
+        peakMirrorDepth = Math.max(peakMirrorDepth, ((await depthRes.json()) as { count: number }).count);
+        const statusRes = await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH());
+        if (((await statusRes.json()) as { status: string }).status === "none") return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error("benchmark migration did not complete");
+    })();
+    await Promise.all([writesPromise, drivePromise]);
+    const migrationMs = Date.now() - migrationStart;
+
+    const finalStatus = (await (
+      await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
+    ).json()) as { rowsCopied: number };
+
+    // Observational metrics — logged (visible with --silent=false), sanity-
+    // checked for well-formedness only, per the spec ("no pass/fail
+    // thresholds"): the absolute numbers are workload- and environment-
+    // dependent.
+    const backfillRowsPerSec = finalStatus.rowsCopied / (migrationMs / 1000);
+    const fenceWindowMs = firstFenceAt !== null && firstPostFenceSuccessAt !== null ? firstPostFenceSuccessAt - firstFenceAt : 0;
+    console.log("MIGRATION BENCHMARK", {
+      rowsCopied: finalStatus.rowsCopied,
+      migrationMs,
+      backfillRowsPerSec: Math.round(backfillRowsPerSec * 10) / 10,
+      fenceWindowMs,
+      peakMirrorDepth,
+    });
+
+    expect(finalStatus.rowsCopied).toBeGreaterThanOrEqual(seedKeys.length);
+    expect(Number.isFinite(backfillRowsPerSec)).toBe(true);
+    expect(backfillRowsPerSec).toBeGreaterThan(0);
+    expect(fenceWindowMs).toBeGreaterThanOrEqual(0);
+    expect(peakMirrorDepth).toBeGreaterThanOrEqual(0);
+
+    // Correctness backstop: every seed row is present post-migration.
+    const targetCount = await env.SHARD.get(env.SHARD.idFromName(targetShardId)).fetch(
+      new Request("https://shard.internal/migrate-checksum", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vbucket, table: "m6_bench_evt", partitionKeyColumn: "id" }),
+      }),
+    );
+    expect(((await targetCount.json()) as { rowCount: number }).rowCount).toBeGreaterThanOrEqual(seedKeys.length);
+  }, 120000);
+});
+
+
 describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {
   it("/admin/tx-status requires an admin token", async () => {
     const res = await post("/admin/tx-status", { txId: "whatever" });
