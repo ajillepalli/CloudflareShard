@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { log } from "./log";
-import { isMutation } from "./sql-safety";
+import { isDeleteStatement, isMutation } from "./sql-safety";
 import { rowKey } from "./structured-op";
 
 type ExecutePayload = {
@@ -19,6 +19,14 @@ type ExecutePayload = {
   tenantId?: string;
   table?: string;
   partitionKey?: string;
+  /** Milestone 3, Chunk 0: the vbucket this (tenantId, table, partitionKey)
+   * hashes to, forwarded by the Worker from CatalogDO's /route response.
+   * Present alongside tenantId/table/partitionKey for any /v1/sql or
+   * /v1/mutate write — written into `__cf_row_owners` so a later migration
+   * can recover a row's logical tenant/vbucket identity from the row itself
+   * (see docs/SPEC.md §14's trust-model limitation: the row's own columns
+   * carry no tenant identity). */
+  vbucket?: number;
 };
 
 type PrepareIntent = {
@@ -27,6 +35,14 @@ type PrepareIntent = {
   tenantId: string;
   table: string;
   partitionKey: string;
+  /** Milestone 3, Chunk 0: present for a genuine base-row mutation intent
+   * (never for a synthetic __cf_indexes-maintenance intent piggybacked onto
+   * the same 2PC transaction — those describe an index shard write, not a
+   * row identity, and must never populate __cf_row_owners for it), used the
+   * same way as ExecutePayload.vbucket/op to update `__cf_row_owners` at
+   * commit time. */
+  vbucket?: number;
+  op?: "insert" | "update" | "delete" | "upsert";
 };
 
 const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -36,7 +52,16 @@ const INDEX_JOB_BASE_DELAY_MS = 5000;
 const INDEX_JOB_MAX_DELAY_MS = 60000;
 const INDEX_JOB_BATCH_SIZE = 20;
 
-const INTERNAL_TABLES = new Set(["applied_requests", "sqlite_sequence", "pending_intents", "row_locks", "__cf_indexes", "index_pending_jobs"]);
+const INTERNAL_TABLES = new Set([
+  "applied_requests",
+  "sqlite_sequence",
+  "pending_intents",
+  "row_locks",
+  "__cf_indexes",
+  "index_pending_jobs",
+  "__cf_row_owners",
+  "__cf_mirror_pending",
+]);
 
 /** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
  * to force a rollback — distinguishes "validation succeeded, roll back on
@@ -191,13 +216,24 @@ export class ShardDO extends DurableObject {
       try {
         const decision = await this.queryCoordinatorDecision(coordinatorTxId);
         if (decision === "committed") {
-          const intents = this.many<{ sql: string; params_json: string }>(
-            "SELECT sql, params_json FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
+          const intents = this.many<{
+            sql: string;
+            params_json: string;
+            table_name: string | null;
+            partition_key: string | null;
+            tenant_id: string | null;
+            vbucket: number | null;
+            op: string | null;
+          }>(
+            "SELECT sql, params_json, table_name, partition_key, tenant_id, vbucket, op FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
             coordinatorTxId,
           );
           this.ctx.storage.transactionSync(() => {
             for (const intent of intents) {
               this.sql.exec(intent.sql, ...(JSON.parse(intent.params_json) as unknown[]));
+              if (intent.op && intent.vbucket !== null && intent.table_name && intent.partition_key && intent.tenant_id) {
+                this.writeOrDeleteProvenance(intent.sql, intent.table_name, intent.partition_key, intent.tenant_id, intent.vbucket);
+              }
             }
             this.sql.exec(
               "UPDATE pending_intents SET status = 'committed', resolved_at = ? WHERE coordinator_tx_id = ?",
@@ -276,6 +312,42 @@ export class ShardDO extends DurableObject {
         lock_key TEXT PRIMARY KEY,
         coordinator_tx_id TEXT NOT NULL,
         acquired_at TEXT NOT NULL
+      )
+    `);
+
+    // Milestone 3, Chunk 0: per-intent routing context, needed at commit time
+    // to write/delete __cf_row_owners provenance for a 2PC-committed base-row
+    // mutation. Nullable/additive — a pending_intents row created before this
+    // migration simply won't have provenance tracked for it (that
+    // transaction was already in flight across a deploy boundary, an
+    // acceptable edge the same way applied_requests.request_hash's
+    // pre-migration '' default is).
+    this.ensureColumn("pending_intents", "tenant_id", "TEXT");
+    this.ensureColumn("pending_intents", "table_name", "TEXT");
+    this.ensureColumn("pending_intents", "partition_key", "TEXT");
+    this.ensureColumn("pending_intents", "vbucket", "INTEGER");
+    this.ensureColumn("pending_intents", "op", "TEXT");
+
+    // Milestone 3, Chunk 0. One row per (table_name, partition_key) currently
+    // owned by a base row on THIS shard, recording the logical (tenantId,
+    // vbucket) identity that hashed it here — recoverable nowhere else, since
+    // base table rows themselves carry no tenant/vbucket column (see
+    // docs/SPEC.md §14's trust model). This is what lets a later migration
+    // (Chunk 4) find every row belonging to a given vbucket without scanning
+    // every table's every row through the hash function against every
+    // candidate tenant (that's Chunk 1's one-time re-attribution backfill,
+    // for rows written before this table existed). Known limitation,
+    // inherited not widened: the PK mirrors the base tables' own physical
+    // layout, which already collides if two tenants share a partition key on
+    // the same shard (§14).
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_row_owners (
+        table_name    TEXT NOT NULL,
+        partition_key TEXT NOT NULL,
+        tenant_id     TEXT NOT NULL,
+        vbucket       INTEGER NOT NULL,
+        updated_at    TEXT NOT NULL,
+        PRIMARY KEY (table_name, partition_key)
       )
     `);
 
@@ -398,6 +470,7 @@ export class ShardDO extends DurableObject {
     );
     const indexPendingJobCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_pending_jobs");
     const indexEntryCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_indexes");
+    const rowOwnerCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_row_owners");
 
     return json({
       ok: true,
@@ -406,6 +479,7 @@ export class ShardDO extends DurableObject {
       pendingIntentCount: pendingIntentCount?.n ?? 0,
       indexPendingJobCount: indexPendingJobCount?.n ?? 0,
       indexEntryCount: indexEntryCount?.n ?? 0,
+      rowOwnerCount: rowOwnerCount?.n ?? 0,
     });
   }
 
@@ -478,11 +552,12 @@ export class ShardDO extends DurableObject {
         const result = this.ctx.storage.transactionSync(() => {
           this.sql.exec(payload.sql, ...(payload.params ?? []));
           const changedRow = this.one<{ count: number }>("SELECT changes() AS count");
+          const rowsAffected = changedRow?.count ?? 0;
 
           const txResult = {
             ok: true,
             type: "mutation",
-            rowsAffected: changedRow?.count ?? 0,
+            rowsAffected,
             executeMs: Date.now() - execStart,
           };
 
@@ -496,6 +571,24 @@ export class ShardDO extends DurableObject {
             JSON.stringify(txResult),
             new Date().toISOString(),
           );
+
+          // Milestone 3, Chunk 0: track row provenance for /v1/sql and
+          // /v1/mutate writes (both land here — /v1/mutate compiles its
+          // StructuredMutation to SQL and calls this same /execute route).
+          // Only when the Worker forwarded full routing context AND the
+          // mutation actually touched a row — a `where` that matched nothing
+          // (rowsAffected === 0) must not fabricate or clear provenance for a
+          // row this write never touched.
+          if (payload.tenantId && payload.table && payload.partitionKey && payload.vbucket !== undefined && rowsAffected > 0) {
+            this.writeOrDeleteProvenance(
+              payload.sql,
+              payload.table,
+              payload.partitionKey,
+              payload.tenantId,
+              payload.vbucket,
+            );
+          }
+
           return txResult;
         });
         return json(result);
@@ -514,6 +607,33 @@ export class ShardDO extends DurableObject {
       log("shard.execution_failed", { requestId: payload.requestId, isMutation: mutating, message });
       return json({ error: "SQL execution failed." }, 400);
     }
+  }
+
+  /** Milestone 3, Chunk 0: writes (insert/update/upsert) or deletes (delete)
+   * a row's `__cf_row_owners` provenance entry, called from inside the same
+   * transactionSync as the base mutation itself so provenance never
+   * diverges from what was actually written. `op` is derived from the SQL
+   * text (isDeleteStatement), the same "ShardDO classifies its own writes"
+   * approach isMutation() already uses — trusting a caller-supplied
+   * classification here would let a mismatched hint desync provenance from
+   * reality the same way a spoofed isMutation flag could disguise a write. */
+  private writeOrDeleteProvenance(sql: string, table: string, partitionKey: string, tenantId: string, vbucket: number): void {
+    if (isDeleteStatement(sql)) {
+      this.sql.exec("DELETE FROM __cf_row_owners WHERE table_name = ? AND partition_key = ?", table, partitionKey);
+      return;
+    }
+    this.sql.exec(
+      `
+      INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (table_name, partition_key) DO UPDATE SET tenant_id = excluded.tenant_id, vbucket = excluded.vbucket, updated_at = excluded.updated_at
+      `,
+      table,
+      partitionKey,
+      tenantId,
+      vbucket,
+      new Date().toISOString(),
+    );
   }
 
   private async handlePrepare(request: Request): Promise<Response> {
@@ -600,8 +720,8 @@ export class ShardDO extends DurableObject {
         );
         this.sql.exec(
           `
-          INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at)
-          VALUES (?, ?, ?, ?, 'prepared', ?, ?)
+          INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, tenant_id, table_name, partition_key, vbucket, op)
+          VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?)
           `,
           coordinatorTxId,
           i,
@@ -609,6 +729,11 @@ export class ShardDO extends DurableObject {
           JSON.stringify(intent.params ?? []),
           JSON.stringify([lockKeys[i]]),
           now,
+          intent.tenantId,
+          intent.table,
+          intent.partitionKey,
+          intent.vbucket ?? null,
+          intent.op ?? null,
         );
       });
     });
@@ -623,8 +748,18 @@ export class ShardDO extends DurableObject {
     }
     const coordinatorTxId = body.coordinatorTxId;
 
-    const intents = this.many<{ intent_seq: number; sql: string; params_json: string; status: string }>(
-      "SELECT intent_seq, sql, params_json, status FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
+    const intents = this.many<{
+      intent_seq: number;
+      sql: string;
+      params_json: string;
+      status: string;
+      table_name: string | null;
+      partition_key: string | null;
+      tenant_id: string | null;
+      vbucket: number | null;
+      op: string | null;
+    }>(
+      "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
       coordinatorTxId,
     );
     if (intents.length === 0) {
@@ -644,6 +779,13 @@ export class ShardDO extends DurableObject {
     this.ctx.storage.transactionSync(() => {
       for (const intent of intents) {
         this.sql.exec(intent.sql, ...(JSON.parse(intent.params_json) as unknown[]));
+        // Milestone 3, Chunk 0: only genuine base-row intents carry op +
+        // vbucket (see PrepareIntent's doc comment) — a synthetic
+        // __cf_indexes-maintenance intent piggybacked onto the same
+        // transaction never does, so it's skipped here automatically.
+        if (intent.op && intent.vbucket !== null && intent.table_name && intent.partition_key && intent.tenant_id) {
+          this.writeOrDeleteProvenance(intent.sql, intent.table_name, intent.partition_key, intent.tenant_id, intent.vbucket);
+        }
       }
       this.sql.exec(
         "UPDATE pending_intents SET status = 'committed', resolved_at = ? WHERE coordinator_tx_id = ?",

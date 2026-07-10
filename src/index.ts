@@ -875,6 +875,7 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
     tenantId: body.tenantId,
     table: body.table,
     partitionKey: body.partitionKey,
+    vbucket: route.vbucket,
   });
   const shardExecuteMs = Date.now() - shardStart;
 
@@ -1103,6 +1104,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
 
   const route = (await routeRes.json()) as {
     shardId: string;
+    vbucket: number;
     catalogShardCount: number | null;
     partitionKeyColumn: string | null;
     indexes?: IndexDefinition[];
@@ -1167,6 +1169,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
     tenantId: body.tenantId,
     table: body.table,
     partitionKey: body.partitionKey,
+    vbucket: route.vbucket,
   });
   if (!shardRes.ok) {
     return new Response(shardRes.body, { status: shardRes.status, headers: shardRes.headers });
@@ -1242,7 +1245,15 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
 
   const compiledByShardId = new Map<
     string,
-    Array<{ sql: string; params: unknown[]; tenantId: string; table: string; partitionKey: string }>
+    Array<{
+      sql: string;
+      params: unknown[];
+      tenantId: string;
+      table: string;
+      partitionKey: string;
+      vbucket?: number;
+      op?: "insert" | "update" | "delete" | "upsert";
+    }>
   >();
   const currentCount = catalogShardCount(env);
   const authorization = request.headers.get("authorization") ?? undefined;
@@ -1257,7 +1268,18 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     return shardIds;
   }
 
-  function addIntent(shardId: string, intent: { sql: string; params: unknown[]; tenantId: string; table: string; partitionKey: string }): void {
+  function addIntent(
+    shardId: string,
+    intent: {
+      sql: string;
+      params: unknown[];
+      tenantId: string;
+      table: string;
+      partitionKey: string;
+      vbucket?: number;
+      op?: "insert" | "update" | "delete" | "upsert";
+    },
+  ): void {
     const existing = compiledByShardId.get(shardId);
     if (existing) {
       existing.push(intent);
@@ -1298,6 +1320,7 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     }
     const route = (await routeRes.json()) as {
       shardId: string;
+      vbucket: number;
       catalogShardCount: number | null;
       partitionKeyColumn: string | null;
       indexes?: IndexDefinition[];
@@ -1369,7 +1392,15 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     const beforeRow: Record<string, unknown> | null = matched ? rawRow : null;
 
     const { sql, params } = compileMutation(mutation, partitionKeyColumn);
-    addIntent(route.shardId, { sql, params, tenantId: mutation.tenantId, table: mutation.table, partitionKey: mutation.partitionKey });
+    addIntent(route.shardId, {
+      sql,
+      params,
+      tenantId: mutation.tenantId,
+      table: mutation.table,
+      partitionKey: mutation.partitionKey,
+      vbucket: route.vbucket,
+      op: mutation.op,
+    });
 
     if (indexes.length > 0) {
       const deltas = computeIndexDeltas(indexes, mutation.op, beforeRow, mutation.op === "delete" ? undefined : mutation.values);
