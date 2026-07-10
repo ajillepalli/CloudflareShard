@@ -32,3 +32,23 @@ export function indexShardIdForKey(
   return ring[hashKey(composite) % ring.length];
 }
 
+/** Milestone 3, Chunk 5: deterministic replacement choice when a shard in an
+ * index's pinned ring is drained — the candidate with the smallest
+ * hashKey(indexName + ":" + shardId), per the spec's substitution rule.
+ * Deterministic on (indexName, candidates) alone, so any orchestrator (or a
+ * re-run after a crash) picks the identical substitute; hash ties break
+ * lexicographically for the same reason. Returns null when no candidate
+ * exists (the caller rejects 409 RING_EVACUATION_NO_CANDIDATE). */
+export function pickRingSubstitute(indexName: string, candidates: string[]): string | null {
+  let best: string | null = null;
+  let bestHash = Number.POSITIVE_INFINITY;
+  for (const shardId of candidates) {
+    const h = hashKey(`${indexName}:${shardId}`);
+    if (h < bestHash || (h === bestHash && best !== null && shardId < best)) {
+      best = shardId;
+      bestHash = h;
+    }
+  }
+  return best;
+}
+

@@ -2610,21 +2610,50 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     const sourceBefore = await checksumOf(sourceShardId);
     expect(sourceBefore.rowCount).toBe(keys.length);
 
+    // Pin the migration pre-flip deterministically: a queued mirror job for
+    // this vbucket that can never land (its SQL targets a nonexistent
+    // table) keeps cutover's step-2 gate (mirror queue must reach zero)
+    // closed no matter how many orchestration ticks run — a quiet migration
+    // would otherwise complete within a single tick, leaving no pre-flip
+    // window to abort in. The abort itself purges this job.
+    const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    const poison = await sourceStub.fetch(
+      new Request("https://shard.internal/enqueue-mirror-job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetShardId,
+          sql: "INSERT INTO __nonexistent_m4_abort (id) VALUES ('x')",
+          params: [],
+          requestId: `poison-${crypto.randomUUID()}`,
+          vbucket,
+        }),
+      }),
+    );
+    expect(poison.status).toBe(200);
+
     const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
     expect(migrateRes.status).toBe(200);
 
-    // One orchestration tick so the backfill actually copies rows to the
-    // target (making the abort's wipe observable), but stop before the
-    // cutover flip.
-    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
-    await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
-      await instance.alarm();
-    });
+    // Simulate partial backfill progress so the abort's target wipe is
+    // observable, through the same /migrate-import the real backfill uses.
+    const targetImport = await env.SHARD.get(env.SHARD.idFromName(targetShardId)).fetch(
+      new Request("https://shard.internal/migrate-import", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          vbucket,
+          table: "m4_abort_evt",
+          rows: keys.slice(0, 2).map((key) => ({ partitionKey: key, tenantId, row: { id: key, v: `v-${key}` } })),
+        }),
+      }),
+    );
+    expect(targetImport.status).toBe(200);
+
     const midStatus = (await (
       await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
-    ).json()) as { status: string; rowsCopied: number };
-    expect(midStatus.status).toBe("cutover"); // copied, fenced, not flipped
-    expect(midStatus.rowsCopied).toBe(keys.length);
+    ).json()) as { status: string };
+    expect(midStatus.status).not.toBe("none"); // started (backfilling or fenced cutover), never flipped
 
     const abortRes = await post("/admin/migrate-vbucket-abort", { catalogShardId: "catalog-0", vbucket }, AUTH());
     expect(abortRes.status).toBe(200);
@@ -2907,6 +2936,12 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
   // block tests drain-vs-2PC/index-job interaction only, not index presence.
   beforeEach(async () => {
     const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    // ensureSchema() only runs on fetch() — warm it first so the direct
+    // storage access below can't hit "no such table" when this block runs
+    // before any other catalog-0 traffic (e.g. under a -t filter).
+    await stub.fetch(
+      new Request("https://catalog.internal/list-shards", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+    );
     await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
       state.storage.sql.exec("DELETE FROM index_rules");
     });
@@ -2918,28 +2953,121 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     expect(res.status).toBe(200);
   });
 
-  it("Milestone 3, Chunk 2: draining a shard while an index is registered now succeeds (SHARD_DRAIN_BLOCKED_BY_INDEXES is removed — index placement hashes over each index's own pinned ring; Chunk 5 adds safe ring evacuation for a shard the ring actually contains)", async () => {
-    await initCluster(1, 4);
-    const createTableRes = await post(
-      "/admin/create-table",
-      { table: "drain_idx_evt", schema: "CREATE TABLE IF NOT EXISTS drain_idx_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
-      AUTH(),
-    );
-    expect(createTableRes.status).toBe(200);
-    const createIndexRes = await post(
-      "/admin/create-index",
-      { indexName: "idx_drain_no_block_by_v", table: "drain_idx_evt", columns: ["v"] },
-      AUTH(),
-    );
+  it("Milestone 3, Chunks 2+5 E2E (criteria 4 & 5): init -> table -> index -> writes -> split -> drain the split source — completes end-to-end with every row readable and every index entry resolving, via vbucket evacuation + deterministic ring substitution (both former 409 codes unreachable)", async () => {
+    // 8 shards per catalog: 64/8 = 8 vbuckets per catalog-0 shard, keeping
+    // the sequential drain's migration count manageable.
+    await post("/admin/init", { numShards: 8, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m5_e2e_evt");
+    const createIndexRes = await post("/admin/create-index", { indexName: "idx_m5_e2e_by_v", table: "m5_e2e_evt", columns: ["v"] }, AUTH());
     expect(createIndexRes.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
 
-    const allowed = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
-    expect(allowed.status).toBe(200);
+    // Writes: 12 rows, v alternating alpha/beta, spread across vbuckets.
+    const ids = Array.from({ length: 12 }, (_, i) => `e2e-${i}`);
+    for (const [i, id] of ids.entries()) {
+      const res = await post(
+        "/v1/mutate",
+        { op: "insert", table: "m5_e2e_evt", tenantId, partitionKey: id, values: { v: i % 2 === 0 ? "alpha" : "beta" } },
+        token,
+      );
+      expect(res.status).toBe(200);
+    }
 
+    // Async index maintenance settles: both value classes fully queryable.
+    const queryCount = async (v: string): Promise<number> => {
+      const res = await post("/v1/index-query", { table: "m5_e2e_evt", indexName: "idx_m5_e2e_by_v", tenantId, values: { v }, limit: 50 }, token);
+      expect(res.status).toBe(200);
+      return ((await res.json()) as { rows: unknown[] }).rows.length;
+    };
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await queryCount("alpha")) === 6 && (await queryCount("beta")) === 6) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(await queryCount("alpha")).toBe(6);
+    expect(await queryCount("beta")).toBe(6);
+
+    // SPLIT: move e2e-0's vbucket onto a brand-new shard (created by the
+    // split itself — its table schema arrives via the migration's
+    // schema-provisioning step, since create-table's fan-out predates it).
+    const splitVbucket = hashKey(`${tenantId}:m5_e2e_evt:e2e-0`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const splitSource = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", splitVbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const splitTarget = "catalog-0-shard-split-e2e";
+    const splitRes = await post("/admin/split-vbucket", { catalogShardId: "catalog-0", vbucket: splitVbucket, newShardId: splitTarget }, AUTH());
+    expect(splitRes.status).toBe(200);
+    expect(((await splitRes.json()) as { migrationStarted: boolean }).migrationStarted).toBe(true);
+    await driveMigrationToCompletion(splitVbucket);
+
+    // The moved row reads back through the data plane from the new shard.
+    const movedRead = await post(
+      "/v1/sql",
+      { sql: "SELECT v FROM m5_e2e_evt WHERE id = ?", params: ["e2e-0"], table: "m5_e2e_evt", tenantId, partitionKey: "e2e-0" },
+      token,
+    );
+    const movedBody = (await movedRead.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
+    expect(movedBody.route.shardId).toBe(splitTarget);
+    expect(movedBody.result.rows[0].v).toBe("alpha");
+
+    // DRAIN the split source. Its pinned-ring membership makes this exercise
+    // ring evacuation too; the only active shard outside the ring is the
+    // split-created one, so the deterministic substitute must be exactly it.
+    const drainRes = await post("/admin/drain-shard", { shardId: splitSource, catalogShardId: "catalog-0" }, AUTH());
+    expect(drainRes.status).toBe(200);
+
+    let drainStatus: { vbucketsRemaining: number; ringsRemaining: number; status: string } | null = null;
+    for (let tick = 0; tick < 40; tick += 1) {
+      await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/drain-shard-status", { catalogShardId: "catalog-0", shardId: splitSource }, AUTH());
+      expect(statusRes.status).toBe(200);
+      drainStatus = (await statusRes.json()) as { vbucketsRemaining: number; ringsRemaining: number; status: string };
+      if (drainStatus.status === "complete") break;
+    }
+    expect(drainStatus?.status).toBe("complete");
+    expect(drainStatus?.vbucketsRemaining).toBe(0);
+    expect(drainStatus?.ringsRemaining).toBe(0);
+
+    // Every row is still readable through the data plane, none on the
+    // drained shard.
+    for (const [i, id] of ids.entries()) {
+      const readRes = await post(
+        "/v1/sql",
+        { sql: "SELECT v FROM m5_e2e_evt WHERE id = ?", params: [id], table: "m5_e2e_evt", tenantId, partitionKey: id },
+        token,
+      );
+      expect(readRes.status).toBe(200);
+      const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
+      expect(readBody.route.shardId).not.toBe(splitSource);
+      expect(readBody.result.rows).toHaveLength(1);
+      expect(readBody.result.rows[0].v).toBe(i % 2 === 0 ? "alpha" : "beta");
+    }
+
+    // The index survived registered, queryable, and complete — no dropped
+    // matches (criteria 4 & 5), with the ring's drained slot substituted by
+    // the split shard (the only out-of-ring candidate) and the drained
+    // shard's entry copies gone.
+    expect(await queryCount("alpha")).toBe(6);
+    expect(await queryCount("beta")).toBe(6);
     const listRes = await post("/admin/list-indexes", {}, AUTH());
-    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string; status: string }> };
-    expect(listBody.indexes.find((i) => i.indexName === "idx_drain_no_block_by_v")?.status).toBe("ready");
-  });
+    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string; status: string; placementRing: string[] }> };
+    const idx = listBody.indexes.find((i) => i.indexName === "idx_m5_e2e_by_v");
+    expect(idx?.status).toBe("ready");
+    expect(idx?.placementRing).not.toContain(splitSource);
+    expect(idx?.placementRing).toContain(splitTarget);
+
+    const drainedStub = env.SHARD.get(env.SHARD.idFromName(splitSource));
+    await runInDurableObject(drainedStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      const entries = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idx_m5_e2e_by_v"));
+      expect(entries).toHaveLength(0);
+      const baseRows = Array.from(state.storage.sql.exec("SELECT id FROM m5_e2e_evt"));
+      expect(baseRows).toHaveLength(0);
+    });
+  }, 120000);
 
   it("rejects draining a shard with an in-flight prepared transaction, 409", async () => {
     await initCluster(1, 4);
