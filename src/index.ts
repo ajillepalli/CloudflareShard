@@ -706,6 +706,190 @@ async function handleAdminDropIndex(request: Request, env: Env): Promise<Respons
   });
 }
 
+const PROVENANCE_BACKFILL_PAGE_SIZE = 500;
+
+/** Milestone 3, Chunk 1: writes __cf_row_owners for one (table, partitionKey)
+ * pair directly — a plain /execute call against the shard, not a
+ * StructuredMutation, since this targets the internal provenance table
+ * itself rather than a base table row. Shared by /admin/backfill-provenance
+ * (single-candidate case) and /admin/set-row-owner. */
+async function writeProvenanceDirect(
+  env: Env,
+  shardId: string,
+  table: string,
+  partitionKey: string,
+  tenantId: string,
+  vbucket: number,
+): Promise<boolean> {
+  const res = await routeToShard(env, shardId, "/execute", {
+    sql: `
+      INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (table_name, partition_key) DO UPDATE SET tenant_id = excluded.tenant_id, vbucket = excluded.vbucket, updated_at = excluded.updated_at
+    `,
+    params: [table, partitionKey, tenantId, vbucket, new Date().toISOString()],
+    requestId: `backfill-provenance-write-${crypto.randomUUID()}`,
+    isMutation: true,
+  });
+  return res.ok;
+}
+
+type AmbiguousRow = { catalogShardId: string; shardId: string; table: string; partitionKey: string; candidateTenants: string[] };
+type OrphanedRow = { catalogShardId: string; shardId: string; table: string; partitionKey: string };
+
+/** Milestone 3, Chunk 1 (POST /admin/backfill-provenance {catalogShardId?}).
+ * Re-attributes rows written before Chunk 0's __cf_row_owners existed.
+ * Discovery is fully mechanical, per the design doc: table names + their
+ * partition_key_column come from table_rules; candidate tenants come from
+ * that catalog shard's tenant_auth; for each shard, for each registered
+ * table, page through partition keys lacking a __cf_row_owners row and test
+ * every candidate tenant's hash against this catalog shard's vbucket_map.
+ * Exactly one match writes provenance; zero is reported orphaned; more than
+ * one is reported ambiguous for manual resolution via /admin/set-row-owner.
+ * Single-pass per shard/table (paginated 500 rows at a time, not chunked
+ * across separate requests) — the same "acceptable at this milestone's
+ * pre-product scale, a known simplification, not a silent bug" tradeoff
+ * /admin/create-index's backfill already makes. */
+async function handleAdminBackfillProvenance(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { catalogShardId?: string };
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const catalogShardIds = body.catalogShardId ? [body.catalogShardId] : allCatalogShardIds(env);
+
+  let attributed = 0;
+  const ambiguous: AmbiguousRow[] = [];
+  const orphaned: OrphanedRow[] = [];
+
+  for (const catalogShardId of catalogShardIds) {
+    const [tablesRes, tenantsRes, vbMapRes, shardsRes] = await Promise.all([
+      routeToCatalog(env, catalogShardId, "/list-tables", {}, authorization),
+      routeToCatalog(env, catalogShardId, "/list-tenants", {}, authorization),
+      routeToCatalog(env, catalogShardId, "/vbucket-map", {}, authorization),
+      routeToCatalog(env, catalogShardId, "/list-shards", {}, authorization),
+    ]);
+    if (!tablesRes.ok) return new Response(tablesRes.body, { status: tablesRes.status, headers: tablesRes.headers });
+    if (!tenantsRes.ok) return new Response(tenantsRes.body, { status: tenantsRes.status, headers: tenantsRes.headers });
+    if (!vbMapRes.ok) return new Response(vbMapRes.body, { status: vbMapRes.status, headers: vbMapRes.headers });
+    if (!shardsRes.ok) return new Response(shardsRes.body, { status: shardsRes.status, headers: shardsRes.headers });
+
+    const tables = ((await tablesRes.json()) as { tables: Array<{ table_name: string; partition_key_column: string }> }).tables.filter(
+      (t) => t.partition_key_column !== UNSET_PARTITION_KEY_COLUMN,
+    );
+    const tenantIds = ((await tenantsRes.json()) as { tenantIds: string[] }).tenantIds;
+    const vbMapBody = (await vbMapRes.json()) as { totalVBuckets: number; map: Array<{ vbucket: number; shardId: string }> };
+    const totalVBuckets = vbMapBody.totalVBuckets;
+    const vbucketToShard = new Map(vbMapBody.map.map((m) => [m.vbucket, m.shardId]));
+    const shardIds = ((await shardsRes.json()) as { shardIds: string[] }).shardIds;
+
+    for (const shardId of shardIds) {
+      for (const table of tables) {
+        const pkCol = table.partition_key_column;
+        const safeTable = `"${table.table_name}"`;
+        const safePk = `"${pkCol}"`;
+        let afterPk = "";
+        for (;;) {
+          const pageRes = await routeToShard(env, shardId, "/execute", {
+            sql: `
+              SELECT b.${safePk} AS pk FROM ${safeTable} b
+              LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b.${safePk}
+              WHERE ro.partition_key IS NULL AND b.${safePk} > ?
+              ORDER BY b.${safePk} ASC
+              LIMIT ?
+            `,
+            params: [table.table_name, afterPk, PROVENANCE_BACKFILL_PAGE_SIZE],
+            requestId: `backfill-provenance-scan-${catalogShardId}-${shardId}-${table.table_name}-${crypto.randomUUID()}`,
+            isMutation: false,
+          });
+          if (!pageRes.ok) {
+            // A table_rules entry doesn't guarantee a physical table exists
+            // on every shard (e.g. /admin/register-table registers metadata
+            // only, with no physical DDL — see index.test.ts's
+            // column_mismatch_evt regression test) — skip rather than fail
+            // the whole multi-shard/multi-table run over one such entry.
+            log("worker.provenance_scan_skipped", { catalogShardId, shardId, table: table.table_name });
+            break;
+          }
+          const pageBody = (await pageRes.json()) as { rows?: Array<{ pk: unknown }> };
+          const pks = pageBody.rows ?? [];
+          if (pks.length === 0) break;
+
+          for (const { pk } of pks) {
+            const partitionKey = String(pk);
+            const candidates = tenantIds.filter((tenantId) => {
+              const vbucket = hashKey(`${tenantId}:${table.table_name}:${partitionKey}`) % totalVBuckets;
+              return vbucketToShard.get(vbucket) === shardId;
+            });
+            if (candidates.length === 1) {
+              const vbucket = hashKey(`${candidates[0]}:${table.table_name}:${partitionKey}`) % totalVBuckets;
+              const ok = await writeProvenanceDirect(env, shardId, table.table_name, partitionKey, candidates[0], vbucket);
+              if (ok) attributed += 1;
+              else orphaned.push({ catalogShardId, shardId, table: table.table_name, partitionKey });
+            } else if (candidates.length === 0) {
+              orphaned.push({ catalogShardId, shardId, table: table.table_name, partitionKey });
+            } else {
+              ambiguous.push({ catalogShardId, shardId, table: table.table_name, partitionKey, candidateTenants: candidates });
+            }
+          }
+
+          afterPk = String(pks[pks.length - 1].pk);
+          if (pks.length < PROVENANCE_BACKFILL_PAGE_SIZE) break;
+        }
+      }
+    }
+  }
+
+  return json({ attributed, ambiguous, orphaned });
+}
+
+/** Milestone 3, Chunk 1 (POST /admin/set-row-owner). Manual resolution for a
+ * row /admin/backfill-provenance reported ambiguous (or any row an operator
+ * otherwise knows the true owner of). Rejects 409 if the claimed tenant's
+ * hash doesn't actually land on the claimed shard — refuses to durably
+ * record an owner assignment that /admin/migrate-vbucket's provenance-gate
+ * (Chunk 4) would itself never have produced, rather than trusting the
+ * caller unconditionally. */
+async function handleAdminSetRowOwner(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as {
+    catalogShardId?: string;
+    shardId?: string;
+    table?: string;
+    partitionKey?: string;
+    tenantId?: string;
+  };
+  if (!body.catalogShardId || !body.shardId || !body.table || !body.partitionKey || !body.tenantId) {
+    return json(
+      { error: { code: "MISSING_FIELDS", message: "Missing catalogShardId, shardId, table, partitionKey, or tenantId." } },
+      400,
+    );
+  }
+  const authorization = request.headers.get("authorization") ?? undefined;
+
+  const vbMapRes = await routeToCatalog(env, body.catalogShardId, "/vbucket-map", {}, authorization);
+  if (!vbMapRes.ok) return new Response(vbMapRes.body, { status: vbMapRes.status, headers: vbMapRes.headers });
+  const vbMapBody = (await vbMapRes.json()) as { totalVBuckets: number; map: Array<{ vbucket: number; shardId: string }> };
+  const vbucketToShard = new Map(vbMapBody.map.map((m) => [m.vbucket, m.shardId]));
+
+  const vbucket = hashKey(`${body.tenantId}:${body.table}:${body.partitionKey}`) % vbMapBody.totalVBuckets;
+  const mappedShardId = vbucketToShard.get(vbucket);
+  if (mappedShardId !== body.shardId) {
+    return json(
+      {
+        error: {
+          code: "ROW_OWNER_SHARD_MISMATCH",
+          message: `Tenant ${body.tenantId}'s hash for this (table, partitionKey) maps to vbucket ${vbucket}, which is on shard ${mappedShardId ?? "(unmapped)"}, not the claimed shard ${body.shardId}.`,
+          fix: "Verify the claimed tenantId, or check /admin/status for the current vbucket_map.",
+        },
+      },
+      409,
+    );
+  }
+
+  const ok = await writeProvenanceDirect(env, body.shardId, body.table, body.partitionKey, body.tenantId, vbucket);
+  if (!ok) {
+    return json({ error: { code: "ROW_OWNER_WRITE_FAILED", message: `Failed to write provenance on shard ${body.shardId}.` } }, 500);
+  }
+  return json({ ok: true });
+}
+
 async function handleAdminDrainShard(request: Request, env: Env): Promise<Response> {
   const payload = (await request.json()) as { shardId: string; catalogShardId?: string };
   if (!payload.catalogShardId) {
@@ -1807,6 +1991,8 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/drop-index": handleAdminDropIndex,
   "/admin/tx-status": handleAdminTxStatus,
   "/admin/tx-force-abort": handleAdminTxForceAbort,
+  "/admin/backfill-provenance": handleAdminBackfillProvenance,
+  "/admin/set-row-owner": handleAdminSetRowOwner,
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
