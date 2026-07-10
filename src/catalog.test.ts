@@ -215,6 +215,27 @@ describe("CatalogDO split-vbucket", () => {
     const res = await stub.fetch(post("/split-vbucket", { vbucket: 9999 }, `Bearer ${env.ADMIN_TOKEN}`));
     expect(res.status).toBe(404);
   });
+
+  it("eng-review fix (Codex-found): rejects splitting while any index is registered, 409 SPLIT_BLOCKED_BY_INDEXES", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const createIndexRes = await stub.fetch(
+      post("/create-index", { indexName: "idx_split_block_by_v", table: "events", columns: ["v"] }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    expect(createIndexRes.status).toBe(200);
+
+    const res = await stub.fetch(post("/split-vbucket", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SPLIT_BLOCKED_BY_INDEXES");
+
+    const dropRes = await stub.fetch(post("/drop-index", { indexName: "idx_split_block_by_v" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(dropRes.status).toBe(200);
+
+    const allowed = await stub.fetch(post("/split-vbucket", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(allowed.status).toBe(200);
+  });
 });
 
 describe("CatalogDO input validation and lifecycle", () => {
