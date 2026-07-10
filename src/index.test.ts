@@ -2744,6 +2744,66 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     expect(replayBody.result.duplicated).toBe(true);
   }, 150000);
 
+  // Review Tier 1 #4: a crash mid-abort must leave the row in 'aborting'
+  // (fence still needing lifting), and a retried abort must RESUME cleanup —
+  // completing the wipe and lifting the fence — rather than 409ing on a
+  // 'none' row and stranding the source fenced forever.
+  it("a retried abort resumes cleanup from the intermediate 'aborting' state and lifts the source fence (not 409)", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_abortresume_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const vbucket = hashKey(`${tenantId}:m4_abortresume_evt:ar`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    // Simulate a crashed abort: the row is stuck 'aborting' (target retained)
+    // and the source is still fenced for the vbucket.
+    await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'aborting', target_shard_id = ? WHERE vbucket = ?",
+        targetShardId,
+        vbucket,
+      );
+    });
+    const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    await sourceStub.fetch(
+      new Request("https://shard.internal/fence-vbucket", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ vbucket }),
+      }),
+    );
+
+    // Retried abort resumes: returns aborted (NOT 409), status back to 'none'.
+    const abortRes = await post("/admin/migrate-vbucket-abort", { catalogShardId: "catalog-0", vbucket }, AUTH());
+    expect(abortRes.status).toBe(200);
+    expect(((await abortRes.json()) as { status: string }).status).toBe("aborted");
+
+    const statusAfter = (await (
+      await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
+    ).json()) as { status: string };
+    expect(statusAfter.status).toBe("none");
+
+    // The fence was lifted — a write to the vbucket on the source succeeds.
+    const fenced = await runInDurableObject(sourceStub, async (_i: ShardDO, state: DurableObjectState) => {
+      return Array.from(state.storage.sql.exec("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = ?", vbucket)).length;
+    });
+    expect(fenced).toBe(0);
+
+    const writeRes = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO m4_abortresume_evt (id, v) VALUES (?, ?)", params: ["ar", "x"], table: "m4_abortresume_evt", tenantId, partitionKey: "ar" },
+      token,
+    );
+    expect(writeRes.status).toBe(200);
+  });
+
   it("criterion 6: abort before the map flip leaves the source's checksum untouched and the target with zero rows and zero provenance for the vbucket", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
     await createIndexTestTable("m4_abort_evt");
