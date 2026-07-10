@@ -32,8 +32,11 @@ type PrepareIntent = {
 const APPLIED_REQUESTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const PENDING_INTENT_TTL_MS = 5 * 60 * 1000;
+const INDEX_JOB_BASE_DELAY_MS = 5000;
+const INDEX_JOB_MAX_DELAY_MS = 60000;
+const INDEX_JOB_BATCH_SIZE = 20;
 
-const INTERNAL_TABLES = new Set(["applied_requests", "sqlite_sequence", "pending_intents", "row_locks"]);
+const INTERNAL_TABLES = new Set(["applied_requests", "sqlite_sequence", "pending_intents", "row_locks", "__cf_indexes", "index_pending_jobs"]);
 
 /** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
  * to force a rollback — distinguishes "validation succeeded, roll back on
@@ -58,6 +61,7 @@ export class ShardDO extends DurableObject {
       "/tx-status": this.handleTxStatus.bind(this),
       "/pending-intent-count": this.handlePendingIntentCount.bind(this),
       "/invalidate-request": this.handleInvalidateRequest.bind(this),
+      "/enqueue-index-job": this.handleEnqueueIndexJob.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -71,7 +75,101 @@ export class ShardDO extends DurableObject {
     const cutoff = new Date(Date.now() - APPLIED_REQUESTS_TTL_MS).toISOString();
     this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
     await this.sweepStalePendingIntents();
-    await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+    const nextIndexJobRetry = await this.processIndexPendingJobs();
+    const nextAlarm = nextIndexJobRetry === null ? Date.now() + PRUNE_INTERVAL_MS : Math.min(nextIndexJobRetry, Date.now() + PRUNE_INTERVAL_MS);
+    await this.ctx.storage.setAlarm(nextAlarm);
+  }
+
+  /** Milestone 2, Chunk 2: retries index writes that failed on their first
+   * (best-effort, ctx.waitUntil()-driven) attempt from the Worker. Mirrors
+   * CoordinatorDO's recovery_queue backoff pattern. Returns the timestamp
+   * (ms) the next retry is due, or null if the queue is empty — the caller
+   * uses this to decide whether to re-arm the alarm sooner than the regular
+   * hourly prune cycle. */
+  private async processIndexPendingJobs(): Promise<number | null> {
+    const due = this.many<{
+      job_id: number;
+      target_shard_id: string;
+      sql: string;
+      params_json: string;
+      request_id: string;
+      attempt_count: number;
+    }>(
+      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM index_pending_jobs WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?",
+      new Date().toISOString(),
+      INDEX_JOB_BATCH_SIZE,
+    );
+
+    for (const job of due) {
+      try {
+        const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
+        const stub = this.shardEnv.SHARD.get(id);
+        const res = await stub.fetch("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: job.sql,
+            params: JSON.parse(job.params_json),
+            requestId: job.request_id,
+            isMutation: true,
+          }),
+        });
+        if (res.ok) {
+          this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+          continue;
+        }
+        throw new Error(`shard responded ${res.status}`);
+      } catch (error) {
+        const attemptCount = job.attempt_count + 1;
+        const delay = Math.min(INDEX_JOB_MAX_DELAY_MS, INDEX_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
+        this.sql.exec(
+          "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+          attemptCount,
+          new Date(Date.now() + delay).toISOString(),
+          job.job_id,
+        );
+        log("shard.index_job_retry_failed", {
+          jobId: job.job_id,
+          targetShardId: job.target_shard_id,
+          attemptCount,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    const next = this.one<{ next_attempt_at: string }>(
+      "SELECT next_attempt_at FROM index_pending_jobs ORDER BY next_attempt_at ASC LIMIT 1",
+    );
+    return next ? new Date(next.next_attempt_at).getTime() : null;
+  }
+
+  /** Called by the Worker when a best-effort index write (issued via
+   * ctx.waitUntil() from handleV1Mutate) fails — records it for alarm-driven
+   * retry instead of losing it. Lives on the BASE shard (where the write
+   * originated), not the index shard (which may be the one that's
+   * unreachable), and schedules an alarm soon rather than waiting for the
+   * next hourly prune cycle. */
+  private async handleEnqueueIndexJob(request: Request): Promise<Response> {
+    const body = (await request.json()) as { targetShardId?: string; sql?: string; params?: unknown[]; requestId?: string };
+    if (!body.targetShardId || !body.sql || !body.requestId) {
+      return json({ error: "Missing targetShardId, sql, or requestId" }, 400);
+    }
+    const now = new Date().toISOString();
+    this.sql.exec(
+      "INSERT INTO index_pending_jobs (target_shard_id, sql, params_json, request_id, next_attempt_at, attempt_count, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+      body.targetShardId,
+      body.sql,
+      JSON.stringify(body.params ?? []),
+      body.requestId,
+      now,
+      now,
+    );
+    const retrySoon = Date.now() + INDEX_JOB_BASE_DELAY_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > retrySoon) {
+      await this.ctx.storage.setAlarm(retrySoon);
+    }
+    return json({ ok: true });
   }
 
   /** A participant that voted "prepared" cannot independently decide to
@@ -180,6 +278,40 @@ export class ShardDO extends DurableObject {
         acquired_at TEXT NOT NULL
       )
     `);
+
+    // Milestone 2 (Index Service). Lives on a shard chosen by hashing
+    // (table, indexName, indexKeyJson) — independent of the base row's own
+    // shard, so /v1/index-query resolves a lookup on one shard rather than
+    // scattering (see the Milestone 2 design doc's index-placement decision).
+    // No tenant_id column — matches base table rows, which also carry no
+    // tenant_id physically (docs/SPEC.md §14's documented trust model).
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_indexes (
+        table_name TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        index_key_json TEXT NOT NULL,
+        partition_key TEXT NOT NULL,
+        source_shard_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (table_name, index_name, index_key_json, partition_key)
+      )
+    `);
+
+    // Milestone 2, Chunk 2: retry queue for a best-effort index write that
+    // failed on its first attempt from the Worker's ctx.waitUntil() call.
+    // Lives on the base shard (the write's origin), not the index shard.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS index_pending_jobs (
+        job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_shard_id TEXT NOT NULL,
+        sql TEXT NOT NULL,
+        params_json TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        next_attempt_at TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      )
+    `);
   }
 
   /** Add a column if a table predating it doesn't have it yet — mirrors
@@ -264,12 +396,16 @@ export class ShardDO extends DurableObject {
     const pendingIntentCount = this.one<{ n: number }>(
       "SELECT COUNT(DISTINCT coordinator_tx_id) AS n FROM pending_intents WHERE status = 'prepared'",
     );
+    const indexPendingJobCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_pending_jobs");
+    const indexEntryCount = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_indexes");
 
     return json({
       ok: true,
       tables: counts,
       idempotencyTableSize: idempotencyCount?.n ?? 0,
       pendingIntentCount: pendingIntentCount?.n ?? 0,
+      indexPendingJobCount: indexPendingJobCount?.n ?? 0,
+      indexEntryCount: indexEntryCount?.n ?? 0,
     });
   }
 
@@ -576,6 +712,10 @@ export class ShardDO extends DurableObject {
     const row = this.one<{ n: number }>(
       "SELECT COUNT(DISTINCT coordinator_tx_id) AS n FROM pending_intents WHERE status = 'prepared'",
     );
-    return json({ count: row?.n ?? 0 });
+    // Milestone 2, Chunk 5: reported alongside the 2PC pending-intent count
+    // (same route, not a new one) so the Worker's drain-shard check can
+    // block on either kind of unfinished work with one round-trip.
+    const indexJobRow = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_pending_jobs");
+    return json({ count: row?.n ?? 0, indexPendingJobCount: indexJobRow?.n ?? 0 });
   }
 }
