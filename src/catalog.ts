@@ -22,16 +22,44 @@ const ADMIN_GATED_ROUTES = new Set([
   "/mark-index-ready",
   "/list-tenants",
   "/vbucket-map",
+  "/migrate-vbucket",
+  "/migrate-vbucket-status",
+  "/migrate-vbucket-abort",
 ]);
+
+// Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
+// loop — each tick advances every in-flight migration one step (a full
+// backfill pass, or one cutover attempt that may be waiting on the mirror
+// queue to drain).
+const MIGRATION_TICK_MS = 250;
+
+type MigrationRow = {
+  vbucket: number;
+  shard_id: string;
+  target_shard_id: string | null;
+  migration_status: string;
+  migration_rows_copied: number;
+};
 
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly adminToken?: string;
+  private readonly catalogEnv: Cloudflare.Env;
   private readonly routes: Record<string, (request: Request) => Promise<Response>>;
+  /** See ShardDO.schemaEnsured — one schema pass per in-memory instance. */
+  private schemaEnsured = false;
+  /** Milestone 3, Chunk 4: DO handlers interleave at await points, so a
+   * scheduled alarm() and any other concurrent invocation could both run
+   * advanceMigration against the same vbucket on stale row snapshots —
+   * worst case, a stale cutover tick observing post-flip state "detects" a
+   * checksum mismatch and wipes just-migrated data. One tick at a time per
+   * instance; a tick that finds the latch held just reschedules. */
+  private migrationTickInFlight = false;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.catalogEnv = env;
     this.adminToken =
       typeof (env as { ADMIN_TOKEN?: unknown }).ADMIN_TOKEN === "string"
         ? (env as { ADMIN_TOKEN: string }).ADMIN_TOKEN
@@ -56,7 +84,26 @@ export class CatalogDO extends DurableObject {
       "/mark-index-ready": this.handleMarkIndexReady.bind(this),
       "/list-tenants": this.handleListTenants.bind(this),
       "/vbucket-map": this.handleVbucketMap.bind(this),
+      "/migrate-vbucket": this.handleMigrateVbucket.bind(this),
+      "/migrate-vbucket-status": this.handleMigrateVbucketStatus.bind(this),
+      "/migrate-vbucket-abort": this.handleMigrateVbucketAbort.bind(this),
     };
+  }
+
+  /** Milestone 3, Chunk 4: CatalogDO drives ShardDO's internal migration
+   * endpoints directly (export/import/fence/checksum) — a deliberate,
+   * spec'd exception to the earlier "CatalogDO and ShardDO never call each
+   * other" convention: the catalog owns the migration state machine (it
+   * already owns vbucket_map), and orchestration from a stateless Worker
+   * request would die with the request. */
+  private async callShard(shardId: string, path: string, payload: unknown): Promise<Response> {
+    const id = this.catalogEnv.SHARD.idFromName(shardId);
+    const stub = this.catalogEnv.SHARD.get(id);
+    return stub.fetch(`https://shard.internal${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   }
 
   /** Add a column if a table predating it doesn't have it yet — CREATE TABLE IF
@@ -70,6 +117,8 @@ export class CatalogDO extends DurableObject {
   }
 
   private ensureSchema(): void {
+    if (this.schemaEnsured) return;
+    this.schemaEnsured = true;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS cluster_config (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -991,6 +1040,12 @@ export class CatalogDO extends DurableObject {
     return json({ ok: true, shardId: body.shardId, metadataVersion: version });
   }
 
+  /** Milestone 3, Chunk 4: /admin/split-vbucket keeps its name and request
+   * shape, but "split" now means "create the target shard and start a real
+   * data migration" instead of repointing vbucket_map and stranding every
+   * row already on the source (the pre-M3 behavior). The response gains
+   * migrationStarted: true; routing flips only when the migration's fenced
+   * cutover completes (steps 1-5 in advanceMigration). */
   private async handleSplitVbucket(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       vbucket: number;
@@ -1001,55 +1056,439 @@ export class CatalogDO extends DurableObject {
       return json({ error: "vbucket must be a non-negative integer" }, 400);
     }
 
-    const existingMap = this.one<{ shard_id: string }>(
-      "SELECT shard_id FROM vbucket_map WHERE vbucket = ?",
-      body.vbucket,
+    // Milestone 3, Chunk 2: splitting no longer blocks on index presence
+    // (the previous 409 SPLIT_BLOCKED_BY_INDEXES is removed) — index
+    // placement hashes over each index's own pinned placement_ring_json,
+    // so adding a new active shard never changes existing index placement.
+    const started = await this.startMigration(body.vbucket, body.newShardId, "/split-vbucket");
+    if (started instanceof Response) return started;
+
+    return json({
+      ok: true,
+      vbucket: body.vbucket,
+      fromShard: started.fromShard,
+      toShard: started.toShard,
+      metadataVersion: started.metadataVersion,
+      migrationStarted: true,
+    });
+  }
+
+  /** Milestone 3, Chunk 4 (POST /migrate-vbucket {vbucket, targetShardId?}).
+   * Same primitive /split-vbucket now builds on, with the target shard
+   * explicit/optional rather than always fresh. */
+  private async handleMigrateVbucket(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number; targetShardId?: string };
+    if (body.vbucket === undefined || !Number.isInteger(body.vbucket) || body.vbucket < 0) {
+      return json({ error: "vbucket must be a non-negative integer" }, 400);
+    }
+    const started = await this.startMigration(body.vbucket, body.targetShardId, "/migrate-vbucket");
+    if (started instanceof Response) return started;
+    return json({
+      ok: true,
+      vbucket: body.vbucket,
+      fromShard: started.fromShard,
+      toShard: started.toShard,
+      status: "backfilling",
+    });
+  }
+
+  /** Registered tables eligible for migration — a table still carrying the
+   * UNSET sentinel can't be exported (no partition-key column to page on). */
+  private migratableTables(): Array<{ table: string; partitionKeyColumn: string }> {
+    return this.many<{ table_name: string; partition_key_column: string }>(
+      "SELECT table_name, partition_key_column FROM table_rules ORDER BY table_name ASC",
+    )
+      .filter((t) => t.partition_key_column !== UNSET_PARTITION_KEY_COLUMN)
+      .map((t) => ({ table: t.table_name, partitionKeyColumn: t.partition_key_column }));
+  }
+
+  /** Shared migration-start guard + state transition for /split-vbucket and
+   * /migrate-vbucket. Returns a Response on rejection. */
+  private async startMigration(
+    vbucket: number,
+    requestedTargetShardId: string | undefined,
+    endpoint: string,
+  ): Promise<Response | { fromShard: string; toShard: string; metadataVersion: number }> {
+    const existingMap = this.one<{ shard_id: string; migration_status: string }>(
+      "SELECT shard_id, migration_status FROM vbucket_map WHERE vbucket = ?",
+      vbucket,
     );
     if (!existingMap) {
-      return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+      return json({ error: `vbucket ${vbucket} has no mapping` }, 404);
+    }
+    if (existingMap.migration_status !== "none") {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_IN_PROGRESS",
+            message: `vbucket ${vbucket} already has a migration in progress (status: ${existingMap.migration_status}).`,
+            fix: "Wait for it to finish (/admin/migrate-vbucket-status) or abort it (/admin/migrate-vbucket-abort).",
+          },
+        },
+        409,
+      );
     }
 
-    // Milestone 3, Chunk 2: splitting no longer needs to block on index
-    // presence (the previous 409 SPLIT_BLOCKED_BY_INDEXES is removed) —
-    // index placement now hashes over each index's own pinned
-    // placement_ring_json, captured once at /admin/create-index, so adding a
-    // new active shard here never changes any existing index's placement
-    // modulo.
-    this.audit("/split-vbucket", { vbucket: body.vbucket, newShardId: body.newShardId, fromShard: existingMap.shard_id });
+    // Provenance gate: every row on the source shard must be attributable
+    // to a (tenant, vbucket) before ANY vbucket can migrate off it —
+    // /migrate-export selects rows via __cf_row_owners, so an unattributed
+    // row would silently be left behind rather than fail loudly here.
+    const tables = this.migratableTables();
+    if (tables.length > 0) {
+      const unattributedRes = await this.callShard(existingMap.shard_id, "/unattributed-count", { tables });
+      if (!unattributedRes.ok) {
+        return json({ error: `Failed to check provenance completeness on shard ${existingMap.shard_id}.` }, 502);
+      }
+      const unattributed = ((await unattributedRes.json()) as { count: number }).count;
+      if (unattributed > 0) {
+        return json(
+          {
+            error: {
+              code: "VBUCKET_PROVENANCE_INCOMPLETE",
+              message: `Source shard ${existingMap.shard_id} has ${unattributed} row(s) with no provenance entry — migration would leave them behind.`,
+              unattributedRows: unattributed,
+              fix: "Run /admin/backfill-provenance (and /admin/set-row-owner for any ambiguous rows), then retry.",
+            },
+          },
+          409,
+        );
+      }
+    }
 
     const config = this.one<{ catalog_shard_id: string | null }>(
       "SELECT catalog_shard_id FROM cluster_config WHERE singleton = 1",
     );
     const shardPrefix = config?.catalog_shard_id ? `${config.catalog_shard_id}-` : "";
-    const targetShard = body.newShardId ?? `${shardPrefix}shard-split-${Date.now()}`;
+    const targetShard = requestedTargetShardId ?? `${shardPrefix}shard-split-${Date.now()}`;
+    if (targetShard === existingMap.shard_id) {
+      return json({ error: `targetShardId must differ from the vbucket's current shard (${existingMap.shard_id}).` }, 400);
+    }
+
+    this.audit(endpoint, { vbucket, fromShard: existingMap.shard_id, toShard: targetShard });
+
     this.sql.exec(
-      `
-      INSERT OR IGNORE INTO shards (shard_id, status, created_at)
-      VALUES (?, 'active', ?)
-      `,
+      "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)",
       targetShard,
       new Date().toISOString(),
     );
-
     const version = this.bumpMetadataVersion();
     this.sql.exec(
       `
       UPDATE vbucket_map
-      SET shard_id = ?, map_version = ?, updated_at = ?
+      SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?, updated_at = ?
       WHERE vbucket = ?
       `,
       targetShard,
-      version,
+      new Date().toISOString(),
+      new Date().toISOString(),
+      vbucket,
+    );
+
+    const soon = Date.now() + MIGRATION_TICK_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > soon) {
+      await this.ctx.storage.setAlarm(soon);
+    }
+
+    return { fromShard: existingMap.shard_id, toShard: targetShard, metadataVersion: version };
+  }
+
+  /** Milestone 3, Chunk 4: alarm-driven migration orchestration. Each tick
+   * advances every in-flight migration one step; the alarm re-arms while any
+   * remains active. */
+  async alarm(): Promise<void> {
+    this.ensureSchema();
+    if (this.migrationTickInFlight) {
+      // Another tick (scheduled alarm vs. a concurrent invocation) is
+      // already advancing migrations — don't interleave with it on stale
+      // row snapshots; just make sure a future tick happens.
+      await this.ctx.storage.setAlarm(Date.now() + MIGRATION_TICK_MS);
+      return;
+    }
+    this.migrationTickInFlight = true;
+    let anyActive = false;
+    try {
+      const migrating = this.many<MigrationRow>(
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE migration_status != 'none' ORDER BY vbucket ASC",
+      );
+      for (const m of migrating) {
+        try {
+          const stillActive = await this.advanceMigration(m);
+          anyActive = anyActive || stillActive;
+        } catch (error) {
+          // Leave the migration in its current state and retry next tick —
+          // every step is idempotent (INSERT OR REPLACE imports,
+          // re-assertable fence, re-comparable checksums).
+          log("catalog.migration_tick_failed", {
+            vbucket: m.vbucket,
+            status: m.migration_status,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          anyActive = true;
+        }
+      }
+    } finally {
+      this.migrationTickInFlight = false;
+    }
+    if (anyActive) {
+      await this.ctx.storage.setAlarm(Date.now() + MIGRATION_TICK_MS);
+    }
+  }
+
+  /** One orchestration step for one migrating vbucket. Returns true while
+   * the migration still needs future ticks.
+   *
+   * backfilling: run a full export/import pass (paged, per table), then
+   * enter cutover — step 1's formal ordering: set migration_status='cutover'
+   * and synchronously fence the source.
+   *
+   * cutover (steps 2-5): re-assert the fence (idempotent, heals a crash
+   * between the status write and the fence write), wait for the source's
+   * mirror queue to drain to zero for this vbucket, verify per-table content
+   * checksums, then flip vbucket_map, unfence, and delete the source copy.
+   * A checksum mismatch aborts back to 'backfilling' (fence lifted, target
+   * wiped) per the spec's step-3 rule. */
+  private async advanceMigration(m: MigrationRow): Promise<boolean> {
+    if (!m.target_shard_id) {
+      // Unreachable by construction (startMigration always sets both), but
+      // fail safe: clear the inconsistent state rather than looping forever.
+      this.sql.exec("UPDATE vbucket_map SET migration_status = 'none' WHERE vbucket = ?", m.vbucket);
+      return false;
+    }
+    const source = m.shard_id;
+    const target = m.target_shard_id;
+    const tables = this.migratableTables();
+
+    if (m.migration_status === "backfilling") {
+      // Only tables that actually own rows of this vbucket on the source
+      // need exporting — every other registered table has nothing to page.
+      const vbTablesRes = await this.callShard(source, "/vbucket-tables", { vbucket: m.vbucket });
+      if (!vbTablesRes.ok) throw new Error(`vbucket-tables failed on ${source}: ${vbTablesRes.status}`);
+      const vbTables = new Set(((await vbTablesRes.json()) as { tables: string[] }).tables);
+      const exportTables = tables.filter((t) => vbTables.has(t.table));
+
+      let copied = 0;
+      for (const t of exportTables) {
+        let afterPk = "";
+        for (;;) {
+          const exportRes = await this.callShard(source, "/migrate-export", {
+            vbucket: m.vbucket,
+            table: t.table,
+            partitionKeyColumn: t.partitionKeyColumn,
+            afterPartitionKey: afterPk,
+            limit: 500,
+          });
+          if (!exportRes.ok) throw new Error(`migrate-export failed on ${source} for ${t.table}: ${exportRes.status}`);
+          const exportBody = (await exportRes.json()) as {
+            rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
+          };
+          const rows = exportBody.rows;
+          if (rows.length === 0) break;
+          const importRes = await this.callShard(target, "/migrate-import", { vbucket: m.vbucket, table: t.table, rows });
+          if (!importRes.ok) throw new Error(`migrate-import failed on ${target} for ${t.table}: ${importRes.status}`);
+          copied += rows.length;
+          afterPk = rows[rows.length - 1].partitionKey;
+          if (rows.length < 500) break;
+        }
+      }
+      this.sql.exec("UPDATE vbucket_map SET migration_rows_copied = migration_rows_copied + ? WHERE vbucket = ?", copied, m.vbucket);
+
+      // Cutover step 1: status first (spec's stated order), then the fence,
+      // synchronously in the same tick. A crash between the two writes is
+      // healed by the cutover branch re-asserting the fence every tick.
+      // Conditional on the row still being THIS migration — an
+      // /admin/migrate-vbucket-abort that landed during the (awaited)
+      // backfill pass above must not be resurrected into cutover.
+      this.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'cutover', updated_at = ? WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+        new Date().toISOString(),
+        m.vbucket,
+        target,
+      );
+      const advanced = this.one<{ n: number }>("SELECT changes() AS n");
+      if ((advanced?.n ?? 0) === 0) {
+        log("catalog.migration_advance_skipped_stale", { vbucket: m.vbucket, expected: "backfilling" });
+        return false;
+      }
+      const fenceRes = await this.callShard(source, "/fence-vbucket", { vbucket: m.vbucket });
+      if (!fenceRes.ok) throw new Error(`fence-vbucket failed on ${source}: ${fenceRes.status}`);
+      return true;
+    }
+
+    if (m.migration_status === "cutover") {
+      // Re-assert the fence (idempotent INSERT OR REPLACE) — guarantees it
+      // exists even if the previous tick crashed after the status write.
+      const fenceRes = await this.callShard(source, "/fence-vbucket", { vbucket: m.vbucket });
+      if (!fenceRes.ok) throw new Error(`fence-vbucket failed on ${source}: ${fenceRes.status}`);
+
+      // Step 2: source's mirror queue for this vbucket must reach zero.
+      const mirrorRes = await this.callShard(source, "/mirror-pending-count", { vbucket: m.vbucket });
+      if (!mirrorRes.ok) throw new Error(`mirror-pending-count failed on ${source}: ${mirrorRes.status}`);
+      const mirrorDepth = ((await mirrorRes.json()) as { count: number }).count;
+      if (mirrorDepth > 0) {
+        return true; // poll again next tick
+      }
+
+      // Step 3: per-table content checksums must match for EVERY registered
+      // table (the spec's verify rule) — computed in one batched round trip
+      // per shard rather than one per table.
+      const [srcRes, tgtRes] = await Promise.all([
+        this.callShard(source, "/migrate-checksums", { vbucket: m.vbucket, tables }),
+        this.callShard(target, "/migrate-checksums", { vbucket: m.vbucket, tables }),
+      ]);
+      if (!srcRes.ok || !tgtRes.ok) throw new Error("migrate-checksums failed");
+      const srcSums = ((await srcRes.json()) as { checksums: Record<string, { checksum: string }> }).checksums;
+      const tgtSums = ((await tgtRes.json()) as { checksums: Record<string, { checksum: string }> }).checksums;
+      // The checksum round-trips above are await points — re-read the row
+      // and bail if the migration was aborted (or otherwise changed) while
+      // they were in flight, BEFORE acting on the comparison. Acting on a
+      // stale view here is the dangerous case: a wipe against a migration
+      // that no longer exists, or a flip for one that was aborted.
+      const fresh = this.one<{ migration_status: string; shard_id: string; target_shard_id: string | null }>(
+        "SELECT migration_status, shard_id, target_shard_id FROM vbucket_map WHERE vbucket = ?",
+        m.vbucket,
+      );
+      if (!fresh || fresh.migration_status !== "cutover" || fresh.shard_id !== source || fresh.target_shard_id !== target) {
+        log("catalog.migration_cutover_skipped_stale", { vbucket: m.vbucket });
+        return fresh !== null && fresh.migration_status !== "none";
+      }
+
+      const mismatched = tables.find((t) => srcSums[t.table]?.checksum !== tgtSums[t.table]?.checksum);
+      if (mismatched) {
+        log("catalog.migration_checksum_mismatch", { vbucket: m.vbucket, table: mismatched.table, source, target });
+        // Abort this cutover attempt: fence lifted, target wiped, status
+        // back to backfilling (a later tick re-copies and retries). Purge
+        // the source's queued mirrors for this vbucket too — their content
+        // is re-derived by the next backfill pass, and left queued they'd
+        // fire against the just-wiped target out of order.
+        await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
+        await this.callShard(source, "/purge-mirror-jobs", { vbucket: m.vbucket });
+        await this.callShard(target, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
+        this.sql.exec(
+          "UPDATE vbucket_map SET migration_status = 'backfilling', updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND target_shard_id = ?",
+          new Date().toISOString(),
+          m.vbucket,
+          target,
+        );
+        return true;
+      }
+
+      // Step 4: flip the map. From this write on, /route sends everything to
+      // the target; the fence still blocks any straggler write that resolved
+      // its route pre-flip and arrives at the source. Conditional, and step
+      // 5's destructive source delete only runs if THIS tick actually
+      // performed the flip.
+      const version = this.bumpMetadataVersion();
+      this.sql.exec(
+        `
+        UPDATE vbucket_map
+        SET shard_id = ?, migration_status = 'none', target_shard_id = NULL, map_version = ?, updated_at = ?
+        WHERE vbucket = ? AND migration_status = 'cutover' AND shard_id = ? AND target_shard_id = ?
+        `,
+        target,
+        version,
+        new Date().toISOString(),
+        m.vbucket,
+        source,
+        target,
+      );
+      const flipped = this.one<{ n: number }>("SELECT changes() AS n");
+      if ((flipped?.n ?? 0) === 0) {
+        log("catalog.migration_flip_skipped_stale", { vbucket: m.vbucket });
+        return false;
+      }
+
+      // Step 5: unfence source, then delete the vbucket's rows + provenance
+      // from it.
+      await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
+      await this.callShard(source, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
+
+      this.audit("/migrate-vbucket-complete", { vbucket: m.vbucket, fromShard: source, toShard: target, metadataVersion: version });
+      return false;
+    }
+
+    return false;
+  }
+
+  /** Milestone 3, Chunk 4 (POST /migrate-vbucket-status {vbucket}). */
+  private async handleMigrateVbucketStatus(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    const row = this.one<MigrationRow & { migration_started_at: string | null }>(
+      "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, migration_started_at FROM vbucket_map WHERE vbucket = ?",
+      body.vbucket,
+    );
+    if (!row) {
+      return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+    }
+    let mirrorQueueDepth = 0;
+    if (row.migration_status !== "none") {
+      const mirrorRes = await this.callShard(row.shard_id, "/mirror-pending-count", { vbucket: body.vbucket });
+      if (mirrorRes.ok) {
+        mirrorQueueDepth = ((await mirrorRes.json()) as { count: number }).count;
+      }
+    }
+    return json({
+      vbucket: row.vbucket,
+      status: row.migration_status,
+      fromShard: row.shard_id,
+      toShard: row.target_shard_id,
+      rowsCopied: row.migration_rows_copied,
+      mirrorQueueDepth,
+      startedAt: row.migration_started_at,
+    });
+  }
+
+  /** Milestone 3, Chunk 4 (POST /migrate-vbucket-abort {vbucket}). Safe at
+   * any point before the map flip — the source never stopped being
+   * authoritative, so aborting is purely: wipe the target's copy of this
+   * vbucket (rows + provenance), lift the fence, clear the migration state.
+   * After the flip there is nothing left to abort (the source copy is
+   * deleted); rolling back is a fresh migration in the other direction. */
+  private async handleMigrateVbucketAbort(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    const row = this.one<MigrationRow>(
+      "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied FROM vbucket_map WHERE vbucket = ?",
+      body.vbucket,
+    );
+    if (!row) {
+      return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+    }
+    if (row.migration_status === "none" || !row.target_shard_id) {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_ALREADY_COMMITTED",
+            message: `vbucket ${body.vbucket} has no active migration — it either already committed (map flipped) or was never started.`,
+            fix: "A committed migration is reversed by migrating the vbucket back with /admin/migrate-vbucket.",
+          },
+        },
+        409,
+      );
+    }
+
+    this.audit("/migrate-vbucket-abort", { vbucket: body.vbucket, fromShard: row.shard_id, toShard: row.target_shard_id });
+
+    const tables = this.migratableTables();
+    await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
+    // Purge queued-but-unsent mirrors before wiping the target — a stale
+    // mirror firing after the wipe would recreate unattributed junk there.
+    await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
+    const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
+    if (!wipeRes.ok) {
+      return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
+    }
+    this.sql.exec(
+      "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, updated_at = ? WHERE vbucket = ?",
       new Date().toISOString(),
       body.vbucket,
     );
 
-    return json({
-      ok: true,
-      vbucket: body.vbucket,
-      fromShard: existingMap.shard_id,
-      toShard: targetShard,
-      metadataVersion: version,
-    });
+    return json({ ok: true, vbucket: body.vbucket, status: "aborted" });
   }
 }

@@ -813,6 +813,228 @@ describe("ShardDO __cf_mirror_pending dual-write retry queue (Milestone 3, Chunk
   });
 });
 
+describe("ShardDO migration fence and export/import (Milestone 3, Chunk 4)", () => {
+  async function createTable(stub: Awaited<ReturnType<typeof freshShard>>) {
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+  }
+
+  async function insertWithProvenance(stub: Awaited<ReturnType<typeof freshShard>>, id: string, v: string, vbucket: number) {
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: [id, v],
+        requestId: `req-ins-${id}-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: id,
+        vbucket,
+      }),
+    );
+    expect(res.status).toBe(200);
+  }
+
+  it("a fenced vbucket rejects new writes 409 VBUCKET_FENCED, still replays already-applied requestIds, ignores other vbuckets, and accepts again after unfence", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await insertWithProvenance(stub, "pre-fence", "a", 5);
+
+    // Capture the exact requestId of an applied write for the replay check.
+    const appliedRequestId = `req-applied-${crypto.randomUUID()}`;
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["applied-row", "x"],
+        requestId: appliedRequestId,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "applied-row",
+        vbucket: 5,
+      }),
+    );
+
+    const fenceRes = await stub.fetch(post("/fence-vbucket", { vbucket: 5 }));
+    expect(fenceRes.status).toBe(200);
+
+    // New write to the fenced vbucket: rejected, retryable shape.
+    const blocked = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["post-fence", "b"],
+        requestId: `req-blocked-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "post-fence",
+        vbucket: 5,
+      }),
+    );
+    expect(blocked.status).toBe(409);
+    const blockedBody = (await blocked.json()) as { error: { code: string } };
+    expect(blockedBody.error.code).toBe("VBUCKET_FENCED");
+
+    // Replay of an ALREADY-APPLIED requestId returns the cached result, not
+    // a spurious fence rejection.
+    const replay = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["applied-row", "x"],
+        requestId: appliedRequestId,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "applied-row",
+        vbucket: 5,
+      }),
+    );
+    expect(replay.status).toBe(200);
+    expect(((await replay.json()) as { duplicated: boolean }).duplicated).toBe(true);
+
+    // A different vbucket on the same shard is unaffected.
+    const otherVb = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["other-vb", "c"],
+        requestId: `req-other-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "other-vb",
+        vbucket: 6,
+      }),
+    );
+    expect(otherVb.status).toBe(200);
+
+    // 2PC prepare against the fenced vbucket is rejected too.
+    const prepBlocked = await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: `tx-fenced-${crypto.randomUUID()}`,
+        intents: [
+          { sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["tx-row", "d"], tenantId: "tenant-1", table: "t", partitionKey: "tx-row", vbucket: 5, op: "insert" },
+        ],
+      }),
+    );
+    expect(prepBlocked.status).toBe(409);
+    expect(((await prepBlocked.json()) as { error: { code: string } }).error.code).toBe("VBUCKET_FENCED");
+
+    await stub.fetch(post("/unfence-vbucket", { vbucket: 5 }));
+    const afterUnfence = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["post-unfence", "e"],
+        requestId: `req-unfenced-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "post-unfence",
+        vbucket: 5,
+      }),
+    );
+    expect(afterUnfence.status).toBe(200);
+  });
+
+  it("export pages stably by partition key, import is idempotent, and source/target checksums match after a full copy", async () => {
+    const source = await freshShard();
+    const targetName = `migrate-target-${crypto.randomUUID()}`;
+    const target = env.SHARD.get(env.SHARD.idFromName(targetName));
+    await createTable(source);
+    await createTable(target);
+
+    // 5 rows in vbucket 9, 1 row in another vbucket that must NOT export.
+    for (let i = 0; i < 5; i += 1) {
+      await insertWithProvenance(source, `row-${i}`, `v${i}`, 9);
+    }
+    await insertWithProvenance(source, "row-other", "vx", 10);
+
+    // Page with limit 2: 2 + 2 + 1.
+    const pages: Array<Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>> = [];
+    let afterPk = "";
+    for (;;) {
+      const res = await source.fetch(
+        post("/migrate-export", { vbucket: 9, table: "t", partitionKeyColumn: "id", afterPartitionKey: afterPk, limit: 2 }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }> };
+      if (body.rows.length === 0) break;
+      pages.push(body.rows);
+      afterPk = body.rows[body.rows.length - 1].partitionKey;
+
+      const importRes = await target.fetch(post("/migrate-import", { vbucket: 9, table: "t", rows: body.rows }));
+      expect(importRes.status).toBe(200);
+      if (body.rows.length < 2) break;
+    }
+    expect(pages.map((p) => p.length)).toEqual([2, 2, 1]);
+    const exportedKeys = pages.flat().map((r) => r.partitionKey);
+    expect(exportedKeys).toEqual(["row-0", "row-1", "row-2", "row-3", "row-4"]); // stable ASC order, no row-other
+
+    // Re-import the first page — idempotent, no duplicates.
+    const reimport = await target.fetch(post("/migrate-import", { vbucket: 9, table: "t", rows: pages[0] }));
+    expect(reimport.status).toBe(200);
+
+    const countRes = await target.fetch(
+      post("/execute", { sql: "SELECT COUNT(*) AS n FROM t", requestId: `req-count-${crypto.randomUUID()}`, isMutation: false }),
+    );
+    expect(((await countRes.json()) as { rows: Array<{ n: number }> }).rows[0].n).toBe(5);
+
+    // Checksums agree between source and target for the migrated vbucket.
+    const srcSum = (await (
+      await source.fetch(post("/migrate-checksum", { vbucket: 9, table: "t", partitionKeyColumn: "id" }))
+    ).json()) as { checksum: string; rowCount: number };
+    const tgtSum = (await (
+      await target.fetch(post("/migrate-checksum", { vbucket: 9, table: "t", partitionKeyColumn: "id" }))
+    ).json()) as { checksum: string; rowCount: number };
+    expect(srcSum.rowCount).toBe(5);
+    expect(tgtSum.rowCount).toBe(5);
+    expect(tgtSum.checksum).toBe(srcSum.checksum);
+
+    // And a divergence IS detected: mutate one target row, checksum differs.
+    await target.fetch(
+      post("/execute", { sql: "UPDATE t SET v = 'tampered' WHERE id = 'row-0'", requestId: `req-tamper-${crypto.randomUUID()}`, isMutation: true }),
+    );
+    const tamperedSum = (await (
+      await target.fetch(post("/migrate-checksum", { vbucket: 9, table: "t", partitionKeyColumn: "id" }))
+    ).json()) as { checksum: string };
+    expect(tamperedSum.checksum).not.toBe(srcSum.checksum);
+  });
+
+  it("/delete-vbucket-rows removes exactly one vbucket's rows + provenance and /unattributed-count reports rows lacking provenance", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await insertWithProvenance(stub, "keep-me", "a", 1);
+    await insertWithProvenance(stub, "delete-me", "b", 2);
+    // A provenance-less row (pre-Chunk-0 write).
+    await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id, v) VALUES ('no-prov', 'c')", requestId: `req-noprov-${crypto.randomUUID()}`, isMutation: true }),
+    );
+
+    const unattributed = (await (
+      await stub.fetch(post("/unattributed-count", { tables: [{ table: "t", partitionKeyColumn: "id" }] }))
+    ).json()) as { count: number };
+    expect(unattributed.count).toBe(1);
+
+    const delRes = await stub.fetch(
+      post("/delete-vbucket-rows", { vbucket: 2, tables: [{ table: "t", partitionKeyColumn: "id" }] }),
+    );
+    expect(delRes.status).toBe(200);
+
+    const remaining = await stub.fetch(
+      post("/execute", { sql: "SELECT id FROM t ORDER BY id", requestId: `req-remaining-${crypto.randomUUID()}`, isMutation: false }),
+    );
+    const remainingBody = (await remaining.json()) as { rows: Array<{ id: string }> };
+    expect(remainingBody.rows.map((r) => r.id)).toEqual(["keep-me", "no-prov"]);
+
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      const prov = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE vbucket = 2"));
+      expect(prov).toHaveLength(0);
+      const kept = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE vbucket = 1"));
+      expect(kept).toHaveLength(1);
+    });
+  });
+});
+
 describe("ShardDO row provenance (Milestone 3, Chunk 0)", () => {
   async function createTable(stub: Awaited<ReturnType<typeof freshShard>>) {
     await stub.fetch(
