@@ -70,4 +70,35 @@ describe("indexShardIdForKey", () => {
     const smallPool = indexShardIdForKey("events", "idx_by_v", '["alpha"]', ["shard-0"]);
     expect(smallPool).toBe("shard-0");
   });
+
+  // Milestone 3, Chunk 2: indexShardIdForKey now takes an explicit `ring` —
+  // an index's PINNED placement ring, captured once at create-index time —
+  // rather than ever being handed the live/current active shard set. These
+  // two tests assert the "pinned" half of that contract: this pure function
+  // has no notion of "the cluster grew/shrank since"; it only ever sees
+  // whatever array the caller passes.
+  it("pinned-ring stability: the same ring resolves to the same shard across repeated calls, unaffected by a larger 'live' shard set existing elsewhere", () => {
+    const pinnedRing = ["shard-0", "shard-1"];
+    const first = indexShardIdForKey("events", "idx_by_v", '["alpha"]', pinnedRing);
+    // A hypothetical live/current active-shard set has since grown (e.g. a
+    // split added shard-2/shard-3) — but nothing here ever sees that array;
+    // the same pinned ring is passed again, exactly as an index's
+    // placement_ring_json would be, unaffected by the cluster's growth.
+    const second = indexShardIdForKey("events", "idx_by_v", '["alpha"]', pinnedRing);
+    expect(second).toBe(first);
+    expect(pinnedRing).toContain(first);
+  });
+
+  it("pinned-ring stability: a smaller ring captured historically keeps resolving within itself even though a much larger live shard array exists side by side", () => {
+    const pinnedRing = ["shard-0", "shard-1"];
+    const liveShardsAfterGrowth = ["shard-0", "shard-1", "shard-2", "shard-3", "shard-4"];
+    for (const indexKeyJson of ['["alpha"]', '["beta"]', '["gamma"]', "[1]", "[42]"]) {
+      const resolved = indexShardIdForKey("events", "idx_by_v", indexKeyJson, pinnedRing);
+      // Resolving against the pinned ring never produces a shard outside it,
+      // regardless of what the live set (computed independently, never
+      // passed in) looks like.
+      expect(pinnedRing).toContain(resolved);
+      void liveShardsAfterGrowth; // documents the scenario; deliberately unused by the call above
+    }
+  });
 });

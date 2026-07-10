@@ -149,6 +149,17 @@ export class CatalogDO extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+    // Milestone 3, Chunk 2: the ordered shard-id array active at the moment
+    // this index was created (/admin/create-index), pinned for the index's
+    // entire lifetime — indexShardIdForKey (hash.ts) hashes over THIS array,
+    // never the live/current active shard set, so /admin/split-vbucket
+    // (grows the active set) and /admin/drain-shard (shrinks it, modulo
+    // Chunk 5's ring-evacuation rule) can't silently orphan existing
+    // __cf_indexes entries by changing the modulo out from under them.
+    // Default '[]' only matters for a row that predates this column (would
+    // need one of the old blockIfIndexesExist-era indexes recreated via the
+    // documented drop-index/create-index upgrade flow anyway).
+    this.ensureColumn("index_rules", "placement_ring_json", "TEXT NOT NULL DEFAULT '[]'");
   }
 
   private audit(endpoint: string, requestSummary: Record<string, unknown>): void {
@@ -401,7 +412,7 @@ export class CatalogDO extends DurableObject {
    * /admin/create-table applies the shard-level schema before registering
    * in table_rules (src/index.ts's handleAdminCreateTable). */
   private async handleCreateIndex(request: Request): Promise<Response> {
-    const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
+    const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[]; placementRing?: string[] };
     if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
       return json(
         {
@@ -458,13 +469,14 @@ export class CatalogDO extends DurableObject {
       );
     }
 
-    this.audit("/create-index", { indexName: body.indexName, table: body.table, columns: body.columns });
+    this.audit("/create-index", { indexName: body.indexName, table: body.table, columns: body.columns, placementRing: body.placementRing });
     this.sql.exec(
-      "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at) VALUES (?, ?, ?, 'building', ?)",
+      "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'building', ?, ?)",
       body.indexName,
       body.table,
       JSON.stringify(body.columns),
       new Date().toISOString(),
+      JSON.stringify(body.placementRing ?? []),
     );
 
     return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
@@ -525,8 +537,15 @@ export class CatalogDO extends DurableObject {
   }
 
   private async handleListIndexes(): Promise<Response> {
-    const indexes = this.many<{ index_name: string; table_name: string; columns_json: string; status: string; created_at: string }>(
-      "SELECT index_name, table_name, columns_json, status, created_at FROM index_rules ORDER BY index_name ASC",
+    const indexes = this.many<{
+      index_name: string;
+      table_name: string;
+      columns_json: string;
+      status: string;
+      created_at: string;
+      placement_ring_json: string;
+    }>(
+      "SELECT index_name, table_name, columns_json, status, created_at, placement_ring_json FROM index_rules ORDER BY index_name ASC",
     );
     return json({
       indexes: indexes.map((i) => ({
@@ -535,6 +554,7 @@ export class CatalogDO extends DurableObject {
         columns: JSON.parse(i.columns_json) as string[],
         status: i.status,
         createdAt: i.created_at,
+        placementRing: JSON.parse(i.placement_ring_json) as string[],
       })),
     });
   }
@@ -552,9 +572,9 @@ export class CatalogDO extends DurableObject {
     const authError = await this.checkTenantAuth(body.tenantId, request);
     if (authError) return authError;
 
-    const index = this.one<{ columns_json: string; partition_key_column: string; status: string }>(
+    const index = this.one<{ columns_json: string; partition_key_column: string; status: string; placement_ring_json: string }>(
       `
-      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status
+      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status, ir.placement_ring_json AS placement_ring_json
       FROM index_rules ir
       JOIN table_rules tr ON tr.table_name = ir.table_name
       WHERE ir.index_name = ? AND ir.table_name = ?
@@ -580,7 +600,11 @@ export class CatalogDO extends DurableObject {
         425,
       );
     }
-    return json({ columns: JSON.parse(index.columns_json) as string[], partitionKeyColumn: index.partition_key_column });
+    return json({
+      columns: JSON.parse(index.columns_json) as string[],
+      partitionKeyColumn: index.partition_key_column,
+      ring: JSON.parse(index.placement_ring_json) as string[],
+    });
   }
 
   /** Data-plane tenant auth check: does the caller's bearer token match the
@@ -802,11 +826,15 @@ export class CatalogDO extends DurableObject {
     // check this itself — see the Milestone 2 eng review's correction), and
     // lets /v1/mutate's async index maintenance (Chunk 2) know which columns
     // each registered index actually covers.
-    const indexRows = this.many<{ index_name: string; columns_json: string }>(
-      "SELECT index_name, columns_json FROM index_rules WHERE table_name = ?",
+    const indexRows = this.many<{ index_name: string; columns_json: string; placement_ring_json: string }>(
+      "SELECT index_name, columns_json, placement_ring_json FROM index_rules WHERE table_name = ?",
       body.table,
     );
-    const indexes = indexRows.map((r) => ({ indexName: r.index_name, columns: JSON.parse(r.columns_json) as string[] }));
+    const indexes = indexRows.map((r) => ({
+      indexName: r.index_name,
+      columns: JSON.parse(r.columns_json) as string[],
+      ring: JSON.parse(r.placement_ring_json) as string[],
+    }));
 
     return json({
       shardId: mapped.shard_id,
@@ -890,42 +918,21 @@ export class CatalogDO extends DurableObject {
       return json({ error: `Shard ${body.shardId} not found` }, 404);
     }
 
-    // Eng-review fix: index-shard placement (indexShardIdForKey) hashes over
-    // the globally active shard set, recomputed fresh on every read/write —
-    // unlike base-row routing, which uses a persistent vbucket->shard
-    // mapping unaffected by shard-count changes. Draining a shard changes
-    // that active set, which changes the hash modulo for nearly every
-    // existing index key, silently orphaning __cf_indexes entries with no
-    // migration path.
-    const drainBlocked = this.blockIfIndexesExist(
-      "SHARD_DRAIN_BLOCKED_BY_INDEXES",
-      "Cannot drain a shard while any secondary index is registered — draining would silently orphan existing index entries.",
-      "Drop all registered indexes (/admin/drop-index) first, drain the shard, then recreate the indexes so backfill uses the post-drain shard set.",
-    );
-    if (drainBlocked) return drainBlocked;
-
+    // Milestone 3, Chunk 2: index placement now hashes over each index's own
+    // PINNED placement_ring_json (captured once at /admin/create-index),
+    // never the live active shard set — so draining a shard no longer
+    // silently orphans __cf_indexes entries for indexes that don't happen to
+    // include the draining shard in their ring. The previous blanket 409
+    // here (SHARD_DRAIN_BLOCKED_BY_INDEXES) is removed. Draining a shard
+    // that a ring DOES contain still needs care — that's Chunk 5's ring
+    // evacuation (drain migrates every vbucket off first, then substitutes
+    // this shard out of any ring containing it before finishing).
     this.audit("/drain-shard", { shardId: body.shardId });
 
     this.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", body.shardId);
 
     const version = this.bumpMetadataVersion();
     return json({ ok: true, shardId: body.shardId, metadataVersion: version });
-  }
-
-  /** Eng-review fix (Codex-found): index-shard placement hashes over the
-   * active shard set — /split-vbucket grows that set by inserting a new
-   * 'active' shard (below), the same hazard /drain-shard's block exists for,
-   * just via growth instead of shrinkage. Shared with handleDrainShard so
-   * both active-shard-count-changing operations get the identical guard. */
-  private blockIfIndexesExist(code: string, message: string, fix: string): Response | null {
-    // index_rules is fanned out identically to every catalog shard by
-    // /create-index, so this catalog shard's row count is representative of
-    // whether ANY index exists cluster-wide.
-    const anyIndex = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_rules");
-    if ((anyIndex?.n ?? 0) > 0) {
-      return json({ error: { code, message, fix } }, 409);
-    }
-    return null;
   }
 
   private async handleSplitVbucket(request: Request): Promise<Response> {
@@ -946,13 +953,12 @@ export class CatalogDO extends DurableObject {
       return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
     }
 
-    const splitBlocked = this.blockIfIndexesExist(
-      "SPLIT_BLOCKED_BY_INDEXES",
-      "Cannot split a vbucket while any secondary index is registered — splitting adds a new active shard, changing index-shard placement and orphaning existing index entries.",
-      "Drop all registered indexes (/admin/drop-index) first, split, then recreate the indexes so backfill uses the post-split shard set.",
-    );
-    if (splitBlocked) return splitBlocked;
-
+    // Milestone 3, Chunk 2: splitting no longer needs to block on index
+    // presence (the previous 409 SPLIT_BLOCKED_BY_INDEXES is removed) —
+    // index placement now hashes over each index's own pinned
+    // placement_ring_json, captured once at /admin/create-index, so adding a
+    // new active shard here never changes any existing index's placement
+    // modulo.
     this.audit("/split-vbucket", { vbucket: body.vbucket, newShardId: body.newShardId, fromShard: existingMap.shard_id });
 
     const config = this.one<{ catalog_shard_id: string | null }>(

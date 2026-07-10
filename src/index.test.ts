@@ -1772,6 +1772,124 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
   });
 });
 
+describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", () => {
+  it("still finds a matching row after its base row physically moves to a different shard and vbucket_map is flipped to point there (simulating what Chunk 4's migration does), proving hydration re-routes via the entry's recorded tenant_id rather than a stale source_shard_id snapshot", async () => {
+    // /admin/init clamps totalVBuckets to a floor of 64 regardless of what's
+    // requested here — matching that floor so the vbucket computed below
+    // agrees with what CatalogDO actually stored.
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("idx_c2_reroute_evt");
+    await post("/admin/create-index", { indexName: "idx_c2_reroute_by_v", table: "idx_c2_reroute_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const insertRes = await post(
+      "/v1/mutate",
+      { op: "insert", table: "idx_c2_reroute_evt", tenantId, partitionKey: "row-move", values: { v: "alpha" } },
+      token,
+    );
+    expect(insertRes.status).toBe(200);
+    await pollIndexRows("idx_c2_reroute_by_v", (r) => r.length === 1);
+
+    // Confirm it resolves correctly before the move (sanity check).
+    const before = await post(
+      "/v1/index-query",
+      { table: "idx_c2_reroute_evt", indexName: "idx_c2_reroute_by_v", tenantId, values: { v: "alpha" } },
+      token,
+    );
+    expect((await before.json() as { rows: Array<{ id: string }> }).rows).toHaveLength(1);
+
+    // Figure out which vbucket/shard this row currently lives on.
+    const vbucket = hashKey(`${tenantId}:idx_c2_reroute_evt:row-move`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const fromShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const row = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return row[0].shard_id;
+    });
+    const toShardId = fromShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    // Simulate a completed migration: copy the row onto the other shard,
+    // delete it from the original, then flip vbucket_map — exactly the end
+    // state Chunk 4's cutover (step 4/5) will produce, just performed by
+    // hand here instead of by that not-yet-built machinery.
+    const toStub = env.SHARD.get(env.SHARD.idFromName(toShardId));
+    await toStub.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_c2_reroute_evt (id, v) VALUES (?, ?)",
+          params: ["row-move", "alpha"],
+          requestId: `reroute-copy-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const fromStub = env.SHARD.get(env.SHARD.idFromName(fromShardId));
+    await fromStub.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "DELETE FROM idx_c2_reroute_evt WHERE id = ?",
+          params: ["row-move"],
+          requestId: `reroute-delete-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET shard_id = ?, updated_at = ? WHERE vbucket = ?",
+        toShardId,
+        new Date().toISOString(),
+        vbucket,
+      );
+    });
+
+    // The index entry itself was never touched (still whatever tenant_id
+    // was recorded at write time) — hydration must recompute the row's
+    // current shard via /route rather than trust any physical shard
+    // snapshot, so this must still find it on its NEW shard.
+    const after = await post(
+      "/v1/index-query",
+      { table: "idx_c2_reroute_evt", indexName: "idx_c2_reroute_by_v", tenantId, values: { v: "alpha" } },
+      token,
+    );
+    expect(after.status).toBe(200);
+    const afterBody = (await after.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(afterBody.rows).toHaveLength(1);
+    expect(afterBody.rows[0].id).toBe("row-move");
+  });
+
+  it("returns PROVENANCE_MISSING_FOR_INDEX when a row has no __cf_row_owners entry at /admin/create-index backfill time", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c2_noprov_evt");
+
+    // Write the row directly to the shard, bypassing every write path that
+    // would normally record __cf_row_owners (Chunk 0) — simulates a row
+    // written before Milestone 3 Chunk 0 shipped.
+    const shardStub = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
+    await shardStub.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_c2_noprov_evt (id, v) VALUES (?, ?)",
+          params: ["row-no-prov", "alpha"],
+          requestId: `noprov-insert-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+
+    const res = await post("/admin/create-index", { indexName: "idx_c2_noprov_by_v", table: "idx_c2_noprov_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PROVENANCE_MISSING_FOR_INDEX");
+  });
+});
+
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
@@ -1894,7 +2012,7 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     expect(res.status).toBe(200);
   });
 
-  it("eng-review fix: rejects draining a shard while any index is registered, 409 SHARD_DRAIN_BLOCKED_BY_INDEXES; succeeds again once dropped", async () => {
+  it("Milestone 3, Chunk 2: draining a shard while an index is registered now succeeds (SHARD_DRAIN_BLOCKED_BY_INDEXES is removed — index placement hashes over each index's own pinned ring; Chunk 5 adds safe ring evacuation for a shard the ring actually contains)", async () => {
     await initCluster(1, 4);
     const createTableRes = await post(
       "/admin/create-table",
@@ -1904,21 +2022,17 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     expect(createTableRes.status).toBe(200);
     const createIndexRes = await post(
       "/admin/create-index",
-      { indexName: "idx_drain_block_by_v", table: "drain_idx_evt", columns: ["v"] },
+      { indexName: "idx_drain_no_block_by_v", table: "drain_idx_evt", columns: ["v"] },
       AUTH(),
     );
     expect(createIndexRes.status).toBe(200);
 
-    const blocked = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
-    expect(blocked.status).toBe(409);
-    const blockedBody = (await blocked.json()) as { error: { code: string } };
-    expect(blockedBody.error.code).toBe("SHARD_DRAIN_BLOCKED_BY_INDEXES");
-
-    const dropRes = await post("/admin/drop-index", { indexName: "idx_drain_block_by_v" }, AUTH());
-    expect(dropRes.status).toBe(200);
-
     const allowed = await post("/admin/drain-shard", { shardId: "catalog-0-shard-0", catalogShardId: "catalog-0" }, AUTH());
     expect(allowed.status).toBe(200);
+
+    const listRes = await post("/admin/list-indexes", {}, AUTH());
+    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string; status: string }> };
+    expect(listBody.indexes.find((i) => i.indexName === "idx_drain_no_block_by_v")?.status).toBe("ready");
   });
 
   it("rejects draining a shard with an in-flight prepared transaction, 409", async () => {
