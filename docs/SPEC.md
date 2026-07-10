@@ -74,18 +74,87 @@ Table: vbucket_map
 - shard_id TEXT NOT NULL
 - map_version INTEGER NOT NULL
 - updated_at TEXT NOT NULL
+- migration_status TEXT NOT NULL DEFAULT 'none' (none | backfilling | cutover — Milestone 3)
+- target_shard_id TEXT (the in-flight migration's destination — Milestone 3)
+- migration_rows_copied INTEGER NOT NULL DEFAULT 0 (Milestone 3)
+- migration_started_at TEXT (Milestone 3)
 
 Table: table_rules
 - table_name TEXT PRIMARY KEY
 - partitioning TEXT NOT NULL (hash for MVP)
 - created_at TEXT NOT NULL
+- partition_key_column TEXT NOT NULL (default sentinel `__unset__` for pre-upgrade rows)
+- schema_sql TEXT (the CREATE TABLE statement captured at /admin/create-table — Milestone 3
+  migration backfill applies it to a target shard created after the original fan-out,
+  e.g. a split target; NULL for tables registered before this column existed)
+
+Table: index_rules (Milestone 2, extended in Milestone 3)
+- index_name TEXT PRIMARY KEY
+- table_name TEXT NOT NULL
+- columns_json TEXT NOT NULL
+- status TEXT NOT NULL DEFAULT 'building' (building | ready)
+- created_at TEXT NOT NULL
+- placement_ring_json TEXT NOT NULL DEFAULT '[]' (Milestone 3: the ordered shard-id array
+  active at /admin/create-index time, pinned for the index's lifetime — `indexShardIdForKey`
+  hashes over THIS ring, never the live shard set, so splits/drains can't reshuffle
+  existing entries; drain substitutes a ring member deterministically instead)
 
 ## 6) Shard Schema
 
 Table: applied_requests
 - request_id TEXT PRIMARY KEY
+- request_hash TEXT NOT NULL DEFAULT ''
 - result_json TEXT NOT NULL
 - applied_at TEXT NOT NULL
+
+Table: __cf_row_owners (Milestone 3, Chunk 0 — row provenance)
+- table_name    TEXT NOT NULL
+- partition_key TEXT NOT NULL
+- tenant_id     TEXT NOT NULL
+- vbucket       INTEGER NOT NULL
+- updated_at    TEXT NOT NULL
+- PRIMARY KEY (table_name, partition_key)
+
+Written transactionally with every write path (`/v1/sql` mutation, `/v1/mutate`, `/v1/tx`
+commit-apply); deletes remove the row's provenance. This is the only place a stored row's
+logical `(tenantId, vbucket)` identity exists — `vbucket = hash(tenantId:table:partitionKey)`
+is unrecoverable from the row itself (§14 trust model). Migration export, the cutover
+checksum, and index backfill all select rows through it. Known limitation, inherited not
+widened: the PK mirrors the base tables' own physical layout, which already collides if two
+tenants use the same partition key on the same shard (§14). Rows written before this table
+existed are re-attributed by `/admin/backfill-provenance` (mechanical: candidate tenants ×
+hash → exactly one match writes provenance; multiple → reported `ambiguous` for
+`/admin/set-row-owner`; zero → reported `orphaned`).
+
+Table: __cf_mirror_pending (Milestone 3, Chunk 3 — dual-write retry queue, on the SOURCE shard)
+- job_id          INTEGER PRIMARY KEY AUTOINCREMENT
+- target_shard_id TEXT NOT NULL
+- sql             TEXT NOT NULL
+- params_json     TEXT NOT NULL
+- request_id      TEXT NOT NULL
+- vbucket         INTEGER NOT NULL
+- next_attempt_at TEXT NOT NULL
+- attempt_count   INTEGER NOT NULL DEFAULT 0
+- created_at      TEXT NOT NULL
+
+Retried by the shard's alarm loop: exponential backoff starting 1s, cap 60s, no attempt
+limit — cutover gates on the queue reaching zero for the migrating vbucket, so jobs must
+eventually land. Mirrored writes reuse the original requestId; the target's
+applied_requests dedupe makes mirror + backfill + retry safely re-appliable in any order.
+
+Table: __cf_fenced_vbuckets (Milestone 3, Chunk 4 — cutover write fence)
+- vbucket   INTEGER PRIMARY KEY
+- fenced_at TEXT NOT NULL
+
+A data write whose payload vbucket appears here is rejected 409 `VBUCKET_FENCED`
+(retryable). Enforced at the data, not at routing: a write that resolved its route before
+the fence and physically arrives after it is still caught.
+
+Table: __cf_indexes (Milestone 2, extended in Milestone 3)
+- gains `tenant_id TEXT NOT NULL DEFAULT ''` (Milestone 3, Chunk 2): the logical identity
+  hydration re-routes through at read time (`vbucket = hash(tenant_id:table:partition_key)`
+  → vbucket_map → current shard), so moved base rows are always found. The old
+  `source_shard_id` column stays physically (additive-migration convention) but is unread.
 
 Application tables are created by tenant SQL statements routed to target shards.
 
@@ -153,13 +222,13 @@ The index is registered in `CatalogDO` *before* the backfill scan runs, not afte
 
 **`building` / `ready` status (eng-review fix).** `index_rules.status` starts `'building'` the moment `CatalogDO` registers the index (before backfill runs) and flips to `'ready'` only once the Worker's backfill loop has fully completed on every shard (`CatalogDO./mark-index-ready`, the last step of `/admin/create-index`). Write-path maintenance (`/v1/mutate` async, `/v1/tx` piggyback) is **not** gated on status — it's live from the moment of registration, which is what makes registering before backfill correct. Only the read path is gated: `/lookup-index` (and therefore `/v1/index-query`) rejects a `'building'` index with 425 `INDEX_BUILDING`, rather than silently returning partial results for rows backfill hasn't reached yet. If backfill fails partway, the index stays `'building'` forever until a retried `/admin/create-index` call (idempotent, per above) succeeds all the way through.
 
-**Draining and splitting are both blocked while any index exists (eng-review fix).** Index-shard placement (`indexShardIdForKey`) hashes over the globally *active* shard set, recomputed fresh on every read/write — unlike base-row routing, which uses a persistent vbucket-to-shard mapping unaffected by shard-count changes. Both draining a shard (shrinking the active set) and `/admin/split-vbucket` (growing it — a split always inserts a new `active` shard) change the hash modulo for nearly every existing index key, silently orphaning `__cf_indexes` entries with no migration path. `CatalogDO./drain-shard` rejects 409 `SHARD_DRAIN_BLOCKED_BY_INDEXES`, and `CatalogDO./split-vbucket` rejects 409 `SPLIT_BLOCKED_BY_INDEXES` (Codex-found — the original fix only covered drain), if any index is registered cluster-wide (checked via `index_rules`, which is fanned out identically to every catalog shard, via a shared `blockIfIndexesExist` helper). Drop all indexes first, drain/split, then recreate them — backfill will then use the post-change shard set.
+**Index placement is pinned, and both former topology blocks are removed (Milestone 3, Chunk 2 — supersedes the Milestone 2 eng-review mitigation).** Milestone 2 shipped `indexShardIdForKey` hashing over the globally *active* shard set, which made any shard-count change silently reshuffle index placement — mitigated then by blocking both topology operations 409 (`SHARD_DRAIN_BLOCKED_BY_INDEXES` / `SPLIT_BLOCKED_BY_INDEXES`) while any index existed. Milestone 3 resolves the underlying topology question instead: each index's placement ring (`index_rules.placement_ring_json`) is captured once at `/admin/create-index` from the then-active shard set and pinned for the index's lifetime; every placement computation (write maintenance, `/v1/index-query`, backfill) hashes over that ring, never the live set. `__cf_indexes` entries additionally carry `tenant_id`, and hydration re-routes per entry at read time (`vbucket = hash(tenant_id:table:partition_key)` → `vbucket_map` → current shard) instead of following the stale physical `source_shard_id` snapshot. Splits therefore never affect index placement; drains substitute a ring member deterministically (Section 11). Both 409 blocks are gone.
 
 **Non-unique only (Milestone 2, Chunk 7 — decided, not a gap).** Every registered index is non-unique: multiple base rows may share the same indexed-column value(s), and `__cf_indexes` writes use `INSERT OR REPLACE` with no constraint check. Unique-index support (rejecting a write that would violate uniqueness, which needs either a real `UNIQUE` constraint at the index-shard level or explicit pre-check-plus-lock coordination to close the race between two concurrent writes both claiming to be first) was scoped out of Milestone 2 entirely — no chunk in the plan allocated space to build it, consistent with this milestone's own founding premise (Chunk 1's Demand Evidence: no validated need exists yet for even the general-purpose composite-index scope this milestone already ships ahead of demand). Tracked in `TODOS.md` as a future increment if real usage ever calls for it.
 
 POST /admin/list-indexes (ADMIN_TOKEN) — Milestone 2, Chunk 1
 Response:
-- indexes: array of `{indexName, table, columns, status, createdAt}` (`status` is `'building'` or `'ready'` — see below)
+- indexes: array of `{indexName, table, columns, status, createdAt, placementRing}` (`status` is `'building'` or `'ready'` — see below; `placementRing` is the pinned shard-id array, Milestone 3)
 
 POST /admin/drop-index (ADMIN_TOKEN) — Milestone 2, Chunk 6
 Request:
@@ -187,10 +256,14 @@ When a mutation's table carries any registered index, its `__cf_indexes` deltas 
 Benchmark — Milestone 2, Chunk 7 (finalizes the design doc's Success Criterion 2)
 `src/index.test.ts`'s "benchmark" describe block measures p50 latency for indexed vs. unindexed `/v1/mutate` inserts and asserts the regression stays under a bar combining an absolute floor (25ms, absorbing test-environment timing noise on an already-fast baseline) and a percentage cap (10%). It also asserts zero rows ever land in `index_pending_jobs` across a clean run — the "repair-debt backlog" half of the criterion — since a nonzero count under non-failure conditions would mean the async dispatch itself is silently degrading, not just slow. Because index maintenance is dispatched via `ctx.waitUntil()` *after* the response is already prepared (Chunk 2), the expected result is that indexed writes are indistinguishable from unindexed ones on the caller-observed path; this benchmark exists to catch a regression if that property is ever accidentally broken (e.g. an future change that awaits the index write before responding), not because a real difference is expected today.
 
-POST /admin/split-vbucket
+Benchmark — Milestone 3, Chunk 6 (observational, no pass/fail thresholds)
+`src/index.test.ts`'s migration-benchmark test migrates a vbucket carrying a few hundred rows while issuing sustained writes against it and records: backfill throughput (rowsCopied / migration wall time), the cutover fence-window duration (first `VBUCKET_FENCED` rejection to first post-flip success, 0 if no write happened to race the fence), and the peak `__cf_mirror_pending` depth sampled per orchestration tick. Deliberately observational — the numbers are workload- and environment-dependent, so the test only sanity-asserts they're well-formed (migration completed, all rows landed) rather than gating on absolute values; run vitest with `--silent=false` to see the recorded numbers.
+
+POST /admin/split-vbucket (ADMIN_TOKEN)
 Request:
+- catalogShardId string (vbucket numbering is local to a catalog shard)
 - vbucket number
-- newShardId string (optional)
+- newShardId string (optional — default `{catalogShardId}-shard-split-{Date.now()}`)
 
 Response:
 - ok
@@ -198,6 +271,41 @@ Response:
 - fromShard
 - toShard
 - metadataVersion
+- migrationStarted boolean (Milestone 3: split now creates the target shard and starts a
+  real data migration; routing flips only when the fenced cutover completes)
+
+Milestone 3 topology routes (all ADMIN_TOKEN-gated, standard `{error:{code,message,fix}}` shape):
+
+POST /admin/migrate-vbucket        {catalogShardId, vbucket, targetShardId?}
+  targetShardId omitted -> default `{catalogShardId}-shard-split-{Date.now()}`
+  -> 200 {ok, vbucket, fromShard, toShard, status:"backfilling"}
+  -> 409 {error:{code:"VBUCKET_PROVENANCE_INCOMPLETE", unattributedRows:N, ...}}
+  -> 409 {error:{code:"MIGRATION_IN_PROGRESS", ...}}   (one migration per vbucket)
+
+POST /admin/migrate-vbucket-status {catalogShardId, vbucket}
+  -> 200 {vbucket, status, fromShard, toShard, rowsCopied, mirrorQueueDepth, startedAt}
+
+POST /admin/migrate-vbucket-abort  {catalogShardId, vbucket}
+  -> 200 {ok, vbucket, status:"aborted"}    (only before the map flip; after it ->
+     409 MIGRATION_ALREADY_COMMITTED — reverse a committed migration by migrating back)
+
+POST /admin/backfill-provenance    {catalogShardId?}            (omitted = all catalog shards)
+  -> 200 {attributed:N, ambiguous:[{catalogShardId,shardId,table,partitionKey,candidateTenants}], orphaned:[...]}
+
+POST /admin/set-row-owner          {catalogShardId, shardId, table, partitionKey, tenantId}
+  -> 200 {ok}  / 409 ROW_OWNER_SHARD_MISMATCH if the claimed tenant does not hash to a
+     vbucket on that shard
+
+POST /admin/drain-shard            {catalogShardId, shardId}
+  -> 200 {ok, shardId, metadataVersion, evacuationStarted:true}
+  -> 409 {error:{code:"RING_EVACUATION_NO_CANDIDATE", ...}}  (pre-checked before any
+     durable state change)
+  (existing 409s SHARD_HAS_IN_FLIGHT_TRANSACTIONS / SHARD_HAS_PENDING_INDEX_JOBS still
+   apply, checked Worker-side first)
+
+POST /admin/drain-shard-status     {catalogShardId, shardId}
+  -> 200 {shardId, vbucketsRemaining, ringsRemaining, status}
+     status: active | migrating-vbuckets | evacuating-rings | complete
 
 POST /admin/register-tenant (ADMIN_TOKEN)
 Request:
@@ -402,24 +510,88 @@ This prevents duplicate writes after network retries and stops a reused requestI
     in-flight-transaction check exactly. `/admin/shard-stats` also reports
     `indexPendingJobCount` and `indexEntryCount` for observability.
 
-## 11) Rebalancing and Split (MVP)
+## 11) Rebalancing, Split, and Drain (Milestone 3 — shipped)
 
-Trigger conditions (future automation):
+Trigger conditions (future automation — see TODOS.md "Automatic split heuristics"):
 - shard DB size > threshold (example 7 GB soft limit)
 - sustained write QPS above threshold
 - p95 latency above threshold
 
-MVP manual split flow:
-1. Create/ensure destination shard exists.
-2. Update vbucket_map for selected vbucket.
-3. Increment metadata_version.
+### vbucket migration (`/admin/migrate-vbucket`, and what `/admin/split-vbucket` now does)
 
-v1 automated safe split flow (planned):
-1. Mark vbucket as splitting in catalog.
-2. Start dual-write for affected keyspace.
-3. Backfill rows in chunks.
-4. Atomic map flip with new metadata version.
-5. Stop dual-write and drain old shard path.
+`CatalogDO` owns the migration state machine (it already owns `vbucket_map`) and drives
+`ShardDO`'s internal `/migrate-export`, `/migrate-import`, `/migrate-checksum(s)`,
+`/fence-vbucket`, `/unfence-vbucket`, and `/delete-vbucket-rows` endpoints from its own
+alarm — a deliberate, spec'd exception to the earlier "CatalogDO and ShardDO never call
+each other" convention (orchestration from a stateless Worker request would die with the
+request). One migration per vbucket at a time (409 `MIGRATION_IN_PROGRESS`); starting is
+gated on the source shard having zero unattributed rows for any registered table
+(409 `VBUCKET_PROVENANCE_INCOMPLETE`, count included).
+
+Phases:
+1. **backfilling** — writes keep landing on the source (authoritative); the gateway
+   mirrors each applied write to the target with the same requestId (dual-write; mirror
+   failure never fails the client write, it enqueues on the source's `__cf_mirror_pending`).
+   `/v1/tx` intents on migrating vbuckets are mirrored post-commit by `CoordinatorDO`,
+   same queue on failure. Meanwhile the catalog pages `/migrate-export` (rows selected via
+   `__cf_row_owners`, 500-row pages, stable partition-key cursor) into `/migrate-import`
+   (INSERT OR REPLACE + provenance, idempotent). If the target shard was created mid-life
+   (a split target), each table's captured `schema_sql` is applied there first.
+2. **cutover** (formal 5-step ordering):
+   1. Catalog sets `migration_status='cutover'` and synchronously writes a fence row to
+      the source (`/fence-vbucket`). From this instant the source rejects any data write
+      whose payload vbucket matches, 409 `VBUCKET_FENCED` (retryable). The fence is
+      enforced at the data, not at routing — a write that resolved its route before the
+      fence still physically arrives at the source and is caught there.
+   2. Source drains `__cf_mirror_pending` for that vbucket to zero (catalog polls).
+   3. Verify: for each registered table, both shards compute a content checksum — sha256
+      over the concatenation of (partition_key, canonical row JSON) ordered by partition
+      key, streamed in the same 500-row pages. Canonical row JSON = JSON.stringify with
+      keys sorted lexicographically. Any mismatch aborts the attempt: fence lifted, target
+      wiped, status back to `backfilling` (a later pass re-copies and retries).
+   4. Flip `vbucket_map.shard_id` to the target, `migration_status='none'`, bump
+      `metadata_version`.
+   5. Unfence the source, then delete the vbucket's rows + provenance from it.
+
+`/admin/migrate-vbucket-abort` at any point before step 4 is safe: the source never
+stopped being authoritative; the target's rows + provenance for the vbucket are wiped,
+the fence lifted, and the source's queued-but-unsent mirrors purged. After the flip it
+rejects 409 `MIGRATION_ALREADY_COMMITTED` — a committed migration is reversed by migrating
+the vbucket back (same primitive, reversed). `/admin/split-vbucket` keeps its name and
+request shape but now creates the target shard and starts this migration (response gains
+`migrationStarted: true`) instead of repointing the map and stranding rows.
+
+Reads stay on the source until the flip. `/v1/scatter` may observe duplicate rows during
+an active migration window (documented limitation).
+
+### Drain v2 (`/admin/drain-shard` + `/admin/drain-shard-status`)
+
+Draining a shard now performs full evacuation, alarm-driven:
+1. Mark draining (existing 503 behavior for newly-routed work).
+2. Migrate every vbucket mapped to the shard off it, sequentially, via the migration
+   primitive above (targets rotated deterministically across the catalog's remaining
+   active shards).
+3. Ring evacuation: for each index whose pinned `placement_ring_json` contains the shard,
+   pick the replacement deterministically — the active shard not already in that ring with
+   the smallest `hashKey(indexName + ":" + shardId)` (candidates gathered cluster-wide;
+   an index's ring pins every shard active at its creation, so viable substitutes are
+   shards added later, e.g. by a split). Substitute at the same ring position, copy the
+   draining shard's `__cf_indexes` rows for that index to the substitute (idempotent
+   INSERT OR REPLACE), repoint the ring on every catalog shard, then delete the source
+   copies. If no candidate exists, `/admin/drain-shard` rejects 409
+   `RING_EVACUATION_NO_CANDIDATE` up front, before any durable state change.
+
+Drain reports completion only when both loops finish; `/admin/drain-shard-status` returns
+`{shardId, vbucketsRemaining, ringsRemaining, status}`. Both former topology blocks
+(`SPLIT_BLOCKED_BY_INDEXES`, `SHARD_DRAIN_BLOCKED_BY_INDEXES`) are removed — index
+placement's pinned ring (Milestone 3, Chunk 2) makes them unnecessary.
+
+**Upgrade flow for indexes created before Milestone 3** (one-time, operator-run): pre-M3
+`__cf_indexes` entries carry no `tenant_id` and pre-M3 `index_rules` rows have no pinned
+ring — run `/admin/drop-index` then `/admin/create-index` per index. The index is
+unqueryable from drop until backfill flips it back to `ready` (the same availability
+contract index creation already has); `/v1/index-query` 404s during the window exactly as
+for a never-created index.
 
 ## 12) Query Planning Rules (MVP)
 
@@ -448,6 +620,9 @@ Emit structured logs and counters for:
 
 - Replace permissive SQL with parsed/validated subset.
 - Add query planner and local pre-aggregation for scatter reads.
-- Add global secondary index service.
-- Add automated split controller and background mover.
+- ~~Add global secondary index service.~~ Shipped (Milestone 2).
+- ~~Add automated split controller and background mover.~~ Shipped (Milestone 3): vbucket
+  migration with dual-write backfill and fenced cutover, split-as-migration, drain-shard
+  evacuation. Automatic split *heuristics* (deciding when to split) remain future work —
+  TODOS.md "Automatic split heuristics".
 - Add backups and restore drills per shard.
