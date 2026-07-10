@@ -51,6 +51,13 @@ const PENDING_INTENT_TTL_MS = 5 * 60 * 1000;
 const INDEX_JOB_BASE_DELAY_MS = 5000;
 const INDEX_JOB_MAX_DELAY_MS = 60000;
 const INDEX_JOB_BATCH_SIZE = 20;
+// Milestone 3, Chunk 3: dual-write mirror retry cadence — deliberately
+// faster/uncapped-attempt compared to the index-job queue (INDEX_JOB_*
+// above), per spec: "exponential backoff starting 1s, cap 60s, no attempt
+// limit — cutover gates on empty queue, so jobs must eventually land."
+const MIRROR_JOB_BASE_DELAY_MS = 1000;
+const MIRROR_JOB_MAX_DELAY_MS = 60000;
+const MIRROR_JOB_BATCH_SIZE = 20;
 
 const INTERNAL_TABLES = new Set([
   "applied_requests",
@@ -87,6 +94,8 @@ export class ShardDO extends DurableObject {
       "/pending-intent-count": this.handlePendingIntentCount.bind(this),
       "/invalidate-request": this.handleInvalidateRequest.bind(this),
       "/enqueue-index-job": this.handleEnqueueIndexJob.bind(this),
+      "/enqueue-mirror-job": this.handleEnqueueMirrorJob.bind(this),
+      "/mirror-pending-count": this.handleMirrorPendingCount.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -101,8 +110,11 @@ export class ShardDO extends DurableObject {
     this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
     await this.sweepStalePendingIntents();
     const nextIndexJobRetry = await this.processIndexPendingJobs();
-    const nextAlarm = nextIndexJobRetry === null ? Date.now() + PRUNE_INTERVAL_MS : Math.min(nextIndexJobRetry, Date.now() + PRUNE_INTERVAL_MS);
-    await this.ctx.storage.setAlarm(nextAlarm);
+    const nextMirrorJobRetry = await this.processMirrorPendingJobs();
+    const candidates = [Date.now() + PRUNE_INTERVAL_MS, nextIndexJobRetry, nextMirrorJobRetry].filter(
+      (t): t is number => t !== null,
+    );
+    await this.ctx.storage.setAlarm(Math.min(...candidates));
   }
 
   /** Milestone 2, Chunk 2: retries index writes that failed on their first
@@ -195,6 +207,119 @@ export class ShardDO extends DurableObject {
       await this.ctx.storage.setAlarm(retrySoon);
     }
     return json({ ok: true });
+  }
+
+  /** Milestone 3, Chunk 3: retries a dual-write mirror that failed on its
+   * first attempt (from the Worker's ctx.waitUntil() call after a source
+   * write succeeds, or from CoordinatorDO's post-commit mirroring for
+   * /v1/tx). Mirrors processIndexPendingJobs' shape, on its own table with
+   * its own (faster, uncapped-attempt) backoff cadence — Chunk 4's cutover
+   * gates on this queue reaching zero for the migrating vbucket, so a job
+   * here must eventually land, never give up. */
+  private async processMirrorPendingJobs(): Promise<number | null> {
+    const due = this.many<{
+      job_id: number;
+      target_shard_id: string;
+      sql: string;
+      params_json: string;
+      request_id: string;
+      attempt_count: number;
+    }>(
+      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM __cf_mirror_pending WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?",
+      new Date().toISOString(),
+      MIRROR_JOB_BATCH_SIZE,
+    );
+
+    for (const job of due) {
+      try {
+        const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
+        const stub = this.shardEnv.SHARD.get(id);
+        const res = await stub.fetch("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: job.sql,
+            params: JSON.parse(job.params_json),
+            requestId: job.request_id,
+            isMutation: true,
+          }),
+        });
+        if (res.ok) {
+          this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
+          continue;
+        }
+        throw new Error(`shard responded ${res.status}`);
+      } catch (error) {
+        const attemptCount = job.attempt_count + 1;
+        const delay = Math.min(MIRROR_JOB_MAX_DELAY_MS, MIRROR_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
+        this.sql.exec(
+          "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+          attemptCount,
+          new Date(Date.now() + delay).toISOString(),
+          job.job_id,
+        );
+        log("shard.mirror_job_retry_failed", {
+          jobId: job.job_id,
+          targetShardId: job.target_shard_id,
+          attemptCount,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    const next = this.one<{ next_attempt_at: string }>(
+      "SELECT next_attempt_at FROM __cf_mirror_pending ORDER BY next_attempt_at ASC LIMIT 1",
+    );
+    return next ? new Date(next.next_attempt_at).getTime() : null;
+  }
+
+  /** Called by the Worker (after a source write to a migrating vbucket
+   * fails to mirror) or by CoordinatorDO (after a 2PC commit whose intent
+   * targets a migrating vbucket fails to mirror) — records it for
+   * alarm-driven retry. Always lives on the SOURCE shard (this shard, the
+   * one that's authoritative during migration), not the target, mirroring
+   * handleEnqueueIndexJob's "lives on the write's origin" placement. */
+  private async handleEnqueueMirrorJob(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      targetShardId?: string;
+      sql?: string;
+      params?: unknown[];
+      requestId?: string;
+      vbucket?: number;
+    };
+    if (!body.targetShardId || !body.sql || !body.requestId || body.vbucket === undefined) {
+      return json({ error: "Missing targetShardId, sql, requestId, or vbucket" }, 400);
+    }
+    const now = new Date().toISOString();
+    this.sql.exec(
+      "INSERT INTO __cf_mirror_pending (target_shard_id, sql, params_json, request_id, vbucket, next_attempt_at, attempt_count, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+      body.targetShardId,
+      body.sql,
+      JSON.stringify(body.params ?? []),
+      body.requestId,
+      body.vbucket,
+      now,
+      now,
+    );
+    const retrySoon = Date.now() + MIRROR_JOB_BASE_DELAY_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > retrySoon) {
+      await this.ctx.storage.setAlarm(retrySoon);
+    }
+    return json({ ok: true });
+  }
+
+  /** Milestone 3, Chunk 4 will poll this from CatalogDO's cutover
+   * orchestration ("source drains __cf_mirror_pending for that vbucket to
+   * zero") — scoped to one vbucket so cutover isn't blocked by unrelated
+   * mirror debt for a different, non-migrating vbucket on the same shard. */
+  private async handleMirrorPendingCount(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    const row =
+      body.vbucket === undefined
+        ? this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_mirror_pending")
+        : this.one<{ n: number }>("SELECT COUNT(*) AS n FROM __cf_mirror_pending WHERE vbucket = ?", body.vbucket);
+    return json({ count: row?.n ?? 0 });
   }
 
   /** A participant that voted "prepared" cannot independently decide to
@@ -392,6 +517,25 @@ export class ShardDO extends DurableObject {
         next_attempt_at TEXT NOT NULL,
         attempt_count INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
+      )
+    `);
+
+    // Milestone 3, Chunk 3: retry queue for a dual-write mirror (source ->
+    // target during an active vbucket migration) that failed on its first
+    // attempt. Lives on the SOURCE shard (the authoritative one during
+    // migration, and the write's origin), not the target. Chunk 4's cutover
+    // polls this to zero (scoped by vbucket) before flipping vbucket_map.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_mirror_pending (
+        job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_shard_id TEXT NOT NULL,
+        sql             TEXT NOT NULL,
+        params_json     TEXT NOT NULL,
+        request_id      TEXT NOT NULL,
+        vbucket         INTEGER NOT NULL,
+        next_attempt_at TEXT NOT NULL,
+        attempt_count   INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL
       )
     `);
   }
