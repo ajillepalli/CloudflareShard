@@ -521,3 +521,80 @@ describe("CatalogDO tenant authorization", () => {
     expect(((await unregistered.json()) as { error: { code: string } }).error.code).toBe("TENANT_NOT_REGISTERED");
   });
 });
+
+describe("CatalogDO migration state on vbucket_map (Milestone 3, Chunk 3)", () => {
+  it("/route returns {targetShardId, migrationStatus} while a vbucket is backfilling, and the authoritative shardId stays the source", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 64 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const token = await registerTenant(stub, "t1");
+
+    const before = (await (
+      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
+    ).json()) as { shardId: string; vbucket: number; migrationStatus?: string; targetShardId?: string };
+    expect(before.migrationStatus).toBeUndefined();
+    expect(before.targetShardId).toBeUndefined();
+
+    // Put this vbucket into 'backfilling' directly — the state Chunk 4's
+    // /admin/migrate-vbucket will set through orchestration.
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'backfilling', target_shard_id = 'shard-target-x' WHERE vbucket = ?",
+        before.vbucket,
+      );
+    });
+
+    const during = (await (
+      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
+    ).json()) as { shardId: string; migrationStatus?: string; targetShardId?: string };
+    expect(during.shardId).toBe(before.shardId); // source stays authoritative
+    expect(during.migrationStatus).toBe("backfilling");
+    expect(during.targetShardId).toBe("shard-target-x");
+
+    // Back to 'none' — the extra fields disappear again (pre-M3 shape).
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL WHERE vbucket = ?",
+        before.vbucket,
+      );
+    });
+    const after = (await (
+      await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, token))
+    ).json()) as { migrationStatus?: string; targetShardId?: string };
+    expect(after.migrationStatus).toBeUndefined();
+    expect(after.targetShardId).toBeUndefined();
+  });
+
+  it("migration columns are added to a pre-existing vbucket_map via ensureColumn (additive migration)", async () => {
+    const stub = await freshCatalog();
+    // Simulate a DO provisioned before the migration columns existed.
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(`
+        CREATE TABLE vbucket_map (
+          vbucket INTEGER PRIMARY KEY,
+          shard_id TEXT NOT NULL,
+          map_version INTEGER NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+      `);
+      state.storage.sql.exec(
+        "INSERT INTO vbucket_map (vbucket, shard_id, map_version, updated_at) VALUES (0, 'shard-0', 1, ?)",
+        new Date().toISOString(),
+      );
+    });
+
+    // Any fetch triggers ensureSchema(), which must upgrade the old table
+    // in place without touching the existing row.
+    await stub.fetch(post("/list-shards", {}));
+
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT vbucket, shard_id, migration_status, target_shard_id FROM vbucket_map WHERE vbucket = 0"),
+      ) as Array<{ vbucket: number; shard_id: string; migration_status: string; target_shard_id: string | null }>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].shard_id).toBe("shard-0");
+      expect(rows[0].migration_status).toBe("none");
+      expect(rows[0].target_shard_id).toBeNull();
+    });
+  });
+});
