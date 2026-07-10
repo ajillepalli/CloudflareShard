@@ -50,41 +50,17 @@
 **Priority:** P3
 **Depends on:** None — can be decided independently, informed by real developer feedback post-Milestone-1.
 
-### Choose an OSS license
-
-**What:** Pick and add a LICENSE file (MIT/Apache-2.0/etc.) now that the distribution model is resolved to self-hosted/OSS-first.
-
-**Why:** A public self-hosted template without a stated license leaves adopters unsure what they're allowed to do with the code.
-
-**Context:** Surfaced as a deferred item during the `/office-hours` session that resolved the distribution/positioning decision (2026-07-09). Small, independent decision — doesn't block Milestone 1 implementation.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None.
-
 ### Automatic split heuristics
 
 **What:** Auto-detect a hot or oversized shard and trigger a split, instead of requiring a manual `/admin/split-vbucket` call.
 
 **Why:** The project's own README has listed this as an unbuilt "next production step" since the MVP was first written.
 
-**Context:** Natural v3 item once Approach B's Milestones 1 and 2 ship. Building heuristics before the underlying split mechanism is proven would be premature — heuristics tuning only makes sense once splits themselves are reliable.
+**Context:** Natural v3 item once Approach B's Milestones 1 and 2 ship. Building heuristics before the underlying split mechanism is proven would be premature — heuristics tuning only makes sense once splits themselves are reliable. **Update (Milestone 3, 2026-07-10):** the mechanism now fully exists — `/admin/split-vbucket` performs a real online migration (dual-write backfill, fenced checksum-verified cutover) and `/admin/drain-shard` fully evacuates a shard. What remains is exactly this TODO's original scope: deciding *when* to trigger a split (shard size / QPS / latency thresholds, per SPEC §11's trigger conditions), which needs real usage data to tune against.
 
 **Effort:** L
 **Priority:** P3
-**Depends on:** Milestone 1 (Transaction Coordinator) and Milestone 2 (Index Service).
-
-### Index-entry topology: physical source_shard_id vs. logical identity + read-time routing
-
-**What:** Decide whether `__cf_indexes` entries store the physical `source_shard_id` they were written on (current Milestone 2 design), or store logical identity `(tenantId, table, partitionKey)` and resolve the owning shard at read time instead.
-
-**Why:** Storing `source_shard_id` bakes topology into the data — every split, drain, or backfill has to rewrite index entries just because placement changed. The logical-identity alternative avoids that rewrite cost at the price of an extra routing hop on every index query. Flagged by an independent Codex outside-voice pass during Milestone 2's `/plan-eng-review`.
-
-**Context:** Real enough to matter once splits start happening on a table with a live index, but deciding now (before Chunk 2/5 implementation experience exists) would be premature — noted as an Open Question in the Milestone 2 design doc for those chunks to weigh directly, not deferred past Milestone 2 entirely. **Update (post-implementation `/plan-eng-review`, 2026-07-09):** the branch-diff eng-review pass confirmed the concrete failure this topology choice risks — index-shard placement (`indexShardIdForKey`) hashes over the *active* shard list, recomputed fresh on every read/write, so draining a shard changes the hash divisor for nearly every existing index key and orphans `__cf_indexes` entries written under the old shard count. Milestone 2 shipped the cheap mitigation (`CatalogDO./drain-shard` now rejects 409 `SHARD_DRAIN_BLOCKED_BY_INDEXES` while any index is registered cluster-wide) rather than resolving the topology question itself — this TODO is still open and now has a concrete trigger: revisit once draining a cluster that also needs live indexes is an actual requirement, not just a hypothetical.
-
-**Effort:** S (a design decision, not implementation work itself)
-**Priority:** P3
-**Depends on:** Milestone 2 Chunks 2 and 5 (async maintenance, drain interaction).
+**Depends on:** ~~Milestone 1 (Transaction Coordinator) and Milestone 2 (Index Service).~~ Mechanism shipped (Milestone 3); heuristics need production usage data.
 
 ### Cross-tenant/cross-shard analytics aggregation
 
@@ -99,6 +75,26 @@
 **Depends on:** None — a future scope decision, not committed work.
 
 ## Completed
+
+### Index-entry topology: physical source_shard_id vs. logical identity + read-time routing
+
+**What:** Decide whether `__cf_indexes` entries store the physical `source_shard_id` they were written on (the Milestone 2 design), or store logical identity and resolve the owning shard at read time instead.
+
+**Why:** Storing `source_shard_id` bakes topology into the data — every split, drain, or backfill has to rewrite index entries just because placement changed. Flagged by an independent Codex outside-voice pass during Milestone 2's `/plan-eng-review`; the post-implementation eng-review confirmed the concrete failure (index placement hashing over the *live* active shard set orphans entries on any shard-count change), which Milestone 2 mitigated by 409-blocking both topology operations while any index existed.
+
+**Resolution (Milestone 3, Chunk 2 — logical identity won, plus a pinning the question didn't originally include):** `__cf_indexes` entries now carry `tenant_id`, and `/v1/index-query` hydration re-routes per entry at read time (`hash(tenant_id:table:partition_key)` → `vbucket_map` → current shard) — moved base rows are always found, and no topology change ever rewrites entries for placement's sake. Index-shard *placement* is additionally pinned per index (`index_rules.placement_ring_json`, captured at `/admin/create-index`), so the live shard set never re-hashes existing entries; a drained ring member is substituted deterministically with its entries copied (Chunk 5). Both former 409 blocks (`SPLIT_BLOCKED_BY_INDEXES`, `SHARD_DRAIN_BLOCKED_BY_INDEXES`) are removed. The accepted cost is the predicted one: one extra routing hop per hydrated match on `/v1/index-query`.
+
+**Completed:** Milestone 3 (2026-07-10)
+
+### Choose an OSS license
+
+**What:** Pick and add a LICENSE file (MIT/Apache-2.0/etc.) now that the distribution model is resolved to self-hosted/OSS-first.
+
+**Why:** A public self-hosted template without a stated license leaves adopters unsure what they're allowed to do with the code.
+
+**Resolution:** Apache-2.0, added at the repo root in Milestone 3's docs chunk — the explicit patent grant suits infrastructure software that adopters embed in their own deployments.
+
+**Completed:** Milestone 3 (2026-07-10)
 
 ### Distribution/positioning decision
 
