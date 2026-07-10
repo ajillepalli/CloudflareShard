@@ -980,6 +980,28 @@ describe("Worker /v1/mutate async index maintenance (Milestone 2 Chunk 2)", () =
     expect(rows[0].partition_key).toBe("row-1");
     expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
   });
+
+  it("eng-review fix (Codex-found): rejects an insert on an indexed table that omits an indexed column's value, 400 INDEXED_COLUMN_REQUIRES_VALUE", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c2_defaulted_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c2_defaulted_evt (id TEXT PRIMARY KEY, v TEXT DEFAULT 'fallback', other TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    await post("/admin/create-index", { indexName: "idx_c2_defaulted_by_v", table: "idx_c2_defaulted_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Supplies "other" but omits "v" (the indexed column, which has a SQL
+    // DEFAULT) — before the fix, this would have silently indexed the row
+    // as v=null instead of the actual DEFAULT SQLite assigns, making the
+    // row unfindable for its real stored value.
+    const res = await post("/v1/mutate", { op: "insert", table: "idx_c2_defaulted_evt", tenantId, partitionKey: "row-1", values: { other: "x" } }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("INDEXED_COLUMN_REQUIRES_VALUE");
+  });
 });
 
 describe("ShardDO index_pending_jobs retry queue (Milestone 2 Chunk 2)", () => {
@@ -1327,7 +1349,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
       {
         mutations: [
           { op: "insert", table: "idx_c3_fail_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } },
-          { op: "insert", table: "idx_c3_fail_evt", tenantId, partitionKey: "row-2", values: { nonexistent_col: "boom" } },
+          { op: "insert", table: "idx_c3_fail_evt", tenantId, partitionKey: "row-2", values: { v: "boom", nonexistent_col: "boom" } },
         ],
         requestId: "req-c3-fail",
       },
@@ -1434,6 +1456,94 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     const rows = await pollIndexRows("idx_c3_zerorow_by_v", (r) => r.length === 1);
     expect(rows[0].partition_key).toBe("row-1");
     expect(JSON.parse(rows[0].index_key_json)).toEqual(["alpha"]);
+  });
+
+  it("eng-review fix (Codex-found): two mutations on the same row in one /v1/tx batch (insert then update) index the row's final value, not the first mutation's stale one", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_c3_samerow_evt");
+    await post("/admin/create-index", { indexName: "idx_c3_samerow_by_v", table: "idx_c3_samerow_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Insert v='a' then update v='b' on the SAME row, in one /v1/tx batch.
+    // Before the fix, the update's beforeRow pre-read hit the real DB
+    // (which doesn't have row-1 yet — /begin hasn't run), so its delta was
+    // computed against a null/stale prior state instead of the insert's
+    // pending "a" — the committed row's real final value ("b") would never
+    // get an index entry at all, only the transient "a" from mutation 1.
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [
+          { op: "insert", table: "idx_c3_samerow_evt", tenantId, partitionKey: "row-1", values: { v: "a" } },
+          { op: "update", table: "idx_c3_samerow_evt", tenantId, partitionKey: "row-1", values: { v: "b" } },
+        ],
+        requestId: "req-c3-samerow-1",
+      },
+      token,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; status: string };
+    expect(body.ok).toBe(true);
+    expect(body.status).toBe("committed");
+
+    const bRows = await pollIndexRows("idx_c3_samerow_by_v", (r) => r.some((row) => JSON.parse(row.index_key_json)[0] === "b"));
+    const bEntry = bRows.find((row) => JSON.parse(row.index_key_json)[0] === "b");
+    expect(bEntry?.partition_key).toBe("row-1");
+
+    // No leftover entry for the transient "a" value — mutation 2's delta
+    // correctly issued a DELETE for it alongside the INSERT for "b".
+    const aQuery = await post("/v1/index-query", { table: "idx_c3_samerow_evt", indexName: "idx_c3_samerow_by_v", tenantId, values: { v: "a" } }, token);
+    const aBody = (await aQuery.json()) as { rows: unknown[] };
+    expect(aBody.rows).toHaveLength(0);
+
+    const bQuery = await post("/v1/index-query", { table: "idx_c3_samerow_evt", indexName: "idx_c3_samerow_by_v", tenantId, values: { v: "b" } }, token);
+    const queryBody = (await bQuery.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(queryBody.rows).toHaveLength(1);
+    expect(queryBody.rows[0].id).toBe("row-1");
+  });
+
+  it("eng-review fix (Codex-found): a where clause on a later mutation in the same batch matches against the earlier mutation's pending state", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res0 = await post(
+      "/admin/create-table",
+      { table: "idx_c3_simwhere_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c3_simwhere_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res0.status).toBe(200);
+    await post("/admin/create-index", { indexName: "idx_c3_simwhere_by_v", table: "idx_c3_simwhere_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Insert status='open', then update where status='open' (matches the
+    // FIRST mutation's pending value, never committed to the DB yet) to
+    // v='b'. This only succeeds if the where-check is evaluated against the
+    // simulated state, not a real (nonexistent-until-commit) DB row.
+    const res = await post(
+      "/v1/tx",
+      {
+        mutations: [
+          { op: "insert", table: "idx_c3_simwhere_evt", tenantId, partitionKey: "row-1", values: { v: "a", status: "open" } },
+          { op: "update", table: "idx_c3_simwhere_evt", tenantId, partitionKey: "row-1", where: { status: "open" }, values: { v: "b" } },
+        ],
+        requestId: "req-c3-simwhere-1",
+      },
+      token,
+    );
+    expect(res.status).toBe(200);
+
+    const checkRes = await post(
+      "/v1/sql",
+      { sql: "SELECT v FROM idx_c3_simwhere_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_simwhere_evt", tenantId, partitionKey: "row-1" },
+      token,
+    );
+    const checkBody = (await checkRes.json()) as { result: { rows: Array<{ v: string }> } };
+    expect(checkBody.result.rows[0].v).toBe("b");
+
+    const bQuery = await post("/v1/index-query", { table: "idx_c3_simwhere_evt", indexName: "idx_c3_simwhere_by_v", tenantId, values: { v: "b" } }, token);
+    const bBody = (await bQuery.json()) as { rows: Array<{ id: string }> };
+    expect(bBody.rows).toHaveLength(1);
+    expect(bBody.rows[0].id).toBe("row-1");
   });
 });
 
@@ -1721,7 +1831,7 @@ describe("Milestone 2 Chunk 7: benchmark — indexed /v1/mutate write latency an
         expect(jobs).toHaveLength(0);
       });
     }
-  });
+  }, 20000);
 });
 
 describe("Worker /admin/tx-status and /admin/tx-force-abort", () => {

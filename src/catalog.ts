@@ -896,22 +896,13 @@ export class CatalogDO extends DurableObject {
     // mapping unaffected by shard-count changes. Draining a shard changes
     // that active set, which changes the hash modulo for nearly every
     // existing index key, silently orphaning __cf_indexes entries with no
-    // migration path. index_rules is fanned out identically to every
-    // catalog shard by /create-index, so this catalog shard's row count is
-    // representative of whether ANY index exists cluster-wide.
-    const anyIndex = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_rules");
-    if ((anyIndex?.n ?? 0) > 0) {
-      return json(
-        {
-          error: {
-            code: "SHARD_DRAIN_BLOCKED_BY_INDEXES",
-            message: "Cannot drain a shard while any secondary index is registered — draining would silently orphan existing index entries.",
-            fix: "Drop all registered indexes (/admin/drop-index) first, drain the shard, then recreate the indexes so backfill uses the post-drain shard set.",
-          },
-        },
-        409,
-      );
-    }
+    // migration path.
+    const drainBlocked = this.blockIfIndexesExist(
+      "SHARD_DRAIN_BLOCKED_BY_INDEXES",
+      "Cannot drain a shard while any secondary index is registered — draining would silently orphan existing index entries.",
+      "Drop all registered indexes (/admin/drop-index) first, drain the shard, then recreate the indexes so backfill uses the post-drain shard set.",
+    );
+    if (drainBlocked) return drainBlocked;
 
     this.audit("/drain-shard", { shardId: body.shardId });
 
@@ -919,6 +910,22 @@ export class CatalogDO extends DurableObject {
 
     const version = this.bumpMetadataVersion();
     return json({ ok: true, shardId: body.shardId, metadataVersion: version });
+  }
+
+  /** Eng-review fix (Codex-found): index-shard placement hashes over the
+   * active shard set — /split-vbucket grows that set by inserting a new
+   * 'active' shard (below), the same hazard /drain-shard's block exists for,
+   * just via growth instead of shrinkage. Shared with handleDrainShard so
+   * both active-shard-count-changing operations get the identical guard. */
+  private blockIfIndexesExist(code: string, message: string, fix: string): Response | null {
+    // index_rules is fanned out identically to every catalog shard by
+    // /create-index, so this catalog shard's row count is representative of
+    // whether ANY index exists cluster-wide.
+    const anyIndex = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_rules");
+    if ((anyIndex?.n ?? 0) > 0) {
+      return json({ error: { code, message, fix } }, 409);
+    }
+    return null;
   }
 
   private async handleSplitVbucket(request: Request): Promise<Response> {
@@ -938,6 +945,13 @@ export class CatalogDO extends DurableObject {
     if (!existingMap) {
       return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
     }
+
+    const splitBlocked = this.blockIfIndexesExist(
+      "SPLIT_BLOCKED_BY_INDEXES",
+      "Cannot split a vbucket while any secondary index is registered — splitting adds a new active shard, changing index-shard placement and orphaning existing index entries.",
+      "Drop all registered indexes (/admin/drop-index) first, split, then recreate the indexes so backfill uses the post-split shard set.",
+    );
+    if (splitBlocked) return splitBlocked;
 
     this.audit("/split-vbucket", { vbucket: body.vbucket, newShardId: body.newShardId, fromShard: existingMap.shard_id });
 
