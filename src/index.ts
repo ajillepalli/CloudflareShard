@@ -9,8 +9,8 @@ import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } fr
 import {
   compileMutation,
   IDENTIFIER_RE,
-  mutationWhereClause,
   participantKey,
+  rowKey,
   UNSET_PARTITION_KEY_COLUMN,
   validateMutation,
   type StructuredMutation,
@@ -893,6 +893,30 @@ async function handleV1Sql(request: Request, env: Env): Promise<Response> {
 
 type IndexDefinition = { indexName: string; columns: string[] };
 
+/** Eng-review fix (Codex-found): an insert/upsert that omits an indexed
+ * column and lets SQLite fill a column DEFAULT would otherwise get indexed
+ * as `null` — computeIndexDeltas has no way to know the actual stored value
+ * without re-reading the row, and re-reading after the write would break
+ * /v1/tx's atomicity (the index delta must be a 2PC participant decided
+ * before /begin, not a follow-up write after commit). Requiring every
+ * indexed column explicitly up front avoids ever needing to guess or
+ * reconstruct a DEFAULT's value, and keeps /v1/mutate and /v1/tx behaving
+ * identically instead of one silently "fixing" it and the other not. */
+function requireIndexedColumnsForInsert(
+  op: "insert" | "update" | "upsert" | "delete",
+  indexedColumns: string[],
+  values: Record<string, unknown> | undefined,
+): { code: string; message: string; fix: string } | null {
+  if ((op !== "insert" && op !== "upsert") || indexedColumns.length === 0) return null;
+  const missing = indexedColumns.filter((c) => !(values && c in values));
+  if (missing.length === 0) return null;
+  return {
+    code: "INDEXED_COLUMN_REQUIRES_VALUE",
+    message: `insert/upsert on an indexed table must explicitly supply every indexed column: missing ${missing.join(", ")}.`,
+    fix: "Provide a value for every indexed column — relying on a SQL DEFAULT for an indexed column isn't supported, since the index entry is computed from the values you supply, not read back from the stored row.",
+  };
+}
+
 /** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
  * failure, records a retry job on the BASE shard (not the index shard, which
  * may be the one that's unreachable) via /enqueue-index-job — ShardDO's
@@ -932,6 +956,23 @@ async function writeIndexEntryBestEffort(
       });
     }
   }
+}
+
+/** Eng-review fix (Codex-found): does `row` satisfy every predicate in
+ * `where`? Used by /v1/tx's same-row multi-mutation tracking to decide
+ * in-JS whether a mutation's `where` matches a simulated (not freshly
+ * queried) row state, the same way SQLite would evaluate it against the
+ * real row once /begin actually runs the batch. `null` never matches
+ * (mirrors "UPDATE ... WHERE" against a nonexistent row affecting 0 rows).
+ * The partition-key predicate itself needs no check here — every caller of
+ * this function already scopes `row` to one specific partitionKey by
+ * construction, matching compileMutation's own unconditional `pkCol = ?`. */
+function simulatedRowMatchesWhere(row: Record<string, unknown> | null, where: Record<string, unknown> | undefined): boolean {
+  if (row === null) return false;
+  for (const [key, value] of Object.entries(where ?? {})) {
+    if (row[key] !== value) return false;
+  }
+  return true;
 }
 
 type IndexDelta = { indexName: string; oldKeyJson: string | null; newKeyJson: string | null };
@@ -1086,6 +1127,11 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
   const indexes = route.indexes ?? [];
   const indexedColumns = Array.from(new Set(indexes.flatMap((i) => i.columns)));
 
+  const missingIndexedValues = requireIndexedColumnsForInsert(body.op, indexedColumns, body.values);
+  if (missingIndexedValues) {
+    return json({ error: missingIndexedValues }, 400);
+  }
+
   // For update/delete/upsert on an indexed table, read the row's current
   // state BEFORE the mutation — needed to remove its now-stale index
   // entries. upsert is included because it may hit the ON CONFLICT UPDATE
@@ -1220,6 +1266,20 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  // Eng-review fix (Codex-found): each mutation's beforeRow pre-read hits
+  // the real database, which only reflects what's already committed — never
+  // what an EARLIER mutation in this SAME batch is about to do, since
+  // /begin hasn't run yet. Two mutations touching the same row in one
+  // /v1/tx call (e.g. insert v='a' then update v='b') would otherwise
+  // compute the second mutation's delta against a stale/nonexistent prior
+  // state, silently losing the index entry for the row's actual final
+  // value. Tracks a simulated row per distinct (tenantId, table,
+  // partitionKey) — same keying as rowKey()/participantKey() — seeded from
+  // the first real pre-read and updated as each mutation is processed,
+  // mirroring how SQLite itself sees each statement's effects within the
+  // same transaction (later statements observe earlier ones' writes).
+  const simulatedRowState = new Map<string, Record<string, unknown> | null>();
+
   for (const mutation of body.mutations) {
     if (!mutation.table || !mutation.tenantId || !mutation.partitionKey) {
       return json({ error: { code: "MISSING_FIELDS", message: "Each mutation requires table, tenantId, partitionKey." } }, 400);
@@ -1260,41 +1320,53 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
     const indexes = route.indexes ?? [];
     const indexedColumns = Array.from(new Set(indexes.flatMap((i) => i.columns)));
 
+    const missingIndexedValues = requireIndexedColumnsForInsert(mutation.op, indexedColumns, mutation.values);
+    if (missingIndexedValues) {
+      return json({ error: missingIndexedValues }, 400);
+    }
+
     // Same pre-read rationale as Chunk 2's /v1/mutate: needed to remove a
     // now-stale index entry on update/delete/upsert. Same known limitation
     // too — this read happens before /begin acquires any row lock, so a
     // concurrent write between the read and the 2PC prepare is possible;
     // accepted here for consistency with the already-shipped /v1/mutate path.
-    let beforeRow: Record<string, unknown> | null = null;
-    if (indexedColumns.length > 0 && (mutation.op === "update" || mutation.op === "delete" || mutation.op === "upsert")) {
-      const safeTable = `"${mutation.table}"`;
-      const selectCols = indexedColumns.map((c) => `"${c}"`).join(", ");
-      // update/delete's actual SQL (compileMutation) filters by partitionKey
-      // AND any caller-supplied `where` — the pre-read must filter by the
-      // EXACT SAME predicate (mutationWhereClause, shared with
-      // compileMutation) or a `where` that won't match would still see a
-      // beforeRow snapshot and wrongly delete/rewrite that row's index entry
-      // for a mutation that, once /begin actually runs it, never touches
-      // it. There's no rowsAffected-gating equivalent here the way Chunk 2's
-      // /v1/mutate has: 2PC participants (including index deltas) must be
-      // decided before /begin, before the mutation has executed at all.
-      // upsert never takes a `where` (compileMutation ignores it for
-      // upsert), so its pre-read stays partitionKey-only.
-      const { sql: whereSql, params: whereParams } =
-        mutation.op === "upsert"
-          ? { sql: `"${partitionKeyColumn}" = ?`, params: [mutation.partitionKey] }
-          : mutationWhereClause(mutation, partitionKeyColumn);
-      const preReadRes = await routeToShard(env, route.shardId, "/execute", {
-        sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${whereSql}`,
-        params: whereParams,
-        requestId: `tx-index-preread-${crypto.randomUUID()}`,
-        isMutation: false,
-      });
-      if (preReadRes.ok) {
-        const preReadBody = (await preReadRes.json()) as { rows?: Array<Record<string, unknown>> };
-        beforeRow = preReadBody.rows?.[0] ?? null;
+    //
+    // rawRow is the row's actual state as of this point in the batch
+    // (simulated, not necessarily what's in the DB yet) — fetched
+    // UNCONDITIONALLY by partition key (not scoped to this mutation's
+    // `where`), so a later mutation in the batch still sees the row's real
+    // state even when THIS mutation's own `where` doesn't match it. `where`
+    // matching is applied separately in JS (simulatedRowMatchesWhere), the
+    // same way SQLite will evaluate it once /begin actually runs the batch.
+    const stateKey = rowKey(mutation.tenantId, mutation.table, mutation.partitionKey);
+    let rawRow: Record<string, unknown> | null = null;
+    if (indexedColumns.length > 0 && mutation.op !== "insert") {
+      if (simulatedRowState.has(stateKey)) {
+        rawRow = simulatedRowState.get(stateKey)!;
+      } else {
+        const safeTable = `"${mutation.table}"`;
+        const safePkCol = `"${partitionKeyColumn}"`;
+        const selectCols = indexedColumns.map((c) => `"${c}"`).join(", ");
+        const preReadRes = await routeToShard(env, route.shardId, "/execute", {
+          sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePkCol} = ?`,
+          params: [mutation.partitionKey],
+          requestId: `tx-index-preread-${crypto.randomUUID()}`,
+          isMutation: false,
+        });
+        if (preReadRes.ok) {
+          const preReadBody = (await preReadRes.json()) as { rows?: Array<Record<string, unknown>> };
+          rawRow = preReadBody.rows?.[0] ?? null;
+        }
       }
     }
+
+    // upsert always "hits" (it always inserts-or-updates); insert never
+    // needs a prior row; update/delete only affect the row if it exists AND
+    // matches any extra `where` predicates — mirrors what compileMutation's
+    // WHERE clause will actually filter on once /begin runs it.
+    const matched =
+      mutation.op === "update" || mutation.op === "delete" ? simulatedRowMatchesWhere(rawRow, mutation.where) : true;
+    const beforeRow: Record<string, unknown> | null = matched ? rawRow : null;
 
     const { sql, params } = compileMutation(mutation, partitionKeyColumn);
     addIntent(route.shardId, { sql, params, tenantId: mutation.tenantId, table: mutation.table, partitionKey: mutation.partitionKey });
@@ -1328,6 +1400,23 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
           }
         }
       }
+    }
+
+    // Advance the simulated row state for any LATER mutation in this batch
+    // targeting the same row.
+    if (indexedColumns.length > 0) {
+      let nextRow: Record<string, unknown> | null;
+      if (mutation.op === "insert") {
+        nextRow = { ...(mutation.values ?? {}), [partitionKeyColumn]: mutation.partitionKey };
+      } else if (!matched) {
+        nextRow = rawRow; // unaffected by this mutation — carry state forward unchanged
+      } else if (mutation.op === "delete") {
+        nextRow = null;
+      } else {
+        // update or upsert: merge caller's values over the row's prior state.
+        nextRow = { ...(rawRow ?? {}), ...(mutation.values ?? {}), [partitionKeyColumn]: mutation.partitionKey };
+      }
+      simulatedRowState.set(stateKey, nextRow);
     }
   }
 
