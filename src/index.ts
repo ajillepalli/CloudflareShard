@@ -1477,25 +1477,36 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     const matches = indexBody.rows ?? [];
     if (matches.length === 0) break; // index exhausted
 
-    for (const match of matches) {
-      const rowRes = await routeToShard(env, match.source_shard_id, "/execute", {
-        sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
-        params: [match.partition_key],
-        requestId: `index-query-hydrate-${crypto.randomUUID()}`,
-        isMutation: false,
-      });
-      if (!rowRes.ok) continue; // base row/shard unreachable — skip rather than fail the whole query
-      const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
-      const row = rowBody.rows?.[0];
-      if (!row) continue; // row deleted since the index entry was written — stale, exclude
+    // Eng-review perf fix: each match's hydrate read is independent of every
+    // other match's in this batch (different partition keys, potentially
+    // different shards) — resolve the whole batch concurrently instead of
+    // one round trip at a time. Promise.all preserves `matches`' order (the
+    // ORDER BY partition_key ASC from the query above), so the sequential
+    // push-until-limit loop below still yields a stable, deterministic
+    // result across repeated calls.
+    const hydrated = await Promise.all(
+      matches.map(async (match): Promise<Record<string, unknown> | null> => {
+        const rowRes = await routeToShard(env, match.source_shard_id, "/execute", {
+          sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
+          params: [match.partition_key],
+          requestId: `index-query-hydrate-${crypto.randomUUID()}`,
+          isMutation: false,
+        });
+        if (!rowRes.ok) return null; // base row/shard unreachable — skip rather than fail the whole query
+        const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
+        const row = rowBody.rows?.[0];
+        if (!row) return null; // row deleted since the index entry was written — stale, exclude
 
-      // Staleness re-check (Chunk 2's index maintenance is async): only
-      // surface this row if it still actually matches the queried tuple.
-      // Excludes a stale entry silently, exactly as if it didn't exist yet —
-      // never returns a row that doesn't match what the caller asked for.
-      const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
-      if (!stillMatches) continue;
-
+        // Staleness re-check (Chunk 2's index maintenance is async): only
+        // surface this row if it still actually matches the queried tuple.
+        // Excludes a stale entry silently, exactly as if it didn't exist yet
+        // — never returns a row that doesn't match what the caller asked for.
+        const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
+        return stillMatches ? row : null;
+      }),
+    );
+    for (const row of hydrated) {
+      if (row === null) continue;
       rows.push(row);
       if (rows.length >= limit) break;
     }
