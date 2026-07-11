@@ -1107,6 +1107,52 @@ describe("ShardDO migration fence and export/import (Milestone 3, Chunk 4)", () 
       expect(kept).toHaveLength(1);
     });
   });
+
+  // Review Tier 2 #9: the checksum is computed incrementally (per-page sha256,
+  // then sha256 of the page digests) so it stays O(page) memory on a large
+  // vbucket. A multi-page vbucket must still produce IDENTICAL checksums on
+  // two shards holding identical data, and differ under any divergence.
+  it("checksum of a multi-page vbucket (> one page) matches between two shards with identical data and differs under divergence", async () => {
+    const a = await freshShard();
+    const b = await freshShard();
+    const N = 1200; // spans 3 pages (MIGRATE_PAGE_SIZE = 500)
+    for (const stub of [a, b]) {
+      await createTable(stub);
+      // Bulk-seed identical base rows + provenance (vbucket 5) via one CTE each.
+      await stub.fetch(
+        post("/execute", {
+          sql: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${N}) INSERT INTO t (id, v) SELECT printf('p%05d', n), 'val' || n FROM seq`,
+          requestId: `seed-rows-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      );
+      await stub.fetch(
+        post("/execute", {
+          sql: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${N}) INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at) SELECT 't', printf('p%05d', n), 'tenant-1', 5, '2026-01-01T00:00:00.000Z' FROM seq`,
+          requestId: `seed-prov-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      );
+    }
+
+    const checksumOf = async (stub: Awaited<ReturnType<typeof freshShard>>) =>
+      (await (await stub.fetch(post("/migrate-checksum", { vbucket: 5, table: "t", partitionKeyColumn: "id" }))).json()) as {
+        checksum: string;
+        rowCount: number;
+      };
+
+    const ca = await checksumOf(a);
+    const cb = await checksumOf(b);
+    expect(ca.rowCount).toBe(N);
+    expect(cb.rowCount).toBe(ca.rowCount);
+    expect(cb.checksum).toBe(ca.checksum);
+
+    // Diverge one row deep in the middle (page 2) — checksum must change.
+    await b.fetch(post("/execute", { sql: "UPDATE t SET v = 'tampered' WHERE id = 'p00600'", requestId: `tamper-${crypto.randomUUID()}`, isMutation: true }));
+    const cbTampered = await checksumOf(b);
+    expect(cbTampered.checksum).not.toBe(ca.checksum);
+    expect(cbTampered.rowCount).toBe(ca.rowCount); // same count, different content
+  });
 });
 
 describe("ShardDO row provenance (Milestone 3, Chunk 0)", () => {
