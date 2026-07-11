@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation } from "./sql-safety";
+import {
+  extractCreateTableName,
+  isDangerous,
+  isDangerousSchema,
+  isInternalTableName,
+  isInternalTableWrite,
+  isMutation,
+  mutationWriteTarget,
+  normalizeTableName,
+} from "./sql-safety";
 
 describe("isMutation", () => {
   it("classifies plain mutation statements", () => {
@@ -51,6 +60,82 @@ describe("isMutation", () => {
 
   it("is not fooled by a comment-then-WITH-then-comment stack", () => {
     expect(isMutation("-- a\nWITH x AS (SELECT 1) -- b\nDELETE FROM events")).toBe(true);
+  });
+});
+
+// Codex review P1: the write-target extractor backs the /v1/sql ALLOWLIST
+// gate (target must equal the caller's declared table). Exhaustive parsing
+// coverage lives here as a pure unit test — zero worker/gateway round trips,
+// so it doesn't add to index.test.ts's cumulative-latency budget.
+describe("mutationWriteTarget", () => {
+  it("extracts a bare target, normalized (lowercased)", () => {
+    expect(mutationWriteTarget("DELETE FROM events")).toBe("events");
+    expect(mutationWriteTarget("delete from Events where id = 1")).toBe("events");
+    expect(mutationWriteTarget("UPDATE events SET v = 1")).toBe("events");
+    expect(mutationWriteTarget("INSERT INTO events (id) VALUES (1)")).toBe("events");
+    expect(mutationWriteTarget("INSERT INTO events(id) VALUES (1)")).toBe("events"); // no space before (
+    expect(mutationWriteTarget("REPLACE INTO events VALUES (1)")).toBe("events");
+    expect(mutationWriteTarget("INSERT OR IGNORE INTO events VALUES (1)")).toBe("events");
+    expect(mutationWriteTarget("UPDATE OR REPLACE events SET v = 1")).toBe("events");
+  });
+
+  it("unquotes a quoted target (double, backtick, bracket) and lowercases it", () => {
+    expect(mutationWriteTarget('DELETE FROM "Events"')).toBe("events");
+    expect(mutationWriteTarget("DELETE FROM `events`")).toBe("events");
+    expect(mutationWriteTarget("DELETE FROM [events]")).toBe("events");
+    expect(mutationWriteTarget('INSERT INTO"events" VALUES (1)')).toBe("events"); // no space after INTO
+  });
+
+  it("drops a schema qualifier (last dotted component wins), tolerating whitespace around the dot", () => {
+    expect(mutationWriteTarget("DELETE FROM main.events")).toBe("events");
+    expect(mutationWriteTarget("DELETE FROM main . events")).toBe("events");
+    expect(mutationWriteTarget("DELETE FROM main   .   events")).toBe("events");
+    expect(mutationWriteTarget('DELETE FROM "main" . "events"')).toBe("events");
+    // The confirmed 4th bypass shape: spaced qualifier + quoted internal table.
+    expect(mutationWriteTarget('DELETE FROM main . "__cf_fenced_vbuckets"')).toBe("__cf_fenced_vbuckets");
+  });
+
+  it("sees through inter-token comments and a leading CTE", () => {
+    expect(mutationWriteTarget("DELETE/**/FROM __cf_row_owners")).toBe("__cf_row_owners");
+    expect(mutationWriteTarget("DELETE /* wipe */ FROM events")).toBe("events");
+    expect(mutationWriteTarget("WITH x AS (SELECT 1) DELETE FROM events")).toBe("events");
+  });
+
+  it("fail-closed (null) on non-DML or an ambiguous/three-part target", () => {
+    expect(mutationWriteTarget("SELECT * FROM events")).toBeNull();
+    expect(mutationWriteTarget("CREATE TABLE events (id TEXT)")).toBeNull();
+    expect(mutationWriteTarget("DELETE FROM db.main.events")).toBeNull(); // 3 parts — not valid table syntax
+    expect(mutationWriteTarget('DELETE FROM "unterminated')).toBeNull();
+  });
+});
+
+describe("isInternalTableName / normalizeTableName", () => {
+  it("recognizes the internal tables and reserved prefixes, case-insensitively", () => {
+    expect(isInternalTableName("applied_requests")).toBe(true);
+    expect(isInternalTableName("__cf_fenced_vbuckets")).toBe(true);
+    expect(isInternalTableName("__cf_anything_new")).toBe(true); // reserved prefix
+    expect(isInternalTableName("sqlite_sequence")).toBe(true);
+    expect(isInternalTableName("events")).toBe(false);
+  });
+
+  it("normalizes (unquote + lowercase)", () => {
+    expect(normalizeTableName('"Events"')).toBe("events");
+    expect(normalizeTableName("`Row_Locks`")).toBe("row_locks");
+    expect(normalizeTableName("  Events  ")).toBe("events");
+  });
+});
+
+describe("isInternalTableWrite (defense-in-depth denylist)", () => {
+  it("blocks a mutation targeting an internal table, however spelled", () => {
+    expect(isInternalTableWrite("DELETE FROM applied_requests")).toBe(true);
+    expect(isInternalTableWrite('DELETE FROM main . "__cf_fenced_vbuckets"')).toBe(true);
+    expect(isInternalTableWrite("INSERT INTO events (id) SELECT partition_key FROM __cf_row_owners")).toBe(true);
+  });
+
+  it("does not flag a legit own-table write, incl. a double-quoted string VALUE equal to an internal name", () => {
+    expect(isInternalTableWrite("INSERT INTO events (id, v) VALUES ('n1', 'row_locks note')")).toBe(false);
+    expect(isInternalTableWrite('INSERT INTO events (id, v) VALUES (\'n1\', "applied_requests")')).toBe(false);
+    expect(isInternalTableWrite("SELECT * FROM __cf_row_owners")).toBe(false); // read, not a mutation
   });
 });
 
