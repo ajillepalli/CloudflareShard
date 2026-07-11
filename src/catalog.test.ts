@@ -845,6 +845,67 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     ).json()) as { rows: Array<{ v: string }> };
     expect(finalTargetRow.rows[0].v).toBe("correct");
   });
+
+  // Re-review: the cutover wait for prepared 2PC intents was unbounded — a tx
+  // prepared-but-never-resolved on the source would block cutover forever with
+  // no operator signal. After the bound elapses the migration must surface a
+  // distinguishable status naming the wedged txId, not loop mutely.
+  it("a prepared 2PC intent that never resolves on the source surfaces status 'cutover-blocked-on-prepared-intents' with the txId (bounded wait)", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Put vbucket 0 directly into cutover against a target, with the
+    // cutover clock set well in the past so the very next tick exceeds the
+    // bound. shard-0 owns vbucket 0 (round-robin from /init).
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES ('shard-cutover-target', 'active', ?)",
+        new Date().toISOString(),
+      );
+      state.storage.sql.exec(
+        `UPDATE vbucket_map
+         SET migration_status = 'cutover', target_shard_id = 'shard-cutover-target',
+             cutover_started_at = ?, cutover_stall_reason = NULL, migration_started_at = ?, updated_at = ?
+         WHERE vbucket = 0`,
+        new Date(Date.now() - 5 * 60_000).toISOString(), // 5 min ago — past the bound
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+    });
+
+    // Seed a never-resolving prepared 2PC intent on the SOURCE for vbucket 0.
+    const source = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await source.fetch(new Request("https://shard.internal/stats", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, vbucket, op)
+         VALUES ('tx-wedged', 0, 'INSERT INTO t (id) VALUES (''x'')', '[]', 'prepared', '[]', ?, 0, 'insert')`,
+        new Date().toISOString(),
+      );
+    });
+
+    // One orchestration tick: mirror queue is empty, so the cutover branch
+    // reaches the prepared-intent gate, sees it non-empty AND past the bound,
+    // and marks the stall (returning true — it keeps polling, doesn't abort).
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    const statusBody = (await (
+      await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
+    ).json()) as { status: string; blockedTxIds?: string[] };
+    expect(statusBody.status).toBe("cutover-blocked-on-prepared-intents");
+    expect(statusBody.blockedTxIds).toEqual(["tx-wedged"]);
+
+    // The migration is NOT aborted — it's still in cutover, awaiting operator
+    // /admin/tx-force-abort of the wedged tx.
+    const raw = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return Array.from(
+        state.storage.sql.exec("SELECT migration_status FROM vbucket_map WHERE vbucket = 0"),
+      ) as Array<{ migration_status: string }>;
+    });
+    expect(raw[0].migration_status).toBe("cutover");
+  });
 });
 
 describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
