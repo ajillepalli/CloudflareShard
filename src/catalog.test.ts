@@ -1255,4 +1255,34 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     // it's no longer parked with the vbucket sitting untouched on shard-0.
     expect(resumed[0].shard_id === "shard-0" && resumed[0].migration_status === "none").toBe(false);
   });
+
+  // Re-review item E: advanceDrain used to label ANY startMigration rejection
+  // 'provenance'. A non-provenance rejection (e.g. MIGRATION_IN_PROGRESS for a
+  // vbucket wedged in 'aborting') must record a distinct reason so the operator
+  // isn't sent to run /admin/backfill-provenance for the wrong cause.
+  it("a non-provenance startMigration rejection parks the drain as 'stalled' with a distinct reason, not mislabeled 'provenance'", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Override startMigration to return a non-provenance rejection (as if the
+    // target vbucket were mid-abort), then drive a tick.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      (instance as unknown as { startMigration: () => Promise<Response> }).startMigration = async () =>
+        new Response(JSON.stringify({ error: { code: "MIGRATION_IN_PROGRESS" } }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      await instance.alarm();
+    });
+
+    const parked = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as {
+      status: string;
+      stallReason: string | null;
+    };
+    expect(parked.stallReason).toBe("migration-blocked");
+    expect(parked.stallReason).not.toBe("provenance");
+    expect(parked.status).toBe("stalled");
+  });
 });
