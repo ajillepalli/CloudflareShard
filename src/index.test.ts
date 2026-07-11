@@ -443,6 +443,62 @@ describe("Worker tenant authorization", () => {
     );
     expect(ok.status).toBe(200);
   });
+
+  // Re-review found THREE confirmed bypasses of the write guard's old
+  // target-extraction approach: case (the set was lowercase but compared the
+  // original case), inter-token comments (the target regex required literal
+  // \s+ between keywords), and schema. qualifiers (the regex captured the
+  // schema, not the __cf_ table). The reference-block replacement must reject
+  // all of them.
+  it("rejects internal-table writes that bypassed the old target-extraction guard (case, inline comment, schema qualifier, quoting)", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+
+    const bypasses = [
+      // 1. CASE — SQLite table names are case-insensitive; the old lowercase
+      //    Set.has(originalCase) missed these against the real tables.
+      "DELETE FROM Applied_Requests",
+      "DELETE FROM PENDING_INTENTS",
+      "DELETE FROM Row_Locks",
+      "UPDATE INDEX_PENDING_JOBS SET x = 1",
+      // 2. INLINE COMMENT between keywords.
+      "DELETE/**/FROM __cf_fenced_vbuckets",
+      "DELETE /* wipe the fence */ FROM __cf_fenced_vbuckets",
+      // 3. SCHEMA QUALIFIER.
+      "DELETE FROM main.__cf_row_owners",
+      "INSERT INTO main.__cf_mirror_pending (x) VALUES (1)",
+      // Quoted, mixed case.
+      'DELETE FROM "Applied_Requests"',
+      "DELETE FROM `row_locks`",
+      "DELETE FROM [pending_intents]",
+      // A subquery-only reference in a mutation is still blocked (blanket
+      // reference-block, not just the write target).
+      "INSERT INTO events (id) SELECT partition_key FROM __cf_row_owners",
+    ];
+    for (const sql of bypasses) {
+      const res = await post("/v1/sql", { sql, table: "events", tenantId: "t1", partitionKey: "p1" }, token);
+      expect(res.status, `${sql} should be 403`).toBe(403);
+      const body = (await res.json()) as { error: { code?: string } | string };
+      const code = typeof body.error === "object" ? body.error.code : undefined;
+      expect(code, `${sql} code`).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
+    }
+
+    // A legitimate write whose STRING DATA merely contains an internal table
+    // name must NOT be blocked (string literals are stripped before the
+    // reference check) — no false positive.
+    const okData = await post(
+      "/v1/sql",
+      {
+        sql: "INSERT INTO events (id, v) VALUES (?, ?)",
+        params: ["note-1", "see row_locks and applied_requests for details"],
+        table: "events",
+        tenantId: "t1",
+        partitionKey: "p1",
+      },
+      token,
+    );
+    expect(okData.status).toBe(200);
+  });
 });
 
 describe("Worker /v1/mutate", () => {
