@@ -154,6 +154,11 @@ export class CatalogDO extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+    // Review Tier 2 #10: when a drain's vbucket migration is blocked by the
+    // provenance gate, the drain parks here rather than re-scanning every
+    // table on the source at the 250ms tick cadence forever. Cleared when the
+    // operator re-invokes /admin/drain-shard (after /admin/backfill-provenance).
+    this.ensureColumn("shards", "drain_stall_reason", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS vbucket_map (
@@ -1102,7 +1107,9 @@ export class CatalogDO extends DurableObject {
 
     this.audit("/drain-shard", { shardId: body.shardId });
 
-    this.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", body.shardId);
+    // Clear any provenance stall (review Tier 2 #10): re-invoking /drain-shard
+    // is the operator's "I've backfilled provenance, resume" signal.
+    this.sql.exec("UPDATE shards SET status = 'draining', drain_stall_reason = NULL WHERE shard_id = ?", body.shardId);
 
     const version = this.bumpMetadataVersion();
 
@@ -1123,7 +1130,10 @@ export class CatalogDO extends DurableObject {
     if (!body.shardId) {
       return json({ error: "Missing shardId" }, 400);
     }
-    const shard = this.one<{ status: string }>("SELECT status FROM shards WHERE shard_id = ?", body.shardId);
+    const shard = this.one<{ status: string; drain_stall_reason: string | null }>(
+      "SELECT status, drain_stall_reason FROM shards WHERE shard_id = ?",
+      body.shardId,
+    );
     if (!shard) {
       return json({ error: `Shard ${body.shardId} not found` }, 404);
     }
@@ -1134,12 +1144,17 @@ export class CatalogDO extends DurableObject {
     const status =
       shard.status !== "draining"
         ? shard.status
-        : vbucketsRemaining > 0
-          ? "migrating-vbuckets"
-          : ringsRemaining > 0
-            ? "evacuating-rings"
-            : "complete";
-    return json({ shardId: body.shardId, vbucketsRemaining, ringsRemaining, status });
+        : // Review Tier 2 #10: a drain parked on the provenance gate reports a
+          // distinct status so the operator knows to run
+          // /admin/backfill-provenance and re-invoke /admin/drain-shard.
+          shard.drain_stall_reason === "provenance"
+          ? "stalled-provenance"
+          : vbucketsRemaining > 0
+            ? "migrating-vbuckets"
+            : ringsRemaining > 0
+              ? "evacuating-rings"
+              : "complete";
+    return json({ shardId: body.shardId, vbucketsRemaining, ringsRemaining, status, stallReason: shard.drain_stall_reason });
   }
 
   /** Milestone 3, Chunk 5: the union of active shard ids across EVERY
@@ -1206,6 +1221,15 @@ export class CatalogDO extends DurableObject {
    * shard's entries for that index to the substitute, repoint the ring on
    * every catalog shard, then delete the source copies. */
   private async advanceDrain(shardId: string): Promise<boolean> {
+    // Review Tier 2 #10: a drain parked on the provenance gate does NOT keep
+    // re-scanning every table on the source at the tick cadence — it stays
+    // parked until the operator re-invokes /admin/drain-shard (which clears
+    // this after they run /admin/backfill-provenance).
+    const stall = this.one<{ drain_stall_reason: string | null }>("SELECT drain_stall_reason FROM shards WHERE shard_id = ?", shardId);
+    if (stall?.drain_stall_reason) {
+      return false;
+    }
+
     const vbuckets = this.many<{ vbucket: number; migration_status: string }>(
       "SELECT vbucket, migration_status FROM vbucket_map WHERE shard_id = ? ORDER BY vbucket ASC",
       shardId,
@@ -1230,8 +1254,13 @@ export class CatalogDO extends DurableObject {
       const target = activeOthers[next % activeOthers.length];
       const started = await this.startMigration(next, target, "/drain-shard-migrate");
       if (started instanceof Response) {
-        log("catalog.drain_migration_start_rejected", { shardId, vbucket: next, status: started.status });
-        return true; // retried next tick (e.g. provenance gate — operator fixes, drain resumes)
+        // Provenance-incomplete (or any start rejection): park the drain so
+        // the alarm stops re-running the full-table provenance scan every
+        // tick (review Tier 2 #10). The operator runs /admin/backfill-provenance
+        // then re-calls /admin/drain-shard to clear the stall and resume.
+        this.sql.exec("UPDATE shards SET drain_stall_reason = 'provenance' WHERE shard_id = ?", shardId);
+        log("catalog.drain_stalled_provenance", { shardId, vbucket: next });
+        return false;
       }
       // Advance it immediately — a quiet vbucket completes this same tick.
       const row = this.one<MigrationRow>(
