@@ -1722,10 +1722,13 @@ export class ShardDO extends DurableObject {
     if (body.vbucket === undefined) {
       return json({ error: "Missing vbucket" }, 400);
     }
-    const row = this.one<{ n: number }>(
-      "SELECT COUNT(*) AS n FROM pending_intents WHERE status = 'prepared' AND vbucket = ?",
+    // DISTINCT coordinator_tx_id: one tx can hold several prepared intents on
+    // the same vbucket; the cutover gate only cares whether ANY remain, and
+    // the txIds let /migrate-vbucket-status name a wedged tx for the operator.
+    const rows = this.many<{ coordinator_tx_id: string }>(
+      "SELECT DISTINCT coordinator_tx_id FROM pending_intents WHERE status = 'prepared' AND vbucket = ?",
       body.vbucket,
     );
-    return json({ count: row?.n ?? 0 });
+    return json({ count: rows.length, txIds: rows.map((r) => r.coordinator_tx_id) });
   }
 }

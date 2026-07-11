@@ -44,6 +44,16 @@ const MIGRATION_TICK_MS = 250;
 // rather than restarting-and-throwing at 4Hz forever.
 const MIGRATION_BACKFILL_PAGES_PER_TICK = 8;
 const MIGRATION_TICK_MAX_MS = 30000;
+// Re-review: bound the cutover wait for the source's prepared 2PC intents to
+// drain. A tx prepared-but-never-resolved (coordinator wedged on an
+// unreachable participant, so the sweep sees it 'prepared' forever) would
+// otherwise block this vbucket's cutover indefinitely with no operator
+// signal. After this long, the migration surfaces a distinct
+// 'cutover-blocked-on-prepared-intents' status via /migrate-vbucket-status
+// (naming the txId) so an operator can /admin/tx-force-abort it. The tick
+// keeps polling rather than aborting — a genuinely slow-but-live tx still
+// completes on its own and clears the marker.
+const CUTOVER_PREPARED_WAIT_MAX_MS = 30000;
 
 type MigrationRow = {
   vbucket: number;
@@ -190,6 +200,11 @@ export class CatalogDO extends DurableObject {
     // per-invocation subrequest cap every 250ms forever.
     this.ensureColumn("vbucket_map", "backfill_table", "TEXT");
     this.ensureColumn("vbucket_map", "backfill_after_pk", "TEXT");
+    // Re-review: cutover-entry timestamp and a stall marker, so the
+    // prepared-2PC-intent cutover wait can be bounded and surfaced via
+    // /migrate-vbucket-status instead of livelocking silently.
+    this.ensureColumn("vbucket_map", "cutover_started_at", "TEXT");
+    this.ensureColumn("vbucket_map", "cutover_stall_reason", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS table_rules (
@@ -1783,7 +1798,8 @@ export class CatalogDO extends DurableObject {
       // /admin/migrate-vbucket-abort that landed during the (awaited)
       // backfill pass above must not be resurrected into cutover.
       this.sql.exec(
-        "UPDATE vbucket_map SET migration_status = 'cutover', updated_at = ? WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+        "UPDATE vbucket_map SET migration_status = 'cutover', cutover_started_at = ?, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+        new Date().toISOString(),
         new Date().toISOString(),
         m.vbucket,
         target,
@@ -1834,10 +1850,40 @@ export class CatalogDO extends DurableObject {
       // it) or aborted. Wait for that rather than racing the flip.
       const preparedRes = await this.callShard(source, "/prepared-intent-count-for-vbucket", { vbucket: m.vbucket });
       if (!preparedRes.ok) throw new Error(`prepared-intent-count failed on ${source}: ${preparedRes.status}`);
-      const preparedCount = ((await preparedRes.json()) as { count: number }).count;
+      const preparedBody = (await preparedRes.json()) as { count: number; txIds?: string[] };
+      const preparedCount = preparedBody.count;
       if (preparedCount > 0) {
+        // Re-review: bound this wait. Once it exceeds CUTOVER_PREPARED_WAIT_MAX_MS,
+        // mark the migration so /migrate-vbucket-status surfaces a distinct
+        // 'cutover-blocked-on-prepared-intents' status (naming the txId), giving
+        // the operator an escape (/admin/tx-force-abort) instead of a silent
+        // livelock. Still poll rather than abort — a slow-but-live tx recovers.
+        const startedRow = this.one<{ cutover_started_at: string | null }>(
+          "SELECT cutover_started_at FROM vbucket_map WHERE vbucket = ?",
+          m.vbucket,
+        );
+        const startedAt = startedRow?.cutover_started_at ? new Date(startedRow.cutover_started_at).getTime() : null;
+        if (startedAt !== null && Date.now() - startedAt > CUTOVER_PREPARED_WAIT_MAX_MS) {
+          log("catalog.migration_cutover_blocked_on_prepared_intents", {
+            vbucket: m.vbucket,
+            preparedCount,
+            txIds: preparedBody.txIds,
+            waitedMs: Date.now() - startedAt,
+          });
+          this.sql.exec(
+            "UPDATE vbucket_map SET cutover_stall_reason = 'prepared-intents', updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover'",
+            new Date().toISOString(),
+            m.vbucket,
+          );
+        }
         return true; // poll again next tick
       }
+      // Prepared intents drained — clear any stall marker set above before
+      // proceeding to the checksum/flip.
+      this.sql.exec(
+        "UPDATE vbucket_map SET cutover_stall_reason = NULL WHERE vbucket = ? AND cutover_stall_reason IS NOT NULL",
+        m.vbucket,
+      );
 
       // Step 3: per-table content checksums must match for EVERY registered
       // table (the spec's verify rule) — computed in one batched round trip
@@ -1875,7 +1921,7 @@ export class CatalogDO extends DurableObject {
         await this.callShard(source, "/purge-mirror-jobs", { vbucket: m.vbucket });
         await this.callShard(target, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
         this.sql.exec(
-          "UPDATE vbucket_map SET migration_status = 'backfilling', updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND target_shard_id = ?",
+          "UPDATE vbucket_map SET migration_status = 'backfilling', cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND target_shard_id = ?",
           new Date().toISOString(),
           m.vbucket,
           target,
@@ -1892,7 +1938,8 @@ export class CatalogDO extends DurableObject {
       this.sql.exec(
         `
         UPDATE vbucket_map
-        SET shard_id = ?, migration_status = 'none', target_shard_id = NULL, map_version = ?, updated_at = ?
+        SET shard_id = ?, migration_status = 'none', target_shard_id = NULL, map_version = ?,
+            cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ?
         WHERE vbucket = ? AND migration_status = 'cutover' AND shard_id = ? AND target_shard_id = ?
         `,
         target,
@@ -1926,8 +1973,8 @@ export class CatalogDO extends DurableObject {
     if (body.vbucket === undefined) {
       return json({ error: "Missing vbucket" }, 400);
     }
-    const row = this.one<MigrationRow & { migration_started_at: string | null }>(
-      "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, migration_started_at FROM vbucket_map WHERE vbucket = ?",
+    const row = this.one<MigrationRow & { migration_started_at: string | null; cutover_stall_reason: string | null }>(
+      "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, migration_started_at, cutover_stall_reason FROM vbucket_map WHERE vbucket = ?",
       body.vbucket,
     );
     if (!row) {
@@ -1940,14 +1987,30 @@ export class CatalogDO extends DurableObject {
         mirrorQueueDepth = ((await mirrorRes.json()) as { count: number }).count;
       }
     }
+
+    // Re-review: surface a bounded cutover stalled on prepared 2PC intents as a
+    // distinct status naming the offending txId(s), so an operator can
+    // /admin/tx-force-abort the wedged transaction instead of watching the
+    // migration livelock in 'cutover' forever.
+    let status = row.migration_status;
+    let blockedTxIds: string[] | undefined;
+    if (row.cutover_stall_reason === "prepared-intents" && row.migration_status === "cutover") {
+      status = "cutover-blocked-on-prepared-intents";
+      const preparedRes = await this.callShard(row.shard_id, "/prepared-intent-count-for-vbucket", { vbucket: body.vbucket });
+      if (preparedRes.ok) {
+        blockedTxIds = ((await preparedRes.json()) as { txIds?: string[] }).txIds;
+      }
+    }
+
     return json({
       vbucket: row.vbucket,
-      status: row.migration_status,
+      status,
       fromShard: row.shard_id,
       toShard: row.target_shard_id,
       rowsCopied: row.migration_rows_copied,
       mirrorQueueDepth,
       startedAt: row.migration_started_at,
+      ...(blockedTxIds ? { blockedTxIds } : {}),
     });
   }
 
@@ -2032,7 +2095,7 @@ export class CatalogDO extends DurableObject {
 
       // Cleanup fully succeeded — only now clear to 'none'.
       this.sql.exec(
-        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, backfill_table = NULL, backfill_after_pk = NULL, updated_at = ? WHERE vbucket = ?",
+        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, backfill_table = NULL, backfill_after_pk = NULL, cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ?",
         new Date().toISOString(),
         body.vbucket,
       );
