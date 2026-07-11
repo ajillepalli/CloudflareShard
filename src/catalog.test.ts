@@ -137,6 +137,18 @@ function post(path: string, body: unknown, authorization?: string) {
   });
 }
 
+/** POSTs directly to a ShardDO stub, bypassing the catalog — for tests that
+ * need to seed or inspect a shard's physical rows/provenance directly. */
+function shardExecute(shardStub: { fetch: (req: Request) => Promise<Response> }, body: unknown) {
+  return shardStub.fetch(
+    new Request("https://shard.internal/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
 async function registerTenant(stub: Awaited<ReturnType<typeof freshCatalog>>, tenantId: string): Promise<string> {
   const res = await stub.fetch(post("/register-tenant", { tenantId }, `Bearer ${env.ADMIN_TOKEN}`));
   const body = (await res.json()) as { token: string };
@@ -170,6 +182,46 @@ describe("CatalogDO auth gate", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ok: boolean };
     expect(body.ok).toBe(true);
+  });
+
+  // Review Tier 3: /list-tenants, /vbucket-map, /migrate-vbucket,
+  // /migrate-vbucket-status, /migrate-vbucket-abort, and /drain-shard-status
+  // were added to ADMIN_GATED_ROUTES without their own unauthorized-case
+  // coverage (unlike /init, /split-vbucket, /register-table above).
+  it("rejects /list-tenants without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/list-tenants", {}));
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects /vbucket-map without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/vbucket-map", {}));
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects /migrate-vbucket without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-x" }));
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects /migrate-vbucket-status without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }));
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects /migrate-vbucket-abort without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/migrate-vbucket-abort", { vbucket: 0 }));
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects /drain-shard-status without an admin token", async () => {
+    const stub = await freshCatalog();
+    const res = await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }));
+    expect(res.status).toBe(401);
   });
 });
 
@@ -678,6 +730,120 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
 
     const sameShard = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
     expect(sameShard.status).toBe(400);
+  });
+
+  // Review Tier 3 test-coverage gap: advanceMigration's cutover step-3 abort
+  // path (a checksum mismatch) was only exercised implicitly (never actually
+  // triggered) by the happy-path split-vbucket test above. Puts the vbucket
+  // directly into 'cutover' with a target whose copy of the row deliberately
+  // diverges from the source, so the very next tick's checksum comparison is
+  // guaranteed to mismatch — then confirms recovery on a later tick.
+  it("a cutover checksum mismatch wipes the target and rewinds status to 'backfilling'; a later tick then completes the migration", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(
+      post(
+        "/register-table",
+        { table: "t", partitionKeyColumn: "id", schemaSql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)" },
+        `Bearer ${env.ADMIN_TOKEN}`,
+      ),
+    );
+
+    // shard-0 owns every vbucket (numShards: 1) — plant the source's real row.
+    const source = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shardExecute(source, { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `schema-src-${crypto.randomUUID()}`, isMutation: true });
+    await shardExecute(source, {
+      sql: "INSERT INTO t (id, v) VALUES ('row-1', 'correct')",
+      requestId: `ins-src-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "t",
+      partitionKey: "row-1",
+      vbucket: 0,
+    });
+
+    // Plant a target whose copy of the SAME row diverges — as if a prior
+    // backfill pass had copied it, then the row changed only on one side.
+    const targetShardId = "shard-mismatch-target";
+    const target = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await shardExecute(target, { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `schema-tgt-${crypto.randomUUID()}`, isMutation: true });
+    await shardExecute(target, {
+      sql: "INSERT INTO t (id, v) VALUES ('row-1', 'WRONG')",
+      requestId: `ins-tgt-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "t",
+      partitionKey: "row-1",
+      vbucket: 0,
+    });
+
+    // Drop vbucket 0 directly into 'cutover' against that target — skips
+    // driving a real backfill pass (irrelevant to the step-3 check under
+    // test) and deterministically reproduces "backfill finished, but the
+    // copies disagree" without racing the single-tick backfill-then-cutover
+    // continuation that a normal migration would otherwise do in one call.
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)",
+        targetShardId,
+        new Date().toISOString(),
+      );
+      state.storage.sql.exec(
+        `
+        UPDATE vbucket_map
+        SET migration_status = 'cutover', target_shard_id = ?, migration_rows_copied = 1,
+            migration_started_at = ?, backfill_table = NULL, backfill_after_pk = NULL, updated_at = ?
+        WHERE vbucket = 0
+        `,
+        targetShardId,
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+    });
+
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    // Rewound to 'backfilling' — not left fenced/half-flipped.
+    const afterMismatch = (await (
+      await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
+    ).json()) as { status: string };
+    expect(afterMismatch.status).toBe("backfilling");
+
+    // Target wiped — the mismatched copy is gone, not left behind.
+    const targetCount = (await (
+      await shardExecute(target, { sql: "SELECT COUNT(*) AS n FROM t WHERE id = 'row-1'", requestId: `cnt-tgt-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ n: number }> };
+    expect(targetCount.rows[0].n).toBe(0);
+
+    // Source untouched — the abort path never touches the source's data.
+    const sourceRow = (await (
+      await shardExecute(source, { sql: "SELECT v FROM t WHERE id = 'row-1'", requestId: `sel-src-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ v: string }> };
+    expect(sourceRow.rows[0].v).toBe("correct");
+
+    // A later tick (or several) re-backfills from the now-clean state and
+    // completes: fresh copy matches, checksums agree, and the map flips.
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusBody = (await (
+        await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
+      ).json()) as { status: string };
+      if (statusBody.status === "none") break;
+    }
+
+    const finalStatus = (await (
+      await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
+    ).json()) as { status: string };
+    expect(finalStatus.status).toBe("none");
+
+    const finalTargetRow = (await (
+      await shardExecute(target, { sql: "SELECT v FROM t WHERE id = 'row-1'", requestId: `sel-tgt-final-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ v: string }> };
+    expect(finalTargetRow.rows[0].v).toBe("correct");
   });
 });
 

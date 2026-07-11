@@ -1174,6 +1174,64 @@ describe("ShardDO migration fence and export/import (Milestone 3, Chunk 4)", () 
     expect(cbTampered.checksum).not.toBe(ca.checksum);
     expect(cbTampered.rowCount).toBe(ca.rowCount); // same count, different content
   });
+
+  // Review Tier 3 test-coverage gap: /migrate-import's failure branch (target
+  // physically lacks the table backfill is trying to populate) was only
+  // exercised implicitly by tests where the table always existed.
+  it("/migrate-import returns 500 MIGRATE_IMPORT_FAILED when the target lacks the table", async () => {
+    const source = await freshShard();
+    const target = await freshShard(); // deliberately never createTable(target)
+    await createTable(source);
+    await insertWithProvenance(source, "row-1", "v1", 3);
+
+    const exportRes = await source.fetch(post("/migrate-export", { vbucket: 3, table: "t", partitionKeyColumn: "id" }));
+    expect(exportRes.status).toBe(200);
+    const exportBody = (await exportRes.json()) as {
+      rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
+    };
+    expect(exportBody.rows).toHaveLength(1);
+
+    const importRes = await target.fetch(post("/migrate-import", { vbucket: 3, table: "t", rows: exportBody.rows }));
+    expect(importRes.status).toBe(500);
+    const importBody = (await importRes.json()) as { error: { code: string } };
+    expect(importBody.error.code).toBe("MIGRATE_IMPORT_FAILED");
+  });
+});
+
+describe("ShardDO /index-entries-export cursor paging (Milestone 3, Chunk 5)", () => {
+  // Review Tier 3 test-coverage gap: ring evacuation's cursor paging
+  // (afterRowid) was only ever exercised with everything fitting in one page
+  // (catalog.test.ts's evacuation tests use 1-2 entries). Forces a multi-page
+  // walk with limit 1 across 4 entries and confirms the cursor produces every
+  // entry exactly once, in stable rowid order — no duplicates, no gaps.
+  it("pages a multi-entry index by rowid cursor with limit 1 and no duplicates or gaps", async () => {
+    const stub = await freshShard();
+    const rows = [1, 2, 3, 4].map((n) => ({
+      table_name: "events",
+      index_name: "idx_paged",
+      index_key_json: JSON.stringify([`k${n}`]),
+      partition_key: `row-${n}`,
+      source_shard_id: "shard-0",
+      tenant_id: "t1",
+      updated_at: new Date().toISOString(),
+    }));
+    const importRes = await stub.fetch(post("/index-entries-import", { rows }));
+    expect(importRes.status).toBe(200);
+
+    const collected: string[] = [];
+    let afterRowid = 0;
+    for (let guard = 0; guard < 10; guard += 1) {
+      const res = await stub.fetch(post("/index-entries-export", { indexName: "idx_paged", afterRowid, limit: 1 }));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ rowid: number; partition_key: string }> };
+      if (body.rows.length === 0) break;
+      expect(body.rows).toHaveLength(1); // limit respected — one entry per page
+      collected.push(...body.rows.map((r) => r.partition_key));
+      afterRowid = body.rows[body.rows.length - 1].rowid;
+    }
+    expect(collected).toEqual(["row-1", "row-2", "row-3", "row-4"]); // stable order, no dup/gap
+    expect(new Set(collected).size).toBe(collected.length);
+  });
 });
 
 describe("ShardDO row provenance (Milestone 3, Chunk 0)", () => {
