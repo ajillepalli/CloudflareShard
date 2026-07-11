@@ -1921,7 +1921,11 @@ export class CatalogDO extends DurableObject {
         await this.callShard(source, "/purge-mirror-jobs", { vbucket: m.vbucket });
         await this.callShard(target, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
         this.sql.exec(
-          "UPDATE vbucket_map SET migration_status = 'backfilling', cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND target_shard_id = ?",
+          // Re-review item D: reset migration_rows_copied to 0 alongside the
+          // rewind. The target's copy was just wiped, so the next backfill
+          // pass re-copies from scratch; without the reset /migrate-vbucket-status
+          // rowsCopied inflated by a full vbucket's worth on every retry.
+          "UPDATE vbucket_map SET migration_status = 'backfilling', migration_rows_copied = 0, cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND target_shard_id = ?",
           new Date().toISOString(),
           m.vbucket,
           target,

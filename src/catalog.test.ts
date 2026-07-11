@@ -808,8 +808,12 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     // Rewound to 'backfilling' — not left fenced/half-flipped.
     const afterMismatch = (await (
       await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
-    ).json()) as { status: string };
+    ).json()) as { status: string; rowsCopied: number };
     expect(afterMismatch.status).toBe("backfilling");
+    // Re-review item D: the rewind resets rowsCopied to 0 (the target was
+    // wiped and will be re-copied from scratch) — it was seeded at 1 above, so
+    // without the reset it would inflate on every retry.
+    expect(afterMismatch.rowsCopied).toBe(0);
 
     // Target wiped — the mismatched copy is gone, not left behind.
     const targetCount = (await (
