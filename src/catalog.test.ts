@@ -1002,6 +1002,76 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     });
   });
 
+  // Re-review: the reconcile safety valve was dead code — the `continue` after
+  // the max passes was on the inner pass-loop's LAST iteration, so execution
+  // fell straight through to the unconditional source DELETE, wiping entries
+  // the substitute might not have copied. Force non-convergence (stub
+  // copyIndexEntries to keep returning a growing cursor) and assert the source
+  // __cf_indexes rows are NOT deleted.
+  it("ring evacuation does NOT delete the source entries when the reconcile never converges (safety valve)", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_evac_unstable",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      // Move every vbucket off shard-0 so the drain skips phase-1 vbucket
+      // migration and goes straight to phase-2 ring evacuation.
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+    });
+
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    for (const pk of ["row-a", "row-b"]) {
+      await shard0.fetch(
+        new Request("https://shard.internal/index-entries-import", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            rows: [
+              {
+                table_name: "events",
+                index_name: "idx_evac_unstable",
+                index_key_json: JSON.stringify(["alpha"]),
+                partition_key: pk,
+                source_shard_id: "shard-1",
+                tenant_id: "t1",
+                updated_at: new Date().toISOString(),
+              },
+            ],
+          }),
+        }),
+      );
+    }
+
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Override copyIndexEntries on the live instance so every call reports a
+    // strictly higher cursor — the reconcile loop can never see afterRowid ===
+    // before, so it exhausts all passes without converging (reconcileUnstable).
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      let cursor = 0;
+      (instance as unknown as { copyIndexEntries: () => Promise<number> }).copyIndexEntries = async () => {
+        cursor += 1;
+        return cursor;
+      };
+      await instance.alarm();
+    });
+
+    // The ring WAS repointed (that happens before reconcile) — but the source
+    // entries must survive, because the substitute wasn't proven to hold them.
+    await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key", "idx_evac_unstable"),
+      ) as Array<{ partition_key: string }>;
+      expect(rows.map((r) => r.partition_key)).toEqual(["row-a", "row-b"]);
+    });
+  });
+
   it("rejects the drain 409 RING_EVACUATION_NO_CANDIDATE when every active shard is already in the index's ring", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));

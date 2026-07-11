@@ -1366,18 +1366,27 @@ export class CatalogDO extends DurableObject {
       // Reconcile pass: catch any entry that raced onto the draining shard
       // between the initial copy's cursor and the repoint. Converges because
       // no new write targets the draining shard after the repoint.
+      let reconcileUnstable = false;
       for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
         const before = afterRowid;
         afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
         if (afterRowid === before) break; // stable — nothing new copied
         if (pass === RING_EVAC_RECONCILE_MAX_PASSES - 1) {
-          // Pathological churn — leave the source rows in place (unreachable
-          // but not lost) rather than deleting entries the substitute may not
-          // have yet. Documented residual (TODOS.md).
+          // Pathological churn — the reconcile never converged, so the
+          // substitute may still be MISSING entries the draining shard holds.
+          reconcileUnstable = true;
           log("catalog.ring_evacuation_reconcile_unstable", { shardId, indexName: rule.index_name });
           this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos, reconcileUnstable: true });
-          continue;
         }
+      }
+
+      if (reconcileUnstable) {
+        // SKIP the destructive source delete: deleting __cf_indexes rows the
+        // substitute hasn't provably received would lose them. Leave the
+        // source copies in place (the ring is already repointed, so they're
+        // unreachable-but-not-lost) for operator action. Previously the
+        // delete below ran unconditionally — the safety valve was dead code.
+        continue;
       }
 
       // Now delete the source copies — everything present has been copied to
