@@ -116,6 +116,15 @@ const INTERNAL_TABLES = new Set<string>(INTERNAL_TABLE_NAMES);
 // loops use the identical constant (a clamp mismatch would silently drop rows).
 export const MIGRATE_PAGE_SIZE = 500;
 
+/** Escapes a SQL identifier's inner double-quotes for interpolation inside a
+ * quoted identifier (`"..."`). Callers still wrap the result in quotes. Shared
+ * by every place that builds a dynamic table/column reference (review Tier 3
+ * DRY) — all such identifiers are already validated against IDENTIFIER_RE at
+ * registration, this is defence-in-depth. */
+function escapeIdent(name: string): string {
+  return name.replace(/"/g, '""');
+}
+
 /** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
  * to force a rollback — distinguishes "validation succeeded, roll back on
  * purpose" from a genuine SQL execution error. */
@@ -520,8 +529,8 @@ export class ShardDO extends DurableObject {
       return json({ error: "Missing vbucket, table, or partitionKeyColumn" }, 400);
     }
     const limit = Math.min(MIGRATE_PAGE_SIZE, Math.max(1, body.limit ?? MIGRATE_PAGE_SIZE));
-    const safeTable = body.table.replace(/"/g, '""');
-    const safePk = body.partitionKeyColumn.replace(/"/g, '""');
+    const safeTable = escapeIdent(body.table);
+    const safePk = escapeIdent(body.partitionKeyColumn);
 
     let raw: Array<Record<string, unknown>> = [];
     try {
@@ -568,7 +577,7 @@ export class ShardDO extends DurableObject {
     const table = body.table;
     const vbucket = body.vbucket;
     const rows = body.rows;
-    const safeTable = table.replace(/"/g, '""');
+    const safeTable = escapeIdent(table);
     const now = new Date().toISOString();
 
     try {
@@ -576,24 +585,13 @@ export class ShardDO extends DurableObject {
         for (const entry of rows) {
           const columns = Object.keys(entry.row);
           if (columns.length === 0) continue;
-          const columnSql = columns.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+          const columnSql = columns.map((c) => `"${escapeIdent(c)}"`).join(", ");
           const placeholders = columns.map(() => "?").join(", ");
           this.sql.exec(
             `INSERT OR REPLACE INTO "${safeTable}" (${columnSql}) VALUES (${placeholders})`,
             ...columns.map((c) => entry.row[c]),
           );
-          this.sql.exec(
-            `
-            INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (table_name, partition_key) DO UPDATE SET tenant_id = excluded.tenant_id, vbucket = excluded.vbucket, updated_at = excluded.updated_at
-            `,
-            table,
-            entry.partitionKey,
-            entry.tenantId,
-            vbucket,
-            now,
-          );
+          this.upsertRowOwner(table, entry.partitionKey, entry.tenantId, vbucket, now);
         }
       });
     } catch (error) {
@@ -614,8 +612,8 @@ export class ShardDO extends DurableObject {
     table: string,
     partitionKeyColumn: string,
   ): Promise<{ checksum: string; rowCount: number }> {
-    const safeTable = table.replace(/"/g, '""');
-    const safePk = partitionKeyColumn.replace(/"/g, '""');
+    const safeTable = escapeIdent(table);
+    const safePk = escapeIdent(partitionKeyColumn);
 
     // Review Tier 2 #9: hash INCREMENTALLY — sha256 of each 500-row page's
     // (partition_key, canonical row JSON) concatenation, then sha256 of the
@@ -746,8 +744,8 @@ export class ShardDO extends DurableObject {
     const tables = body.tables;
     this.ctx.storage.transactionSync(() => {
       for (const t of tables) {
-        const safeTable = t.table.replace(/"/g, '""');
-        const safePk = t.partitionKeyColumn.replace(/"/g, '""');
+        const safeTable = escapeIdent(t.table);
+        const safePk = escapeIdent(t.partitionKeyColumn);
         try {
           this.sql.exec(
             `DELETE FROM "${safeTable}" WHERE "${safePk}" IN (SELECT partition_key FROM __cf_row_owners WHERE table_name = ? AND vbucket = ?)`,
@@ -857,8 +855,8 @@ export class ShardDO extends DurableObject {
     }
     let total = 0;
     for (const t of body.tables) {
-      const safeTable = t.table.replace(/"/g, '""');
-      const safePk = t.partitionKeyColumn.replace(/"/g, '""');
+      const safeTable = escapeIdent(t.table);
+      const safePk = escapeIdent(t.partitionKeyColumn);
       try {
         const row = this.one<{ n: number }>(
           `
@@ -1190,7 +1188,7 @@ export class ShardDO extends DurableObject {
     const counts: Array<{ table: string; rowCount: number }> = [];
     for (const t of tables) {
       if (INTERNAL_TABLES.has(t.name)) continue;
-      const safeName = t.name.replace(/"/g, '""');
+      const safeName = escapeIdent(t.name);
       const result = this.one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${safeName}"`);
       counts.push({ table: t.name, rowCount: result?.n ?? 0 });
     }
@@ -1430,6 +1428,16 @@ export class ShardDO extends DurableObject {
       this.sql.exec("DELETE FROM __cf_row_owners WHERE table_name = ? AND partition_key = ?", table, partitionKey);
       return;
     }
+    this.upsertRowOwner(table, partitionKey, tenantId, vbucket, new Date().toISOString());
+  }
+
+  /** Shared __cf_row_owners upsert (review Tier 3 DRY) — insert-or-update a
+   * row's provenance entry. Used both from writeOrDeleteProvenance (the
+   * single-row path called inside the same transactionSync as the base
+   * mutation) and handleMigrateImport (the batch-import path applying a
+   * whole exported page). Identical ON CONFLICT semantics in both callers:
+   * the latest write always wins. */
+  private upsertRowOwner(table: string, partitionKey: string, tenantId: string, vbucket: number, updatedAt: string): void {
     this.sql.exec(
       `
       INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at)
@@ -1440,7 +1448,7 @@ export class ShardDO extends DurableObject {
       partitionKey,
       tenantId,
       vbucket,
-      new Date().toISOString(),
+      updatedAt,
     );
   }
 

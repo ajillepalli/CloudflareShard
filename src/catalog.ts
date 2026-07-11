@@ -1307,7 +1307,6 @@ export class CatalogDO extends DurableObject {
     const indexRules = this.many<{ index_name: string; placement_ring_json: string }>(
       "SELECT index_name, placement_ring_json FROM index_rules ORDER BY index_name ASC",
     );
-    let remaining = false;
     const ringsToEvacuate = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(shardId));
     const clusterActive = ringsToEvacuate.length > 0 ? await this.clusterActiveShards(shardId) : [];
     for (const rule of ringsToEvacuate) {
@@ -1397,7 +1396,9 @@ export class CatalogDO extends DurableObject {
 
       this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos });
     }
-    return remaining;
+    // Every ring either fully evacuated or (no-candidate / reconcile-unstable)
+    // left for operator action — nothing here needs another tick.
+    return false;
   }
 
   /** Copies one index's __cf_indexes entries from `fromShard` to `toShard`
