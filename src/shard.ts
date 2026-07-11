@@ -1017,6 +1017,15 @@ export class ShardDO extends DurableObject {
         PRIMARY KEY (table_name, partition_key)
       )
     `);
+    // Review Tier 2 #11: migrate-export / migrate-checksum / delete-vbucket-rows
+    // / vbucket-tables all filter by (vbucket, table_name) and page by
+    // partition_key. Without this index each of those is a full table scan of
+    // __cf_row_owners; the composite index makes them range scans. The PK is
+    // (table_name, partition_key), so a vbucket-scoped query has no covering
+    // index otherwise.
+    this.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_cf_row_owners_vb ON __cf_row_owners (vbucket, table_name, partition_key)",
+    );
 
     // Milestone 2 (Index Service). Lives on a shard chosen by hashing
     // (table, indexName, indexKeyJson) — independent of the base row's own

@@ -1108,6 +1108,27 @@ describe("ShardDO migration fence and export/import (Milestone 3, Chunk 4)", () 
     });
   });
 
+  // Review Tier 2 #11: __cf_row_owners must carry the (vbucket, table_name,
+  // partition_key) index so migrate-export/checksum/delete/vbucket-tables are
+  // range scans, not full table scans. Guard that it exists and the planner
+  // uses it for a vbucket-scoped lookup.
+  it("__cf_row_owners has the (vbucket, table_name, partition_key) index and a vbucket-scoped query uses it", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `s-${crypto.randomUUID()}`, isMutation: true }),
+    );
+    await runInDurableObject(stub, async (_i: ShardDO, state: DurableObjectState) => {
+      const idx = Array.from(
+        state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_cf_row_owners_vb'"),
+      );
+      expect(idx).toHaveLength(1);
+      const plan = Array.from(
+        state.storage.sql.exec("EXPLAIN QUERY PLAN SELECT partition_key FROM __cf_row_owners WHERE vbucket = 5 AND table_name = 't'"),
+      ) as Array<{ detail: string }>;
+      expect(plan.some((r) => r.detail.includes("idx_cf_row_owners_vb"))).toBe(true);
+    });
+  });
+
   // Review Tier 2 #9: the checksum is computed incrementally (per-page sha256,
   // then sha256 of the page digests) so it stays O(page) memory on a large
   // vbucket. A multi-page vbucket must still produce IDENTICAL checksums on
