@@ -1906,11 +1906,16 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   // index is exhausted. rawScanCap bounds total work against a pathologically
   // stale index (e.g. after a burst of deletes whose async cleanup hasn't
   // caught up yet) rather than scanning without bound.
+  const tenantCatalogShardId = catalogShardIdForTenant(env, body.tenantId);
   const rows: Array<Record<string, unknown>> = [];
   const rawScanCap = limit * 5;
   let offset = 0;
   while (rows.length < limit && offset < rawScanCap) {
-    const batchLimit = Math.min(limit, rawScanCap - offset);
+    // Review Tier 2 #12: fetch (and therefore hydrate) at most the number of
+    // rows still needed, not a full `limit` every batch — the whole batch is
+    // hydrated, so offset advances by exactly what was fetched (no skip).
+    const remaining = limit - rows.length;
+    const batchLimit = Math.min(remaining, rawScanCap - offset);
     const indexRes = await routeToShard(env, indexShardId, "/execute", {
       sql: "SELECT partition_key, tenant_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ? OFFSET ?",
       params: [body.table, body.indexName, indexKeyJson, batchLimit, offset],
@@ -1924,37 +1929,44 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     const matches = indexBody.rows ?? [];
     if (matches.length === 0) break; // index exhausted
 
-    // Eng-review perf fix: each match's hydrate read is independent of every
-    // other match's in this batch (different partition keys, potentially
-    // different shards) — resolve the whole batch concurrently instead of
-    // one round trip at a time. Promise.all preserves `matches`' order (the
-    // ORDER BY partition_key ASC from the query above), so the sequential
-    // push-until-limit loop below still yields a stable, deterministic
-    // result across repeated calls.
-    //
-    // Milestone 3, Chunk 2: re-routes to the base row's CURRENT shard at
-    // read time via the entry's recorded tenant_id (vbucket = hashKey
-    // (tenant_id:table:partition_key) % total_vbuckets -> vbucket_map ->
-    // shard, computed by CatalogDO's existing /route) — rather than
-    // following the entry's static source_shard_id snapshot, which goes
-    // stale the instant the base row migrates to a different shard. A
-    // /route failure (including an auth mismatch, if tenant_id somehow
-    // diverges from the querying tenant) is treated the same as an
-    // unreachable shard: skip this match rather than fail the whole query.
-    const hydrated = await Promise.all(
-      matches.map(async (match): Promise<Record<string, unknown> | null> => {
-        const rowCatalogShardId = catalogShardIdForTenant(env, match.tenant_id);
-        const rerouteRes = await routeToCatalog(
-          env,
-          rowCatalogShardId,
-          "/route",
-          { table: body.table, tenantId: match.tenant_id, partitionKey: match.partition_key },
-          request.headers.get("authorization") ?? undefined,
-        );
-        if (!rerouteRes.ok) return null; // couldn't resolve the base row's current shard — skip
-        const rerouteBody = (await rerouteRes.json()) as { shardId: string };
+    // Tenant isolation: only the querying tenant's own entries are hydratable
+    // (an index shard may hold entries for other tenants that share the
+    // indexed value). Filtering here replaces the per-entry /route auth check
+    // the previous implementation relied on.
+    const ownMatches = matches.filter((m) => m.tenant_id === body.tenantId);
 
-        const rowRes = await routeToShard(env, rerouteBody.shardId, "/execute", {
+    // Review Tier 2 #12: resolve every match's CURRENT shard in ONE
+    // tenant-authenticated /route-batch call, instead of one /route
+    // subrequest per entry serialized through this CatalogDO. Milestone 3,
+    // Chunk 2's re-routing (a base row that migrated is found on its new
+    // shard) is preserved — /route-batch reads the live vbucket_map.
+    const shardByPk = new Map<string, string>();
+    if (ownMatches.length > 0) {
+      const batchRes = await routeToCatalog(
+        env,
+        tenantCatalogShardId,
+        "/route-batch",
+        { table: body.table, tenantId: body.tenantId, partitionKeys: ownMatches.map((m) => m.partition_key) },
+        request.headers.get("authorization") ?? undefined,
+      );
+      if (!batchRes.ok) {
+        return new Response(batchRes.body, { status: batchRes.status, headers: batchRes.headers });
+      }
+      const batchBody = (await batchRes.json()) as { routes: Array<{ partitionKey: string; shardId: string | null }> };
+      for (const r of batchBody.routes) {
+        if (r.shardId) shardByPk.set(r.partitionKey, r.shardId);
+      }
+    }
+
+    // Each match's hydrate read is independent — resolve the whole batch
+    // concurrently. Promise.all preserves `ownMatches`' order (ORDER BY
+    // partition_key ASC), so the push-until-limit loop below stays stable.
+    const hydrated = await Promise.all(
+      ownMatches.map(async (match): Promise<Record<string, unknown> | null> => {
+        const shardId = shardByPk.get(match.partition_key);
+        if (!shardId) return null; // no mapping (shouldn't happen) — skip
+
+        const rowRes = await routeToShard(env, shardId, "/execute", {
           sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
           params: [match.partition_key],
           requestId: `index-query-hydrate-${crypto.randomUUID()}`,
@@ -1967,8 +1979,6 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
 
         // Staleness re-check (Chunk 2's index maintenance is async): only
         // surface this row if it still actually matches the queried tuple.
-        // Excludes a stale entry silently, exactly as if it didn't exist yet
-        // — never returns a row that doesn't match what the caller asked for.
         const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
         return stillMatches ? row : null;
       }),

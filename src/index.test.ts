@@ -1824,6 +1824,55 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("INDEX_BUILDING");
   });
+
+  // Review Tier 2 #12: hydration resolves all matched entries' shards in one
+  // tenant-authenticated /route-batch call (not one /route per entry).
+  // Multiple matches all hydrate; an entry belonging to another tenant that
+  // shares the indexed value is NOT returned (isolation, previously enforced
+  // by the per-entry /route auth check).
+  it("returns all of one tenant's matching rows in a single query and never another tenant's row sharing the indexed value", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("idx_iso_evt");
+    await post("/admin/create-index", { indexName: "idx_iso_by_v", table: "idx_iso_evt", columns: ["v"] }, AUTH());
+
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    // A different tenant on the SAME catalog shard (so its rows share the
+    // vbucket space), also writing the shared indexed value.
+    let tenantB = "";
+    for (let i = 0; ; i += 1) {
+      const cand = `iso-b-${i}`;
+      if (hashKey(cand) % 4 === 0) {
+        tenantB = cand;
+        break;
+      }
+    }
+    const tokenB = await registerTenant(tenantB);
+
+    // Tenant A: three rows with v='shared'. Tenant B: one row with v='shared'.
+    for (const pk of ["a1", "a2", "a3"]) {
+      const r = await post("/v1/mutate", { op: "insert", table: "idx_iso_evt", tenantId: tenantA, partitionKey: pk, values: { v: "shared" } }, tokenA);
+      expect(r.status).toBe(200);
+    }
+    const rb = await post("/v1/mutate", { op: "insert", table: "idx_iso_evt", tenantId: tenantB, partitionKey: "b1", values: { v: "shared" } }, tokenB);
+    expect(rb.status).toBe(200);
+
+    // Let async index maintenance settle, then query as A.
+    let bodyA: { rows: Array<{ id: string }> } = { rows: [] };
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const res = await post("/v1/index-query", { table: "idx_iso_evt", indexName: "idx_iso_by_v", tenantId: tenantA, values: { v: "shared" }, limit: 50 }, tokenA);
+      expect(res.status).toBe(200);
+      bodyA = (await res.json()) as { rows: Array<{ id: string }> };
+      if (bodyA.rows.length === 3) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(bodyA.rows.map((r) => r.id).sort()).toEqual(["a1", "a2", "a3"]); // all of A's, none of B's
+
+    // And B sees only its own.
+    const resB = await post("/v1/index-query", { table: "idx_iso_evt", indexName: "idx_iso_by_v", tenantId: tenantB, values: { v: "shared" }, limit: 50 }, tokenB);
+    const bodyB = (await resB.json()) as { rows: Array<{ id: string }> };
+    expect(bodyB.rows.map((r) => r.id)).toEqual(["b1"]);
+  });
 });
 
 describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", () => {

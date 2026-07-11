@@ -83,6 +83,7 @@ export class CatalogDO extends DurableObject {
       "/init": this.handleInit.bind(this),
       "/register-table": this.handleRegisterTable.bind(this),
       "/route": this.handleRoute.bind(this),
+      "/route-batch": this.handleRouteBatch.bind(this),
       "/list-shards": this.handleListShards.bind(this),
       "/status": this.handleStatus.bind(this),
       "/list-tables": this.handleListTables.bind(this),
@@ -962,6 +963,35 @@ export class CatalogDO extends DurableObject {
         ? { migrationStatus: mapped.migration_status, targetShardId: mapped.target_shard_id }
         : {}),
     });
+  }
+
+  /** Review Tier 2 #12: resolve MANY (tenant, table, partitionKey) tuples to
+   * their current shards in ONE tenant-authenticated call — /v1/index-query
+   * hydration used to make one /route subrequest per matched entry (up to
+   * 100+ per query, all serialized through this one CatalogDO). Auth is
+   * checked once for the whole batch (all tuples share the caller's tenant).
+   * Only the shard mapping is returned (no per-tuple index/metadata payload),
+   * since the caller already resolved the index. */
+  private async handleRouteBatch(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string; tenantId?: string; partitionKeys?: string[] };
+    if (!body.table || !body.tenantId || !body.partitionKeys) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing table, tenantId, or partitionKeys." } }, 400);
+    }
+    const authError = await this.checkTenantAuth(body.tenantId, request);
+    if (authError) return authError;
+
+    const config = this.one<{ total_vbuckets: number }>("SELECT total_vbuckets FROM cluster_config WHERE singleton = 1");
+    if (!config) {
+      return json({ error: "Cluster not initialized. Call /admin/init first." }, 400);
+    }
+    const vbucketToShard = new Map(
+      this.many<{ vbucket: number; shard_id: string }>("SELECT vbucket, shard_id FROM vbucket_map").map((r) => [r.vbucket, r.shard_id]),
+    );
+    const routes = body.partitionKeys.map((pk) => {
+      const vbucket = hashKey(`${body.tenantId}:${body.table}:${pk}`) % config.total_vbuckets;
+      return { partitionKey: pk, shardId: vbucketToShard.get(vbucket) ?? null };
+    });
+    return json({ routes });
   }
 
   private async handleListShards(): Promise<Response> {
