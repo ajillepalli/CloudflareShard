@@ -617,7 +617,14 @@ export class ShardDO extends DurableObject {
     const safeTable = table.replace(/"/g, '""');
     const safePk = partitionKeyColumn.replace(/"/g, '""');
 
-    const parts: string[] = [];
+    // Review Tier 2 #9: hash INCREMENTALLY — sha256 of each 500-row page's
+    // (partition_key, canonical row JSON) concatenation, then sha256 of the
+    // concatenated page digests. Memory stays O(page) instead of O(vbucket),
+    // which previously accumulated every row's JSON in one array on both
+    // shards, per cutover attempt, in a 128MB DO. Both shards page identically
+    // (same MIGRATE_PAGE_SIZE, same ORDER BY), so the page boundaries — and
+    // therefore the digest sequence — are deterministic and comparable.
+    const pageDigests: string[] = [];
     let rowCount = 0;
     let afterPk = "";
     for (;;) {
@@ -643,16 +650,18 @@ export class ShardDO extends DurableObject {
         break;
       }
       if (page.length === 0) break;
+      let pageParts = "";
       for (const r of page) {
         const { __cf_export_pk, ...rest } = r;
-        parts.push(`${String(__cf_export_pk)}${this.canonicalRowJson(rest)}`);
+        pageParts += `${String(__cf_export_pk)}${this.canonicalRowJson(rest)}`;
         rowCount += 1;
       }
+      pageDigests.push(await this.sha256HexOf(pageParts));
       afterPk = String(page[page.length - 1].__cf_export_pk);
       if (page.length < MIGRATE_PAGE_SIZE) break;
     }
 
-    const checksum = await this.sha256HexOf(parts.join(""));
+    const checksum = await this.sha256HexOf(pageDigests.join(""));
     return { checksum, rowCount };
   }
 
