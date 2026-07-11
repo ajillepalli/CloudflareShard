@@ -543,6 +543,41 @@ describe("Worker tenant authorization", () => {
       expect(code, `${sql} code`).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
     }
   });
+
+  // Codex review P1: the guard is reframed to an ALLOWLIST — a /v1/sql
+  // mutation's write target must equal the caller's declared body.table. The
+  // exhaustive parsing matrix (spaced-qualifier 4th bypass, quoting, etc.)
+  // lives as a pure unit test in sql-safety.test.ts (mutationWriteTarget) to
+  // avoid adding gateway round trips to this already-long file; here we only
+  // verify the worker gate is wired: the 4th bypass and a cross-table write
+  // are rejected with the right codes, and a legit own-table write succeeds.
+  it("allowlist gate: rejects the spaced-qualifier internal bypass and a cross-table write, allows an own-table write", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+
+    const internal = await post(
+      "/v1/sql",
+      { sql: 'DELETE FROM main . "__cf_fenced_vbuckets"', table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(internal.status).toBe(403);
+    expect(((await internal.json()) as { error: { code: string } }).error.code).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
+
+    const crossTable = await post(
+      "/v1/sql",
+      { sql: "DELETE FROM other_table WHERE id = 1", table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(crossTable.status).toBe(403);
+    expect(((await crossTable.json()) as { error: { code: string } }).error.code).toBe("WRITE_TARGET_TABLE_MISMATCH");
+
+    const ok = await post(
+      "/v1/sql",
+      { sql: "UPDATE events SET v = ? WHERE id = ?", params: ["v", `allow-${crypto.randomUUID()}`], table: "events", tenantId: "t1", partitionKey: "p1" },
+      token,
+    );
+    expect(ok.status).toBe(200);
+  });
 });
 
 describe("Worker /v1/mutate", () => {
@@ -2842,6 +2877,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     );
     expect(sourceLeftovers).toHaveLength(0);
   });
+
 
   it("criterion 2: >=100 writes issued concurrently with the migration all land — post-cutover checksums pass, every requestId is on the target exactly once, and replays return the stored result", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
