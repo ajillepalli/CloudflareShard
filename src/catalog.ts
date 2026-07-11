@@ -35,10 +35,15 @@ const ADMIN_GATED_ROUTES = new Set([
 ]);
 
 // Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
-// loop — each tick advances every in-flight migration one step (a full
-// backfill pass, or one cutover attempt that may be waiting on the mirror
+// loop — each tick advances every in-flight migration one step (a bounded
+// backfill slice, or one cutover attempt that may be waiting on the mirror
 // queue to drain).
 const MIGRATION_TICK_MS = 250;
+// Review Tier 2 #8: cap the backfill work per tick and back off the alarm
+// re-arm when a tick throws, so a large migration resumes from its cursor
+// rather than restarting-and-throwing at 4Hz forever.
+const MIGRATION_BACKFILL_PAGES_PER_TICK = 8;
+const MIGRATION_TICK_MAX_MS = 30000;
 
 type MigrationRow = {
   vbucket: number;
@@ -62,6 +67,9 @@ export class CatalogDO extends DurableObject {
    * checksum mismatch and wipes just-migrated data. One tick at a time per
    * instance; a tick that finds the latch held just reschedules. */
   private migrationTickInFlight = false;
+  /** Review Tier 2 #8: consecutive throwing orchestration ticks, for the
+   * alarm re-arm backoff. Reset on a clean tick or when nothing's active. */
+  private migrationTickFailureStreak = 0;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -170,6 +178,12 @@ export class CatalogDO extends DurableObject {
     // vbucket at a time is an invariant (409 MIGRATION_IN_PROGRESS).
     this.ensureColumn("vbucket_map", "migration_rows_copied", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("vbucket_map", "migration_started_at", "TEXT");
+    // Review Tier 2 #8: a persisted backfill cursor (current table + last
+    // partition key copied) so a large vbucket's backfill resumes across
+    // alarm ticks instead of restarting from page zero and re-exceeding the
+    // per-invocation subrequest cap every 250ms forever.
+    this.ensureColumn("vbucket_map", "backfill_table", "TEXT");
+    this.ensureColumn("vbucket_map", "backfill_after_pk", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS table_rules (
@@ -1481,7 +1495,8 @@ export class CatalogDO extends DurableObject {
     this.sql.exec(
       `
       UPDATE vbucket_map
-      SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?, updated_at = ?
+      SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?,
+          backfill_table = NULL, backfill_after_pk = NULL, updated_at = ?
       WHERE vbucket = ?
       `,
       targetShard,
@@ -1513,6 +1528,7 @@ export class CatalogDO extends DurableObject {
     }
     this.migrationTickInFlight = true;
     let anyActive = false;
+    let anyThrew = false;
     try {
       const migrating = this.many<MigrationRow>(
         // Review Tier 1 #4: the alarm's migration loop drives only active
@@ -1527,13 +1543,15 @@ export class CatalogDO extends DurableObject {
         } catch (error) {
           // Leave the migration in its current state and retry next tick —
           // every step is idempotent (INSERT OR REPLACE imports,
-          // re-assertable fence, re-comparable checksums).
+          // re-assertable fence, re-comparable checksums; the backfill cursor
+          // resumes rather than restarts, review Tier 2 #8).
           log("catalog.migration_tick_failed", {
             vbucket: m.vbucket,
             status: m.migration_status,
             message: error instanceof Error ? error.message : String(error),
           });
           anyActive = true;
+          anyThrew = true;
         }
       }
 
@@ -1550,13 +1568,28 @@ export class CatalogDO extends DurableObject {
             message: error instanceof Error ? error.message : String(error),
           });
           anyActive = true;
+          anyThrew = true;
         }
       }
     } finally {
       this.migrationTickInFlight = false;
     }
     if (anyActive) {
-      await this.ctx.storage.setAlarm(Date.now() + MIGRATION_TICK_MS);
+      // Review Tier 2 #8: exponential backoff on a throwing tick (e.g. a
+      // shard transiently over its subrequest budget) instead of hammering
+      // at the 250ms base cadence; reset the streak on a clean tick.
+      if (anyThrew) {
+        this.migrationTickFailureStreak += 1;
+      } else {
+        this.migrationTickFailureStreak = 0;
+      }
+      const delay =
+        this.migrationTickFailureStreak === 0
+          ? MIGRATION_TICK_MS
+          : Math.min(MIGRATION_TICK_MAX_MS, MIGRATION_TICK_MS * 2 ** this.migrationTickFailureStreak);
+      await this.ctx.storage.setAlarm(Date.now() + delay);
+    } else {
+      this.migrationTickFailureStreak = 0;
     }
   }
 
@@ -1587,19 +1620,38 @@ export class CatalogDO extends DurableObject {
     if (m.migration_status === "backfilling") {
       // Only tables that actually own rows of this vbucket on the source
       // need exporting — every other registered table has nothing to page.
+      // Ordered by table_name (migratableTables orders) so the persisted
+      // cursor's table position is stable across ticks.
       const vbTablesRes = await this.callShard(source, "/vbucket-tables", { vbucket: m.vbucket });
       if (!vbTablesRes.ok) throw new Error(`vbucket-tables failed on ${source}: ${vbTablesRes.status}`);
       const vbTables = new Set(((await vbTablesRes.json()) as { tables: string[] }).tables);
       const exportTables = tables.filter((t) => vbTables.has(t.table));
 
+      // Review Tier 2 #8: resume from the persisted cursor and copy at most
+      // MIGRATION_BACKFILL_PAGES_PER_TICK pages this tick, so a large vbucket
+      // doesn't exceed the DO's per-invocation subrequest cap (which would
+      // throw and restart from page zero every tick forever).
+      const cursor = this.one<{ backfill_table: string | null; backfill_after_pk: string | null }>(
+        "SELECT backfill_table, backfill_after_pk FROM vbucket_map WHERE vbucket = ?",
+        m.vbucket,
+      );
+      let idx = cursor?.backfill_table ? exportTables.findIndex((t) => t.table === cursor.backfill_table) : 0;
+      let afterPk = "";
+      if (idx >= 0 && cursor?.backfill_table) {
+        afterPk = cursor.backfill_after_pk ?? "";
+      } else {
+        idx = 0; // cursor's table no longer present (e.g. dropped) — restart
+      }
+
       let copied = 0;
-      for (const t of exportTables) {
-        // A shard created mid-life (e.g. a split target) has none of the
-        // tables that were fanned out at /admin/create-table time — apply
-        // the captured schema first, under the same stable requestId
-        // create-table itself uses per (table, shard), so it dedupes with
-        // any earlier application instead of double-executing.
-        if (t.schemaSql) {
+      let pages = 0;
+      while (idx < exportTables.length && pages < MIGRATION_BACKFILL_PAGES_PER_TICK) {
+        const t = exportTables[idx];
+        // Provision the table on a shard created mid-life (e.g. a split
+        // target) before the first page of this table. Stable requestId
+        // (create-table-<table>-<shard>) so re-applying it on a resumed tick
+        // dedupes rather than double-executes.
+        if (afterPk === "" && t.schemaSql) {
           const schemaRes = await this.callShard(target, "/execute", {
             sql: t.schemaSql,
             requestId: `create-table-${t.table}-${target}`,
@@ -1607,29 +1659,53 @@ export class CatalogDO extends DurableObject {
           });
           if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
         }
-        let afterPk = "";
-        for (;;) {
-          const exportRes = await this.callShard(source, "/migrate-export", {
-            vbucket: m.vbucket,
-            table: t.table,
-            partitionKeyColumn: t.partitionKeyColumn,
-            afterPartitionKey: afterPk,
-            limit: 500,
-          });
-          if (!exportRes.ok) throw new Error(`migrate-export failed on ${source} for ${t.table}: ${exportRes.status}`);
-          const exportBody = (await exportRes.json()) as {
-            rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
-          };
-          const rows = exportBody.rows;
-          if (rows.length === 0) break;
+        const exportRes = await this.callShard(source, "/migrate-export", {
+          vbucket: m.vbucket,
+          table: t.table,
+          partitionKeyColumn: t.partitionKeyColumn,
+          afterPartitionKey: afterPk,
+          limit: MIGRATE_PAGE_SIZE,
+        });
+        if (!exportRes.ok) throw new Error(`migrate-export failed on ${source} for ${t.table}: ${exportRes.status}`);
+        const rows = ((await exportRes.json()) as {
+          rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
+        }).rows;
+        pages += 1;
+        if (rows.length > 0) {
           const importRes = await this.callShard(target, "/migrate-import", { vbucket: m.vbucket, table: t.table, rows });
           if (!importRes.ok) throw new Error(`migrate-import failed on ${target} for ${t.table}: ${importRes.status}`);
           copied += rows.length;
           afterPk = rows[rows.length - 1].partitionKey;
-          if (rows.length < 500) break;
+        }
+        if (rows.length < MIGRATE_PAGE_SIZE) {
+          idx += 1; // this table is exhausted — advance to the next
+          afterPk = "";
         }
       }
-      this.sql.exec("UPDATE vbucket_map SET migration_rows_copied = migration_rows_copied + ? WHERE vbucket = ?", copied, m.vbucket);
+
+      // Persist progress. Conditional on the row still being THIS migration —
+      // an abort landing during the awaits above must not have its cursor
+      // resurrected.
+      if (idx < exportTables.length) {
+        // More to copy — save the cursor and come back next tick.
+        this.sql.exec(
+          "UPDATE vbucket_map SET migration_rows_copied = migration_rows_copied + ?, backfill_table = ?, backfill_after_pk = ?, updated_at = ? WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+          copied,
+          exportTables[idx].table,
+          afterPk,
+          new Date().toISOString(),
+          m.vbucket,
+          target,
+        );
+        return true;
+      }
+      // Fully backfilled — clear the cursor and proceed to cutover.
+      this.sql.exec(
+        "UPDATE vbucket_map SET migration_rows_copied = migration_rows_copied + ?, backfill_table = NULL, backfill_after_pk = NULL WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+        copied,
+        m.vbucket,
+        target,
+      );
 
       // Cutover step 1: status first (spec's stated order), then the fence,
       // synchronously in the same tick. A crash between the two writes is
@@ -1887,7 +1963,7 @@ export class CatalogDO extends DurableObject {
 
       // Cleanup fully succeeded — only now clear to 'none'.
       this.sql.exec(
-        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, updated_at = ? WHERE vbucket = ?",
+        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, backfill_table = NULL, backfill_after_pk = NULL, updated_at = ? WHERE vbucket = ?",
         new Date().toISOString(),
         body.vbucket,
       );

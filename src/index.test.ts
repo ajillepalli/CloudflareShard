@@ -2551,6 +2551,95 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     await purgeUnattributedRows();
   }, 30000);
 
+  // Review Tier 2 #8: a backfill that needs more rows than one tick's page
+  // cap (MIGRATION_BACKFILL_PAGES_PER_TICK * MIGRATE_PAGE_SIZE = 8*500=4000)
+  // must resume from its persisted cursor across ticks — monotonic rowsCopied
+  // — instead of restarting from page zero and re-exceeding the subrequest
+  // cap every tick forever.
+  it("a large backfill spans multiple ticks, resuming from its persisted cursor (monotonic rowsCopied, no restart)", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_big_evt");
+
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const vbucket = 0;
+    const tenantId = "big-tenant";
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+
+    // Bulk-seed 4500 rows + provenance (all tagged vbucket 0) directly on the
+    // source shard — two recursive-CTE statements, cheap despite the count.
+    const N = 4500;
+    const bulk = async (sql: string) => {
+      const res = await env.SHARD.get(env.SHARD.idFromName(sourceShardId)).fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sql, requestId: `bulk-${crypto.randomUUID()}`, isMutation: true }),
+        }),
+      );
+      expect(res.status).toBe(200);
+    };
+    await bulk(
+      `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${N}) INSERT INTO m4_big_evt (id, v) SELECT printf('k%06d', n), 'x' FROM seq`,
+    );
+    await bulk(
+      `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${N}) INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at) SELECT 'm4_big_evt', printf('k%06d', n), '${tenantId}', ${vbucket}, '2026-01-01T00:00:00.000Z' FROM seq`,
+    );
+
+    const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
+    expect(migrateRes.status).toBe(200);
+
+    // Tick 1: copies exactly one page-cap's worth (4000), stays 'backfilling'
+    // with a persisted cursor — does NOT reach cutover.
+    await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const afterTick1 = (await (
+      await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
+    ).json()) as { status: string; rowsCopied: number };
+    // Still backfilling (page cap hit — didn't reach cutover), with a
+    // persisted cursor. The exact count depends on whether any other table
+    // also has vbucket-0 rows (page accounting), so assert the invariants:
+    // capped (< N), meaningful progress, cursor set.
+    expect(afterTick1.status).toBe("backfilling");
+    expect(afterTick1.rowsCopied).toBeGreaterThan(3000);
+    expect(afterTick1.rowsCopied).toBeLessThan(N);
+    const cursor1 = await runInDurableObject(catalogStub, async (_i: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT backfill_table, backfill_after_pk FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{
+        backfill_table: string | null;
+        backfill_after_pk: string | null;
+      }>;
+      return rows[0];
+    });
+    expect(cursor1.backfill_table).not.toBeNull(); // cursor persisted for resume
+
+    // Tick 2: resumes from the cursor — rowsCopied is monotonic (did NOT
+    // restart from zero) and it moves past backfilling.
+    await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const afterTick2 = (await (
+      await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
+    ).json()) as { status: string; rowsCopied: number };
+    expect(afterTick2.rowsCopied).toBeGreaterThan(afterTick1.rowsCopied);
+
+    // Drive to completion and confirm all 4500 rows landed on the target.
+    await driveMigrationToCompletion(vbucket).catch(() => undefined);
+    const targetCount = (await (
+      await env.SHARD.get(env.SHARD.idFromName(targetShardId)).fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sql: "SELECT COUNT(*) AS n FROM m4_big_evt", requestId: "cnt", isMutation: false }),
+        }),
+      )
+    ).json()) as { rows: Array<{ n: number }> };
+    expect(targetCount.rows[0].n).toBe(N);
+  }, 60000);
+
   it("criterion 1: a row written before migration is readable via /v1/sql with the same partitionKey after its vbucket migrates, and the source copy is gone", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
     await createIndexTestTable("m4_happy_evt");
