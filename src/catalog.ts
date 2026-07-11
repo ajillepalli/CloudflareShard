@@ -3,7 +3,13 @@ import { json } from "./http";
 import { hashKey, pickRingSubstitute } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
+import { MIGRATE_PAGE_SIZE } from "./shard";
 import { IDENTIFIER_RE, UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
+
+// Review Tier 1 #6: how many reconcile passes ring evacuation makes to catch
+// entries that raced onto the draining shard after the ring repoint before
+// giving up (leaving them in place, unreachable-but-not-lost).
+const RING_EVAC_RECONCILE_MAX_PASSES = 10;
 
 const ADMIN_GATED_ROUTES = new Set([
   "/status",
@@ -1247,20 +1253,18 @@ export class CatalogDO extends DurableObject {
         continue;
       }
 
-      // Copy this index's entries from the draining shard to the substitute
-      // BEFORE repointing the ring — a reader mid-window still resolves
-      // against the draining shard, which still has everything.
-      let afterRowid = 0;
-      for (;;) {
-        const exportRes = await this.callShard(shardId, "/index-entries-export", { indexName: rule.index_name, afterRowid, limit: 500 });
-        if (!exportRes.ok) throw new Error(`index-entries-export failed on ${shardId}: ${exportRes.status}`);
-        const rows = ((await exportRes.json()) as { rows: Array<{ rowid: number }> }).rows;
-        if (rows.length === 0) break;
-        const importRes = await this.callShard(substitute, "/index-entries-import", { rows });
-        if (!importRes.ok) throw new Error(`index-entries-import failed on ${substitute}: ${importRes.status}`);
-        afterRowid = rows[rows.length - 1].rowid;
-        if (rows.length < 500) break;
-      }
+      // Review Tier 1 #6: an index write racing this evacuation must not be
+      // silently lost. Ordering: (1) copy the draining shard's current
+      // entries to the substitute (so a reader keeps seeing every entry —
+      // the draining shard still has them, no read gap yet); (2) repoint the
+      // ring, so from here every NEW /route resolves this index to the
+      // substitute and no new write targets the draining shard; (3)
+      // RECONCILE — re-copy any entry that landed on the draining shard
+      // during the awaits above (a write whose /route resolved with the old
+      // ring), looping by ascending rowid until a pass finds nothing new;
+      // (4) only then delete the source copies. Because racing writes stop
+      // arriving after the repoint, the reconcile converges.
+      let afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, 0);
 
       // Substitute at the SAME ring position — every other entry's
       // placement is untouched.
@@ -1287,7 +1291,25 @@ export class CatalogDO extends DurableObject {
         if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
       }
 
-      // Now delete the source copies.
+      // Reconcile pass: catch any entry that raced onto the draining shard
+      // between the initial copy's cursor and the repoint. Converges because
+      // no new write targets the draining shard after the repoint.
+      for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
+        const before = afterRowid;
+        afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
+        if (afterRowid === before) break; // stable — nothing new copied
+        if (pass === RING_EVAC_RECONCILE_MAX_PASSES - 1) {
+          // Pathological churn — leave the source rows in place (unreachable
+          // but not lost) rather than deleting entries the substitute may not
+          // have yet. Documented residual (TODOS.md).
+          log("catalog.ring_evacuation_reconcile_unstable", { shardId, indexName: rule.index_name });
+          this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos, reconcileUnstable: true });
+          continue;
+        }
+      }
+
+      // Now delete the source copies — everything present has been copied to
+      // the substitute, and no new write can arrive (ring repointed).
       const deleteRes = await this.callShard(shardId, "/execute", {
         sql: "DELETE FROM __cf_indexes WHERE index_name = ?",
         params: [rule.index_name],
@@ -1303,6 +1325,25 @@ export class CatalogDO extends DurableObject {
       this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos });
     }
     return remaining;
+  }
+
+  /** Copies one index's __cf_indexes entries from `fromShard` to `toShard`
+   * with rowid > afterRowid, paged, and returns the highest rowid copied (or
+   * afterRowid unchanged if nothing). Used by ring evacuation's initial copy
+   * and its reconcile loop. */
+  private async copyIndexEntries(fromShard: string, toShard: string, indexName: string, afterRowid: number): Promise<number> {
+    let cursor = afterRowid;
+    for (;;) {
+      const exportRes = await this.callShard(fromShard, "/index-entries-export", { indexName, afterRowid: cursor, limit: MIGRATE_PAGE_SIZE });
+      if (!exportRes.ok) throw new Error(`index-entries-export failed on ${fromShard}: ${exportRes.status}`);
+      const rows = ((await exportRes.json()) as { rows: Array<{ rowid: number }> }).rows;
+      if (rows.length === 0) break;
+      const importRes = await this.callShard(toShard, "/index-entries-import", { rows });
+      if (!importRes.ok) throw new Error(`index-entries-import failed on ${toShard}: ${importRes.status}`);
+      cursor = rows[rows.length - 1].rowid;
+      if (rows.length < MIGRATE_PAGE_SIZE) break;
+    }
+    return cursor;
   }
 
   /** Milestone 3, Chunk 4: /admin/split-vbucket keeps its name and request
