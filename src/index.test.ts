@@ -2744,6 +2744,88 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     expect(replayBody.result.duplicated).toBe(true);
   }, 150000);
 
+  // Review Tier 1 #7: a 2PC tx prepared BEFORE its vbucket's migration
+  // started carries no mirror target. Cutover must not flip while such a
+  // prepared intent exists on the source (the fence blocks new prepares, so
+  // the count only decreases); once the tx commits, its write lands on the
+  // source with provenance and the checksum re-copies it to the target — so
+  // the write is never silently stranded on the old source after the flip.
+  it("a tx prepared before migration commits after cutover starts without being stranded — the write ends up queryable on the new shard", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("m4_tx7_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const pk = "tx7-row";
+    const vbucket = hashKey(`${tenantId}:m4_tx7_evt:${pk}`) % 64;
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = ?", vbucket)) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+    const sourceStub = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    const shardPost = (path: string, body: unknown) =>
+      sourceStub.fetch(new Request(`https://shard.internal${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+
+    // Prepare a 2PC intent on the source for this vbucket (no mirror target —
+    // migration hasn't started yet).
+    const prep = await shardPost("/prepare", {
+      coordinatorTxId: "tx7",
+      intents: [
+        {
+          sql: "INSERT INTO m4_tx7_evt (id, v) VALUES (?, ?)",
+          params: [pk, "committed"],
+          tenantId,
+          table: "m4_tx7_evt",
+          partitionKey: pk,
+          vbucket,
+          op: "insert",
+        },
+      ],
+    });
+    expect(prep.status).toBe(200);
+
+    // Start the migration and drive several ticks — it reaches cutover but
+    // WAITS for the prepared intent (won't flip).
+    const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId: "catalog-0", vbucket, targetShardId }, AUTH());
+    expect(migrateRes.status).toBe(200);
+    for (let tick = 0; tick < 6; tick += 1) {
+      await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+    }
+    const blockedStatus = (await (
+      await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket }, AUTH())
+    ).json()) as { status: string };
+    expect(blockedStatus.status).toBe("cutover"); // fenced, blocked on the prepared intent
+
+    // Commit the tx — the row lands on the source with provenance.
+    const commit = await shardPost("/commit", { coordinatorTxId: "tx7" });
+    expect(commit.status).toBe(200);
+
+    // Now the migration completes (checksum mismatch re-copies the row, then
+    // flips).
+    await driveMigrationToCompletion(vbucket);
+
+    // The committed write is queryable via the data plane, routed to the NEW
+    // shard — not stranded on the old source.
+    const readRes = await post(
+      "/v1/sql",
+      { sql: "SELECT v FROM m4_tx7_evt WHERE id = ?", params: [pk], table: "m4_tx7_evt", tenantId, partitionKey: pk },
+      token,
+    );
+    expect(readRes.status).toBe(200);
+    const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
+    expect(readBody.route.shardId).toBe(targetShardId);
+    expect(readBody.result.rows).toHaveLength(1);
+    expect(readBody.result.rows[0].v).toBe("committed");
+
+    // The old source no longer has it (deleted on flip).
+    const sourceLeftover = (await shardExecute(sourceShardId, "SELECT id FROM m4_tx7_evt WHERE id = ?", [pk])).rows;
+    expect(sourceLeftover).toHaveLength(0);
+  }, 60000);
+
   // Review Tier 1 #4: a crash mid-abort must leave the row in 'aborting'
   // (fence still needing lifting), and a retried abort must RESUME cleanup —
   // completing the wipe and lifting the fence — rather than 409ing on a
@@ -2917,7 +2999,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
       token,
     );
     expect(postAbortWrite.status).toBe(200);
-  });
+  }, 60000);
 
   it("criterion 10: a write that resolved its route pre-fence and arrives post-fence gets 409 VBUCKET_FENCED, and the same requestId succeeds on retry against the new shard after the flip", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());

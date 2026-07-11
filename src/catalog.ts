@@ -1638,6 +1638,21 @@ export class CatalogDO extends DurableObject {
         return true; // poll again next tick
       }
 
+      // Review Tier 1 #7: don't flip while the source has a prepared 2PC
+      // intent touching this vbucket. A tx that prepared BEFORE the migration
+      // started carries no mirror target, so a commit landing after the flip
+      // would strand its write on the old source. The fence (set above)
+      // blocks NEW prepares, so this count only decreases; once it's zero all
+      // such txs have committed (applied to the source with provenance, so
+      // the checksum below catches any source/target divergence and re-copies
+      // it) or aborted. Wait for that rather than racing the flip.
+      const preparedRes = await this.callShard(source, "/prepared-intent-count-for-vbucket", { vbucket: m.vbucket });
+      if (!preparedRes.ok) throw new Error(`prepared-intent-count failed on ${source}: ${preparedRes.status}`);
+      const preparedCount = ((await preparedRes.json()) as { count: number }).count;
+      if (preparedCount > 0) {
+        return true; // poll again next tick
+      }
+
       // Step 3: per-table content checksums must match for EVERY registered
       // table (the spec's verify rule) — computed in one batched round trip
       // per shard rather than one per table.
