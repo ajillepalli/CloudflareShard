@@ -128,42 +128,92 @@ export const INTERNAL_TABLE_NAMES = [
   "__cf_fenced_vbuckets",
 ] as const;
 
-const INTERNAL_TABLE_SET = new Set<string>(INTERNAL_TABLE_NAMES);
-
-/** Extracts the write-target table name of an INSERT/REPLACE/UPDATE/DELETE
- * statement (comments + a leading CTE stripped first, mirroring isMutation),
- * unquoting `"x"`/`` `x` ``/`[x]`. Returns null if the statement isn't a
- * recognizable single-table DML write. Only the write target matters for the
- * internal-table guard: a subquery that merely *reads* an internal table
- * doesn't mutate it. */
-function mutationTargetTable(sql: string): string | null {
-  const afterComments = stripLeadingComments(sql);
-  const s = stripLeadingComments(skipLeadingCte(afterComments));
-  const ident = `("([^"]+)"|\`([^\`]+)\`|\\[([^\\]]+)\\]|([A-Za-z_][A-Za-z0-9_]*))`;
-  const patterns = [
-    new RegExp(`^\\s*insert(?:\\s+or\\s+\\w+)?\\s+into\\s+${ident}`, "i"),
-    new RegExp(`^\\s*replace\\s+into\\s+${ident}`, "i"),
-    new RegExp(`^\\s*update(?:\\s+or\\s+\\w+)?\\s+${ident}`, "i"),
-    new RegExp(`^\\s*delete\\s+from\\s+${ident}`, "i"),
-  ];
-  for (const re of patterns) {
-    const m = re.exec(s);
-    if (m) return m[2] ?? m[3] ?? m[4] ?? m[5] ?? null;
+/** Removes single-quoted string literals (respecting `''` escaping), `-- ...`
+ * line comments, and `/* ... *​/` block comments from anywhere in the SQL —
+ * NOT just the leading run (see stripLeadingComments) — replacing each with a
+ * space. Double-quoted / backtick / bracket spans are left intact: those are
+ * IDENTIFIERS (a quoted table/column reference), which the internal-table
+ * reference check must still see. Used so that check can't be fooled by
+ * `DELETE/**​/FROM __cf_x` (inter-token comment) and doesn't false-positive on
+ * a string DATA value that merely contains an internal table name. */
+function stripStringsAndComments(sql: string): string {
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'") {
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      out += " ";
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      i = nl === -1 ? sql.length : nl;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i += 1;
   }
-  return null;
+  return out;
 }
 
-/** True if `sql` is a mutation whose write target is one of ShardDO's internal
- * tables (or any `__cf_`/`sqlite_`-prefixed name, for forward-safety against a
- * table added later). The tenant-facing `/v1/sql` gate rejects these 403 —
- * the raw-execute path is otherwise reachable with an arbitrary SQL string,
- * and `body.table` (used only for routing) says nothing about what table the
- * SQL text actually touches. */
+/** Case-insensitive word-boundary match for ANY internal table name. Derived
+ * from INTERNAL_TABLE_NAMES so it can't drift: the four fixed names plus the
+ * `__cf_`/`sqlite_` prefixes (which cover the prefixed entries AND any table
+ * added later under those reserved namespaces). Word boundaries make it
+ * agnostic to a `schema.` qualifier (`main.__cf_row_owners`), quoting
+ * (`"Applied_Requests"`, `` `row_locks` ``, `[pending_intents]`), and case. */
+const INTERNAL_TABLE_REFERENCE_RE = new RegExp(
+  `\\b(${[
+    ...INTERNAL_TABLE_NAMES.filter((n) => !n.startsWith("__cf_") && !n.startsWith("sqlite_")),
+    "__cf_\\w+",
+    "sqlite_\\w+",
+  ].join("|")})\\b`,
+  "i",
+);
+
+/** True if `sql` is a mutation that references any of ShardDO's internal
+ * bookkeeping tables ANYWHERE (write target, subquery, join, RETURNING, …).
+ * The tenant-facing `/v1/sql` gate rejects these 403.
+ *
+ * Deliberately a blanket REFERENCE block rather than write-target extraction:
+ * tenants have no legitimate reason to name these tables in raw SQL at all, so
+ * matching any case-insensitive word-boundary occurrence (after stripping
+ * comments + string literals) is both safer and simpler than parsing out the
+ * single target — and it closes the target-extraction bypasses a re-review
+ * confirmed: mixed-case (`Applied_Requests`), inter-token comments
+ * (`DELETE/**​/FROM __cf_x`), and `schema.` qualifiers (`DELETE FROM
+ * main.__cf_row_owners`) all now match.
+ *
+ * Scoped to mutations (isMutation) so a legitimate read that happens to name a
+ * column identically isn't blocked — the guard's job is to stop internal-table
+ * WRITES from the data plane. Defense-in-depth at ShardDO /execute is NOT
+ * added: /execute is a DO-internal route whose own callers (index maintenance
+ * writing __cf_indexes, mirror delivery, provenance upserts) legitimately
+ * write these tables, so a blanket block there would break them; tenants only
+ * reach /execute THROUGH this Worker gate, which is therefore the correct
+ * single chokepoint. */
 export function isInternalTableWrite(sql: string): boolean {
-  const target = mutationTargetTable(sql);
-  if (target === null) return false;
-  const lower = target.toLowerCase();
-  return INTERNAL_TABLE_SET.has(target) || lower.startsWith("__cf_") || lower.startsWith("sqlite_");
+  if (!isMutation(sql)) return false;
+  return INTERNAL_TABLE_REFERENCE_RE.test(stripStringsAndComments(sql));
 }
 
 function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {
