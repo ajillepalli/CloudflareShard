@@ -144,6 +144,7 @@ export class ShardDO extends DurableObject {
       "/abort": this.handleAbort.bind(this),
       "/tx-status": this.handleTxStatus.bind(this),
       "/pending-intent-count": this.handlePendingIntentCount.bind(this),
+      "/prepared-intent-count-for-vbucket": this.handlePreparedIntentCountForVbucket.bind(this),
       "/invalidate-request": this.handleInvalidateRequest.bind(this),
       "/enqueue-index-job": this.handleEnqueueIndexJob.bind(this),
       "/enqueue-mirror-job": this.handleEnqueueMirrorJob.bind(this),
@@ -1680,5 +1681,25 @@ export class ShardDO extends DurableObject {
     // block on either kind of unfinished work with one round-trip.
     const indexJobRow = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_pending_jobs");
     return json({ count: row?.n ?? 0, indexPendingJobCount: indexJobRow?.n ?? 0 });
+  }
+
+  /** Milestone 3 (review Tier 1 #7): how many prepared 2PC intents on this
+   * shard touch the given vbucket. Cutover polls this before flipping the
+   * map — a tx that prepared BEFORE the migration started carries no mirror
+   * target, so if it committed after the flip its write would strand on the
+   * old source. The fence blocks NEW prepares, so this count only decreases;
+   * once it's zero (all such txs committed-or-aborted) the flip is safe (a
+   * committed one applied to the source with provenance, caught by the
+   * cutover checksum and re-copied if needed). */
+  private async handlePreparedIntentCountForVbucket(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    const row = this.one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM pending_intents WHERE status = 'prepared' AND vbucket = ?",
+      body.vbucket,
+    );
+    return json({ count: row?.n ?? 0 });
   }
 }
