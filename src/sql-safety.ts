@@ -128,24 +128,55 @@ export const INTERNAL_TABLE_NAMES = [
   "__cf_fenced_vbuckets",
 ] as const;
 
-/** Removes single-quoted string literals (respecting `''` escaping), `-- ...`
- * line comments, and `/* ... *​/` block comments from anywhere in the SQL —
- * NOT just the leading run (see stripLeadingComments) — replacing each with a
- * space. Double-quoted / backtick / bracket spans are left intact: those are
- * IDENTIFIERS (a quoted table/column reference), which the internal-table
- * reference check must still see. Used so that check can't be fooled by
- * `DELETE/**​/FROM __cf_x` (inter-token comment) and doesn't false-positive on
- * a string DATA value that merely contains an internal table name. */
+const INTERNAL_TABLE_SET = new Set<string>(INTERNAL_TABLE_NAMES);
+
+/** Removes `-- ...` line and `/* ... *​/` block comments from anywhere in the
+ * SQL (replacing each with a space), leaving all quoted spans intact. Used
+ * before write-target extraction so an inter-token comment (`DELETE/**​/FROM
+ * x`) can't hide the keyword/target structure. */
+function stripComments(sql: string): string {
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      i = nl === -1 ? sql.length : nl;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** Like stripComments, but ALSO strips single-quoted (`'x'`, `''` escape) AND
+ * double-quoted (`"x"`, `""` escape) string spans, replacing each with a
+ * space. Double-quoted spans are stripped because SQLite treats a
+ * double-quoted token that doesn't resolve as an identifier as a STRING
+ * LITERAL — so a legit `VALUES ('n1', "applied_requests")` would otherwise
+ * false-positive against the internal-table reference check. The write TARGET
+ * (a double-quoted table name after FROM/INTO/UPDATE) is handled separately by
+ * mutationTargetIsInternal, so stripping double quotes here doesn't weaken the
+ * guard. */
 function stripStringsAndComments(sql: string): string {
   let out = "";
   let i = 0;
   while (i < sql.length) {
     const c = sql[i];
-    if (c === "'") {
+    if (c === "'" || c === '"') {
+      const quote = c;
       i += 1;
       while (i < sql.length) {
-        if (sql[i] === "'") {
-          if (sql[i + 1] === "'") {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
             i += 2;
             continue;
           }
@@ -179,8 +210,8 @@ function stripStringsAndComments(sql: string): string {
  * from INTERNAL_TABLE_NAMES so it can't drift: the four fixed names plus the
  * `__cf_`/`sqlite_` prefixes (which cover the prefixed entries AND any table
  * added later under those reserved namespaces). Word boundaries make it
- * agnostic to a `schema.` qualifier (`main.__cf_row_owners`), quoting
- * (`"Applied_Requests"`, `` `row_locks` ``, `[pending_intents]`), and case. */
+ * agnostic to a `schema.` qualifier (`main.__cf_row_owners`), backtick/bracket
+ * quoting (`` `row_locks` ``, `[pending_intents]`), and case. */
 const INTERNAL_TABLE_REFERENCE_RE = new RegExp(
   `\\b(${[
     ...INTERNAL_TABLE_NAMES.filter((n) => !n.startsWith("__cf_") && !n.startsWith("sqlite_")),
@@ -190,18 +221,50 @@ const INTERNAL_TABLE_REFERENCE_RE = new RegExp(
   "i",
 );
 
-/** True if `sql` is a mutation that references any of ShardDO's internal
- * bookkeeping tables ANYWHERE (write target, subquery, join, RETURNING, …).
- * The tenant-facing `/v1/sql` gate rejects these 403.
+/** Unquotes a single identifier token: `"x"`/`` `x` ``/`[x]` (honoring the
+ * doubled-quote escape for the first two). Bare tokens pass through. */
+function unquoteIdentifier(tok: string): string {
+  if (tok.length >= 2) {
+    const first = tok[0];
+    const last = tok[tok.length - 1];
+    if (first === '"' && last === '"') return tok.slice(1, -1).replace(/""/g, '"');
+    if (first === "`" && last === "`") return tok.slice(1, -1).replace(/``/g, "`");
+    if (first === "[" && last === "]") return tok.slice(1, -1);
+  }
+  return tok;
+}
+
+/** True if the statement's write TARGET (the table right after INSERT INTO /
+ * REPLACE INTO / UPDATE / DELETE FROM) is an internal table — handling an
+ * inter-token comment (stripped first), a `schema.` qualifier (last dotted
+ * component wins), quoting, and case. This is the layer that must still block a
+ * double-quoted target like `DELETE FROM "applied_requests"`, which the
+ * reference check below can't see (it strips double-quoted spans). */
+function mutationTargetIsInternal(sql: string): boolean {
+  const s = stripLeadingComments(skipLeadingCte(stripComments(sql)));
+  const m = /^\s*(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|update(?:\s+or\s+\w+)?|delete\s+from)\s+([^\s(]+)/i.exec(s);
+  if (!m) return false;
+  const parts = m[1].split("."); // drop any schema. qualifier
+  const last = unquoteIdentifier(parts[parts.length - 1]).toLowerCase();
+  return INTERNAL_TABLE_SET.has(last) || last.startsWith("__cf_") || last.startsWith("sqlite_");
+}
+
+/** True if `sql` is a mutation that touches any of ShardDO's internal
+ * bookkeeping tables. The tenant-facing `/v1/sql` gate rejects these 403.
  *
- * Deliberately a blanket REFERENCE block rather than write-target extraction:
- * tenants have no legitimate reason to name these tables in raw SQL at all, so
- * matching any case-insensitive word-boundary occurrence (after stripping
- * comments + string literals) is both safer and simpler than parsing out the
- * single target — and it closes the target-extraction bypasses a re-review
- * confirmed: mixed-case (`Applied_Requests`), inter-token comments
- * (`DELETE/**​/FROM __cf_x`), and `schema.` qualifiers (`DELETE FROM
- * main.__cf_row_owners`) all now match.
+ * Two layers:
+ *  1. mutationTargetIsInternal — the write target itself, however quoted or
+ *     schema-qualified (catches `DELETE FROM "applied_requests"`).
+ *  2. a blanket REFERENCE block (word-boundary regex) over text with comments
+ *     and single- AND double-quoted string literals stripped — catches a bare
+ *     or backtick/bracket-quoted internal name anywhere else (subquery, join),
+ *     while NOT false-positiving on a double-quoted STRING VALUE such as
+ *     `VALUES ('n1', "applied_requests")` (SQLite treats a non-identifier
+ *     double-quoted token as a string literal).
+ *
+ * Together they close the target-extraction bypasses a re-review confirmed
+ * (mixed case, inter-token comments, `schema.` qualifiers) without the
+ * double-quoted-string-value false positive a later pass found.
  *
  * Scoped to mutations (isMutation) so a legitimate read that happens to name a
  * column identically isn't blocked — the guard's job is to stop internal-table
@@ -213,6 +276,7 @@ const INTERNAL_TABLE_REFERENCE_RE = new RegExp(
  * single chokepoint. */
 export function isInternalTableWrite(sql: string): boolean {
   if (!isMutation(sql)) return false;
+  if (mutationTargetIsInternal(sql)) return true;
   return INTERNAL_TABLE_REFERENCE_RE.test(stripStringsAndComments(sql));
 }
 

@@ -499,6 +499,50 @@ describe("Worker tenant authorization", () => {
     );
     expect(okData.status).toBe(200);
   });
+
+  // Adversarial re-review: SQLite treats a double-quoted token that doesn't
+  // resolve as an identifier as a STRING LITERAL, so a double-quoted string
+  // VALUE equal to an internal table name must be allowed, while a
+  // double-quoted TARGET table name must still be blocked.
+  it("blocks a double-quoted internal TARGET but allows a double-quoted string VALUE equal to an internal name", async () => {
+    await initCluster();
+    const token = await registerTenant("t1");
+
+    // Double-quoted string value in VALUES position — a legit write, allowed.
+    const okDoubleQuotedValue = await post(
+      "/v1/sql",
+      {
+        sql: 'INSERT INTO events (id, v) VALUES (\'n1\', "applied_requests")',
+        table: "events",
+        tenantId: "t1",
+        partitionKey: "p1",
+      },
+      token,
+    );
+    expect(okDoubleQuotedValue.status, "double-quoted string value should be allowed").toBe(200);
+
+    // Double-quoted string value in SET position — also allowed.
+    const okDoubleQuotedSet = await post(
+      "/v1/sql",
+      {
+        sql: 'UPDATE events SET v = "row_locks" WHERE id = \'n1\'',
+        table: "events",
+        tenantId: "t1",
+        partitionKey: "p1",
+      },
+      token,
+    );
+    expect(okDoubleQuotedSet.status, "double-quoted SET value should be allowed").toBe(200);
+
+    // But a double-quoted TARGET table name is still an internal write — 403.
+    for (const sql of ['DELETE FROM "applied_requests"', 'INSERT INTO "row_locks" (x) VALUES (1)', 'UPDATE "pending_intents" SET x = 1']) {
+      const res = await post("/v1/sql", { sql, table: "events", tenantId: "t1", partitionKey: "p1" }, token);
+      expect(res.status, `${sql} should be 403`).toBe(403);
+      const body = (await res.json()) as { error: { code?: string } | string };
+      const code = typeof body.error === "object" ? body.error.code : undefined;
+      expect(code, `${sql} code`).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
+    }
+  });
 });
 
 describe("Worker /v1/mutate", () => {
