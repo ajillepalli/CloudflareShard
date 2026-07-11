@@ -764,6 +764,78 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     expect(statusBody.status).toBe("complete");
   });
 
+  // Review Tier 1 #6: ring evacuation must not lose an index entry that
+  // lands on the draining shard around the copy window. Entries with a range
+  // of rowids (modelling a late/racing write appended after earlier ones)
+  // are all captured — the reconcile loop re-scans by ascending rowid until
+  // stable, so nothing beyond the initial copy cursor is dropped.
+  it("ring evacuation copies EVERY index entry on the draining shard (including higher-rowid late arrivals) to the substitute, and the base row stays queryable position-for-position", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_evac_race",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+    });
+
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    const importEntry = (pk: string) =>
+      shard0.fetch(
+        new Request("https://shard.internal/index-entries-import", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            rows: [
+              {
+                table_name: "events",
+                index_name: "idx_evac_race",
+                index_key_json: JSON.stringify(["alpha"]),
+                partition_key: pk,
+                source_shard_id: "shard-1",
+                tenant_id: "t1",
+                updated_at: new Date().toISOString(),
+              },
+            ],
+          }),
+        }),
+      );
+    // First batch, then a "later" batch with higher rowids (a racing write
+    // that appended after the earlier ones).
+    await importEntry("row-a");
+    await importEntry("row-b");
+    await importEntry("row-c-late");
+
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    const candidates = ["shard-1", "shard-2"];
+    const substitute = candidates.reduce((best, s) =>
+      hashKey(`idx_evac_race:${s}`) < hashKey(`idx_evac_race:${best}`) ? s : best,
+    );
+    const substituteStub = env.SHARD.get(env.SHARD.idFromName(substitute));
+    const copied = await runInDurableObject(substituteStub, async (_i: unknown, state: DurableObjectState) => {
+      return (
+        Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key", "idx_evac_race")) as Array<{
+          partition_key: string;
+        }>
+      ).map((r) => r.partition_key);
+    });
+    expect(copied).toEqual(["row-a", "row-b", "row-c-late"]);
+
+    // Source drained.
+    await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idx_evac_race"))).toHaveLength(0);
+    });
+  });
+
   it("rejects the drain 409 RING_EVACUATION_NO_CANDIDATE when every active shard is already in the index's ring", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));

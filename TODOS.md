@@ -2,6 +2,18 @@
 
 ## Architecture
 
+### Ring-evacuation vs. stale fixed-target index writes (residual risk)
+
+**What:** During a shard drain's ring evacuation, `advanceDrain` copies the draining shard's `__cf_indexes` entries to the deterministic substitute, repoints `placement_ring_json` cluster-wide, runs a reconcile loop to catch entries that raced onto the draining shard during the evacuation's async gaps, then deletes the source copies. This closes the dominant race (a write whose `/route` resolved with the old ring landing on the draining shard mid-evacuation is caught by the reconcile loop, since after the repoint no *new* route targets the draining shard). **Residual:** a `index_pending_jobs` retry enqueued before the repoint carries a *fixed* target shard id (the draining shard) and does not re-resolve the ring, so if it fires after the reconcile loop's final pass it writes an entry to the draining shard that the delete then removes — the base row survives but its index entry is lost. The reconcile loop is capped (`RING_EVAC_RECONCILE_MAX_PASSES`); pathological churn leaves source rows in place (unreachable, not deleted) rather than losing them.
+
+**Why not fully closed here:** the complete fix is a ring-version stamped at index-write time, rejected by the index shard if stale, with the writer (including the `index_pending_jobs` retry) re-resolving the ring on rejection — a cross-cutting change to the index-write path, the retry-queue schema, and `/route`. Out of proportion to a rare admin operation (drain) racing an async index-maintenance retry whose target shard is simultaneously being evacuated.
+
+**Mitigations already in place:** index writes are best-effort and self-healing — a subsequent write to the same row re-derives and re-writes the entry against the current ring; and the drain's own feasibility checks plus the reconcile loop bound the window to the narrow interval between the final reconcile pass and the source delete.
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** a ring-version mechanism on the index-write path.
+
 ### Unique-index support for the Index Service
 
 **What:** Support rejecting a write that would violate a declared uniqueness constraint on a registered index, instead of today's non-unique-only model (`__cf_indexes` uses `INSERT OR REPLACE`, no constraint check).
