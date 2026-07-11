@@ -1878,8 +1878,25 @@ export class CatalogDO extends DurableObject {
           "SELECT cutover_started_at FROM vbucket_map WHERE vbucket = ?",
           m.vbucket,
         );
-        const startedAt = startedRow?.cutover_started_at ? new Date(startedRow.cutover_started_at).getTime() : null;
-        if (startedAt !== null && Date.now() - startedAt > CUTOVER_PREPARED_WAIT_MAX_MS) {
+        // Adversarial re-review: cutover_started_at is a nullable column added
+        // after cutover existed, so a migration ALREADY in 'cutover' at deploy
+        // time (or one that reached cutover before this field was populated)
+        // has NULL here. A NULL must NOT mean "never times out" — that would
+        // reintroduce the exact livelock this bound closes. Stamp the clock
+        // NOW (start it from this tick) so the bound engages on a later tick.
+        let startedAt: number;
+        if (startedRow?.cutover_started_at) {
+          startedAt = new Date(startedRow.cutover_started_at).getTime();
+        } else {
+          startedAt = Date.now();
+          this.sql.exec(
+            "UPDATE vbucket_map SET cutover_started_at = ?, updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND cutover_started_at IS NULL",
+            new Date(startedAt).toISOString(),
+            new Date().toISOString(),
+            m.vbucket,
+          );
+        }
+        if (Date.now() - startedAt > CUTOVER_PREPARED_WAIT_MAX_MS) {
           log("catalog.migration_cutover_blocked_on_prepared_intents", {
             vbucket: m.vbucket,
             preparedCount,
