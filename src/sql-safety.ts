@@ -234,19 +234,84 @@ function unquoteIdentifier(tok: string): string {
   return tok;
 }
 
-/** True if the statement's write TARGET (the table right after INSERT INTO /
- * REPLACE INTO / UPDATE / DELETE FROM) is an internal table — handling an
- * inter-token comment (stripped first), a `schema.` qualifier (last dotted
- * component wins), quoting, and case. This is the layer that must still block a
- * double-quoted target like `DELETE FROM "applied_requests"`, which the
- * reference check below can't see (it strips double-quoted spans). */
-function mutationTargetIsInternal(sql: string): boolean {
+/** Normalizes a table identifier for comparison: unquote, then lowercase
+ * (SQLite table names are case-insensitive). */
+export function normalizeTableName(name: string): string {
+  return unquoteIdentifier(name.trim()).toLowerCase();
+}
+
+/** True if a normalized (unquoted, lowercased) table name is one of ShardDO's
+ * internal tables or under a reserved `__cf_`/`sqlite_` prefix. */
+export function isInternalTableName(name: string): boolean {
+  return INTERNAL_TABLE_SET.has(name) || name.startsWith("__cf_") || name.startsWith("sqlite_");
+}
+
+/** Reads one identifier token starting at `pos` after skipping leading
+ * whitespace: a quoted `"..."`/`` `...` ``/`[...]` span (honoring the doubled-
+ * quote escape for the first two) or a bare identifier. Returns the raw
+ * (still-quoted) token text and the index just past it, or null if none is
+ * present or a quote is unterminated (ambiguous → fail closed). */
+function readIdentifierToken(s: string, pos: number): { raw: string; next: number } | null {
+  while (pos < s.length && /\s/.test(s[pos])) pos += 1;
+  if (pos >= s.length) return null;
+  const c = s[pos];
+  if (c === '"' || c === "`" || c === "[") {
+    const close = c === "[" ? "]" : c;
+    let j = pos + 1;
+    while (j < s.length) {
+      if (s[j] === close) {
+        if ((close === '"' || close === "`") && s[j + 1] === close) {
+          j += 2;
+          continue;
+        }
+        j += 1;
+        return { raw: s.slice(pos, j), next: j };
+      }
+      j += 1;
+    }
+    return null; // unterminated quote
+  }
+  const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(pos));
+  if (!m) return null;
+  return { raw: m[0], next: pos + m[0].length };
+}
+
+/** Extracts the single write-target table of an INSERT/REPLACE/UPDATE/DELETE
+ * statement, normalized (unquoted, lowercased, `schema.` qualifier dropped —
+ * last dotted component wins). Robust to leading comments/CTE, arbitrary
+ * whitespace around a `schema . table` qualifier, and quoting on either
+ * component. Returns null if the statement isn't a recognizable single-table
+ * DML write, the target can't be parsed, or a third dotted component appears
+ * (not valid SQLite table syntax) — callers MUST treat null as REJECT
+ * (fail-closed). This is the primary allowlist gate: the Worker requires the
+ * extracted target to equal the caller's declared, already-validated
+ * body.table, which structurally forbids writes to internal tables AND to any
+ * other tenant's table — strictly stronger than any denylist. */
+export function mutationWriteTarget(sql: string): string | null {
   const s = stripLeadingComments(skipLeadingCte(stripComments(sql)));
-  const m = /^\s*(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|update(?:\s+or\s+\w+)?|delete\s+from)\s+([^\s(]+)/i.exec(s);
-  if (!m) return false;
-  const parts = m[1].split("."); // drop any schema. qualifier
-  const last = unquoteIdentifier(parts[parts.length - 1]).toLowerCase();
-  return INTERNAL_TABLE_SET.has(last) || last.startsWith("__cf_") || last.startsWith("sqlite_");
+  const kw = /^\s*(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|update(?:\s+or\s+\w+)?|delete\s+from)(?=\s|["`[])/i.exec(s);
+  if (!kw) return null;
+  const first = readIdentifierToken(s, kw[0].length);
+  if (!first) return null;
+  let k = first.next;
+  while (k < s.length && /\s/.test(s[k])) k += 1;
+  if (s[k] === ".") {
+    const second = readIdentifierToken(s, k + 1);
+    if (!second) return null;
+    let k2 = second.next;
+    while (k2 < s.length && /\s/.test(s[k2])) k2 += 1;
+    if (s[k2] === ".") return null; // db.schema.table — ambiguous, fail closed
+    return normalizeTableName(second.raw);
+  }
+  return normalizeTableName(first.raw);
+}
+
+/** True if the statement's write TARGET is an internal table — now derived
+ * from the robust mutationWriteTarget extractor (handles inter-token comments,
+ * spaced `schema . table` qualifiers, and quoting on either component). */
+function mutationTargetIsInternal(sql: string): boolean {
+  const target = mutationWriteTarget(sql);
+  return target !== null && isInternalTableName(target);
 }
 
 /** True if `sql` is a mutation that touches any of ShardDO's internal

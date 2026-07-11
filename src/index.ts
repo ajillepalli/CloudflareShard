@@ -5,7 +5,16 @@ import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
-import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableWrite, isMutation } from "./sql-safety";
+import {
+  extractCreateTableName,
+  isDangerous,
+  isDangerousSchema,
+  isInternalTableName,
+  isInternalTableWrite,
+  isMutation,
+  mutationWriteTarget,
+  normalizeTableName,
+} from "./sql-safety";
 import {
   compileMutation,
   IDENTIFIER_RE,
@@ -1064,14 +1073,40 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ error: "SQL statement not permitted." }, 403);
   }
 
-  // Tenant SQL must never write ShardDO's internal bookkeeping tables. The
-  // routed shard executes body.sql verbatim, and body.table (used only for
-  // routing) says nothing about what table the SQL text touches — so a write
-  // like `DELETE FROM __cf_fenced_vbuckets` sent with table:"events" would
-  // otherwise pass every gate and run, lifting a cutover fence or forging
-  // provenance from the data plane. Reject at the tenant boundary; the
-  // internal DO routes that legitimately write these tables call /execute
-  // directly, never through here.
+  // PRIMARY ALLOWLIST GATE (P1 security reframe). The routed shard executes
+  // body.sql verbatim, and body.table (used for routing) is validated as one
+  // of THIS tenant's registered, non-internal tables. So instead of trying to
+  // denylist every way to name an internal table (a regex denylist leaked FOUR
+  // times — mixed case, inter-token comments, `schema.` qualifiers, and a
+  // spaced+quoted `main . "__cf_fenced_vbuckets"`), require that the
+  // statement's single write target IS body.table. This structurally forbids
+  // writes to internal tables AND to any other tenant's table. Fail-closed:
+  // a mutation whose target can't be parsed is rejected.
+  if (mutating) {
+    const target = mutationWriteTarget(body.sql);
+    const declared = normalizeTableName(body.table);
+    if (target === null || target !== declared) {
+      const error =
+        target !== null && isInternalTableName(target)
+          ? {
+              code: "INTERNAL_TABLE_WRITE_FORBIDDEN",
+              message: "Writes to internal system tables are not permitted.",
+              fix: "Target one of your own registered tables.",
+            }
+          : {
+              code: "WRITE_TARGET_TABLE_MISMATCH",
+              message: "The statement's write target must match the declared table.",
+              fix: `Send the write with table set to the SQL's actual target${target ? ` (${target})` : ""}, and only write your own registered tables.`,
+            };
+      return json({ error }, 403);
+    }
+  }
+
+  // DEFENSE-IN-DEPTH DENYLIST. Even with the allowlist above, keep rejecting
+  // any statement that references an internal table (e.g. a write to the
+  // tenant's own table that READS an internal table in a subquery, or the
+  // theoretical case of a mis-trusted body.table). The internal DO routes that
+  // legitimately write these tables call /execute directly, never through here.
   if (isInternalTableWrite(body.sql)) {
     return json(
       {
