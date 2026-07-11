@@ -862,4 +862,96 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
       expect(rows[0].status).toBe("active");
     });
   });
+
+  // Review Tier 2 #10: a drain whose vbucket migration is blocked by the
+  // provenance gate must PARK (stalled-provenance), not re-scan every table on
+  // the source at the 250ms tick cadence forever. Re-invoking /drain-shard
+  // after backfilling provenance clears the stall and resumes.
+  it("a drain blocked by the provenance gate parks as 'stalled-provenance' (no 4Hz rescan) and resumes when re-invoked after provenance is backfilled", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Put an unattributed row on shard-0 (a registered table row with no
+    // __cf_row_owners entry) so its vbucket migration fails the provenance
+    // gate. shard-0 owns vbucket 0 (round-robin from /init).
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shard0.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, v TEXT)",
+          requestId: `sc-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    await shard0.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sql: "INSERT INTO events (id, v) VALUES ('legacy', 'x')", requestId: `li-${crypto.randomUUID()}`, isMutation: true }),
+      }),
+    );
+
+    const drainRes = await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(drainRes.status).toBe(200);
+
+    // Drive a tick: the migration start hits the provenance gate → parks.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const parked = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as {
+      status: string;
+      stallReason: string | null;
+    };
+    expect(parked.status).toBe("stalled-provenance");
+    expect(parked.stallReason).toBe("provenance");
+
+    // Parked: a further alarm tick does NOT start a migration (no rescan-spin)
+    // — the vbucket is still on shard-0, un-migrated.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const stillParked = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return Array.from(state.storage.sql.exec("SELECT migration_status FROM vbucket_map WHERE vbucket = 0")) as Array<{ migration_status: string }>;
+    });
+    expect(stillParked[0].migration_status).toBe("none"); // never started while parked
+
+    // Attribute the legacy row directly (equivalent to running
+    // /admin/backfill-provenance), then re-invoke /drain-shard.
+    await shard0.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at) VALUES ('events','legacy','t1',0,'2026-01-01T00:00:00.000Z')",
+          requestId: `prov-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+
+    const reinvoke = await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(reinvoke.status).toBe(200);
+    const cleared = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return Array.from(state.storage.sql.exec("SELECT drain_stall_reason FROM shards WHERE shard_id = 'shard-0'")) as Array<{ drain_stall_reason: string | null }>;
+    });
+    expect(cleared[0].drain_stall_reason).toBeNull();
+
+    // Now a tick starts the vbucket migration (no longer gated).
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const resumed = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return Array.from(state.storage.sql.exec("SELECT shard_id, migration_status FROM vbucket_map WHERE vbucket = 0")) as Array<{
+        shard_id: string;
+        migration_status: string;
+      }>;
+    });
+    // Either mid-migration or already flipped off shard-0 — the key point is
+    // it's no longer parked with the vbucket sitting untouched on shard-0.
+    expect(resumed[0].shard_id === "shard-0" && resumed[0].migration_status === "none").toBe(false);
+  });
 });
