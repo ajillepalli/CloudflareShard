@@ -910,6 +910,83 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     });
     expect(raw[0].migration_status).toBe("cutover");
   });
+
+  // Adversarial re-review: cutover_started_at is nullable, so a migration
+  // already in 'cutover' at deploy time has NULL there. A NULL must not read
+  // as "never times out" (that reintroduces the livelock) — the first tick
+  // that observes a prepared intent stamps the clock, and once the stamp is
+  // past the bound the stall surfaces.
+  it("a 'cutover' row with a NULL cutover_started_at gets its clock stamped, then engages the prepared-intents bound", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 8 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Put vbucket 0 into cutover with a NULL clock (models a pre-existing
+    // cutover at the deploy that added the column). shard-0 owns vbucket 0.
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES ('shard-nullclock-target', 'active', ?)",
+        new Date().toISOString(),
+      );
+      state.storage.sql.exec(
+        `UPDATE vbucket_map
+         SET migration_status = 'cutover', target_shard_id = 'shard-nullclock-target',
+             cutover_started_at = NULL, cutover_stall_reason = NULL, migration_started_at = ?, updated_at = ?
+         WHERE vbucket = 0`,
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+    });
+
+    // Never-resolving prepared 2PC intent on the source for vbucket 0. shard-0
+    // is a fixed-name DO shared across this file's tests, so first clear any
+    // prepared intents an earlier test left on vbucket 0 (keeps blockedTxIds
+    // deterministic).
+    const source = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await source.fetch(new Request("https://shard.internal/stats", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
+      state.storage.sql.exec(
+        `INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, vbucket, op)
+         VALUES ('tx-nullclock', 0, 'INSERT INTO t (id) VALUES (''x'')', '[]', 'prepared', '[]', ?, 0, 'insert')`,
+        new Date().toISOString(),
+      );
+    });
+
+    // First tick: the prepared-intent gate observes the NULL clock and STAMPS
+    // it (starting the bound from now) — but not yet past the bound, so no
+    // stall marker. Without the fix the NULL would yield elapsed=null and the
+    // stall would never engage.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const afterFirst = (await (
+      await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
+    ).json()) as { status: string };
+    expect(afterFirst.status).toBe("cutover"); // clock started, not yet stalled
+    const stamped = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return Array.from(
+        state.storage.sql.exec("SELECT cutover_started_at FROM vbucket_map WHERE vbucket = 0"),
+      ) as Array<{ cutover_started_at: string | null }>;
+    });
+    expect(stamped[0].cutover_started_at).not.toBeNull(); // the NULL was stamped
+
+    // Simulate the bound elapsing by pushing the stamp into the past, then
+    // tick again — now the stall engages.
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET cutover_started_at = ? WHERE vbucket = 0",
+        new Date(Date.now() - 5 * 60_000).toISOString(),
+      );
+    });
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const afterSecond = (await (
+      await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))
+    ).json()) as { status: string; blockedTxIds?: string[] };
+    expect(afterSecond.status).toBe("cutover-blocked-on-prepared-intents");
+    expect(afterSecond.blockedTxIds).toEqual(["tx-nullclock"]);
+  });
 });
 
 describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
