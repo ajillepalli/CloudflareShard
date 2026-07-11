@@ -1194,11 +1194,17 @@ export class CatalogDO extends DurableObject {
           // /admin/backfill-provenance and re-invoke /admin/drain-shard.
           shard.drain_stall_reason === "provenance"
           ? "stalled-provenance"
-          : vbucketsRemaining > 0
-            ? "migrating-vbuckets"
-            : ringsRemaining > 0
-              ? "evacuating-rings"
-              : "complete";
+          : // Re-review item E: any other stall reason (e.g. a vbucket wedged
+            // in 'aborting', or an unreachable shard) is also parked — report
+            // it as generically stalled (stallReason carries the specifics)
+            // rather than the misleading 'migrating-vbuckets'.
+            shard.drain_stall_reason
+            ? "stalled"
+            : vbucketsRemaining > 0
+              ? "migrating-vbuckets"
+              : ringsRemaining > 0
+                ? "evacuating-rings"
+                : "complete";
     return json({ shardId: body.shardId, vbucketsRemaining, ringsRemaining, status, stallReason: shard.drain_stall_reason });
   }
 
@@ -1299,12 +1305,22 @@ export class CatalogDO extends DurableObject {
       const target = activeOthers[next % activeOthers.length];
       const started = await this.startMigration(next, target, "/drain-shard-migrate");
       if (started instanceof Response) {
-        // Provenance-incomplete (or any start rejection): park the drain so
-        // the alarm stops re-running the full-table provenance scan every
-        // tick (review Tier 2 #10). The operator runs /admin/backfill-provenance
-        // then re-calls /admin/drain-shard to clear the stall and resume.
-        this.sql.exec("UPDATE shards SET drain_stall_reason = 'provenance' WHERE shard_id = ?", shardId);
-        log("catalog.drain_stalled_provenance", { shardId, vbucket: next });
+        // Park the drain so the alarm stops re-running the full-table
+        // provenance scan every tick (review Tier 2 #10). Re-review item E:
+        // record the ACTUAL reason rather than always claiming 'provenance' —
+        // an incomplete-provenance rejection is fixed by
+        // /admin/backfill-provenance, but a MIGRATION_IN_PROGRESS (e.g. a
+        // vbucket wedged in 'aborting') or an unreachable-shard 502 is not, so
+        // mislabeling it sends the operator down the wrong path.
+        let code: string | undefined;
+        try {
+          code = ((await started.clone().json()) as { error?: { code?: string } }).error?.code;
+        } catch {
+          // Non-JSON body (e.g. a plain-string error) — leave code undefined.
+        }
+        const reason = code === "VBUCKET_PROVENANCE_INCOMPLETE" ? "provenance" : "migration-blocked";
+        this.sql.exec("UPDATE shards SET drain_stall_reason = ? WHERE shard_id = ?", reason, shardId);
+        log("catalog.drain_stalled", { shardId, vbucket: next, reason, code });
         return false;
       }
       // Advance it immediately — a quiet vbucket completes this same tick.
