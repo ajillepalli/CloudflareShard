@@ -157,7 +157,32 @@ async function handleAdminInit(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleAdminRegisterTable(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as Record<string, unknown>;
+  const payload = (await request.json()) as Record<string, unknown> & { table?: string; schemaSql?: string };
+  // Review Tier 3: /admin/register-table stores schemaSql (if present) for
+  // later use — a split target's backfill executes it verbatim to provision
+  // the table (see handleAdminCreateTable's comment above /register-table's
+  // fan-out, and CatalogDO.migratableTables/advanceMigration's backfill pass).
+  // Without this check an admin could seed DDL here that /admin/create-table
+  // itself would reject, and have it silently executed later.
+  if (typeof payload.schemaSql === "string" && payload.schemaSql.length > 0) {
+    if (!/^\s*create\s+table\b/i.test(payload.schemaSql)) {
+      return json({ error: "schemaSql must be a CREATE TABLE statement." }, 400);
+    }
+    if (isDangerousSchema(payload.schemaSql)) {
+      return json({ error: "schemaSql statement not permitted." }, 403);
+    }
+    const schemaTableName = extractCreateTableName(payload.schemaSql);
+    if (schemaTableName === null || schemaTableName !== payload.table) {
+      return json(
+        {
+          error: "schemaSql's CREATE TABLE name does not match table.",
+          table: payload.table,
+          schemaTableName,
+        },
+        400,
+      );
+    }
+  }
   const authorization = request.headers.get("authorization") ?? undefined;
   const results = await fanOutToAllCatalogs(env, "/register-table", () => payload, authorization);
   const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to register the table.");
