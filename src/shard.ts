@@ -1613,11 +1613,21 @@ export class ShardDO extends DurableObject {
     this.ctx.storage.transactionSync(() => {
       for (const intent of intents) {
         this.sql.exec(intent.sql, ...(JSON.parse(intent.params_json) as unknown[]));
+        // Codex full-PR review P1: gate provenance + mirror on the intent
+        // actually changing a row, mirroring the rowsAffected>0 gating on the
+        // /v1/sql and /v1/mutate paths. A 2PC update/delete intent whose extra
+        // `where` matched zero rows is a no-op here — but writeOrDeleteProvenance
+        // would still DELETE the __cf_row_owners entry for a DELETE statement
+        // regardless, so a no-op tenant delete during an active migration would
+        // strip provenance from a STILL-LIVE row (migrate-export/checksum/
+        // delete-vbucket-rows would then miss it → cutover strands or wipes it).
+        // Also avoids enqueuing a mirror for a write that changed nothing.
+        const rowsAffected = this.one<{ n: number }>("SELECT changes() AS n")?.n ?? 0;
         // Milestone 3, Chunk 0: only genuine base-row intents carry op +
         // vbucket (see PrepareIntent's doc comment) — a synthetic
         // __cf_indexes-maintenance intent piggybacked onto the same
         // transaction never does, so it's skipped here automatically.
-        if (intent.op && intent.vbucket !== null && intent.table_name && intent.partition_key && intent.tenant_id) {
+        if (rowsAffected > 0 && intent.op && intent.vbucket !== null && intent.table_name && intent.partition_key && intent.tenant_id) {
           this.writeOrDeleteProvenance(intent.sql, intent.table_name, intent.partition_key, intent.tenant_id, intent.vbucket);
           // Review Tier 1 #2: a migrating vbucket's committed intent enqueues
           // its mirror atomically with the commit.
