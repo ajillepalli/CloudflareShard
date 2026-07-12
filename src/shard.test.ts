@@ -382,6 +382,71 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     expect(countBody.rows[0].n).toBe(1);
   });
 
+  // Codex full-PR review P1: a committed 2PC update/delete intent whose extra
+  // `where` matches ZERO rows is a no-op — provenance and the mirror must be
+  // gated on it actually changing a row (changes()>0), mirroring the /v1/sql
+  // and /v1/mutate paths. Otherwise a no-op DELETE strips the __cf_row_owners
+  // entry for a STILL-LIVE row (writeOrDeleteProvenance deletes on any DELETE),
+  // stranding it in a migration.
+  it("a committed 2PC delete intent that matches zero rows preserves provenance and enqueues no mirror", async () => {
+    const stub = await freshShard();
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)");
+
+    // A live, attributed row (vbucket 5).
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["live-row", "keep"],
+        requestId: `ins-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "t1",
+        table: "t",
+        partitionKey: "live-row",
+        vbucket: 5,
+      }),
+    );
+    const provBefore = await runInDurableObject(stub, async (_i: ShardDO, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE table_name = 't' AND partition_key = 'live-row'")).length,
+    );
+    expect(provBefore).toBe(1);
+
+    // 2PC delete intent for live-row whose WHERE matches nothing (v mismatch),
+    // with a mirror target set (as if the vbucket is mid-migration). Commit it.
+    await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: "tx-noop-del",
+        intents: [
+          {
+            sql: "DELETE FROM t WHERE id = ? AND v = ?",
+            params: ["live-row", "does-not-match"],
+            tenantId: "t1",
+            table: "t",
+            partitionKey: "live-row",
+            vbucket: 5,
+            op: "delete",
+            mirrorTargetShardId: "some-target-shard",
+          },
+        ],
+      }),
+    );
+    const commitRes = await stub.fetch(post("/commit", { coordinatorTxId: "tx-noop-del" }));
+    expect(commitRes.status).toBe(200);
+
+    // The still-live row survives (the delete matched nothing).
+    const rowCount = (await (
+      await stub.fetch(post("/execute", { sql: "SELECT COUNT(*) AS n FROM t WHERE id = 'live-row'", requestId: `q-${crypto.randomUUID()}`, isMutation: false }))
+    ).json()) as { rows: Array<{ n: number }> };
+    expect(rowCount.rows[0].n).toBe(1);
+
+    // Provenance is NOT stripped, and no mirror job was enqueued.
+    const after = await runInDurableObject(stub, async (_i: ShardDO, state: DurableObjectState) => ({
+      prov: Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE table_name = 't' AND partition_key = 'live-row'")).length,
+      mirrors: Array.from(state.storage.sql.exec("SELECT job_id FROM __cf_mirror_pending WHERE vbucket = 5")).length,
+    }));
+    expect(after.prov, "no-op delete must NOT strip a live row's provenance").toBe(1);
+    expect(after.mirrors, "no-op delete must NOT enqueue a mirror").toBe(0);
+  });
+
   it("abort leaves no trace and is idempotent", async () => {
     const stub = await freshShard();
     await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)");
