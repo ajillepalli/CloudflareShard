@@ -767,6 +767,14 @@ export class CatalogDO extends DurableObject {
         401,
       );
     }
+    // Admin bypass: the operator (ADMIN_TOKEN) may /route as ANY tenant — used
+    // by the now-admin-only /v1/sql path (which still passes body.tenantId for
+    // routing/hashing but is authenticated as the operator, not the tenant).
+    // Harmless for the tenant-facing endpoints (admin is a superuser) and does
+    // not weaken tenant auth: a tenant token must still match its own hash.
+    if (this.adminToken && timingSafeEqual(token, this.adminToken)) {
+      return null;
+    }
 
     const row = this.one<{ token_hash: string; revoked_at: string | null }>(
       "SELECT token_hash, revoked_at FROM tenant_auth WHERE tenant_id = ?",
