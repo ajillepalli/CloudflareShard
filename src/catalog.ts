@@ -2081,10 +2081,23 @@ export class CatalogDO extends DurableObject {
         return false;
       }
 
-      // Step 5: unfence source, then delete the vbucket's rows + provenance
-      // from it.
-      await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
+      // Step 5: clean up the source while it stays FENCED, and unfence LAST.
+      // Codex full-PR review P1 (silent data loss): the old order unfenced
+      // FIRST, then deleted (which also purges this vbucket's __cf_mirror_pending).
+      // A straggler write that resolved the OLD source route before the flip and
+      // arrived in the unfence→delete window was ACCEPTED by the now-unfenced
+      // source (enqueuing a mirror) and then had its row deleted AND its mirror
+      // purged — the acked write reached neither source nor target. Lost.
+      // Deleting + purging while still fenced means such a straggler can only
+      // 409 VBUCKET_FENCED (retryable → the client re-routes to the flipped
+      // target). Residual: a straggler arriving AFTER this unfence writes an
+      // orphan row to a shard that no longer owns the vbucket — but its effect
+      // still reaches the target via the mirror its payload enqueues (not lost),
+      // and reads never route to the source. We DO unfence (rather than leave
+      // the source fenced forever) so a later migrate-back onto this shard isn't
+      // blocked by a stale fence.
       await this.callShard(source, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
+      await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
 
       this.audit("/migrate-vbucket-complete", { vbucket: m.vbucket, fromShard: source, toShard: target, metadataVersion: version });
       return false;
