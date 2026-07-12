@@ -1476,6 +1476,21 @@ export class CatalogDO extends DurableObject {
         // source copies in place (the ring is already repointed, so they're
         // unreachable-but-not-lost) for operator action. Previously the
         // delete below ran unconditionally — the safety valve was dead code.
+        //
+        // Codex full-PR review P2: the safety valve stopped the DELETE, but the
+        // drain then fell through and /drain-shard-status reported 'complete'
+        // (vbuckets drained + ring repointed away → 0 rings remaining) — so an
+        // operator could decommission a shard that still physically holds index
+        // entries the substitute was never proven to have, a silent index miss.
+        // Park the drain with a distinct stall reason so status reports a
+        // NON-'complete' 'stalled' instead. The source entries stay reachable
+        // only via operator inspection (the ring is repointed), but they are
+        // NOT lost, and the shard is flagged not-done. Cleared when the operator
+        // re-invokes /admin/drain-shard after resolving the write churn.
+        this.sql.exec(
+          "UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?",
+          shardId,
+        );
         continue;
       }
 

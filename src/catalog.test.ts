@@ -1854,6 +1854,84 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     });
   });
 
+  // Codex full-PR review P2 (drain reports complete despite stranded entries):
+  // when ring-evacuation reconcile never converges, the safety valve correctly
+  // SKIPS the destructive source delete — but the ring is already repointed, so
+  // vbuckets=0 + rings-remaining=0 made /drain-shard-status report 'complete'.
+  // An operator could then decommission a shard that still physically holds
+  // index entries the substitute was never proven to have (silent index miss).
+  // The fix parks the drain with drain_stall_reason='ring-reconcile-unstable' so
+  // status reports a distinguishable NON-'complete' stall.
+  it("a reconcile that never converges parks the drain as a 'ring-reconcile-unstable' stall (NOT 'complete'), and the source index entries remain queryable", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_evac_stall",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      // Move every vbucket off shard-0 so the drain skips phase-1 vbucket
+      // migration and goes straight to phase-2 ring evacuation.
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+    });
+
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    for (const pk of ["row-a", "row-b"]) {
+      await shard0.fetch(
+        new Request("https://shard.internal/index-entries-import", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            rows: [
+              {
+                table_name: "events",
+                index_name: "idx_evac_stall",
+                index_key_json: JSON.stringify(["alpha"]),
+                partition_key: pk,
+                source_shard_id: "shard-1",
+                tenant_id: "t1",
+                updated_at: new Date().toISOString(),
+              },
+            ],
+          }),
+        }),
+      );
+    }
+
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Force the reconcile to never converge (strictly growing cursor), then run
+    // a tick.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      let cursor = 0;
+      (instance as unknown as { copyIndexEntries: () => Promise<number> }).copyIndexEntries = async () => {
+        cursor += 1;
+        return cursor;
+      };
+      await instance.alarm();
+    });
+
+    // /drain-shard-status must NOT report 'complete' — it reports the stall.
+    const status = (await (
+      await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))
+    ).json()) as { status: string; stallReason: string | null };
+    expect(status.status).not.toBe("complete");
+    expect(status.stallReason).toBe("ring-reconcile-unstable");
+
+    // The source index entries remain in place (not deleted) — still there to
+    // be queried / recovered, not silently lost.
+    await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key", "idx_evac_stall"),
+      ) as Array<{ partition_key: string }>;
+      expect(rows.map((r) => r.partition_key)).toEqual(["row-a", "row-b"]);
+    });
+  });
+
   // Codex full-PR review P2: ring evacuation repointed the LOCAL ring first,
   // then fanned /update-index-ring out to siblings. If a sibling call failed,
   // the next tick read the already-repointed local ring (no longer containing
