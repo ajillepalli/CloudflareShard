@@ -4,6 +4,7 @@ import { hashKey, pickRingSubstitute } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
 import { MIGRATE_PAGE_SIZE } from "./shard";
+import { ensureCreateTableIfNotExists } from "./sql-safety";
 import { IDENTIFIER_RE, UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
 
 // Review Tier 1 #6: how many reconcile passes ring evacuation makes to catch
@@ -1800,7 +1801,11 @@ export class CatalogDO extends DurableObject {
         for (const t of tables) {
           if (!t.schemaSql) continue;
           const schemaRes = await this.callShard(target, "/execute", {
-            sql: t.schemaSql,
+            // Idempotent DDL: re-running against a target that already has the
+            // table must be a no-op, not a 400 — applied_requests dedup can be
+            // pruned (7-day TTL) so a drain/migration to an existing shard may
+            // genuinely re-execute the captured schema.
+            sql: ensureCreateTableIfNotExists(t.schemaSql),
             requestId: `create-table-${t.table}-${target}`,
             isMutation: true,
           });
@@ -1827,7 +1832,11 @@ export class CatalogDO extends DurableObject {
         // the provision_pending pass above — but only on a fresh target.)
         if (afterPk === "" && t.schemaSql) {
           const schemaRes = await this.callShard(target, "/execute", {
-            sql: t.schemaSql,
+            // Idempotent DDL — see the provision_pending pass above: a stable
+            // requestId dedupes normally, but applied_requests' TTL can prune
+            // the dedup row, so re-executing against an existing table must
+            // no-op rather than 400 and throw the migration into a retry loop.
+            sql: ensureCreateTableIfNotExists(t.schemaSql),
             requestId: `create-table-${t.table}-${target}`,
             isMutation: true,
           });
