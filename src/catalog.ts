@@ -1037,9 +1037,30 @@ export class CatalogDO extends DurableObject {
     return json({ routes });
   }
 
-  private async handleListShards(): Promise<Response> {
+  /** Default: ACTIVE shards only — the placement-ring / substitution pool. A
+   * draining shard must never be pinned into a new ring or chosen as a
+   * substitute target, so ring-building callers (clusterActiveShards, the
+   * create-index placement ring) rely on this default and pass no body.
+   *
+   * With `{ includeDraining: true }`: also returns DRAINING shards — a
+   * draining shard still physically holds its base rows until its vbuckets
+   * finish migrating, so any operation that must SEE every existing row
+   * (backfill-provenance's re-attribution scan, create-index's backfill scan)
+   * needs it. This is purely about seeing a draining shard's DATA; it does not
+   * make the shard a candidate for placement. */
+  private async handleListShards(request: Request): Promise<Response> {
+    let includeDraining = false;
+    try {
+      const body = (await request.json()) as { includeDraining?: boolean };
+      includeDraining = body?.includeDraining === true;
+    } catch {
+      // No/blank body — default to active-only.
+    }
+    const statuses = includeDraining ? ["active", "draining"] : ["active"];
+    const placeholders = statuses.map(() => "?").join(", ");
     const shards = this.many<{ shard_id: string }>(
-      "SELECT shard_id FROM shards WHERE status = 'active' ORDER BY shard_id ASC",
+      `SELECT shard_id FROM shards WHERE status IN (${placeholders}) ORDER BY shard_id ASC`,
+      ...statuses,
     );
     return json({ shardIds: shards.map((s) => s.shard_id) });
   }

@@ -812,7 +812,13 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
       routeToCatalog(env, catalogShardId, "/list-tables", {}, authorization),
       routeToCatalog(env, catalogShardId, "/list-tenants", {}, authorization),
       routeToCatalog(env, catalogShardId, "/vbucket-map", {}, authorization),
-      routeToCatalog(env, catalogShardId, "/list-shards", {}, authorization),
+      // P1 (Codex): a shard is marked 'draining' BEFORE its vbuckets migrate,
+      // and /admin/drain-shard stalls with VBUCKET_PROVENANCE_INCOMPLETE
+      // pointing the operator here. An active-only enumeration would then skip
+      // the very draining shard whose unattributed rows are blocking the drain
+      // — a deadlock. Enumerate active + draining so re-attribution scans the
+      // draining source and the drain can resume.
+      routeToCatalog(env, catalogShardId, "/list-shards", { includeDraining: true }, authorization),
     ]);
     if (!tablesRes.ok) return new Response(tablesRes.body, { status: tablesRes.status, headers: tablesRes.headers });
     if (!tenantsRes.ok) return new Response(tenantsRes.body, { status: tenantsRes.status, headers: tenantsRes.headers });
