@@ -1062,6 +1062,79 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     });
     expect(write.status).toBe(200);
   });
+
+  // Codex review P2: /migrate-vbucket-abort swallowed the /unfence-vbucket
+  // result. If unfence failed but the later wipe succeeded, the row was
+  // cleared to 'none' with the source still fenced — a permanent VBUCKET_FENCED
+  // with no 'aborting' state to resume from. The abort must leave the row
+  // 'aborting' (source still fenced) on an unfence failure, and only a retry
+  // (unfence succeeding) clears to 'none' and lifts the fence.
+  it("abort leaves the row 'aborting' + source fenced when /unfence-vbucket fails; a retry completes and lifts the fence", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(
+      post("/register-table", { table: "ab_evt", partitionKeyColumn: "id", schemaSql: "CREATE TABLE IF NOT EXISTS ab_evt (id TEXT PRIMARY KEY, v TEXT)" }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+
+    // Repoint vbucket 0 to a FRESH source shard (and a fresh target) so this
+    // test doesn't inherit fence/migration state other tests left on the
+    // shared shard-0. Put it into cutover, and REALLY fence the source.
+    const sourceShardId = `shard-abort-src-${crypto.randomUUID()}`;
+    const targetShardId = `shard-abort-target-${crypto.randomUUID()}`;
+    const source = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)", sourceShardId, new Date().toISOString());
+      state.storage.sql.exec("INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)", targetShardId, new Date().toISOString());
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = ?, migration_status = 'cutover', target_shard_id = ?, updated_at = ? WHERE vbucket = 0", sourceShardId, targetShardId, new Date().toISOString());
+    });
+    await source.fetch(
+      new Request("https://shard.internal/fence-vbucket", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ vbucket: 0 }) }),
+    );
+
+    const isFenced = async () =>
+      runInDurableObject(source, async (_i: unknown, state: DurableObjectState) =>
+        Array.from(state.storage.sql.exec("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = 0")).length > 0,
+      );
+    const migStatus = async () =>
+      runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+        (Array.from(state.storage.sql.exec("SELECT migration_status FROM vbucket_map WHERE vbucket = 0")) as Array<{ migration_status: string }>)[0].migration_status,
+      );
+    expect(await isFenced()).toBe(true);
+
+    // First abort: intercept /unfence-vbucket to fail. Expect 502, and the row
+    // stays 'aborting' with the source STILL fenced.
+    const firstStatus = await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __realCallShard?: (s: string, p: string, b: unknown) => Promise<Response>;
+        handleMigrateVbucketAbort: (r: Request) => Promise<Response>;
+      };
+      inst.__realCallShard = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) =>
+        path === "/unfence-vbucket"
+          ? new Response(JSON.stringify({ error: "boom" }), { status: 500, headers: { "content-type": "application/json" } })
+          : inst.__realCallShard!(shardId, path, payload);
+      const res = await inst.handleMigrateVbucketAbort(
+        new Request("https://catalog.internal/migrate-vbucket-abort", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ vbucket: 0 }) }),
+      );
+      return res.status;
+    });
+    expect(firstStatus).toBe(502);
+    expect(await migStatus()).toBe("aborting");
+    expect(await isFenced()).toBe(true); // source NOT left cleared-yet-fenced
+
+    // Restore the real callShard, then retry — the abort now completes.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as { callShard: unknown; __realCallShard: unknown };
+      inst.callShard = inst.__realCallShard;
+    });
+    const retry = await stub.fetch(post("/migrate-vbucket-abort", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(retry.status).toBe(200);
+    expect(((await retry.json()) as { status: string }).status).toBe("aborted");
+    expect(await migStatus()).toBe("none");
+    expect(await isFenced()).toBe(false); // fence lifted on the successful retry
+  });
+
 });
 
 describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
