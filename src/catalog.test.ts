@@ -1063,6 +1063,86 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(write.status).toBe(200);
   });
 
+  // Codex review P2 (residual): migration-time schema provisioning re-executes
+  // the captured schema_sql against the target. Its stable requestId normally
+  // dedupes, but applied_requests has a 7-day TTL — once pruned, a
+  // migration/drain to an ALREADY-EXISTING shard re-runs the CREATE TABLE. If
+  // the captured schema lacks IF NOT EXISTS, that's a 400 "table already
+  // exists" → advanceMigration throws → the migration retries forever. The fix
+  // injects IF NOT EXISTS at provision time so re-execution is a no-op.
+  it("migration-time provisioning is idempotent: a re-run CREATE TABLE (no IF NOT EXISTS, dedup absent) on an existing target no-ops instead of stalling; a fresh target still gets the table", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    // Registered schema DELIBERATELY without IF NOT EXISTS.
+    const schema = "CREATE TABLE provreplay_evt (id TEXT PRIMARY KEY, v TEXT)";
+    await stub.fetch(post("/register-table", { table: "provreplay_evt", partitionKeyColumn: "id", schemaSql: schema }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const source = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shardExecute(source, { sql: "CREATE TABLE IF NOT EXISTS provreplay_evt (id TEXT PRIMARY KEY, v TEXT)", requestId: `sc-${crypto.randomUUID()}`, isMutation: true });
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket IN (0, 1)");
+      state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket IN (0, 1)");
+    });
+    await shardExecute(source, {
+      sql: "INSERT INTO provreplay_evt (id, v) VALUES ('r0', 'x')",
+      requestId: `ins-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "provreplay_evt",
+      partitionKey: "r0",
+      vbucket: 0,
+    });
+
+    // Part A — EXISTING target that ALREADY has the table. Its copy was created
+    // under a DIFFERENT requestId, so the migration's provisioning requestId
+    // (create-table-provreplay_evt-<target>) is NOT cached there: it genuinely
+    // re-executes the captured CREATE TABLE, exactly as it would after the
+    // dedup row's TTL prune.
+    const existingTarget = `shard-existing-${crypto.randomUUID()}`;
+    const existingTargetStub = env.SHARD.get(env.SHARD.idFromName(existingTarget));
+    await shardExecute(existingTargetStub, { sql: "CREATE TABLE provreplay_evt (id TEXT PRIMARY KEY, v TEXT)", requestId: `pre-${crypto.randomUUID()}`, isMutation: true });
+    // Pre-register it as an active shard so startMigration treats it as EXISTING
+    // (provision_pending=0 → exercises the per-table in-loop provisioning path).
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)", existingTarget, new Date().toISOString());
+    });
+
+    const migA = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: existingTarget }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(migA.status).toBe(200);
+    for (let tick = 0; tick < 12; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const s = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+      if (s.status === "none") break;
+    }
+    const finalA = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(finalA.status).toBe("none"); // did NOT stall on the re-run CREATE TABLE
+    const rowA = (await (
+      await shardExecute(existingTargetStub, { sql: "SELECT v FROM provreplay_evt WHERE id = 'r0'", requestId: `q-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ v: string }> };
+    expect(rowA.rows).toHaveLength(1); // the row imported
+
+    // Part B — a FRESH target still gets the table created from the same
+    // no-IF-NOT-EXISTS schema (provision_pending path also normalizes the DDL).
+    const freshTarget = `shard-fresh-${crypto.randomUUID()}`;
+    const migB = await stub.fetch(post("/migrate-vbucket", { vbucket: 1, targetShardId: freshTarget }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(migB.status).toBe(200);
+    for (let tick = 0; tick < 12; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const s = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 1 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+      if (s.status === "none") break;
+    }
+    const finalB = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 1 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(finalB.status).toBe("none");
+    const freshTables = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(freshTarget)), async (_i: unknown, state: DurableObjectState) => {
+      return (Array.from(state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name = 'provreplay_evt'")) as Array<{ name: string }>).map((r) => r.name);
+    });
+    expect(freshTables).toContain("provreplay_evt");
+  });
+
   // Codex review P2: /migrate-vbucket-abort swallowed the /unfence-vbucket
   // result. If unfence failed but the later wipe succeeded, the row was
   // cleared to 'none' with the source still fenced — a permanent VBUCKET_FENCED
