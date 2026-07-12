@@ -5,16 +5,7 @@ import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
-import {
-  extractCreateTableName,
-  isDangerous,
-  isDangerousSchema,
-  isInternalTableName,
-  isMutation,
-  mutationWriteTarget,
-  normalizeTableName,
-  referencesInternalTable,
-} from "./sql-safety";
+import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation, mutationTargetIsInternal } from "./sql-safety";
 import {
   compileMutation,
   IDENTIFIER_RE,
@@ -1062,6 +1053,18 @@ async function handleAdminShardStats(request: Request, env: Env): Promise<Respon
 }
 
 async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  // ARCHITECTURE CHANGE: /v1/sql is now ADMIN-ONLY (operator/debugging), like
+  // /v1/scatter. The per-tenant SQL guard was structurally unwinnable — the
+  // denylist/allowlist leaked six times — and a raw partition-scoped SELECT
+  // leaked another tenant's data (base rows carry no physical tenant_id, so the
+  // shard can't filter by tenant; see docs/SPEC.md §14). Rather than keep
+  // patching an unwinnable guard, the whole trust-based tenant path is removed:
+  // tenants write via /v1/mutate + /v1/tx and read via /v1/index-query.
+  // body.tenantId is still required (routing/hashing) but is NOT authenticated
+  // against the caller — the caller is the operator (ADMIN_TOKEN).
+  const adminAuthError = requireAdminAuth(env, request);
+  if (adminAuthError) return adminAuthError;
+
   const body = (await request.json()) as SqlRequest;
   if (!body.sql || !body.table || !body.tenantId) {
     return json({ error: "Missing required fields: sql, table, tenantId." }, 400);
@@ -1073,55 +1076,19 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ error: "SQL statement not permitted." }, 403);
   }
 
-  // PRIMARY ALLOWLIST GATE (P1 security reframe). The routed shard executes
-  // body.sql verbatim, and body.table (used for routing) is validated as one
-  // of THIS tenant's registered, non-internal tables. So instead of trying to
-  // denylist every way to name an internal table (a regex denylist leaked FOUR
-  // times — mixed case, inter-token comments, `schema.` qualifiers, and a
-  // spaced+quoted `main . "__cf_fenced_vbuckets"`), require that the
-  // statement's single write target IS body.table. This structurally forbids
-  // writes to internal tables AND to any other tenant's table. Fail-closed:
-  // a mutation whose target can't be parsed is rejected.
-  if (mutating) {
-    const target = mutationWriteTarget(body.sql);
-    const declared = normalizeTableName(body.table);
-    if (target === null || target !== declared) {
-      const error =
-        target !== null && isInternalTableName(target)
-          ? {
-              code: "INTERNAL_TABLE_WRITE_FORBIDDEN",
-              message: "Writes to internal system tables are not permitted.",
-              fix: "Target one of your own registered tables.",
-            }
-          : {
-              code: "WRITE_TARGET_TABLE_MISMATCH",
-              message: "The statement's write target must match the declared table.",
-              fix: `Send the write with table set to the SQL's actual target${target ? ` (${target})` : ""}, and only write your own registered tables.`,
-            };
-      return json({ error }, 403);
-    }
-  }
-
-  // INTERNAL-TABLE REFERENCE BLOCK — reads AND writes. Beyond the write-target
-  // allowlist above, reject ANY reference to an internal bookkeeping table
-  // anywhere in the statement. This closes a cross-tenant LEAK the allowlist
-  // alone missed (P1): a mutation whose target is the caller's own table can
-  // still READ an internal table in a subquery and copy it out
-  // (`INSERT INTO mine SELECT partition_key FROM "__cf_row_owners"`), and a
-  // plain `SELECT * FROM __cf_row_owners` with a partitionKey leaks the same
-  // way — both expose other tenants' partition keys / tenant ids / provenance.
-  // Double-quoted identifiers are matched (only single-quoted string literals
-  // are stripped), so `"__cf_row_owners"` is caught; the documented tradeoff is
-  // that a double-quoted string VALUE equal to an internal name is rejected —
-  // tenants must single-quote string values. Reinforces the TODOS.md case for
-  // deprecating raw /v1/sql.
-  if (referencesInternalTable(body.sql)) {
+  // Light guardrail: block a MUTATION whose write target is an internal
+  // bookkeeping table, so a fat-fingered operator query can't corrupt
+  // fence/provenance/mirror state from the data plane. Internal-table READS are
+  // ALLOWED (an operator may need to inspect them for debugging) and cross-table
+  // access is allowed — admin is trusted. The internal DO routes that
+  // legitimately write these tables call /execute directly, never through here.
+  if (mutating && mutationTargetIsInternal(body.sql)) {
     return json(
       {
         error: {
-          code: "INTERNAL_TABLE_ACCESS_FORBIDDEN",
-          message: "Access to internal system tables is not permitted.",
-          fix: "Reference only your own registered tables; use single quotes for string literals.",
+          code: "INTERNAL_TABLE_WRITE_FORBIDDEN",
+          message: "Writes to internal system tables are not permitted, even for the operator.",
+          fix: "Manipulate migration/fence/provenance state only through the /admin/* orchestration routes.",
         },
       },
       403,

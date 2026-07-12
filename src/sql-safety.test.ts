@@ -5,11 +5,10 @@ import {
   isDangerous,
   isDangerousSchema,
   isInternalTableName,
-  isInternalTableWrite,
   isMutation,
+  mutationTargetIsInternal,
   mutationWriteTarget,
   normalizeTableName,
-  referencesInternalTable,
 } from "./sql-safety";
 
 describe("isMutation", () => {
@@ -65,10 +64,10 @@ describe("isMutation", () => {
   });
 });
 
-// Codex review P1: the write-target extractor backs the /v1/sql ALLOWLIST
-// gate (target must equal the caller's declared table). Exhaustive parsing
-// coverage lives here as a pure unit test — zero worker/gateway round trips,
-// so it doesn't add to index.test.ts's cumulative-latency budget.
+// The write-target extractor backs mutationTargetIsInternal, the admin-only
+// /v1/sql write guardrail. Exhaustive parsing coverage lives here as a pure
+// unit test — zero worker/gateway round trips, so it doesn't add to
+// index.test.ts's cumulative-latency budget.
 describe("mutationWriteTarget", () => {
   it("extracts a bare target, normalized (lowercased)", () => {
     expect(mutationWriteTarget("DELETE FROM events")).toBe("events");
@@ -127,42 +126,29 @@ describe("isInternalTableName / normalizeTableName", () => {
   });
 });
 
-describe("isInternalTableWrite (mutation reference)", () => {
-  it("blocks a mutation targeting or referencing an internal table, however spelled", () => {
-    expect(isInternalTableWrite("DELETE FROM applied_requests")).toBe(true);
-    expect(isInternalTableWrite('DELETE FROM main . "__cf_fenced_vbuckets"')).toBe(true);
-    expect(isInternalTableWrite("INSERT INTO events (id) SELECT partition_key FROM __cf_row_owners")).toBe(true);
+// Architecture change: /v1/sql is admin-only; the remaining guardrail blocks a
+// MUTATION whose write TARGET is an internal table (however spelled), while
+// ALLOWING internal-table READS and mutations that only READ an internal table
+// in a subquery (target is a normal table). Target-based, not a reference block.
+describe("mutationTargetIsInternal (admin /v1/sql write guardrail)", () => {
+  it("blocks a mutation whose TARGET is an internal table, however quoted/qualified/obfuscated", () => {
+    expect(mutationTargetIsInternal("DELETE FROM applied_requests")).toBe(true);
+    expect(mutationTargetIsInternal('DELETE FROM main . "__cf_fenced_vbuckets"')).toBe(true);
+    expect(mutationTargetIsInternal("DELETE/**/FROM __cf_row_owners")).toBe(true);
+    expect(mutationTargetIsInternal("UPDATE `row_locks` SET x = 1")).toBe(true);
+    expect(mutationTargetIsInternal("INSERT INTO [pending_intents] (x) VALUES (1)")).toBe(true);
   });
 
-  it("does not flag a legit own-table write with SINGLE-quoted string data", () => {
-    expect(isInternalTableWrite("INSERT INTO events (id, v) VALUES ('n1', 'row_locks note')")).toBe(false);
-    expect(isInternalTableWrite("INSERT INTO events (id, v) VALUES ('n1', 'applied_requests')")).toBe(false);
+  it("ALLOWS a mutation to a normal table, even one that reads an internal table in a subquery", () => {
+    expect(mutationTargetIsInternal("INSERT INTO events (id) VALUES ('x')")).toBe(false);
+    expect(mutationTargetIsInternal("INSERT INTO events (id) SELECT partition_key FROM __cf_row_owners")).toBe(false);
+    expect(mutationTargetIsInternal("UPDATE events SET v = (SELECT count(*) FROM applied_requests)")).toBe(false);
   });
 
-  it("is a mutation gate: a read is not a WRITE even if it references an internal table", () => {
-    expect(isInternalTableWrite("SELECT * FROM __cf_row_owners")).toBe(false);
-  });
-});
-
-// Codex full-PR review P1: the reference block applies to reads AND writes and
-// catches DOUBLE-quoted internal identifiers (only single-quoted string
-// literals are stripped) — closing the subquery/plain-read exfiltration leak.
-describe("referencesInternalTable (reads and writes)", () => {
-  it("catches an internal reference anywhere, including a double-quoted identifier", () => {
-    expect(referencesInternalTable('SELECT * FROM "__cf_row_owners"')).toBe(true);
-    expect(referencesInternalTable("SELECT * FROM __cf_row_owners")).toBe(true);
-    expect(referencesInternalTable("INSERT INTO events (id) SELECT partition_key FROM `__cf_row_owners`")).toBe(true);
-    expect(referencesInternalTable("SELECT e.id FROM events e JOIN [row_locks] r ON 1=1")).toBe(true);
-    expect(referencesInternalTable('DELETE FROM "applied_requests"')).toBe(true);
-    // Documented tradeoff: a DOUBLE-quoted string value equal to an internal
-    // name is treated as an identifier reference and blocked.
-    expect(referencesInternalTable('INSERT INTO events (id, v) VALUES (\'n1\', "applied_requests")')).toBe(true);
-  });
-
-  it("allows own-table statements whose data is SINGLE-quoted", () => {
-    expect(referencesInternalTable("SELECT v FROM events WHERE v = 'applied_requests'")).toBe(false);
-    expect(referencesInternalTable("INSERT INTO events (id, v) VALUES ('n1', 'row_locks note')")).toBe(false);
-    expect(referencesInternalTable("SELECT * FROM events WHERE id = 'x'")).toBe(false);
+  it("ALLOWS reads (not a mutation), including reads of internal tables", () => {
+    expect(mutationTargetIsInternal("SELECT * FROM __cf_row_owners")).toBe(false);
+    expect(mutationTargetIsInternal('SELECT * FROM "applied_requests"')).toBe(false);
+    expect(mutationTargetIsInternal("SELECT v FROM events WHERE id = 'x'")).toBe(false);
   });
 });
 

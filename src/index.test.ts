@@ -106,7 +106,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
           tenantId,
           partitionKey: "p1",
         },
-        token,
+        AUTH(),
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as { route: { catalogShardId: string; shardId: string } };
@@ -331,7 +331,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
         tenantId,
         partitionKey: "p1",
       },
-      token,
+      AUTH(),
     );
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
@@ -340,12 +340,16 @@ describe("Worker multi-catalog-shard fan-out", () => {
 
   it("/v1/sql still rejects CREATE/DROP/ALTER as dangerous", async () => {
     await initCluster();
-    const res = await post("/v1/sql", {
-      sql: "CREATE TABLE IF NOT EXISTS other (id TEXT PRIMARY KEY)",
-      table: "events",
-      tenantId: "t1",
-      partitionKey: "p1",
-    });
+    const res = await post(
+      "/v1/sql",
+      {
+        sql: "CREATE TABLE IF NOT EXISTS other (id TEXT PRIMARY KEY)",
+        table: "events",
+        tenantId: "t1",
+        partitionKey: "p1",
+      },
+      AUTH(),
+    );
     expect(res.status).toBe(403);
   });
 });
@@ -356,18 +360,28 @@ describe("Worker tenant authorization", () => {
     expect(res.status).toBe(401);
   });
 
-  it("/admin/register-tenant issues a token that /v1/sql accepts", async () => {
+  // Architecture change: /v1/sql is ADMIN-ONLY. A tenant token (the value
+  // /register-tenant issues) is NO LONGER accepted — tenants use /v1/mutate,
+  // /v1/tx, /v1/index-query. The admin token works.
+  it("/v1/sql rejects a tenant token 401 and accepts ADMIN_TOKEN", async () => {
     await initCluster();
-    const token = await registerTenant("t1");
-    const res = await post(
+    const tenantToken = await registerTenant("t1");
+    const rejected = await post(
       "/v1/sql",
       { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["1", "a"], table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
+      tenantToken,
     );
-    expect(res.status).toBe(200);
+    expect(rejected.status).toBe(401);
+
+    const accepted = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["1", "a"], table: "events", tenantId: "t1", partitionKey: "p1" },
+      AUTH(),
+    );
+    expect(accepted.status).toBe(200);
   });
 
-  it("/v1/sql requires a tenant token (regression: data-plane had no auth at all)", async () => {
+  it("/v1/sql requires the admin token (no token → 401)", async () => {
     await initCluster();
     const res = await post("/v1/sql", {
       sql: "SELECT * FROM events",
@@ -378,215 +392,61 @@ describe("Worker tenant authorization", () => {
     expect(res.status).toBe(401);
   });
 
-  it("/admin/revoke-tenant invalidates a tenant's access via /v1/sql", async () => {
+  it("/admin/revoke-tenant invalidates a tenant's access via /v1/mutate (the tenant data plane)", async () => {
     await initCluster();
     const token = await registerTenant("t1");
     await post("/admin/revoke-tenant", { tenantId: "t1" }, AUTH());
     const res = await post(
-      "/v1/sql",
-      { sql: "SELECT * FROM events", table: "events", tenantId: "t1", partitionKey: "p1" },
+      "/v1/mutate",
+      { op: "insert", table: "events", tenantId: "t1", partitionKey: "p1", values: { v: "a" } },
       token,
     );
     expect(res.status).toBe(401);
   });
 
-  // Review Tier 1 #1: a tenant routes by a registered table but sends SQL that
-  // writes an internal bookkeeping table — must be rejected 403 before it can
-  // reach the shard and lift a fence / forge provenance / purge the mirror
-  // queue from the data plane.
-  it("rejects a /v1/sql DML/DELETE/INSERT/UPDATE against each internal table with 403, even when routed via a registered table", async () => {
+  // Architecture change: /v1/sql is admin-only. The remaining guardrail blocks
+  // a MUTATION whose write TARGET is an internal bookkeeping table (so a
+  // fat-fingered operator can't corrupt fence/provenance/mirror state), while
+  // ALLOWING internal-table READS (operator debugging) and cross-table access
+  // (admin is trusted). The exhaustive target-spelling matrix (case, inline
+  // comments, schema qualifiers, quoting) lives in sql-safety.test.ts
+  // (mutationTargetIsInternal); here we verify the worker wiring.
+  it("admin guardrail: blocks WRITES to internal targets, but ALLOWS internal-table reads and cross-table writes", async () => {
     await initCluster();
-    const token = await registerTenant("t1");
-    const internalTables = [
-      "__cf_fenced_vbuckets",
-      "__cf_row_owners",
-      "__cf_mirror_pending",
-      "__cf_indexes",
-      "applied_requests",
-      "pending_intents",
-      "row_locks",
-      "index_pending_jobs",
-    ];
-    const statements = (t: string) => [
-      `DELETE FROM ${t}`,
-      `INSERT INTO ${t} (x) VALUES (1)`,
-      `UPDATE ${t} SET x = 1`,
-      `DELETE FROM "${t}" WHERE 1=1`,
-    ];
-    for (const t of internalTables) {
-      for (const sql of statements(t)) {
-        const res = await post(
-          "/v1/sql",
-          { sql, table: "events", tenantId: "t1", partitionKey: "p1" },
-          token,
-        );
-        expect(res.status, `${sql} should be 403`).toBe(403);
-        const body = (await res.json()) as { error: { code?: string } | string };
-        const code = typeof body.error === "object" ? body.error.code : undefined;
-        expect(code).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
-      }
-    }
-
-    // A comment-obfuscated leading keyword can't smuggle it past the guard.
-    const obfuscated = await post(
-      "/v1/sql",
-      { sql: "-- harmless\nDELETE FROM __cf_fenced_vbuckets", table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
+    await post(
+      "/admin/create-table",
+      { table: "other_tbl", schema: "CREATE TABLE IF NOT EXISTS other_tbl (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
     );
-    expect(obfuscated.status).toBe(403);
 
-    // A normal write to the tenant's own table still works.
-    const ok = await post(
-      "/v1/sql",
-      { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["ok-1", "x"], table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
-    );
-    expect(ok.status).toBe(200);
-  });
-
-  // Re-review found THREE confirmed bypasses of the write guard's old
-  // target-extraction approach: case (the set was lowercase but compared the
-  // original case), inter-token comments (the target regex required literal
-  // \s+ between keywords), and schema. qualifiers (the regex captured the
-  // schema, not the __cf_ table). The reference-block replacement must reject
-  // all of them.
-  it("rejects internal-table writes that bypassed the old target-extraction guard (case, inline comment, schema qualifier, quoting)", async () => {
-    await initCluster();
-    const token = await registerTenant("t1");
-
-    const bypasses = [
-      // 1. CASE — SQLite table names are case-insensitive; the old lowercase
-      //    Set.has(originalCase) missed these against the real tables.
-      "DELETE FROM Applied_Requests",
-      "DELETE FROM PENDING_INTENTS",
-      "DELETE FROM Row_Locks",
-      "UPDATE INDEX_PENDING_JOBS SET x = 1",
-      // 2. INLINE COMMENT between keywords.
-      "DELETE/**/FROM __cf_fenced_vbuckets",
-      "DELETE /* wipe the fence */ FROM __cf_fenced_vbuckets",
-      // 3. SCHEMA QUALIFIER.
-      "DELETE FROM main.__cf_row_owners",
-      "INSERT INTO main.__cf_mirror_pending (x) VALUES (1)",
-      // Quoted, mixed case.
-      'DELETE FROM "Applied_Requests"',
-      "DELETE FROM `row_locks`",
-      "DELETE FROM [pending_intents]",
-    ];
-    for (const sql of bypasses) {
-      const res = await post("/v1/sql", { sql, table: "events", tenantId: "t1", partitionKey: "p1" }, token);
+    // WRITES whose target is an internal table → 403, however spelled.
+    for (const sql of [
+      "DELETE FROM __cf_fenced_vbuckets",
+      'DELETE FROM main . "__cf_row_owners"',
+      "DELETE/**/FROM applied_requests",
+      "UPDATE `row_locks` SET x = 1",
+    ]) {
+      const res = await post("/v1/sql", { sql, table: "events", tenantId: "t1", partitionKey: "p1" }, AUTH());
       expect(res.status, `${sql} should be 403`).toBe(403);
-      const body = (await res.json()) as { error: { code?: string } | string };
-      const code = typeof body.error === "object" ? body.error.code : undefined;
-      expect(code, `${sql} code`).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
+      expect(((await res.json()) as { error: { code?: string } }).error.code, `${sql} code`).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
     }
 
-    // A legitimate write whose STRING DATA merely contains an internal table
-    // name must NOT be blocked (string literals are stripped before the
-    // reference check) — no false positive.
-    const okData = await post(
+    // A plain READ of an internal table is ALLOWED (operator debugging).
+    const read = await post(
       "/v1/sql",
-      {
-        sql: "INSERT INTO events (id, v) VALUES (?, ?)",
-        params: ["note-1", "see row_locks and applied_requests for details"],
-        table: "events",
-        tenantId: "t1",
-        partitionKey: "p1",
-      },
-      token,
+      { sql: "SELECT COUNT(*) AS n FROM __cf_row_owners", table: "events", tenantId: "t1", partitionKey: "p1" },
+      AUTH(),
     );
-    expect(okData.status).toBe(200);
-  });
+    expect(read.status, "internal-table read allowed for admin").toBe(200);
 
-  // Codex full-PR review P1 (5th guard leak): a double-quoted internal-table
-  // REFERENCE resolves as an identifier in SQLite, so it must be blocked — even
-  // as a subquery/value position. The security tradeoff (documented) is that a
-  // double-quoted STRING VALUE equal to an internal name is now rejected too;
-  // tenants must single-quote string literals.
-  it("blocks a double-quoted internal reference (identifier); a single-quoted string value with the same text is allowed", async () => {
-    await initCluster();
-    const token = await registerTenant("t1");
-
-    // A double-quoted token equal to an internal name is an IDENTIFIER, blocked
-    // even in a VALUE position (the documented single-quotes-for-strings
-    // tradeoff) → reference block. A double-quoted TARGET → allowlist gate.
-    // (Full matrix in sql-safety.test.ts referencesInternalTable.)
-    const dqValue = await post("/v1/sql", { sql: 'INSERT INTO events (id, v) VALUES (\'n1\', "applied_requests")', table: "events", tenantId: "t1", partitionKey: "p1" }, token);
-    expect(dqValue.status).toBe(403);
-    expect(((await dqValue.json()) as { error: { code?: string } }).error.code).toBe("INTERNAL_TABLE_ACCESS_FORBIDDEN");
-
-    const dqTarget = await post("/v1/sql", { sql: 'DELETE FROM "applied_requests"', table: "events", tenantId: "t1", partitionKey: "p1" }, token);
-    expect(dqTarget.status).toBe(403);
-    expect(((await dqTarget.json()) as { error: { code?: string } }).error.code).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
-
-    // The SAME text as a SINGLE-quoted string literal is data — allowed.
-    const okSingleQuoted = await post(
+    // A cross-table write (target differs from body.table) is ALLOWED — there
+    // is no per-tenant table ownership for the operator.
+    const cross = await post(
       "/v1/sql",
-      { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: [`sq-${crypto.randomUUID()}`, "applied_requests"], table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
+      { sql: "INSERT INTO other_tbl (id, v) VALUES (?, ?)", params: [`x-${crypto.randomUUID()}`, "v"], table: "events", tenantId: "t1", partitionKey: "p1" },
+      AUTH(),
     );
-    expect(okSingleQuoted.status, "single-quoted string value should be allowed").toBe(200);
-  });
-
-  // Codex full-PR review P1: the allowlist gates the write TARGET, but a
-  // mutation to the tenant's OWN table could still READ an internal table in a
-  // subquery and exfiltrate it, and a plain SELECT of an internal table leaks
-  // the same way. Here we only verify the worker gate is wired for both a
-  // write-subquery and a plain read (403 INTERNAL_TABLE_ACCESS_FORBIDDEN) and
-  // that a legit own-table read is allowed; the exhaustive matrix (double-
-  // quoted/backtick/bracket identifiers, joins) is a pure unit test in
-  // sql-safety.test.ts (referencesInternalTable), to keep this long file's
-  // per-test gateway budget down.
-  it("worker gate blocks a subquery/plain-read internal-table reference (cross-tenant leak), allows an own-table read", async () => {
-    await initCluster();
-    const token = await registerTenant("t1");
-
-    for (const sql of ['INSERT INTO events (id) SELECT partition_key FROM "__cf_row_owners"', "SELECT * FROM __cf_row_owners"]) {
-      const res = await post("/v1/sql", { sql, table: "events", tenantId: "t1", partitionKey: "p1" }, token);
-      expect(res.status, `${sql} should be 403`).toBe(403);
-      expect(((await res.json()) as { error: { code?: string } }).error.code, `${sql} code`).toBe("INTERNAL_TABLE_ACCESS_FORBIDDEN");
-    }
-
-    const okRead = await post(
-      "/v1/sql",
-      { sql: "SELECT v FROM events WHERE v = 'applied_requests'", table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
-    );
-    expect(okRead.status, "own-table read with single-quoted data should be allowed").toBe(200);
-  });
-
-  // Codex review P1: the guard is reframed to an ALLOWLIST — a /v1/sql
-  // mutation's write target must equal the caller's declared body.table. The
-  // exhaustive parsing matrix (spaced-qualifier 4th bypass, quoting, etc.)
-  // lives as a pure unit test in sql-safety.test.ts (mutationWriteTarget) to
-  // avoid adding gateway round trips to this already-long file; here we only
-  // verify the worker gate is wired: the 4th bypass and a cross-table write
-  // are rejected with the right codes, and a legit own-table write succeeds.
-  it("allowlist gate: rejects the spaced-qualifier internal bypass and a cross-table write, allows an own-table write", async () => {
-    await initCluster();
-    const token = await registerTenant("t1");
-
-    const internal = await post(
-      "/v1/sql",
-      { sql: 'DELETE FROM main . "__cf_fenced_vbuckets"', table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
-    );
-    expect(internal.status).toBe(403);
-    expect(((await internal.json()) as { error: { code: string } }).error.code).toBe("INTERNAL_TABLE_WRITE_FORBIDDEN");
-
-    const crossTable = await post(
-      "/v1/sql",
-      { sql: "DELETE FROM other_table WHERE id = 1", table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
-    );
-    expect(crossTable.status).toBe(403);
-    expect(((await crossTable.json()) as { error: { code: string } }).error.code).toBe("WRITE_TARGET_TABLE_MISMATCH");
-
-    const ok = await post(
-      "/v1/sql",
-      { sql: "UPDATE events SET v = ? WHERE id = ?", params: ["v", `allow-${crypto.randomUUID()}`], table: "events", tenantId: "t1", partitionKey: "p1" },
-      token,
-    );
-    expect(ok.status).toBe(200);
+    expect(cross.status, "cross-table write allowed for admin").toBe(200);
   });
 });
 
@@ -613,7 +473,7 @@ describe("Worker /v1/mutate", () => {
     const checkRes = await post(
       "/v1/sql",
       { sql: "SELECT id FROM events WHERE id = ?", params: ["row-1"], table: "events", tenantId: "t1", partitionKey: "row-1" },
-      token,
+      AUTH(),
     );
     const checkBody = (await checkRes.json()) as { result: { rows: Array<{ id: string }> } };
     expect(checkBody.result.rows).toHaveLength(1);
@@ -636,7 +496,7 @@ describe("Worker /v1/mutate", () => {
     const checkRes = await post(
       "/v1/sql",
       { sql: "SELECT id FROM events WHERE id = ?", params: ["row-b"], table: "events", tenantId: "t2", partitionKey: "row-b" },
-      tokenB,
+      AUTH(),
     );
     const checkBody = (await checkRes.json()) as { result: { rows: Array<{ id: string }> } };
     expect(checkBody.result.rows).toHaveLength(1);
@@ -955,7 +815,7 @@ describe("Worker /admin/drop-index (Milestone 2 Chunk 6)", () => {
     const rawRes = await post(
       "/v1/sql",
       { sql: "INSERT INTO idx_c6_drop_evt (id, v) VALUES (?, ?)", params: ["row-2", "beta"], table: "idx_c6_drop_evt", tenantId, partitionKey: "row-2" },
-      token,
+      AUTH(),
     );
     expect(rawRes.status).toBe(200);
   });
@@ -973,7 +833,7 @@ describe("Worker /v1/sql raw mutation against an indexed table (Milestone 2 Chun
     const res = await post(
       "/v1/sql",
       { sql: "INSERT INTO idx_reject_evt (id, v) VALUES (?, ?)", params: ["row-x", "x"], table: "idx_reject_evt", tenantId, partitionKey: "row-x" },
-      token,
+      AUTH(),
     );
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: { code: string } };
@@ -990,7 +850,7 @@ describe("Worker /v1/sql raw mutation against an indexed table (Milestone 2 Chun
     const res = await post(
       "/v1/sql",
       { sql: "SELECT * FROM idx_select_evt WHERE id = ?", params: ["row-x"], table: "idx_select_evt", tenantId, partitionKey: "row-x" },
-      token,
+      AUTH(),
     );
     expect(res.status).toBe(200);
   });
@@ -1003,7 +863,7 @@ describe("Worker /v1/sql raw mutation against an indexed table (Milestone 2 Chun
     const res = await post(
       "/v1/sql",
       { sql: "INSERT INTO idx_noindex_evt (id, v) VALUES (?, ?)", params: ["row-y", "y"], table: "idx_noindex_evt", tenantId, partitionKey: "row-y" },
-      token,
+      AUTH(),
     );
     expect(res.status).toBe(200);
   });
@@ -1336,7 +1196,7 @@ async function findPartitionKeyPairOnDifferentShards(token: string, tenantId: st
     const res = await post(
       "/v1/sql",
       { sql: "SELECT 1", table, tenantId, partitionKey },
-      token,
+      AUTH(),
     );
     const body = (await res.json()) as { route: { shardId: string } };
     seen.set(partitionKey, body.route.shardId);
@@ -1431,9 +1291,9 @@ describe("Worker /v1/tx (cross-shard atomic transactions)", () => {
     expect(body.ok).toBe(true);
     expect(body.status).toBe("committed");
 
-    const checkA = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkA], table: "events", tenantId: "tx-happy", partitionKey: pkA }, token);
+    const checkA = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkA], table: "events", tenantId: "tx-happy", partitionKey: pkA }, AUTH());
     expect(((await checkA.json()) as { result: { rows: unknown[] } }).result.rows).toHaveLength(1);
-    const checkB = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkB], table: "events", tenantId: "tx-happy", partitionKey: pkB }, token);
+    const checkB = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkB], table: "events", tenantId: "tx-happy", partitionKey: pkB }, AUTH());
     expect(((await checkB.json()) as { result: { rows: unknown[] } }).result.rows).toHaveLength(1);
   });
 
@@ -1460,7 +1320,7 @@ describe("Worker /v1/tx (cross-shard atomic transactions)", () => {
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("TX_ABORTED");
 
-    const checkA = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkA], table: "events", tenantId: "tx-fail", partitionKey: pkA }, token);
+    const checkA = await post("/v1/sql", { sql: "SELECT id FROM events WHERE id = ?", params: [pkA], table: "events", tenantId: "tx-fail", partitionKey: pkA }, AUTH());
     expect(((await checkA.json()) as { result: { rows: unknown[] } }).result.rows).toHaveLength(0);
   });
 
@@ -1478,7 +1338,7 @@ describe("Worker /v1/tx (cross-shard atomic transactions)", () => {
     const secondBody = (await second.json()) as { status: string };
     expect(secondBody.status).toBe("committed");
 
-    const countRes = await post("/v1/sql", { sql: "SELECT COUNT(*) as n FROM events WHERE id = ?", params: ["p-idem"], table: "events", tenantId: "tx-idem", partitionKey: "p-idem" }, token);
+    const countRes = await post("/v1/sql", { sql: "SELECT COUNT(*) as n FROM events WHERE id = ?", params: ["p-idem"], table: "events", tenantId: "tx-idem", partitionKey: "p-idem" }, AUTH());
     const countBody = (await countRes.json()) as { result: { rows: Array<{ n: number }> } };
     expect(countBody.result.rows[0].n).toBe(1);
   });
@@ -1556,7 +1416,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     );
     expect(res.status).toBe(409);
 
-    const checkRes = await post("/v1/sql", { sql: "SELECT * FROM idx_c3_fail_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_fail_evt", tenantId, partitionKey: "row-1" }, token);
+    const checkRes = await post("/v1/sql", { sql: "SELECT * FROM idx_c3_fail_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_fail_evt", tenantId, partitionKey: "row-1" }, AUTH());
     const checkBody = (await checkRes.json()) as { result: { rows: unknown[] } };
     expect(checkBody.result.rows).toHaveLength(0);
 
@@ -1647,7 +1507,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     const checkRes = await post(
       "/v1/sql",
       { sql: "SELECT v FROM idx_c3_zerorow_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_zerorow_evt", tenantId, partitionKey: "row-1" },
-      token,
+      AUTH(),
     );
     const checkBody = (await checkRes.json()) as { result: { rows: Array<{ v: string }> } };
     expect(checkBody.result.rows[0].v).toBe("alpha");
@@ -1734,7 +1594,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     const checkRes = await post(
       "/v1/sql",
       { sql: "SELECT v FROM idx_c3_simwhere_evt WHERE id = ?", params: ["row-1"], table: "idx_c3_simwhere_evt", tenantId, partitionKey: "row-1" },
-      token,
+      AUTH(),
     );
     const checkBody = (await checkRes.json()) as { result: { rows: Array<{ v: string }> } };
     expect(checkBody.result.rows[0].v).toBe("b");
@@ -2845,14 +2705,14 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
       const res = await post(
         "/v1/sql",
         { sql: "INSERT INTO m4_happy_evt (id, v) VALUES (?, ?)", params: [key, `val-${key}`], table: "m4_happy_evt", tenantId, partitionKey: key },
-        token,
+        AUTH(),
       );
       expect(res.status).toBe(200);
     }
 
     const vbucket = hashKey(`${tenantId}:m4_happy_evt:hp`) % 64;
     const routeBefore = (await (
-      await post("/v1/sql", { sql: "SELECT * FROM m4_happy_evt WHERE id = ?", params: ["hp"], table: "m4_happy_evt", tenantId, partitionKey: "hp" }, token)
+      await post("/v1/sql", { sql: "SELECT * FROM m4_happy_evt WHERE id = ?", params: ["hp"], table: "m4_happy_evt", tenantId, partitionKey: "hp" }, AUTH())
     ).json()) as { route: { shardId: string } };
     const sourceShardId = routeBefore.route.shardId;
     const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
@@ -2872,7 +2732,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
       const readRes = await post(
         "/v1/sql",
         { sql: "SELECT v FROM m4_happy_evt WHERE id = ?", params: [key], table: "m4_happy_evt", tenantId, partitionKey: key },
-        token,
+        AUTH(),
       );
       expect(readRes.status).toBe(200);
       const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
@@ -2903,12 +2763,12 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
       await post(
         "/v1/sql",
         { sql: "INSERT INTO m4_conc_evt (id, v) VALUES (?, ?)", params: [key, `pre-${key}`], table: "m4_conc_evt", tenantId, partitionKey: key, requestId: `pre-${key}` },
-        token,
+        AUTH(),
       );
     }
 
     const routeBefore = (await (
-      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_conc_evt WHERE id = ?", params: ["cc"], table: "m4_conc_evt", tenantId, partitionKey: "cc" }, token)
+      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_conc_evt WHERE id = ?", params: ["cc"], table: "m4_conc_evt", tenantId, partitionKey: "cc" }, AUTH())
     ).json()) as { route: { shardId: string } };
     const sourceShardId = routeBefore.route.shardId;
     const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
@@ -2934,7 +2794,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
             partitionKey: key,
             requestId,
           },
-          token,
+          AUTH(),
         );
         if (res.status === 200) return;
         const body = (await res.json()) as { error?: { code?: string } | string };
@@ -2977,7 +2837,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
       const readRes = await post(
         "/v1/sql",
         { sql: "SELECT v FROM m4_conc_evt WHERE id = ?", params: [key], table: "m4_conc_evt", tenantId, partitionKey: key },
-        token,
+        AUTH(),
       );
       const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
       expect(readBody.route.shardId).toBe(targetShardId);
@@ -3021,7 +2881,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
         partitionKey: keys[0],
         requestId: `conc-${keys[0]}`,
       },
-      token,
+      AUTH(),
     );
     expect(replayRes.status).toBe(200);
     const replayBody = (await replayRes.json()) as { result: { duplicated?: boolean } };
@@ -3097,7 +2957,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     const readRes = await post(
       "/v1/sql",
       { sql: "SELECT v FROM m4_tx7_evt WHERE id = ?", params: [pk], table: "m4_tx7_evt", tenantId, partitionKey: pk },
-      token,
+      AUTH(),
     );
     expect(readRes.status).toBe(200);
     const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
@@ -3165,7 +3025,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     const writeRes = await post(
       "/v1/sql",
       { sql: "INSERT INTO m4_abortresume_evt (id, v) VALUES (?, ?)", params: ["ar", "x"], table: "m4_abortresume_evt", tenantId, partitionKey: "ar" },
-      token,
+      AUTH(),
     );
     expect(writeRes.status).toBe(200);
   });
@@ -3181,12 +3041,12 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
       await post(
         "/v1/sql",
         { sql: "INSERT INTO m4_abort_evt (id, v) VALUES (?, ?)", params: [key, `v-${key}`], table: "m4_abort_evt", tenantId, partitionKey: key },
-        token,
+        AUTH(),
       );
     }
     const vbucket = hashKey(`${tenantId}:m4_abort_evt:ab`) % 64;
     const routeBefore = (await (
-      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_abort_evt WHERE id = ?", params: ["ab"], table: "m4_abort_evt", tenantId, partitionKey: "ab" }, token)
+      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_abort_evt WHERE id = ?", params: ["ab"], table: "m4_abort_evt", tenantId, partitionKey: "ab" }, AUTH())
     ).json()) as { route: { shardId: string } };
     const sourceShardId = routeBefore.route.shardId;
     const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
@@ -3259,7 +3119,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     const readRes = await post(
       "/v1/sql",
       { sql: "SELECT v FROM m4_abort_evt WHERE id = ?", params: [keys[0]], table: "m4_abort_evt", tenantId, partitionKey: keys[0] },
-      token,
+      AUTH(),
     );
     const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: unknown[] } };
     expect(readBody.route.shardId).toBe(sourceShardId);
@@ -3280,7 +3140,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     const postAbortWrite = await post(
       "/v1/sql",
       { sql: "INSERT INTO m4_abort_evt (id, v) VALUES (?, ?)", params: [`${keys[0]}-after`, "x"], table: "m4_abort_evt", tenantId, partitionKey: keys[0] },
-      token,
+      AUTH(),
     );
     expect(postAbortWrite.status).toBe(200);
   }, 60000);
@@ -3295,11 +3155,11 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     await post(
       "/v1/sql",
       { sql: "INSERT INTO m4_race_evt (id, v) VALUES (?, ?)", params: [key, "seed"], table: "m4_race_evt", tenantId, partitionKey: key },
-      token,
+      AUTH(),
     );
     const vbucket = hashKey(`${tenantId}:m4_race_evt:${key}`) % 64;
     const routeBefore = (await (
-      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_race_evt WHERE id = ?", params: [key], table: "m4_race_evt", tenantId, partitionKey: key }, token)
+      await post("/v1/sql", { sql: "SELECT 1 AS one FROM m4_race_evt WHERE id = ?", params: [key], table: "m4_race_evt", tenantId, partitionKey: key }, AUTH())
     ).json()) as { route: { shardId: string } };
     const sourceShardId = routeBefore.route.shardId;
     const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
@@ -3365,7 +3225,7 @@ describe("Worker /admin/migrate-vbucket end-to-end (Milestone 3, Chunk 4)", () =
     const retryRes = await post(
       "/v1/sql",
       { sql: "UPDATE m4_race_evt SET v = ? WHERE id = ?", params: ["raced", key], table: "m4_race_evt", tenantId, partitionKey: key, requestId },
-      token,
+      AUTH(),
     );
     expect(retryRes.status).toBe(200);
     const retryBody = (await retryRes.json()) as { route: { shardId: string }; result: { rowsAffected: number } };
@@ -3495,7 +3355,7 @@ describe("Milestone 3 Chunk 6: migration benchmark (observational — no pass/fa
       await post(
         "/v1/sql",
         { sql: "INSERT INTO m6_bench_evt (id, v) VALUES (?, ?)", params: [key, "seed"], table: "m6_bench_evt", tenantId, partitionKey: key },
-        token,
+        AUTH(),
       );
     }
     const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
@@ -3528,7 +3388,7 @@ describe("Milestone 3 Chunk 6: migration benchmark (observational — no pass/fa
               partitionKey: key,
               requestId: `bench-${key}`,
             },
-            token,
+            AUTH(),
           );
           if (res.status === 200) {
             if (firstFenceAt !== null && firstPostFenceSuccessAt === null) firstPostFenceSuccessAt = Date.now();
@@ -3724,7 +3584,7 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     const movedRead = await post(
       "/v1/sql",
       { sql: "SELECT v FROM m5_e2e_evt WHERE id = ?", params: ["e2e-0"], table: "m5_e2e_evt", tenantId, partitionKey: "e2e-0" },
-      token,
+      AUTH(),
     );
     const movedBody = (await movedRead.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
     expect(movedBody.route.shardId).toBe(splitTarget);
@@ -3756,7 +3616,7 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
       const readRes = await post(
         "/v1/sql",
         { sql: "SELECT v FROM m5_e2e_evt WHERE id = ?", params: [id], table: "m5_e2e_evt", tenantId, partitionKey: id },
-        token,
+        AUTH(),
       );
       expect(readRes.status).toBe(200);
       const readBody = (await readRes.json()) as { route: { shardId: string }; result: { rows: Array<{ v: string }> } };
@@ -3839,7 +3699,7 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     const res = await post(
       "/v1/sql",
       { sql: "INSERT INTO events (id, v) VALUES (?, ?)", params: ["p1", "a"], table: "events", tenantId, partitionKey: "p1" },
-      token,
+      AUTH(),
     );
     expect(res.status).toBe(503);
   });
@@ -3941,9 +3801,12 @@ describe("Worker top-level routes", () => {
   });
 
   it("returns a clean 500 instead of a crash on malformed JSON", async () => {
+    // /v1/sql is admin-only now, so pass the admin token to get PAST auth and
+    // reach the body parse — the point of this test is that a malformed body is
+    // a clean 500, not an unhandled crash.
     const res = await SELF.fetch("https://worker.internal/v1/sql", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${env.ADMIN_TOKEN}` },
       body: "{not valid json",
     });
     expect(res.status).toBe(500);
@@ -3954,39 +3817,37 @@ describe("Worker top-level routes", () => {
 
 describe("Worker /v1/sql input validation", () => {
   it("returns 400 for missing sql/table/tenantId", async () => {
-    const res = await post("/v1/sql", { table: "events" });
+    const res = await post("/v1/sql", { table: "events" }, AUTH());
     expect(res.status).toBe(400);
   });
 
   it("returns 400 when params is not an array", async () => {
     await initCluster();
-    const res = await post("/v1/sql", {
-      sql: "SELECT * FROM events",
-      table: "events",
-      tenantId: "t1",
-      partitionKey: "p1",
-      params: "not-an-array",
-    });
+    const res = await post(
+      "/v1/sql",
+      { sql: "SELECT * FROM events", table: "events", tenantId: "t1", partitionKey: "p1", params: "not-an-array" },
+      AUTH(),
+    );
     expect(res.status).toBe(400);
   });
 
   it("returns 400 for a mutating statement without partitionKey", async () => {
     await initCluster();
-    const res = await post("/v1/sql", {
-      sql: "INSERT INTO events (id, v) VALUES ('1','a')",
-      table: "events",
-      tenantId: "t1",
-    });
+    const res = await post(
+      "/v1/sql",
+      { sql: "INSERT INTO events (id, v) VALUES ('1','a')", table: "events", tenantId: "t1" },
+      AUTH(),
+    );
     expect(res.status).toBe(400);
   });
 
   it("returns 400 for a SELECT without partitionKey (must use /v1/scatter)", async () => {
     await initCluster();
-    const res = await post("/v1/sql", {
-      sql: "SELECT * FROM events",
-      table: "events",
-      tenantId: "t1",
-    });
+    const res = await post(
+      "/v1/sql",
+      { sql: "SELECT * FROM events", table: "events", tenantId: "t1" },
+      AUTH(),
+    );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("/v1/scatter");
@@ -4044,7 +3905,7 @@ describe("Worker /v1/scatter input validation and partial failure", () => {
           tenantId,
           partitionKey: "p1",
         },
-        token,
+        AUTH(),
       );
     }
     const res = await post("/v1/scatter", { sql: "SELECT id FROM events", limit: 2 }, AUTH());
