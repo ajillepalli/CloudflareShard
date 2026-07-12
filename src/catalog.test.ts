@@ -1649,6 +1649,107 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     });
   });
 
+  // Codex full-PR review P2: ring evacuation repointed the LOCAL ring first,
+  // then fanned /update-index-ring out to siblings. If a sibling call failed,
+  // the next tick read the already-repointed local ring (no longer containing
+  // the draining shard), skipped this ring, and left the failed sibling routing
+  // to the drained shard forever. The fix updates local LAST, so a sibling
+  // failure leaves local still showing the draining shard and the next tick
+  // retries the whole fan-out until every catalog is consistent.
+  it("retries the ring fan-out when a sibling /update-index-ring fails once, so no catalog is left pointing the index at the drained shard", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES ('idx_ring_partial', 'events', ?, 'ready', ?, ?)",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+      // Pretend this catalog is 'catalog-0' in a 2-shard catalog cluster, so
+      // ring evacuation fans /update-index-ring out to the sibling 'catalog-1'.
+      state.storage.sql.exec("UPDATE cluster_config SET catalog_shard_id = 'catalog-0', catalog_shard_count = 2 WHERE singleton = 1");
+    });
+
+    // Seed the identical index_rules row on the real sibling catalog-1.
+    const catalog1 = env.CATALOG.get(env.CATALOG.idFromName("catalog-1"));
+    await catalog1.fetch(new Request("https://catalog.internal/list-shards", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })); // trigger ensureSchema
+    await runInDurableObject(catalog1, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM index_rules WHERE index_name = 'idx_ring_partial'");
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES ('idx_ring_partial', 'events', ?, 'ready', ?, ?)",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+    });
+
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shard0.fetch(
+      new Request("https://shard.internal/index-entries-import", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          rows: [
+            { table_name: "events", index_name: "idx_ring_partial", index_key_json: JSON.stringify(["alpha"]), partition_key: "row-1", source_shard_id: "shard-1", tenant_id: "t1", updated_at: new Date().toISOString() },
+          ],
+        }),
+      }),
+    );
+
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Fail the sibling /update-index-ring the FIRST time, then delegate to the
+    // real catalog-1 so it genuinely repoints on retry.
+    let ringUpdateAttempts = 0;
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as { catalogEnv: { CATALOG: { get: (id: unknown) => { fetch: (i: unknown, init?: unknown) => Promise<Response> } } } };
+      // catalogEnv.CATALOG is the shared namespace binding — save and RESTORE
+      // its .get so this override doesn't leak into other tests.
+      const catalogBinding = inst.catalogEnv.CATALOG;
+      const originalGet = catalogBinding.get;
+      const realGet = originalGet.bind(catalogBinding);
+      catalogBinding.get = (id: unknown) => {
+        const realStub = realGet(id);
+        return {
+          fetch: async (input: unknown, init?: unknown) => {
+            const url = typeof input === "string" ? input : (input as Request).url;
+            if (url.includes("/update-index-ring")) {
+              ringUpdateAttempts += 1;
+              if (ringUpdateAttempts === 1) {
+                return new Response(JSON.stringify({ error: "boom" }), { status: 500, headers: { "content-type": "application/json" } });
+              }
+            }
+            return realStub.fetch(input as Request, init as RequestInit);
+          },
+        };
+      };
+      try {
+        for (let tick = 0; tick < 15; tick += 1) {
+          await instance.alarm();
+        }
+      } finally {
+        catalogBinding.get = originalGet;
+      }
+    });
+
+    // The fan-out failed once and was retried.
+    expect(ringUpdateAttempts).toBeGreaterThanOrEqual(2);
+
+    const ringOf = async (cat: typeof stub) =>
+      (await runInDurableObject(cat, async (_i: CatalogDO, state: DurableObjectState) => {
+        const rows = Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_ring_partial'")) as Array<{ placement_ring_json: string }>;
+        return rows.length ? (JSON.parse(rows[0].placement_ring_json) as string[]) : [];
+      }));
+
+    // BOTH catalogs are repointed away from the drained shard — the local one
+    // AND the sibling that initially failed (without the fix the sibling would
+    // stay on [shard-0] forever after the first-tick failure repointed local).
+    expect(await ringOf(stub), "local (catalog-0) ring must be repointed").not.toContain("shard-0");
+    expect(await ringOf(catalog1), "sibling (catalog-1) ring must be repointed").not.toContain("shard-0");
+  });
+
   it("rejects the drain 409 RING_EVACUATION_NO_CANDIDATE when every active shard is already in the index's ring", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
