@@ -118,10 +118,11 @@ blocks the new structured paths.
 
 ### 4) Register a tenant
 
-`/v1/sql` and `/v1/mutate` are data-plane routes and require a tenant bearer
-token, not `ADMIN_TOKEN` — this isolates apps/environments within one
-deployment (see "Tenant authorization" below). `/register-tenant` returns the
-plaintext token exactly once; store it.
+`/v1/mutate`, `/v1/tx`, and `/v1/index-query` are the tenant data-plane routes
+and require a tenant bearer token, not `ADMIN_TOKEN` — this isolates
+apps/environments within one deployment (see "Tenant authorization" below).
+(`/v1/sql` is **admin-only** — see the note under step 5.) `/register-tenant`
+returns the plaintext token exactly once; store it.
 
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/register-tenant \
@@ -139,34 +140,42 @@ export TENANT_TOKEN=<token from the response above>
 
 ### 5) Insert data
 
+Tenants write through the structured data plane (`/v1/mutate`, below, and
+`/v1/tx`), not raw SQL:
+
 ```bash
-curl -X POST http://127.0.0.1:8787/v1/sql \
+curl -X POST http://127.0.0.1:8787/v1/mutate \
   -H "content-type: application/json" \
   -H "authorization: Bearer $TENANT_TOKEN" \
   -d '{
+    "op":"insert",
     "table":"events",
     "tenantId":"t1",
-    "partitionKey":"user-1",
+    "partitionKey":"e1",
     "requestId":"req-1",
-    "sql":"INSERT INTO events (id, user_id, body, created_at) VALUES (?, ?, ?, ?)",
-    "params":["e1","user-1","hello","2026-06-29T00:00:00Z"]
+    "values":{"user_id":"user-1","body":"hello","created_at":"2026-06-29T00:00:00Z"}
   }'
 ```
 
-### 6) Query same partition
+> **`/v1/sql` is admin-only.** Raw `/v1/sql` (reads *and* writes) now requires
+> `ADMIN_TOKEN`, not a tenant token — it's an operator/debugging escape hatch,
+> not a tenant path. The per-tenant SQL guard proved structurally unwinnable
+> (it leaked six times), and a raw partition-scoped `SELECT` could return
+> another tenant's rows because base rows carry no physical `tenant_id` (see
+> SPEC §14). Tenants use `/v1/mutate` + `/v1/tx` for writes and `/v1/index-query`
+> for reads. Even for the operator, `/v1/sql` still refuses *writes* to internal
+> bookkeeping tables (fence/provenance/mirror), while allowing reads of them for
+> debugging.
 
-```bash
-curl -X POST http://127.0.0.1:8787/v1/sql \
-  -H "content-type: application/json" \
-  -H "authorization: Bearer $TENANT_TOKEN" \
-  -d '{
-    "table":"events",
-    "tenantId":"t1",
-    "partitionKey":"user-1",
-    "sql":"SELECT * FROM events WHERE user_id = ?",
-    "params":["user-1"]
-  }'
-```
+### 6) Query a partition
+
+There is currently **no general partition-scoped tenant `SELECT`** — the raw
+`/v1/sql` read path was removed for tenants (see the note above). Tenants read
+through the secondary-index path, `/v1/index-query` (step 4 of the index
+walkthrough / the "Secondary indexes" section). A structured, isolation-enforced
+tenant read API (partition-scoped `SELECT` with an enforced `tenant_id`
+predicate) is a planned future milestone; it depends on giving base rows a
+physical `tenant_id` column (see SPEC §14 and TODOS.md).
 
 ### 7) Structured mutation (row-owned, single-shard)
 
@@ -343,9 +352,11 @@ with 409 `RING_EVACUATION_NO_CANDIDATE` (add a shard via a split first).
 
 ## Tenant authorization
 
-`/v1/sql` and `/v1/mutate` require a tenant bearer token (`POST
-/admin/register-tenant {"tenantId": "..."}`, `ADMIN_TOKEN`-gated), separate
-from `ADMIN_TOKEN` itself. This isolates apps/environments *within* one
+The tenant data-plane routes — `/v1/mutate`, `/v1/tx`, and `/v1/index-query` —
+require a tenant bearer token (`POST /admin/register-tenant {"tenantId":
+"..."}`, `ADMIN_TOKEN`-gated), separate from `ADMIN_TOKEN` itself. (`/v1/sql`
+and `/v1/scatter` are admin-only, `ADMIN_TOKEN`-gated operator routes — not
+tenant paths.) This isolates apps/environments *within* one
 deployment — it is not a multi-customer-SaaS boundary. In this project's
 current self-hosted distribution model, the deploying developer holds both
 the operator role (`ADMIN_TOKEN`) and every tenant role (`tenant_auth`
