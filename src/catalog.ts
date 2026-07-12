@@ -2084,9 +2084,30 @@ export class CatalogDO extends DurableObject {
         // the source's queued mirrors for this vbucket too — their content
         // is re-derived by the next backfill pass, and left queued they'd
         // fire against the just-wiped target out of order.
-        await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
-        await this.callShard(source, "/purge-mirror-jobs", { vbucket: m.vbucket });
-        await this.callShard(target, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
+        //
+        // Codex full-PR review P2: check ALL THREE cleanup calls and do NOT
+        // rewind to 'backfilling' unless every one succeeded — return true so
+        // this stays in 'cutover' and the next tick retries the (idempotent)
+        // cleanup. A transient /unfence-vbucket failure that still rewound
+        // would leave the source FENCED while status said 'backfilling', so the
+        // next backfill/cutover ran against a fenced source (writes 409); a
+        // failed purge/wipe would leave stale mirror jobs / target rows to
+        // corrupt the retry.
+        const unfenceRes = await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
+        if (!unfenceRes.ok) {
+          log("catalog.mismatch_cleanup_unfence_failed", { vbucket: m.vbucket, source, status: unfenceRes.status });
+          return true; // stay 'cutover', retry cleanup next tick — no rewind while fenced
+        }
+        const purgeRes = await this.callShard(source, "/purge-mirror-jobs", { vbucket: m.vbucket });
+        if (!purgeRes.ok) {
+          log("catalog.mismatch_cleanup_purge_failed", { vbucket: m.vbucket, source, status: purgeRes.status });
+          return true;
+        }
+        const wipeRes = await this.callShard(target, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
+        if (!wipeRes.ok) {
+          log("catalog.mismatch_cleanup_wipe_failed", { vbucket: m.vbucket, target, status: wipeRes.status });
+          return true;
+        }
         this.sql.exec(
           // Re-review item D: reset migration_rows_copied to 0 alongside the
           // rewind. The target's copy was just wiped, so the next backfill

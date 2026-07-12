@@ -850,6 +850,107 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(finalTargetRow.rows[0].v).toBe("correct");
   });
 
+  // Codex full-PR review P2: the checksum-mismatch rewind must check its three
+  // cleanup calls and NOT rewind to 'backfilling' unless all succeed. A
+  // transient /unfence-vbucket failure that still rewound would leave the
+  // source FENCED while status said 'backfilling' → the next backfill/cutover
+  // runs against a fenced source (writes 409); a failed purge/wipe leaves stale
+  // mirror jobs / target rows to corrupt the retry.
+  it("checksum-mismatch rewind does NOT complete while cleanup fails: stays 'cutover' with the source fenced until unfence/purge/wipe all succeed", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(
+      post("/register-table", { table: "t", partitionKeyColumn: "id", schemaSql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)" }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+
+    const sourceShardId = "shard-0";
+    const source = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    await shardExecute(source, { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `sc-${crypto.randomUUID()}`, isMutation: true });
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_fenced_vbuckets WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_row_owners WHERE table_name = 't'");
+      state.storage.sql.exec("DELETE FROM t");
+    });
+    await shardExecute(source, {
+      sql: "INSERT INTO t (id, v) VALUES ('row-1', 'correct')",
+      requestId: `ins-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "t",
+      partitionKey: "row-1",
+      vbucket: 0,
+    });
+
+    // Target with a DIVERGENT copy → guaranteed checksum mismatch.
+    const targetShardId = `shard-mismatch-cleanup-${crypto.randomUUID()}`;
+    const target = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    await shardExecute(target, { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `sct-${crypto.randomUUID()}`, isMutation: true });
+    await shardExecute(target, {
+      sql: "INSERT INTO t (id, v) VALUES ('row-1', 'WRONG')",
+      requestId: `inst-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "t",
+      partitionKey: "row-1",
+      vbucket: 0,
+    });
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)", targetShardId, new Date().toISOString());
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'cutover', target_shard_id = ?, migration_rows_copied = 1, migration_started_at = ?, updated_at = ? WHERE vbucket = 0",
+        targetShardId,
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+    });
+
+    const migStatus = async () =>
+      ((await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string }).status;
+    const sourceFenced = async () =>
+      runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => Array.from(state.storage.sql.exec("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = 0")).length > 0);
+
+    // Phase 1: /unfence-vbucket on the source fails → cleanup can't complete →
+    // must NOT rewind; stays 'cutover' with the source (re-)fenced.
+    const unfence = { fail: true };
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __real?: (s: string, p: string, b: unknown) => Promise<Response>;
+      };
+      inst.__real = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) => {
+        if (shardId === sourceShardId && path === "/unfence-vbucket" && unfence.fail) {
+          return new Response(JSON.stringify({ error: "boom" }), { status: 500, headers: { "content-type": "application/json" } });
+        }
+        return inst.__real!(shardId, path, payload);
+      };
+      for (let tick = 0; tick < 3; tick += 1) {
+        await instance.alarm();
+      }
+    });
+    expect(await migStatus()).toBe("cutover"); // did NOT rewind while cleanup failed
+    expect(await sourceFenced()).toBe(true); // source still fenced (not left fenced-while-backfilling)
+    // The target's divergent copy is still there — wipe wasn't reached.
+    const tgtDuring = (await (
+      await shardExecute(target, { sql: "SELECT COUNT(*) AS n FROM t WHERE id = 'row-1'", requestId: `q1-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ n: number }> };
+    expect(tgtDuring.rows[0].n).toBe(1);
+
+    // Phase 2: let unfence succeed; the next tick completes the rewind.
+    unfence.fail = false;
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    expect(await migStatus()).toBe("backfilling"); // rewind completed
+    expect(await sourceFenced()).toBe(false); // source unfenced
+    const tgtAfter = (await (
+      await shardExecute(target, { sql: "SELECT COUNT(*) AS n FROM t WHERE id = 'row-1'", requestId: `q2-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ n: number }> };
+    expect(tgtAfter.rows[0].n).toBe(0); // target wiped
+  });
+
   // Codex full-PR review P1 (silent data loss at cutover step 5): the source
   // must stay FENCED through cleanup (delete rows + purge mirror) and unfence
   // LAST. The old order unfenced FIRST, so a straggler write that resolved the
@@ -947,6 +1048,9 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
       state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
       state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_fenced_vbuckets WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_row_owners WHERE table_name = 't'");
+      state.storage.sql.exec("DELETE FROM t");
     });
     await shardExecute(source, {
       sql: "INSERT INTO t (id, v) VALUES ('row-1', 'x')",
