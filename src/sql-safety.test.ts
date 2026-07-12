@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ensureCreateTableIfNotExists,
   extractCreateTableName,
   isDangerous,
   isDangerousSchema,
@@ -191,5 +192,42 @@ describe("extractCreateTableName", () => {
 
   it("returns null for a malformed statement", () => {
     expect(extractCreateTableName("CREATE TABLE (id TEXT PRIMARY KEY)")).toBe(null);
+  });
+});
+
+// Codex review P2: migration-time schema provisioning must be idempotent —
+// re-executing a captured CREATE TABLE against a target that already has the
+// table (once applied_requests' dedup row is pruned by TTL) must no-op, not
+// 400 and throw the migration into a retry loop.
+describe("ensureCreateTableIfNotExists", () => {
+  it("injects IF NOT EXISTS into a bare CREATE TABLE, leaving name and body untouched", () => {
+    expect(ensureCreateTableIfNotExists("CREATE TABLE events (id TEXT PRIMARY KEY, v TEXT)")).toBe(
+      "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, v TEXT)",
+    );
+  });
+
+  it("leaves a statement that already has IF NOT EXISTS unchanged", () => {
+    const sql = "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY)";
+    expect(ensureCreateTableIfNotExists(sql)).toBe(sql);
+  });
+
+  it("is case- and whitespace-insensitive", () => {
+    expect(ensureCreateTableIfNotExists("create   table events (id TEXT)")).toBe("create   table IF NOT EXISTS events (id TEXT)");
+    expect(ensureCreateTableIfNotExists("Create Table Events (id TEXT)")).toBe("Create Table IF NOT EXISTS Events (id TEXT)");
+    expect(ensureCreateTableIfNotExists("  CREATE TABLE events (id TEXT)")).toBe("  CREATE TABLE IF NOT EXISTS events (id TEXT)");
+    // already-present, mixed case + spacing → unchanged
+    const inx = "create table if  not  exists events (id TEXT)";
+    expect(ensureCreateTableIfNotExists(inx)).toBe(inx);
+  });
+
+  it("handles quoted and schema-qualified names (name untouched)", () => {
+    expect(ensureCreateTableIfNotExists('CREATE TABLE "events" (id TEXT)')).toBe('CREATE TABLE IF NOT EXISTS "events" (id TEXT)');
+    expect(ensureCreateTableIfNotExists("CREATE TABLE main.events (id TEXT)")).toBe("CREATE TABLE IF NOT EXISTS main.events (id TEXT)");
+    expect(ensureCreateTableIfNotExists("CREATE TABLE [events] (id TEXT)")).toBe("CREATE TABLE IF NOT EXISTS [events] (id TEXT)");
+  });
+
+  it("returns a non-CREATE-TABLE statement unchanged", () => {
+    expect(ensureCreateTableIfNotExists("INSERT INTO events VALUES (1)")).toBe("INSERT INTO events VALUES (1)");
+    expect(ensureCreateTableIfNotExists("CREATE INDEX idx ON events (v)")).toBe("CREATE INDEX idx ON events (v)");
   });
 });

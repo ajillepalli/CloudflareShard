@@ -378,3 +378,21 @@ export function extractCreateTableName(sql: string): string | null {
   if (!match) return null;
   return match[2] ?? match[3] ?? match[4] ?? match[5] ?? null;
 }
+
+/** Returns `sql` with `IF NOT EXISTS` injected after `CREATE TABLE` when it's a
+ * CREATE TABLE statement that lacks it — so re-executing a captured schema
+ * against a target that ALREADY has the table is a harmless no-op instead of a
+ * 400 "table already exists". Case- and whitespace-insensitive; the name
+ * (quoted or `schema.`-qualified) and the body are left untouched, and a
+ * statement that already has IF NOT EXISTS (or isn't a leading CREATE TABLE) is
+ * returned unchanged.
+ *
+ * Used ONLY at migration-provision time to make schema provisioning idempotent
+ * regardless of applied_requests dedup/TTL state — the stored schema_sql and
+ * /admin/create-table's own validation are deliberately NOT changed. */
+export function ensureCreateTableIfNotExists(sql: string): string {
+  const m = /^(\s*create\s+table\s+)(if\s+not\s+exists\s+)?/i.exec(sql);
+  if (!m) return sql; // not a leading CREATE TABLE — leave as-is
+  if (m[2]) return sql; // already idempotent
+  return sql.slice(0, m[1].length) + "IF NOT EXISTS " + sql.slice(m[1].length);
+}
