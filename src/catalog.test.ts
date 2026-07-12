@@ -928,6 +928,86 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(sourceRows.rows.map((r) => r.id)).not.toContain("row-1");
   });
 
+  // Codex full-PR review P2: post-flip cleanup (delete rows + unfence source)
+  // must be retryable. The flip sets status='none' AND cleanup_pending=1
+  // atomically; if step-5 cleanup fails there's no active migration row for the
+  // migrating loop, so the alarm's cleanup loop (keyed on cleanup_pending) must
+  // retry. A failed /unfence-vbucket must not leave the source stale-fenced
+  // forever while status reports the migration complete.
+  it("post-flip cleanup is retryable: a failed /unfence-vbucket keeps cleanup_pending set (status stays flipped, source fenced) until a later tick lifts the fence", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(
+      post("/register-table", { table: "t", partitionKeyColumn: "id", schemaSql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)" }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+
+    const sourceShardId = "shard-0";
+    const source = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    await shardExecute(source, { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `sc-${crypto.randomUUID()}`, isMutation: true });
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = 0");
+    });
+    await shardExecute(source, {
+      sql: "INSERT INTO t (id, v) VALUES ('row-1', 'x')",
+      requestId: `ins-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "t",
+      partitionKey: "row-1",
+      vbucket: 0,
+    });
+
+    const targetShardId = `shard-flip-cleanup-${crypto.randomUUID()}`;
+    await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Fail /unfence-vbucket on the source (the flip still commits, cleanup does
+    // not). Drive several ticks: the flip lands, then the cleanup loop retries
+    // and keeps failing while unfence is forced to fail.
+    const unfence = { fail: true };
+    await runInDurableObject(stub, async (instance: CatalogDO, state: DurableObjectState) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __real?: (s: string, p: string, b: unknown) => Promise<Response>;
+      };
+      inst.__real = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) => {
+        if (shardId === sourceShardId && path === "/unfence-vbucket" && unfence.fail) {
+          return new Response(JSON.stringify({ error: "boom" }), { status: 500, headers: { "content-type": "application/json" } });
+        }
+        return inst.__real!(shardId, path, payload);
+      };
+      for (let tick = 0; tick < 8; tick += 1) {
+        await instance.alarm();
+      }
+      // Now let unfence succeed and drive the cleanup retry to completion.
+      unfence.fail = false;
+      for (let tick = 0; tick < 8; tick += 1) {
+        await instance.alarm();
+        const done = (
+          Array.from(state.storage.sql.exec("SELECT cleanup_pending FROM vbucket_map WHERE vbucket = 0")) as Array<{ cleanup_pending: number }>
+        )[0].cleanup_pending;
+        if (done === 0) break;
+      }
+    });
+
+    // The map flip stands: status 'none', vbucket now owned by the target.
+    const status = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(status.status).toBe("none");
+    const mapped = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT shard_id, cleanup_pending FROM vbucket_map WHERE vbucket = 0")) as Array<{ shard_id: string; cleanup_pending: number }>)[0],
+    );
+    expect(mapped.shard_id).toBe(targetShardId); // flip stands
+
+    // Cleanup completed on the retry: cleanup_pending cleared and the source is
+    // no longer fenced.
+    expect(mapped.cleanup_pending).toBe(0);
+    const stillFenced = await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = 0")).length > 0,
+    );
+    expect(stillFenced).toBe(false);
+  });
+
   // Re-review: the cutover wait for prepared 2PC intents was unbounded — a tx
   // prepared-but-never-resolved on the source would block cutover forever with
   // no operator signal. After the bound elapses the migration must surface a

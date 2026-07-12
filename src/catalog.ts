@@ -215,6 +215,16 @@ export class CatalogDO extends DurableObject {
     // re-issue a provision call per registered table per vbucket (that would
     // be O(tables x vbuckets) subrequests and swamp a single alarm tick).
     this.ensureColumn("vbucket_map", "provision_pending", "INTEGER NOT NULL DEFAULT 0");
+    // Codex full-PR review P2: post-flip source cleanup (delete rows + unfence)
+    // must be RETRYABLE. Set atomically with the map flip (status back to
+    // 'none'); the alarm processes cleanup_pending=1 rows independently of
+    // migration_status and clears the flag only once BOTH shard calls succeed,
+    // so a failed unfence/delete can't leave the source permanently
+    // stale-fenced or with undeleted rows while status reports 'complete'.
+    // cleanup_source_shard_id remembers the old source (the flip nulls
+    // target_shard_id and moves shard_id to the target).
+    this.ensureColumn("vbucket_map", "cleanup_pending", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("vbucket_map", "cleanup_source_shard_id", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS table_rules (
@@ -1704,6 +1714,31 @@ export class CatalogDO extends DurableObject {
         }
       }
 
+      // Codex full-PR review P2: retry post-flip source cleanup independently
+      // of migration_status. After a flip the row is 'none' (not in the
+      // migrating set above), so a failed step-5 delete/unfence would otherwise
+      // never be retried, leaving the source stale-fenced or with undeleted
+      // rows while status reports 'complete'. cleanup_pending drives the retry.
+      const cleanups = this.many<{ vbucket: number; cleanup_source_shard_id: string | null }>(
+        "SELECT vbucket, cleanup_source_shard_id FROM vbucket_map WHERE cleanup_pending = 1 ORDER BY vbucket ASC",
+      );
+      const cleanupTables = cleanups.length > 0 ? this.migratableTables() : [];
+      for (const c of cleanups) {
+        if (!c.cleanup_source_shard_id) {
+          // Nothing to clean against — clear the flag so it can't loop forever.
+          this.sql.exec("UPDATE vbucket_map SET cleanup_pending = 0 WHERE vbucket = ?", c.vbucket);
+          continue;
+        }
+        try {
+          const stillPending = await this.runPostFlipCleanup(c.vbucket, c.cleanup_source_shard_id, cleanupTables);
+          anyActive = anyActive || stillPending;
+        } catch (error) {
+          log("catalog.cleanup_tick_failed", { vbucket: c.vbucket, message: error instanceof Error ? error.message : String(error) });
+          anyActive = true;
+          anyThrew = true;
+        }
+      }
+
       // Milestone 3, Chunk 5: drive shard drains (vbucket evacuation, then
       // ring evacuation) for every draining shard.
       const draining = this.many<{ shard_id: string }>("SELECT shard_id FROM shards WHERE status = 'draining' ORDER BY shard_id ASC");
@@ -2070,16 +2105,24 @@ export class CatalogDO extends DurableObject {
       // its route pre-flip and arrives at the source. Conditional, and step
       // 5's destructive source delete only runs if THIS tick actually
       // performed the flip.
+      // Step 4: flip the map AND arm the retryable post-flip cleanup atomically.
+      // Codex full-PR review P2: the map flip and cleanup_pending flag are set
+      // in ONE UPDATE so there's no window where the flip committed but nothing
+      // records that the source still needs cleaning — if step 5 below then
+      // fails, the alarm's cleanup loop (keyed on cleanup_pending) retries it
+      // independently of migration_status (which is now 'none').
       const version = this.bumpMetadataVersion();
       this.sql.exec(
         `
         UPDATE vbucket_map
         SET shard_id = ?, migration_status = 'none', target_shard_id = NULL, map_version = ?,
-            cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ?
+            cutover_started_at = NULL, cutover_stall_reason = NULL,
+            cleanup_pending = 1, cleanup_source_shard_id = ?, updated_at = ?
         WHERE vbucket = ? AND migration_status = 'cutover' AND shard_id = ? AND target_shard_id = ?
         `,
         target,
         version,
+        source,
         new Date().toISOString(),
         m.vbucket,
         source,
@@ -2091,28 +2134,45 @@ export class CatalogDO extends DurableObject {
         return false;
       }
 
-      // Step 5: clean up the source while it stays FENCED, and unfence LAST.
-      // Codex full-PR review P1 (silent data loss): the old order unfenced
-      // FIRST, then deleted (which also purges this vbucket's __cf_mirror_pending).
-      // A straggler write that resolved the OLD source route before the flip and
-      // arrived in the unfence→delete window was ACCEPTED by the now-unfenced
-      // source (enqueuing a mirror) and then had its row deleted AND its mirror
-      // purged — the acked write reached neither source nor target. Lost.
-      // Deleting + purging while still fenced means such a straggler can only
-      // 409 VBUCKET_FENCED (retryable → the client re-routes to the flipped
-      // target). Residual: a straggler arriving AFTER this unfence writes an
-      // orphan row to a shard that no longer owns the vbucket — but its effect
-      // still reaches the target via the mirror its payload enqueues (not lost),
-      // and reads never route to the source. We DO unfence (rather than leave
-      // the source fenced forever) so a later migrate-back onto this shard isn't
-      // blocked by a stale fence.
-      await this.callShard(source, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
-      await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
-
       this.audit("/migrate-vbucket-complete", { vbucket: m.vbucket, fromShard: source, toShard: target, metadataVersion: version });
-      return false;
+      // Step 5: attempt the (retryable) source cleanup now; if a call fails,
+      // cleanup_pending stays 1 and the alarm retries it next tick.
+      return this.runPostFlipCleanup(m.vbucket, source, tables);
     }
 
+    return false;
+  }
+
+  /** Post-flip source cleanup, made RETRYABLE via cleanup_pending (set
+   * atomically in the flip UPDATE). The map is already flipped — reads/writes
+   * route to the target — so this is pure cleanup that can retry indefinitely
+   * without affecting routing. Deletes the migrated vbucket's rows + provenance
+   * from the old source and unfences it; BOTH are idempotent (re-runnable).
+   * Ordering (Codex P1 silent-loss fix): delete WHILE the source is still
+   * fenced, then unfence LAST, so a straggler that resolved the old route can
+   * only 409 during the window rather than being accepted-then-dropped. Clears
+   * cleanup_pending only once BOTH succeed; on any failure leaves it set and
+   * returns true so the caller/alarm keeps ticking. */
+  private async runPostFlipCleanup(
+    vbucket: number,
+    sourceShardId: string,
+    tables: Array<{ table: string; partitionKeyColumn: string; schemaSql: string | null }>,
+  ): Promise<boolean> {
+    const deleteRes = await this.callShard(sourceShardId, "/delete-vbucket-rows", { vbucket, tables });
+    if (!deleteRes.ok) {
+      log("catalog.post_flip_cleanup_delete_failed", { vbucket, sourceShardId, status: deleteRes.status });
+      return true; // retry next tick — cleanup_pending stays set
+    }
+    const unfenceRes = await this.callShard(sourceShardId, "/unfence-vbucket", { vbucket });
+    if (!unfenceRes.ok) {
+      log("catalog.post_flip_cleanup_unfence_failed", { vbucket, sourceShardId, status: unfenceRes.status });
+      return true; // retry — source stays fenced (delete already done) until unfence succeeds
+    }
+    this.sql.exec(
+      "UPDATE vbucket_map SET cleanup_pending = 0, cleanup_source_shard_id = NULL, updated_at = ? WHERE vbucket = ? AND cleanup_pending = 1",
+      new Date().toISOString(),
+      vbucket,
+    );
     return false;
   }
 
