@@ -1384,17 +1384,24 @@ export class CatalogDO extends DurableObject {
       const newRing = [...ring];
       newRing[pos] = substitute;
 
-      // Repoint the ring on this catalog and every sibling (index_rules is
-      // replicated identically to all catalog shards). Self is updated
-      // locally — never via a DO self-fetch.
-      this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), rule.index_name);
+      // Repoint the ring on every SIBLING catalog FIRST, then locally
+      // (index_rules is replicated identically to all catalog shards;
+      // /update-index-ring is idempotent). Codex full-PR review P2: updating
+      // the LOCAL ring first and THEN fanning out meant that if a sibling call
+      // failed, the next advanceDrain tick read the already-repointed local
+      // ring (which no longer contains the draining shard), skipped this ring
+      // entirely, and left the failed sibling routing index reads/writes to the
+      // drained shard forever. By updating local LAST, a sibling failure throws
+      // with the local ring STILL showing the draining shard, so the next tick
+      // re-selects this ring and retries the whole (idempotent) fan-out until
+      // every catalog is consistent.
       const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
         "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
       );
       const siblingCount = config?.catalog_shard_count ?? 0;
       for (let i = 0; i < siblingCount; i += 1) {
         const siblingId = `catalog-${i}`;
-        if (config?.catalog_shard_id === siblingId) continue; // already updated locally
+        if (config?.catalog_shard_id === siblingId) continue; // self is updated locally below
         const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
         const res = await stub.fetch("https://catalog.internal/update-index-ring", {
           method: "POST",
@@ -1403,6 +1410,9 @@ export class CatalogDO extends DurableObject {
         });
         if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
       }
+      // Every sibling repointed — now repoint locally (never via a DO
+      // self-fetch). Reached only after the fan-out fully succeeds.
+      this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), rule.index_name);
 
       // Reconcile pass: catch any entry that raced onto the draining shard
       // between the initial copy's cursor and the repoint. Converges because
