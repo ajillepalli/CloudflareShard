@@ -2202,6 +2202,41 @@ describe("Worker /admin/backfill-provenance and /admin/set-row-owner (Milestone 
     const owners = await rowOwnerEntries("catalog-0-shard-0", "bp_allshards_evt", "row-f");
     expect(owners).toHaveLength(1);
   });
+
+  // Codex full-PR review P1 (drain deadlock): /admin/drain-shard marks a shard
+  // 'draining' BEFORE its vbuckets migrate, then — if that shard holds
+  // unattributed rows — stalls VBUCKET_PROVENANCE_INCOMPLETE and tells the
+  // operator to run /admin/backfill-provenance. But backfill-provenance
+  // enumerated shards via /list-shards (active-only), which excludes the very
+  // draining shard whose rows are blocking the drain: the rows were never
+  // scanned, provenance never written, and the drain could never resume — a
+  // deadlock. The fix enumerates active + draining, so the draining source is
+  // scanned and its rows attributed.
+  it("scans a DRAINING shard's unattributed rows (drain-aware) so the drain no longer deadlocks on VBUCKET_PROVENANCE_INCOMPLETE", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("bp_draining_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    await registerTenant(tenantId);
+    // An unattributed row on the shard we're about to drain.
+    await insertRowBypassingProvenance("catalog-0-shard-0", "bp_draining_evt", "row-drn", "x");
+
+    // Mark the shard 'draining' directly — exactly the state /admin/drain-shard
+    // leaves it in before it stalls on the provenance gate.
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogStub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", "catalog-0-shard-0");
+    });
+
+    const res = await post("/admin/backfill-provenance", { catalogShardId: "catalog-0" }, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { attributed: number };
+    expect(body.attributed).toBeGreaterThanOrEqual(1); // the DRAINING shard was scanned
+
+    // The blocking row now has provenance — the drain's gate can pass.
+    const owners = await rowOwnerEntries("catalog-0-shard-0", "bp_draining_evt", "row-drn");
+    expect(owners).toHaveLength(1);
+    expect(owners[0].tenant_id).toBe(tenantId);
+  });
 });
 
 /** Runs a SQL statement against one shard directly via its /execute route. */
