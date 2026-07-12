@@ -38,17 +38,17 @@
 **Priority:** P3
 **Depends on:** Milestone 1 shipping with real usage data available.
 
-### Evaluate deprecating raw `/v1/sql` mutations in favor of the structured DSL
+### Structured tenant read API + physical `tenant_id`
 
-**What:** Decide whether the raw-SQL mutation path and the new structured-mutation DSL (`/v1/mutate`, `/v1/tx`) should coexist long-term, or whether raw SQL mutations should be deprecated/admin-only once the structured path covers the common cases.
+**What:** Add a structured, isolation-enforced tenant READ path — a partition-scoped `SELECT` (single vbucket) that the shard executes with an enforced `tenant_id` predicate — to replace the general tenant read path removed when `/v1/sql` became admin-only. Today tenants can only read via `/v1/index-query` (secondary-index lookups); there is no way to do a partition-scoped scan of one's own rows.
 
-**Why:** Codex flagged that two first-class write paths with different row-ownership guarantees (raw SQL: trust-based; structured: enforced) is a non-auditable correctness story and a security-footgun risk — a caller could always fall back to the weaker path. Milestone 2's `/plan-eng-review` added a third reason: raw `/v1/sql` mutations bypass every index-maintenance mechanism entirely, silently desyncing any index on a table they touch — Milestone 2's Chunk 1 closes this specific hole with a 409 rejection, but it's the same underlying dual-write-path problem surfacing again.
+**Why:** Removing raw tenant `/v1/sql` (see Completed) closed a cross-tenant read leak but left tenants with no general read path. The blocker for a safe one is physical: **base rows carry no `tenant_id` column** (SPEC §14) — the logical identity lives only in `__cf_row_owners`, so a shard can't add `WHERE tenant_id = ?` to a tenant's `SELECT`, and two tenants' rows can share a vbucket. A safe tenant read therefore needs base rows to carry a physical `tenant_id` (written on every mutation, indexed), after which the gateway can offer a structured partition-scoped read that injects the tenant predicate the same way `/v1/mutate` injects the partition-key predicate.
 
-**Context:** Milestone 2 (Index Service) will also depend on structured mutations for index maintenance, which may tip the balance toward deprecating raw SQL mutations entirely. Not urgent for Milestone 1 since raw `/v1/sql` isn't used for coordinated transactions, but worth deciding before the dual-path pattern calcifies into tenant-facing API surface people build against.
+**Context:** This is the replacement for the removed read path, not a nice-to-have — without it tenants cannot read arbitrary rows at all. Adding a physical `tenant_id` is a schema/write-path change (touches `/v1/mutate`, `/v1/tx` apply, and migration import) and should be scoped with the read API together.
 
-**Effort:** M
-**Priority:** P3
-**Depends on:** Milestone 2 (Index Service) — revisit once its structured-mutation dependency is clear.
+**Effort:** L
+**Priority:** P2
+**Depends on:** physical `tenant_id` on base rows (schema + write paths).
 
 ### CLI/SDK wrapper or write-path consolidation
 
@@ -87,6 +87,16 @@
 **Depends on:** None — a future scope decision, not committed work.
 
 ## Completed
+
+### Evaluate deprecating raw `/v1/sql` mutations in favor of the structured DSL
+
+**What:** Decide whether raw-SQL and the structured DSL (`/v1/mutate`, `/v1/tx`) coexist long-term, or whether raw SQL should be deprecated/admin-only.
+
+**Why:** Two first-class write paths with different row-ownership guarantees (raw SQL: trust-based; structured: enforced) is a non-auditable correctness story and a security footgun — a caller could always fall back to the weaker path — and raw `/v1/sql` mutations also bypass every index-maintenance mechanism.
+
+**Resolution (Milestone 3 — went further than "mutations"):** raw `/v1/sql` is now **fully admin-only — reads AND writes**, not just mutations. The per-tenant write guard against a passthrough SQL string proved structurally unwinnable (six leaked bypasses), and there is no safe tenant `SELECT` while base rows carry no physical `tenant_id` (a partition-scoped raw read could return another tenant's rows in the same vbucket). The trust-based tenant path was removed entirely: tenants write via `/v1/mutate` + `/v1/tx` and read via `/v1/index-query`; `/v1/sql` requires `ADMIN_TOKEN` (operator/debugging), with a residual guardrail blocking operator writes to internal bookkeeping tables. The follow-on "Structured tenant read API + physical `tenant_id`" item (Architecture) tracks the replacement read path.
+
+**Completed:** Milestone 3 (2026-07-12)
 
 ### Index-entry topology: physical source_shard_id vs. logical identity + read-time routing
 
