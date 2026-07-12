@@ -1143,6 +1143,76 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(freshTables).toContain("provreplay_evt");
   });
 
+  // Codex review P1 (regression on the idempotency fix): the provisioning sites
+  // send IF-NOT-EXISTS-MODIFIED SQL. If they reuse /admin/create-table's
+  // requestId (create-table-<table>-<target>), and that applied_requests row is
+  // still PRESENT (the common case, within its 7-day TTL, hashed over the
+  // UNMODIFIED schema), ShardDO returns 409 "different sql" → provisioning
+  // throws → the migration to that existing shard stalls. Provisioning must use
+  // its OWN requestId namespace (migrate-provision-) so it can't collide.
+  it("migration provisioning uses a distinct requestId namespace: it does NOT 409 against a present create-table dedup row (within-TTL) and the migration completes", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const schema = "CREATE TABLE provcollide_evt (id TEXT PRIMARY KEY, v TEXT)"; // no IF NOT EXISTS
+    await stub.fetch(post("/register-table", { table: "provcollide_evt", partitionKeyColumn: "id", schemaSql: schema }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const source = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shardExecute(source, { sql: "CREATE TABLE IF NOT EXISTS provcollide_evt (id TEXT PRIMARY KEY, v TEXT)", requestId: `sc-${crypto.randomUUID()}`, isMutation: true });
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = 0");
+    });
+    await shardExecute(source, {
+      sql: "INSERT INTO provcollide_evt (id, v) VALUES ('r0', 'x')",
+      requestId: `ins-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "provcollide_evt",
+      partitionKey: "r0",
+      vbucket: 0,
+    });
+
+    const target = `shard-collide-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(target));
+    // Create the table on the target under the EXACT requestId /admin/create-table
+    // uses, with the UNMODIFIED (no IF NOT EXISTS) schema — leaving the
+    // applied_requests row (hashed over that SQL) that the OLD provisioning
+    // would collide with. Register it as an existing active shard so
+    // startMigration uses the per-table in-loop provisioning path.
+    await shardExecute(targetStub, { sql: schema, requestId: `create-table-provcollide_evt-${target}`, isMutation: true });
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)", target, new Date().toISOString());
+    });
+
+    const mig = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: target }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(mig.status).toBe(200);
+    for (let tick = 0; tick < 12; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const s = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+      if (s.status === "none") break;
+    }
+    const final = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(final.status).toBe("none"); // did NOT 409-stall on the create-table requestId collision
+
+    // Distinct namespaces coexist: the create-table row is untouched, and a
+    // separate migrate-provision row now records the (idempotent) provisioning.
+    const appliedIds = await runInDurableObject(targetStub, async (_i: unknown, state: DurableObjectState) => {
+      return (
+        Array.from(
+          state.storage.sql.exec(
+            "SELECT request_id FROM applied_requests WHERE request_id IN (?, ?)",
+            `create-table-provcollide_evt-${target}`,
+            `migrate-provision-provcollide_evt-${target}`,
+          ),
+        ) as Array<{ request_id: string }>
+      ).map((r) => r.request_id);
+    });
+    expect(appliedIds).toContain(`create-table-provcollide_evt-${target}`);
+    expect(appliedIds).toContain(`migrate-provision-provcollide_evt-${target}`);
+  });
+
   // Codex review P2: /migrate-vbucket-abort swallowed the /unfence-vbucket
   // result. If unfence failed but the later wipe succeeded, the row was
   // cleared to 'none' with the source still fenced — a permanent VBUCKET_FENCED

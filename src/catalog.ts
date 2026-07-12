@@ -1801,12 +1801,16 @@ export class CatalogDO extends DurableObject {
         for (const t of tables) {
           if (!t.schemaSql) continue;
           const schemaRes = await this.callShard(target, "/execute", {
-            // Idempotent DDL: re-running against a target that already has the
-            // table must be a no-op, not a 400 — applied_requests dedup can be
-            // pruned (7-day TTL) so a drain/migration to an existing shard may
-            // genuinely re-execute the captured schema.
+            // Idempotent DDL so re-execution against a table that already
+            // physically exists is a no-op, not a 400. Its requestId is its OWN
+            // namespace (migrate-provision-, NOT create-table-): reusing
+            // /admin/create-table's requestId would collide in applied_requests
+            // — that row is hashed over the UNMODIFIED schema, so this
+            // IF-NOT-EXISTS-modified SQL would 409 "different sql" while the
+            // (common, within-7-day-TTL) row is still present. Stable per
+            // (table, target) so a resumed migration's retries still dedup.
             sql: ensureCreateTableIfNotExists(t.schemaSql),
-            requestId: `create-table-${t.table}-${target}`,
+            requestId: `migrate-provision-${t.table}-${target}`,
             isMutation: true,
           });
           if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
@@ -1832,12 +1836,14 @@ export class CatalogDO extends DurableObject {
         // the provision_pending pass above — but only on a fresh target.)
         if (afterPk === "" && t.schemaSql) {
           const schemaRes = await this.callShard(target, "/execute", {
-            // Idempotent DDL — see the provision_pending pass above: a stable
-            // requestId dedupes normally, but applied_requests' TTL can prune
-            // the dedup row, so re-executing against an existing table must
-            // no-op rather than 400 and throw the migration into a retry loop.
+            // Idempotent DDL + its OWN requestId namespace — see the
+            // provision_pending pass above. IF NOT EXISTS covers a table that
+            // physically exists under a fresh (or TTL-pruned) dedup row; the
+            // migrate-provision- prefix avoids colliding with
+            // /admin/create-table's applied_requests row (hashed over the
+            // UNMODIFIED schema), which would otherwise 409 within its TTL.
             sql: ensureCreateTableIfNotExists(t.schemaSql),
-            requestId: `create-table-${t.table}-${target}`,
+            requestId: `migrate-provision-${t.table}-${target}`,
             isMutation: true,
           });
           if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
