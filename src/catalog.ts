@@ -1593,36 +1593,55 @@ export class CatalogDO extends DurableObject {
       return json({ error: `targetShardId must differ from the vbucket's current shard (${existingMap.shard_id}).` }, 400);
     }
 
-    this.audit(endpoint, { vbucket, fromShard: existingMap.shard_id, toShard: targetShard });
-
-    this.sql.exec(
-      "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)",
-      targetShard,
-      new Date().toISOString(),
-    );
-    // Codex review P1 (correctness): a brand-new target shard (INSERT actually
-    // inserted) never got the create-table fan-out, so mark it for full schema
-    // provisioning on the first backfill tick. An existing target (INSERT
-    // ignored) already has every registered table (create-table fans out to
-    // all existing shards, and any shard created mid-life is provisioned when
-    // IT was the target), so it's left 0 — a drain to existing shards issues no
-    // provision calls. Read changes() from the INSERT above, before any other
-    // statement resets it.
-    const targetIsFresh = (this.one<{ n: number }>("SELECT changes() AS n")?.n ?? 0) > 0;
-    const version = this.bumpMetadataVersion();
+    // Codex review P2 (TOCTOU): the migration_status !== 'none' check above and
+    // this state transition are separated by the awaited provenance check, and
+    // DO handlers interleave at await points — so two concurrent
+    // /admin/migrate-vbucket (or /split-vbucket) calls for the same vbucket can
+    // BOTH pass the check. Claim the migration with a CONDITIONAL update (only
+    // from 'none') and check changes(); if we lost the race, bail 409 BEFORE
+    // creating the target shard, so the loser leaves no orphaned target state
+    // and never overwrites the winner's target_shard_id.
+    const now = new Date().toISOString();
     this.sql.exec(
       `
       UPDATE vbucket_map
       SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?,
-          backfill_table = NULL, backfill_after_pk = NULL, provision_pending = ?, updated_at = ?
-      WHERE vbucket = ?
+          backfill_table = NULL, backfill_after_pk = NULL, updated_at = ?
+      WHERE vbucket = ? AND migration_status = 'none'
       `,
       targetShard,
-      new Date().toISOString(),
-      targetIsFresh ? 1 : 0,
-      new Date().toISOString(),
+      now,
+      now,
       vbucket,
     );
+    const claimed = this.one<{ n: number }>("SELECT changes() AS n");
+    if ((claimed?.n ?? 0) === 0) {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_IN_PROGRESS",
+            message: `vbucket ${vbucket} already has a migration in progress (a concurrent request won the race).`,
+            fix: "Wait for it to finish (/admin/migrate-vbucket-status) or abort it (/admin/migrate-vbucket-abort).",
+          },
+        },
+        409,
+      );
+    }
+
+    this.audit(endpoint, { vbucket, fromShard: existingMap.shard_id, toShard: targetShard });
+    // Only the winner creates the target shard and bumps the map version.
+    this.sql.exec(
+      "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)",
+      targetShard,
+      now,
+    );
+    // P1 (correctness): a brand-new target shard (INSERT actually inserted)
+    // never got the create-table fan-out — mark it for full schema
+    // provisioning on the first backfill tick; an existing target (INSERT
+    // ignored) already has every table, so it's left 0.
+    const targetIsFresh = (this.one<{ n: number }>("SELECT changes() AS n")?.n ?? 0) > 0;
+    this.sql.exec("UPDATE vbucket_map SET provision_pending = ? WHERE vbucket = ?", targetIsFresh ? 1 : 0, vbucket);
+    const version = this.bumpMetadataVersion();
 
     const soon = Date.now() + MIGRATION_TICK_MS;
     const existingAlarm = await this.ctx.storage.getAlarm();
