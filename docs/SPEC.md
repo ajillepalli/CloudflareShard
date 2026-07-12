@@ -326,14 +326,24 @@ Response:
 - tenantId
 - revoked boolean
 
-POST /v1/sql (tenant bearer token)
+POST /v1/sql (ADMIN_TOKEN — admin-only, operator/debugging escape hatch)
 Request:
 - sql string
 - params array (optional)
 - table string
-- tenantId string
+- tenantId string (routing/hashing only — NOT authenticated against the caller; the caller is the operator)
 - partitionKey string (required for all writes and single-shard reads)
 - requestId string (optional)
+
+As of Milestone 3, /v1/sql is admin-only (reads AND writes) — see §14. The
+per-tenant SQL guard was structurally unwinnable and a raw partition-scoped
+SELECT leaked cross-tenant data (base rows carry no physical tenant_id), so the
+trust-based tenant path was removed entirely; tenants use /v1/mutate + /v1/tx
+(writes) and /v1/index-query (reads). A light guardrail remains even for the
+operator: a mutation whose write TARGET is an internal bookkeeping table
+(applied_requests / pending_intents / row_locks / __cf_* / sqlite_*) is rejected
+403, so a fat-fingered query can't corrupt fence/provenance/mirror state;
+internal-table READS and cross-table access are allowed (admin is trusted).
 
 Response:
 - route { shardId, vbucket, metadataVersion }
@@ -611,9 +621,10 @@ Emit structured logs and counters for:
 
 ## 14) Security and Multi-tenancy
 
-- Require authenticated principal at Gateway — implemented via `tenant_auth` bearer tokens (`/admin/register-tenant`), checked in `CatalogDO.handleRoute` before any routing info is returned.
+- Require authenticated principal at Gateway — implemented via `tenant_auth` bearer tokens (`/admin/register-tenant`), checked in `CatalogDO.handleRoute` before any routing info is returned. `ADMIN_TOKEN` is accepted there as a universal bypass (the operator may route as any tenant), used by the admin-only `/v1/sql`.
 - Verify tenantId belongs to principal before route — implemented: the caller's bearer token is hashed and compared against the claimed `tenantId`'s stored hash; missing/wrong/revoked tokens are all rejected with 401.
 - This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary — see README.md's "Tenant authorization" section for the operator/tenant distinction this milestone's distribution model assumes.
+- **Raw `/v1/sql` is ADMIN-ONLY (Milestone 3), reads AND writes.** The trust-based tenant SQL path was removed rather than continue an unwinnable guard. Two things forced it: (1) the per-tenant write guard (denylist → allowlist against a passthrough SQL string) leaked six times — mixed case, inter-token comments, `schema.` qualifiers, a spaced+quoted internal name, double-quoted internal identifiers; and (2) there is **no safe tenant `SELECT`**, because base rows carry no physical `tenant_id` column — the shard cannot add a `WHERE tenant_id = ?` predicate, so a partition-scoped raw read could return another tenant's rows that hash into the same vbucket. `/v1/sql` now requires `ADMIN_TOKEN` (operator/debugging); tenants write via `/v1/mutate` + `/v1/tx` (which force the partition-key predicate structurally) and read via `/v1/index-query`. Even for the operator, a `/v1/sql` mutation whose write TARGET is an internal bookkeeping table is rejected 403 (internal reads and cross-table access are allowed — admin is trusted). A structured, isolation-enforced tenant read API (partition-scoped `SELECT` with an enforced `tenant_id` predicate) is future work and depends on giving base rows a physical `tenant_id` — see TODOS.md.
 - Enforce SQL policy allowlist in production (MVP currently permissive).
 
 ## 15) Migration Path to Production
