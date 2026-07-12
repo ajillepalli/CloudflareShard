@@ -2175,13 +2175,23 @@ export class CatalogDO extends DurableObject {
       // Cleanup, all idempotent so a resumed abort re-runs it safely:
       // unfence the source, purge its queued-but-unsent mirrors (a stale
       // mirror firing after the wipe would recreate unattributed junk on the
-      // target), then wipe the target's copy.
-      await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
-      await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
+      // target), then wipe the target's copy. Every step's result is checked —
+      // Codex review P2: a swallowed /unfence-vbucket failure that then cleared
+      // to 'none' would strand the source permanently VBUCKET_FENCED with no
+      // 'aborting' state left to resume from. On ANY failure, leave the row
+      // 'aborting' and return 502 so a retried abort re-runs the (idempotent)
+      // remaining cleanup.
+      const unfenceRes = await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
+      if (!unfenceRes.ok) {
+        return json({ error: `Failed to unfence source shard ${row.shard_id} — abort not completed, retry.` }, 502);
+      }
+      const purgeRes = await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
+      if (!purgeRes.ok) {
+        return json({ error: `Failed to purge mirror jobs on source shard ${row.shard_id} — abort not completed, retry.` }, 502);
+      }
       const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
       if (!wipeRes.ok) {
-        // Leave the row 'aborting' (fence already lifted above) — a retried
-        // abort resumes and completes the wipe.
+        // Leave the row 'aborting' — a retried abort resumes and completes the wipe.
         return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
       }
 
