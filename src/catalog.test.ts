@@ -1,7 +1,28 @@
-import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { env, reset, runInDurableObject } from "cloudflare:test";
+import { afterEach, describe, expect, it } from "vitest";
 import type { CatalogDO } from "./catalog";
 import { hashKey } from "./hash";
+
+// Migration/drain tests below deliberately reuse FIXED Durable Object names
+// across `it` blocks (e.g. "shard-0" — the name CatalogDO's own /init always
+// assigns a single-shard cluster's first shard, per src/catalog.ts's
+// `shard-${i}` naming; not something a test can randomize without changing
+// production shard-naming). DO storage is NOT isolated per test by this pool
+// (confirmed empirically — a value written to a fixed-name DO in one `it`
+// block is still there in the next), and several of those tests leave a real
+// DO alarm armed (CatalogDO.alarm() re-arms itself every MIGRATION_TICK_MS
+// while a migration is active, and a test that intentionally stops driving
+// ticks before a migration/drain fully resolves leaves that alarm live). Left
+// alone, that alarm can fire in the background — on real wall-clock time —
+// during a LATER test and mutate the shared shard's fencing/mirror/intent
+// state out from under it, producing exactly the run-to-run flakiness this
+// guards against (different assertion fails on different runs, depending on
+// real timing). `reset()` is @cloudflare/vitest-pool-workers' documented
+// fix for this: it deletes all Durable Object data (and, since the objects
+// themselves are gone, cancels any alarm they had armed) between tests.
+afterEach(async () => {
+  await reset();
+});
 
 describe("CatalogDO audit log", () => {
   it("records init, register-table, split-vbucket, and drain-shard as audit entries", async () => {
