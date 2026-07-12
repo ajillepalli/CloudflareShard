@@ -157,26 +157,28 @@ function stripComments(sql: string): string {
   return out;
 }
 
-/** Like stripComments, but ALSO strips single-quoted (`'x'`, `''` escape) AND
- * double-quoted (`"x"`, `""` escape) string spans, replacing each with a
- * space. Double-quoted spans are stripped because SQLite treats a
- * double-quoted token that doesn't resolve as an identifier as a STRING
- * LITERAL — so a legit `VALUES ('n1', "applied_requests")` would otherwise
- * false-positive against the internal-table reference check. The write TARGET
- * (a double-quoted table name after FROM/INTO/UPDATE) is handled separately by
- * mutationTargetIsInternal, so stripping double quotes here doesn't weaken the
- * guard. */
-function stripStringsAndComments(sql: string): string {
+/** Like stripComments, but ALSO strips SINGLE-quoted string literals (`'x'`,
+ * `''` escape) — and ONLY single-quoted. Double-quoted (and backtick/bracket)
+ * spans are LEFT INTACT because SQLite resolves a double-quoted token that
+ * matches an existing table as an IDENTIFIER, so a double-quoted internal-table
+ * reference in a subquery (`INSERT ... SELECT ... FROM "__cf_row_owners"`, or a
+ * plain `SELECT * FROM "__cf_row_owners"`) MUST still be caught — that's a
+ * cross-tenant read/exfiltration of another tenant's partition keys, tenant
+ * ids, and provenance (P1). Documented tradeoff: a tenant using a DOUBLE-quoted
+ * string *value* equal to an internal table name (e.g. `VALUES ('x',
+ * "applied_requests")`) is rejected — in SQL, double quotes are identifiers and
+ * single quotes are string literals, so tenants must single-quote string
+ * values. This reinforces the TODOS.md case for deprecating raw /v1/sql. */
+function stripSingleQuotedAndComments(sql: string): string {
   let out = "";
   let i = 0;
   while (i < sql.length) {
     const c = sql[i];
-    if (c === "'" || c === '"') {
-      const quote = c;
+    if (c === "'") {
       i += 1;
       while (i < sql.length) {
-        if (sql[i] === quote) {
-          if (sql[i + 1] === quote) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
             i += 2;
             continue;
           }
@@ -306,43 +308,38 @@ export function mutationWriteTarget(sql: string): string | null {
   return normalizeTableName(first.raw);
 }
 
-/** True if the statement's write TARGET is an internal table — now derived
- * from the robust mutationWriteTarget extractor (handles inter-token comments,
- * spaced `schema . table` qualifiers, and quoting on either component). */
-function mutationTargetIsInternal(sql: string): boolean {
-  const target = mutationWriteTarget(sql);
-  return target !== null && isInternalTableName(target);
+/** True if `sql` references ANY of ShardDO's internal bookkeeping tables
+ * ANYWHERE — write target, subquery, join, RETURNING, or a plain read — for
+ * BOTH reads and writes. The tenant-facing `/v1/sql` gate rejects these 403.
+ *
+ * A blanket REFERENCE block (word-boundary regex) over the text with comments
+ * and SINGLE-quoted string literals stripped. Double-quoted / backtick /
+ * bracket identifier spans are deliberately NOT stripped, so a double-quoted
+ * internal reference in a subquery — `INSERT INTO mine SELECT pk FROM
+ * "__cf_row_owners"`, or a plain `SELECT * FROM "__cf_row_owners"` — is caught.
+ * Those leak another tenant's partition keys / tenant ids / provenance (P1);
+ * the earlier version stripped double quotes and missed exactly this.
+ *
+ * Applies to reads too (not just mutations): a raw `SELECT * FROM
+ * __cf_row_owners` with a partitionKey is the same cross-tenant leak. The
+ * documented tradeoff (see stripSingleQuotedAndComments) is that a
+ * double-quoted string *value* equal to an internal table name is rejected —
+ * tenants must single-quote string literals. This reinforces the TODOS.md case
+ * for deprecating raw /v1/sql in favor of the structured data plane.
+ *
+ * NOTE: this is the tenant-boundary chokepoint. ShardDO's own /execute is a
+ * DO-internal route whose callers (index maintenance writing __cf_indexes,
+ * mirror delivery, provenance upserts) legitimately touch these tables, so no
+ * blanket block is added there; tenants only reach /execute through this gate. */
+export function referencesInternalTable(sql: string): boolean {
+  return INTERNAL_TABLE_REFERENCE_RE.test(stripSingleQuotedAndComments(sql));
 }
 
-/** True if `sql` is a mutation that touches any of ShardDO's internal
- * bookkeeping tables. The tenant-facing `/v1/sql` gate rejects these 403.
- *
- * Two layers:
- *  1. mutationTargetIsInternal — the write target itself, however quoted or
- *     schema-qualified (catches `DELETE FROM "applied_requests"`).
- *  2. a blanket REFERENCE block (word-boundary regex) over text with comments
- *     and single- AND double-quoted string literals stripped — catches a bare
- *     or backtick/bracket-quoted internal name anywhere else (subquery, join),
- *     while NOT false-positiving on a double-quoted STRING VALUE such as
- *     `VALUES ('n1', "applied_requests")` (SQLite treats a non-identifier
- *     double-quoted token as a string literal).
- *
- * Together they close the target-extraction bypasses a re-review confirmed
- * (mixed case, inter-token comments, `schema.` qualifiers) without the
- * double-quoted-string-value false positive a later pass found.
- *
- * Scoped to mutations (isMutation) so a legitimate read that happens to name a
- * column identically isn't blocked — the guard's job is to stop internal-table
- * WRITES from the data plane. Defense-in-depth at ShardDO /execute is NOT
- * added: /execute is a DO-internal route whose own callers (index maintenance
- * writing __cf_indexes, mirror delivery, provenance upserts) legitimately
- * write these tables, so a blanket block there would break them; tenants only
- * reach /execute THROUGH this Worker gate, which is therefore the correct
- * single chokepoint. */
+/** True if `sql` is a MUTATION that references an internal table (write target
+ * or subquery). Retained for the shard-side/unit callers; the Worker gate uses
+ * the read+write `referencesInternalTable` directly. */
 export function isInternalTableWrite(sql: string): boolean {
-  if (!isMutation(sql)) return false;
-  if (mutationTargetIsInternal(sql)) return true;
-  return INTERNAL_TABLE_REFERENCE_RE.test(stripStringsAndComments(sql));
+  return isMutation(sql) && referencesInternalTable(sql);
 }
 
 function hasMultiStatementOrKeyword(sql: string, bannedKeywords: RegExp): boolean {

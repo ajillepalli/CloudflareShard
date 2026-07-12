@@ -10,10 +10,10 @@ import {
   isDangerous,
   isDangerousSchema,
   isInternalTableName,
-  isInternalTableWrite,
   isMutation,
   mutationWriteTarget,
   normalizeTableName,
+  referencesInternalTable,
 } from "./sql-safety";
 import {
   compileMutation,
@@ -1102,18 +1102,26 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
     }
   }
 
-  // DEFENSE-IN-DEPTH DENYLIST. Even with the allowlist above, keep rejecting
-  // any statement that references an internal table (e.g. a write to the
-  // tenant's own table that READS an internal table in a subquery, or the
-  // theoretical case of a mis-trusted body.table). The internal DO routes that
-  // legitimately write these tables call /execute directly, never through here.
-  if (isInternalTableWrite(body.sql)) {
+  // INTERNAL-TABLE REFERENCE BLOCK — reads AND writes. Beyond the write-target
+  // allowlist above, reject ANY reference to an internal bookkeeping table
+  // anywhere in the statement. This closes a cross-tenant LEAK the allowlist
+  // alone missed (P1): a mutation whose target is the caller's own table can
+  // still READ an internal table in a subquery and copy it out
+  // (`INSERT INTO mine SELECT partition_key FROM "__cf_row_owners"`), and a
+  // plain `SELECT * FROM __cf_row_owners` with a partitionKey leaks the same
+  // way — both expose other tenants' partition keys / tenant ids / provenance.
+  // Double-quoted identifiers are matched (only single-quoted string literals
+  // are stripped), so `"__cf_row_owners"` is caught; the documented tradeoff is
+  // that a double-quoted string VALUE equal to an internal name is rejected —
+  // tenants must single-quote string values. Reinforces the TODOS.md case for
+  // deprecating raw /v1/sql.
+  if (referencesInternalTable(body.sql)) {
     return json(
       {
         error: {
-          code: "INTERNAL_TABLE_WRITE_FORBIDDEN",
-          message: "Writes to internal system tables are not permitted.",
-          fix: "Target one of your own registered tables.",
+          code: "INTERNAL_TABLE_ACCESS_FORBIDDEN",
+          message: "Access to internal system tables is not permitted.",
+          fix: "Reference only your own registered tables; use single quotes for string literals.",
         },
       },
       403,
