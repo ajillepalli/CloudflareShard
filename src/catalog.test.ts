@@ -1135,6 +1135,65 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(await isFenced()).toBe(false); // fence lifted on the successful retry
   });
 
+
+  // Codex review P2 (TOCTOU): startMigration checked migration_status !== 'none'
+  // then awaited /unattributed-count then UPDATEd unconditionally. Two
+  // concurrent calls for the same vbucket both pass the check and both UPDATE —
+  // the loser overwrites the winner's target_shard_id and orphans its own new
+  // shard. The transition must be a conditional claim (only from 'none') so the
+  // loser 409s without leaving state. Simulated deterministically: a concurrent
+  // winner claims the vbucket DURING this call's provenance await.
+  it("startMigration loses the race with a conditional claim: 409, no overwrite of the winner's target, no orphaned shard", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    // A registered table so startMigration performs the awaited provenance
+    // check (the interleaving point) rather than skipping it.
+    await stub.fetch(
+      post("/register-table", { table: "toctou_evt", partitionKeyColumn: "id", schemaSql: "CREATE TABLE IF NOT EXISTS toctou_evt (id TEXT PRIMARY KEY, v TEXT)" }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+
+    // Override the provenance round trip so that, mid-await, a concurrent
+    // migration claims vbucket 0 (status -> backfilling, target -> winner-shard).
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __realCallShard?: (s: string, p: string, b: unknown) => Promise<Response>;
+        sql: { exec: (q: string, ...p: unknown[]) => unknown };
+      };
+      inst.__realCallShard = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) => {
+        if (path === "/unattributed-count") {
+          inst.sql.exec(
+            "UPDATE vbucket_map SET migration_status = 'backfilling', target_shard_id = 'winner-shard', updated_at = ? WHERE vbucket = 0",
+            new Date().toISOString(),
+          );
+        }
+        return inst.__realCallShard!(shardId, path, payload);
+      };
+    });
+
+    const res = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "loser-shard" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("MIGRATION_IN_PROGRESS");
+
+    // The winner's target survived (not overwritten to loser-shard).
+    const row = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return (
+        Array.from(state.storage.sql.exec("SELECT migration_status, target_shard_id FROM vbucket_map WHERE vbucket = 0")) as Array<{
+          migration_status: string;
+          target_shard_id: string | null;
+        }>
+      )[0];
+    });
+    expect(row.migration_status).toBe("backfilling");
+    expect(row.target_shard_id).toBe("winner-shard");
+
+    // The losing call created NO orphaned target shard.
+    const loserShardExists = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      return Array.from(state.storage.sql.exec("SELECT shard_id FROM shards WHERE shard_id = 'loser-shard'")).length > 0;
+    });
+    expect(loserShardExists).toBe(false);
+  });
 });
 
 describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
