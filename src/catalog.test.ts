@@ -850,6 +850,84 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(finalTargetRow.rows[0].v).toBe("correct");
   });
 
+  // Codex full-PR review P1 (silent data loss at cutover step 5): the source
+  // must stay FENCED through cleanup (delete rows + purge mirror) and unfence
+  // LAST. The old order unfenced FIRST, so a straggler write that resolved the
+  // old route before the flip and arrived in the unfence→delete window was
+  // ACCEPTED by the now-unfenced source (enqueuing a mirror) and then had its
+  // row deleted AND its mirror purged — acked but reaching neither shard. Lost.
+  // We assert the fix's invariant directly: on the source, /delete-vbucket-rows
+  // is issued BEFORE /unfence-vbucket — so the fence set at cutover step 1 is
+  // held through the entire delete+purge, and any straggler in that window can
+  // only 409 VBUCKET_FENCED (retryable → re-routes to the flipped target).
+  it("keeps the source fenced through cutover cleanup: /delete-vbucket-rows runs before /unfence-vbucket (straggler can only 409, not be dropped)", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(
+      post("/register-table", { table: "t", partitionKeyColumn: "id", schemaSql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)" }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+
+    const sourceShardId = "shard-0";
+    const source = env.SHARD.get(env.SHARD.idFromName(sourceShardId));
+    await shardExecute(source, { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `sc-${crypto.randomUUID()}`, isMutation: true });
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = 0");
+    });
+    await shardExecute(source, {
+      sql: "INSERT INTO t (id, v) VALUES ('row-1', 'x')",
+      requestId: `ins-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "t",
+      partitionKey: "row-1",
+      vbucket: 0,
+    });
+
+    const targetShardId = `shard-flip-target-${crypto.randomUUID()}`;
+    const mig = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(mig.status).toBe(200);
+
+    // Record the ORDER of the catalog's shard calls (the cross-DO I/O rules
+    // forbid actually fetching the source from inside this DO context, so we
+    // assert the ordering invariant the straggler protection rests on).
+    const calls: string[] = [];
+    await runInDurableObject(stub, async (instance: CatalogDO, state: DurableObjectState) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __real?: (s: string, p: string, b: unknown) => Promise<Response>;
+      };
+      inst.__real = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) => {
+        calls.push(`${shardId}|${path}`);
+        return inst.__real!(shardId, path, payload);
+      };
+      for (let tick = 0; tick < 12; tick += 1) {
+        await instance.alarm();
+        const st = (
+          Array.from(state.storage.sql.exec("SELECT migration_status FROM vbucket_map WHERE vbucket = 0")) as Array<{ migration_status: string }>
+        )[0].migration_status;
+        if (st === "none") break;
+      }
+    });
+    const final = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(final.status).toBe("none"); // migration completed
+
+    // Invariant: on the SOURCE, delete-vbucket-rows precedes unfence-vbucket —
+    // the fence is held through row+mirror cleanup.
+    const deleteIdx = calls.indexOf(`${sourceShardId}|/delete-vbucket-rows`);
+    const unfenceIdx = calls.indexOf(`${sourceShardId}|/unfence-vbucket`);
+    expect(deleteIdx, `calls=${JSON.stringify(calls)}`).toBeGreaterThanOrEqual(0);
+    expect(unfenceIdx).toBeGreaterThanOrEqual(0);
+    expect(unfenceIdx, "source must stay fenced through cleanup: delete before unfence").toBeGreaterThan(deleteIdx);
+
+    // And the source ends with no rows for the migrated vbucket.
+    const sourceRows = (await (
+      await shardExecute(source, { sql: "SELECT id FROM t", requestId: `q-${crypto.randomUUID()}`, isMutation: false })
+    ).json()) as { rows: Array<{ id: string }> };
+    expect(sourceRows.rows.map((r) => r.id)).not.toContain("row-1");
+  });
+
   // Re-review: the cutover wait for prepared 2PC intents was unbounded — a tx
   // prepared-but-never-resolved on the source would block cutover forever with
   // no operator signal. After the bound elapses the migration must surface a
