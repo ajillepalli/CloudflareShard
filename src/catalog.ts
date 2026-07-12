@@ -205,6 +205,15 @@ export class CatalogDO extends DurableObject {
     // /migrate-vbucket-status instead of livelocking silently.
     this.ensureColumn("vbucket_map", "cutover_started_at", "TEXT");
     this.ensureColumn("vbucket_map", "cutover_stall_reason", "TEXT");
+    // Codex review P1 (correctness): set only when a migration's target shard
+    // is FRESHLY created (a split target that never received the create-table
+    // fan-out). Its first backfill tick then provisions every registered
+    // table's schema on it — including tables with zero rows in this vbucket,
+    // which the row-export path alone would skip. A drain to an existing shard
+    // (which already has every table) leaves this 0, so the backfill does NOT
+    // re-issue a provision call per registered table per vbucket (that would
+    // be O(tables x vbuckets) subrequests and swamp a single alarm tick).
+    this.ensureColumn("vbucket_map", "provision_pending", "INTEGER NOT NULL DEFAULT 0");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS table_rules (
@@ -1591,16 +1600,26 @@ export class CatalogDO extends DurableObject {
       targetShard,
       new Date().toISOString(),
     );
+    // Codex review P1 (correctness): a brand-new target shard (INSERT actually
+    // inserted) never got the create-table fan-out, so mark it for full schema
+    // provisioning on the first backfill tick. An existing target (INSERT
+    // ignored) already has every registered table (create-table fans out to
+    // all existing shards, and any shard created mid-life is provisioned when
+    // IT was the target), so it's left 0 — a drain to existing shards issues no
+    // provision calls. Read changes() from the INSERT above, before any other
+    // statement resets it.
+    const targetIsFresh = (this.one<{ n: number }>("SELECT changes() AS n")?.n ?? 0) > 0;
     const version = this.bumpMetadataVersion();
     this.sql.exec(
       `
       UPDATE vbucket_map
       SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?,
-          backfill_table = NULL, backfill_after_pk = NULL, updated_at = ?
+          backfill_table = NULL, backfill_after_pk = NULL, provision_pending = ?, updated_at = ?
       WHERE vbucket = ?
       `,
       targetShard,
       new Date().toISOString(),
+      targetIsFresh ? 1 : 0,
       new Date().toISOString(),
       vbucket,
     );
@@ -1743,14 +1762,50 @@ export class CatalogDO extends DurableObject {
         idx = 0; // cursor's table no longer present (e.g. dropped) — restart
       }
 
+      // P1 correctness (Codex review): when the target is a freshly created
+      // split shard (provision_pending set by startMigration), provision
+      // schema_sql for EVERY registered table with a captured schema — NOT just
+      // the ones that have rows in this vbucket. A registered table with zero
+      // rows here is absent from exportTables, so coupling provisioning to the
+      // export loop would never create it on the fresh target, and the first
+      // later write to it on the moved vbucket would fail `no such table` (a
+      // mirror job for it would also stay queued forever). Gated on
+      // provision_pending (not merely the initial tick) so a drain to an
+      // EXISTING shard — which already has every table — issues zero provision
+      // calls, keeping this O(1) rather than O(tables x vbuckets) subrequests.
+      // The stable requestId makes it idempotent; only clear the flag once all
+      // succeed so a thrown tick retries.
+      const provisionPending =
+        (this.one<{ provision_pending: number }>("SELECT provision_pending FROM vbucket_map WHERE vbucket = ?", m.vbucket)?.provision_pending ?? 0) === 1;
+      if (provisionPending) {
+        for (const t of tables) {
+          if (!t.schemaSql) continue;
+          const schemaRes = await this.callShard(target, "/execute", {
+            sql: t.schemaSql,
+            requestId: `create-table-${t.table}-${target}`,
+            isMutation: true,
+          });
+          if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
+        }
+        this.sql.exec(
+          "UPDATE vbucket_map SET provision_pending = 0 WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+          m.vbucket,
+          target,
+        );
+      }
+
       let copied = 0;
       let pages = 0;
       while (idx < exportTables.length && pages < MIGRATION_BACKFILL_PAGES_PER_TICK) {
         const t = exportTables[idx];
-        // Provision the table on a shard created mid-life (e.g. a split
-        // target) before the first page of this table. Stable requestId
-        // (create-table-<table>-<shard>) so re-applying it on a resumed tick
-        // dedupes rather than double-executes.
+        // Provision THIS table's schema on the target before its first page —
+        // required for the import to succeed if the target lacks it (a fresh
+        // split shard, or an existing shard missing a table). Bounded to
+        // exportTables (tables that actually have rows in this vbucket), so a
+        // drain to an existing shard stays O(tables-with-rows), not O(all
+        // registered tables). Stable requestId dedupes across resumed ticks.
+        // (Zero-row tables, absent from exportTables, are covered separately by
+        // the provision_pending pass above — but only on a fresh target.)
         if (afterPk === "" && t.schemaSql) {
           const schemaRes = await this.callShard(target, "/execute", {
             sql: t.schemaSql,

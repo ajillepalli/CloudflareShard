@@ -987,6 +987,81 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(afterSecond.status).toBe("cutover-blocked-on-prepared-intents");
     expect(afterSecond.blockedTxIds).toEqual(["tx-nullclock"]);
   });
+
+  // Codex review P1 (correctness): schema provisioning on a freshly created
+  // split target was coupled to the row-export loop, which is filtered to only
+  // tables that have rows in the migrating vbucket. So a registered table with
+  // ZERO rows in that vbucket never got its schema created on the new shard —
+  // the migration cut over fine (empty checksums as empty), but a later write
+  // to it on the moved vbucket would fail `no such table`.
+  it("provisions schema_sql for a registered table with zero rows in the migrating vbucket onto a fresh split target", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const hasSchema = "CREATE TABLE IF NOT EXISTS p1prov_hasrows (id TEXT PRIMARY KEY, v TEXT)";
+    const noSchema = "CREATE TABLE IF NOT EXISTS p1prov_norows (id TEXT PRIMARY KEY, v TEXT)";
+    await stub.fetch(post("/register-table", { table: "p1prov_hasrows", partitionKeyColumn: "id", schemaSql: hasSchema }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "p1prov_norows", partitionKeyColumn: "id", schemaSql: noSchema }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // shard-0 owns vbucket 0 (numShards 1). Create ONLY p1prov_hasrows there
+    // and give it one attributed row in vbucket 0. p1prov_norows has zero rows
+    // (it isn't even created on the source).
+    const source = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shardExecute(source, { sql: hasSchema, requestId: `sc-${crypto.randomUUID()}`, isMutation: true });
+    // shard-0 is a fixed-name DO shared across this file's tests; clear any
+    // prepared intents / mirror jobs an earlier test left on vbucket 0, or the
+    // cutover gates would block this migration from completing.
+    await runInDurableObject(source, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE vbucket = 0");
+      state.storage.sql.exec("DELETE FROM __cf_mirror_pending WHERE vbucket = 0");
+    });
+    await shardExecute(source, {
+      sql: "INSERT INTO p1prov_hasrows (id, v) VALUES ('r1', 'x')",
+      requestId: `ins-${crypto.randomUUID()}`,
+      isMutation: true,
+      tenantId: "t1",
+      table: "p1prov_hasrows",
+      partitionKey: "r1",
+      vbucket: 0,
+    });
+
+    // Migrate vbucket 0 to a BRAND-NEW target shard that never received the
+    // create-table fan-out — it only gets whatever the migration provisions.
+    const targetShardId = `shard-freshsplit-${crypto.randomUUID()}`;
+    const mig = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(mig.status).toBe(200);
+
+    for (let tick = 0; tick < 12; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const s = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+      if (s.status === "none") break;
+    }
+    const finalStatus = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(finalStatus.status).toBe("none"); // migration completed
+
+    // The fresh target must physically have BOTH tables — including the one
+    // with no rows in this vbucket.
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardId));
+    const tableNames = await runInDurableObject(targetStub, async (_i: unknown, state: DurableObjectState) => {
+      return (
+        Array.from(
+          state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('p1prov_hasrows','p1prov_norows')"),
+        ) as Array<{ name: string }>
+      ).map((r) => r.name);
+    });
+    expect(tableNames).toContain("p1prov_norows");
+    expect(tableNames).toContain("p1prov_hasrows");
+
+    // And a write to the zero-rows table on the target now succeeds.
+    const write = await shardExecute(targetStub, {
+      sql: "INSERT INTO p1prov_norows (id, v) VALUES ('n1', 'ok')",
+      requestId: `w-${crypto.randomUUID()}`,
+      isMutation: true,
+    });
+    expect(write.status).toBe(200);
+  });
 });
 
 describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
