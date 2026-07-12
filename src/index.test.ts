@@ -717,6 +717,51 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     expect(listBody.indexes.map((i) => i.indexName)).toContain("idx_backfill_by_v");
   });
 
+  // Codex full-PR review P1 (silent index miss): an index created AFTER a
+  // shard is marked draining but BEFORE its vbuckets migrate must still index
+  // that shard's existing rows — the backfill scan is drain-aware (active +
+  // draining). The placement RING stays active-only, so the draining shard is
+  // never pinned; its rows' entries land on the active ring and carry
+  // tenant_id, so /v1/index-query hydrates them via the live vbucket_map.
+  it("backfills a DRAINING shard's rows so /v1/index-query doesn't silently miss them, while the placement ring stays active-only", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_draining_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Insert via the normal path so __cf_row_owners provenance is recorded
+    // (create-index's backfill requires it). numShards:1 → the tenant's
+    // catalog (catalog-0) has a single shard, so row-1 lands on
+    // catalog-0-shard-0.
+    await post("/v1/mutate", { op: "insert", table: "idx_draining_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+
+    // Mark that shard 'draining' — it still physically holds row-1 (its
+    // vbuckets haven't migrated). Every other catalog's shard stays active.
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogStub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", "catalog-0-shard-0");
+    });
+
+    // Create the index AFTER the shard is draining. The drain-aware backfill
+    // must still index row-1.
+    const res = await post("/admin/create-index", { indexName: "idx_draining_by_v", table: "idx_draining_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+
+    // The row is queryable — not silently missed.
+    const queryRes = await post("/v1/index-query", { table: "idx_draining_evt", indexName: "idx_draining_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(queryRes.status).toBe(200);
+    const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(queryBody.rows).toHaveLength(1);
+    expect(queryBody.rows[0].id).toBe("row-1");
+
+    // The placement ring is active-only — it must not contain the draining shard.
+    const listRes = await post("/admin/list-indexes", {}, AUTH());
+    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string; placementRing?: string[] }> };
+    const ring = listBody.indexes.find((i) => i.indexName === "idx_draining_by_v")?.placementRing ?? [];
+    expect(ring.length).toBeGreaterThan(0);
+    expect(ring).not.toContain("catalog-0-shard-0");
+  });
+
   it("is idempotent: retrying the same indexName+table+columns succeeds instead of 409 (eng-review fix — needed so a caller can retry after a partial backfill failure)", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_dup_evt");
