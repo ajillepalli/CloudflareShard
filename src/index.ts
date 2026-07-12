@@ -436,6 +436,11 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   }
   const pkCol = tableInfo.partition_key_column;
 
+  // The index's PLACEMENT RING is active shards only: a draining shard is
+  // about to be evacuated and must never be pinned into a new ring (it would
+  // strand entries on a shard headed for decommission). shardIds is captured
+  // here and persisted as index_rules.placement_ring_json for the index's
+  // whole lifetime.
   const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
   const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
   if (listFailed) return listFailed;
@@ -443,6 +448,20 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   if (shardIds.length === 0) {
     return json({ error: { code: "NO_SHARDS", message: "No shards exist yet.", fix: "Call /admin/init first." } }, 400);
   }
+
+  // Codex full-PR review P1 (silent index miss): the BACKFILL SCAN, by
+  // contrast, must cover active + DRAINING shards. A draining shard still
+  // physically holds its base rows until its vbuckets finish migrating; an
+  // index created after the shard is marked draining but before that migration
+  // would, with an active-only scan, never index those existing rows —
+  // /v1/index-query would then silently miss them. The entries it finds are
+  // still PLACED on the active ring (indexShardIdForKey over shardIds) and
+  // carry tenant_id, so hydration re-routes correctly after the base rows
+  // later migrate off the draining shard.
+  const dataListResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({ includeDraining: true }));
+  const dataListFailed = firstCatalogFanOutFailure(dataListResults, "Failed to list data shards.");
+  if (dataListFailed) return dataListFailed;
+  const dataShardIds = dataListResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
 
   // Validate the requested columns actually exist on the schema (mirrors
   // handleAdminCreateTable's PRAGMA table_info check).
@@ -498,9 +517,11 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
   if (registerFailed) return registerFailed;
 
-  // Backfill: scan every shard's existing rows for this table, compute each
-  // row's index entry, and write it to its own computed index shard.
-  for (const shardId of shardIds) {
+  // Backfill: scan every data-holding shard's existing rows for this table
+  // (active + draining — see dataShardIds above), compute each row's index
+  // entry, and write it to its own computed index shard (placed on the active
+  // ring via indexShardIdForKey(..., shardIds)).
+  for (const shardId of dataShardIds) {
     const safeTable = `"${table}"`;
     const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
     const scanRes = await routeToShard(env, shardId, "/execute", {
