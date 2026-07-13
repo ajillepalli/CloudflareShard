@@ -599,6 +599,8 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
         params: [table, indexName, indexKeyJson, partitionKey, shardId, tenantId, new Date().toISOString()],
         requestId: `create-index-backfill-write-${indexName}-${crypto.randomUUID()}`,
         isMutation: true,
+        // Codex round-13 fix: label so the index-ring fence applies here too.
+        indexName,
       });
       if (!writeRes.ok) {
         return json(
@@ -1292,12 +1294,44 @@ function rejectReservedRequestId(requestId: string | undefined): Response | null
   return null;
 }
 
+/** Codex round-13 fix: fetch an index's CURRENT pinned placement ring from the
+ * catalog (catalog-0 answers — index_rules is replicated to every catalog
+ * shard). Used to re-resolve an index write's target after an INDEX_RING_FENCED
+ * rejection. Returns [] if unknown/unreachable so the caller falls back. */
+async function fetchIndexRing(env: Env, indexName: string): Promise<string[]> {
+  try {
+    const res = await routeToCatalog(env, "catalog-0", "/index-ring", { indexName });
+    if (!res.ok) return [];
+    return ((await res.json()) as { ring?: string[] }).ring ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Is this a 409 whose error code is INDEX_RING_FENCED? */
+async function isIndexRingFenced(res: Response): Promise<boolean> {
+  if (res.status !== 409) return false;
+  try {
+    return ((await res.clone().json()) as { error?: { code?: string } }).error?.code === "INDEX_RING_FENCED";
+  } catch {
+    return false;
+  }
+}
+
 /** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
  * failure, records a retry job on the BASE shard (not the index shard, which
  * may be the one that's unreachable) via /enqueue-index-job — ShardDO's
  * alarm() picks it up from there. Never throws: this always runs inside
  * ctx.waitUntil(), after the caller's response has already been sent, so
- * there's no one left to propagate an exception to. */
+ * there's no one left to propagate an exception to.
+ *
+ * Codex round-13 fix: labels the write with `indexName` so the target shard can
+ * enforce the index-ring write fence, and on an INDEX_RING_FENCED rejection
+ * RE-RESOLVES the index's current ring and writes to the newly-resolved shard
+ * (the substitute) — converting an in-flight write that resolved the OLD ring
+ * before a drain repoint into a correct write, instead of stranding it on a
+ * shard about to be decommissioned. The enqueued retry carries the same
+ * structured fields so a later alarm retry can re-resolve too. */
 async function writeIndexEntryBestEffort(
   env: Env,
   baseShardId: string,
@@ -1305,10 +1339,26 @@ async function writeIndexEntryBestEffort(
   sql: string,
   params: unknown[],
   requestId: string,
+  indexName: string,
+  table: string,
+  indexKeyJson: string,
 ): Promise<void> {
   try {
-    const res = await routeToShard(env, targetShardId, "/execute", { sql, params, requestId, isMutation: true });
+    const res = await routeToShard(env, targetShardId, "/execute", { sql, params, requestId, isMutation: true, indexName });
     if (res.ok) return;
+    if (await isIndexRingFenced(res)) {
+      // The target is being evacuated for this index — re-resolve and write to
+      // the substitute. If re-resolution succeeds we're done; otherwise fall
+      // through to the durable retry queue (which also re-resolves).
+      const ring = await fetchIndexRing(env, indexName);
+      if (ring.length > 0) {
+        const resolved = indexShardIdForKey(table, indexName, indexKeyJson, ring);
+        if (resolved !== targetShardId) {
+          const retryRes = await routeToShard(env, resolved, "/execute", { sql, params, requestId, isMutation: true, indexName });
+          if (retryRes.ok) return;
+        }
+      }
+    }
     throw new Error(`shard responded ${res.status}`);
   } catch (error) {
     log("worker.index_write_failed_enqueuing_retry", {
@@ -1318,7 +1368,15 @@ async function writeIndexEntryBestEffort(
       message: error instanceof Error ? error.message : String(error),
     });
     try {
-      await routeToShard(env, baseShardId, "/enqueue-index-job", { targetShardId, sql, params, requestId });
+      await routeToShard(env, baseShardId, "/enqueue-index-job", {
+        targetShardId,
+        sql,
+        params,
+        requestId,
+        indexName,
+        indexTable: table,
+        indexKeyJson,
+      });
     } catch (enqueueError) {
       // Base shard itself unreachable — nothing left to do; the write is
       // lost until a future write to the same row happens to correct it.
@@ -1434,6 +1492,9 @@ async function maintainIndexesAsync(
           "DELETE FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? AND partition_key = ?",
           [table, delta.indexName, delta.oldKeyJson, partitionKey],
           requestId,
+          delta.indexName,
+          table,
+          delta.oldKeyJson,
         ),
       );
     }
@@ -1448,6 +1509,9 @@ async function maintainIndexesAsync(
           "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
           [table, delta.indexName, delta.newKeyJson, partitionKey, baseShardId, tenantId, now],
           requestId,
+          delta.indexName,
+          table,
+          delta.newKeyJson,
         ),
       );
     }
