@@ -1427,28 +1427,64 @@ export class CatalogDO extends DurableObject {
    * gate: it's never exposed through the Worker, the same trust model every
    * ShardDO internal route already uses. */
   private async handleUpdateIndexRing(request: Request): Promise<Response> {
-    const body = (await request.json()) as { indexName?: string; ring?: string[]; evacFromShards?: string[] };
+    const body = (await request.json()) as {
+      indexName?: string;
+      ring?: string[];
+      evacFromShards?: string[];
+      evacAdd?: string;
+      evacRemove?: string;
+    };
     if (!body.indexName || !body.ring) {
       return json({ error: "Missing indexName or ring" }, 400);
     }
-    // Codex round-14 P2: set the read-shadow (evacFromShards) ATOMICALLY with
-    // the ring, so any catalog that has the repointed ring also knows the
-    // draining shard whose not-yet-copied entries /v1/index-query must still
-    // read. Absent/empty clears it (evacuation complete).
-    this.sql.exec(
-      "UPDATE index_rules SET placement_ring_json = ?, evac_from_shards_json = ? WHERE index_name = ?",
-      JSON.stringify(body.ring),
-      JSON.stringify(body.evacFromShards ?? []),
-      body.indexName,
-    );
+    this.applyIndexRingUpdate(body.indexName, body.ring, {
+      set: body.evacFromShards,
+      add: body.evacAdd,
+      remove: body.evacRemove,
+    });
     return json({ ok: true, indexName: body.indexName });
   }
 
-  /** Codex round-14 P2: fan an index's ring (and its read-shadow evacFromShards)
-   * to every SIBLING catalog, then apply locally — the same replication the
-   * ring repoint uses, so ring + shadow stay atomic on every catalog. Throws on
-   * a sibling failure so the drain retries the whole (idempotent) fan-out. */
-  private async fanUpdateIndexRing(indexName: string, ring: string[], evacFromShards: string[]): Promise<void> {
+  /** Applies a ring repoint and a read-shadow (evac_from_shards_json) change
+   * ATOMICALLY on THIS catalog. The shadow op is one of:
+   *  - set:    replace the whole shadow (legacy/full-set callers);
+   *  - add:    MERGE a draining shard into the existing shadow;
+   *  - remove: drop only that shard, leaving any others;
+   *  - none:   leave the shadow unchanged.
+   * Codex round-15 P1 #1: add/remove (not a singleton set) is what keeps the
+   * shadow the UNION of ALL concurrent same-index evacuations' draining shards —
+   * a second drain's repoint must not overwrite (and drop) the first's shadow,
+   * or /v1/index-query silently stops dual-reading the first draining shard. The
+   * read-modify-write is atomic on a single-threaded DO (no awaits here). */
+  private applyIndexRingUpdate(
+    indexName: string,
+    ring: string[],
+    shadow: { set?: string[]; add?: string; remove?: string },
+  ): void {
+    this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(ring), indexName);
+    if (shadow.set !== undefined) {
+      this.sql.exec("UPDATE index_rules SET evac_from_shards_json = ? WHERE index_name = ?", JSON.stringify(shadow.set), indexName);
+    } else if (shadow.add !== undefined || shadow.remove !== undefined) {
+      const row = this.one<{ evac_from_shards_json: string }>("SELECT evac_from_shards_json FROM index_rules WHERE index_name = ?", indexName);
+      const cur = new Set<string>((row ? (JSON.parse(row.evac_from_shards_json) as string[]) : []));
+      if (shadow.add !== undefined) cur.add(shadow.add);
+      if (shadow.remove !== undefined) cur.delete(shadow.remove);
+      this.sql.exec("UPDATE index_rules SET evac_from_shards_json = ? WHERE index_name = ?", JSON.stringify([...cur].sort()), indexName);
+    }
+    // else: leave the shadow untouched.
+  }
+
+  /** Codex round-14 P2 / round-15 P1 #1: fan an index's ring repoint and a
+   * read-shadow change to every SIBLING catalog, then apply locally — the same
+   * replication path so ring + shadow stay atomic on every catalog. `shadow`
+   * carries the merge op (add/remove/set) so concurrent same-index evacuations
+   * union their draining shards rather than clobber each other. Throws on a
+   * sibling failure so the drain retries the whole (idempotent) fan-out. */
+  private async fanUpdateIndexRing(
+    indexName: string,
+    ring: string[],
+    shadow: { set?: string[]; add?: string; remove?: string },
+  ): Promise<void> {
     const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
       "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
     );
@@ -1460,17 +1496,12 @@ export class CatalogDO extends DurableObject {
       const res = await stub.fetch("https://catalog.internal/update-index-ring", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ indexName, ring, evacFromShards }),
+        body: JSON.stringify({ indexName, ring, evacFromShards: shadow.set, evacAdd: shadow.add, evacRemove: shadow.remove }),
       });
       if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
     }
     // Every sibling applied — now locally (never via a DO self-fetch).
-    this.sql.exec(
-      "UPDATE index_rules SET placement_ring_json = ?, evac_from_shards_json = ? WHERE index_name = ?",
-      JSON.stringify(ring),
-      JSON.stringify(evacFromShards),
-      indexName,
-    );
+    this.applyIndexRingUpdate(indexName, ring, shadow);
   }
 
   /** Milestone 3, Chunk 5: one drain-orchestration step for one draining
@@ -1669,7 +1700,10 @@ export class CatalogDO extends DurableObject {
         if (pos !== -1) {
           const newRing = [...currentRing];
           newRing[pos] = substitute;
-          await this.fanUpdateIndexRing(indexName, newRing, [shardId]);
+          // Codex round-15 P1 #1: MERGE this draining shard into the shadow
+          // (never overwrite) so a concurrent evacuation of another shard in the
+          // same index's ring keeps its own shadow entry.
+          await this.fanUpdateIndexRing(indexName, newRing, { add: shardId });
         }
 
         // (d) Flush queued index_pending_jobs targeting the draining shard
@@ -1722,7 +1756,9 @@ export class CatalogDO extends DurableObject {
         // shadow pointing at a decommissioned shard).
         const currentRow = this.one<{ placement_ring_json: string }>("SELECT placement_ring_json FROM index_rules WHERE index_name = ?", indexName);
         const finalRing = currentRow ? (JSON.parse(currentRow.placement_ring_json) as string[]) : [];
-        await this.fanUpdateIndexRing(indexName, finalRing, []);
+        // Codex round-15 P1 #1: REMOVE only this drain's shard from the shadow,
+        // leaving any concurrent evacuation's shard still shadowed.
+        await this.fanUpdateIndexRing(indexName, finalRing, { remove: shardId });
 
         // Complete — clear the marker. The fence is LEFT in place: the shard is
         // being decommissioned, and a stray late write to it for this index

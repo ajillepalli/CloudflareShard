@@ -2172,6 +2172,72 @@ describe("Worker /v1/index-query dual-lookup during ring evacuation (Codex round
     expect(after.status).toBe(200);
     expect(((await after.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]);
   });
+
+  // Codex round-15 P1 #1: the read-shadow must be the UNION of ALL concurrent
+  // same-index evacuations' draining shards, not a singleton. A second drain's
+  // repoint that overwrote the shadow with only its own shard would drop the
+  // first drain's shard → /v1/index-query silently stops dual-reading it.
+  it("unions the read-shadow across two concurrent evacuations of the same index; completing one leaves the other still shadowed and queryable", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("union_evt");
+    await post("/admin/create-index", { indexName: "union_by_v", table: "union_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const ring = ((await (await post("/admin/list-indexes", {}, AUTH())).json()) as { indexes: Array<{ indexName: string; placementRing: string[] }> })
+      .indexes.find((i) => i.indexName === "union_by_v")!.placementRing;
+
+    // Two indexed values whose entries land on two DIFFERENT ring shards S1, S2.
+    let V1 = "", V2 = "", S1 = "", S2 = "";
+    for (let i = 0; V1 === "" || V2 === ""; i += 1) {
+      const cand = `u-${i}`;
+      const s = indexShardIdForKey("union_evt", "union_by_v", JSON.stringify([cand]), ring);
+      if (V1 === "") { V1 = cand; S1 = s; }
+      else if (s !== S1) { V2 = cand; S2 = s; }
+    }
+    expect(S1).not.toBe(S2);
+
+    await post("/v1/mutate", { op: "insert", table: "union_evt", tenantId, partitionKey: "row-1", values: { v: V1 } }, token);
+    await post("/v1/mutate", { op: "insert", table: "union_evt", tenantId, partitionKey: "row-2", values: { v: V2 } }, token);
+    await pollIndexRows("union_by_v", (r) => r.length === 2);
+
+    // Simulate two CONCURRENT evacuations (different catalogs) of the same index:
+    // drain of S1 repoints S1→sub1 and MERGE-adds S1; drain of S2 repoints
+    // S2→sub2 and MERGE-adds S2. Neither copies its entry yet. The shadow must
+    // end up = {S1, S2}.
+    const sub1 = "catalog-0-shard-usub1";
+    const sub2 = "catalog-0-shard-usub2";
+    const ring1 = ring.map((s) => (s === S1 ? sub1 : s));
+    const ring2 = ring1.map((s) => (s === S2 ? sub2 : s));
+    for (let c = 0; c < 4; c += 1) {
+      const catStub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${c}`));
+      await catStub.fetch(new Request("https://catalog.internal/update-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "union_by_v", ring: ring1, evacAdd: S1 }) }));
+      await catStub.fetch(new Request("https://catalog.internal/update-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "union_by_v", ring: ring2, evacAdd: S2 }) }));
+    }
+
+    // Both draining shards are dual-read: V1 (entry on S1) and V2 (entry on S2)
+    // are both found even though the ring now points at the empty substitutes.
+    const q1 = await post("/v1/index-query", { table: "union_evt", indexName: "union_by_v", tenantId, values: { v: V1 } }, token);
+    expect(((await q1.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]);
+    const q2 = await post("/v1/index-query", { table: "union_evt", indexName: "union_by_v", tenantId, values: { v: V2 } }, token);
+    expect(((await q2.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-2"]);
+
+    // Complete drain of S1: copy its entry to sub1, then MERGE-remove S1 (leaving
+    // S2 shadowed). Both keys stay queryable.
+    const e1 = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(S1)), async (_i: unknown, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at FROM __cf_indexes WHERE index_name = 'union_by_v'")) as Array<Record<string, unknown>>)[0],
+    );
+    await env.SHARD.get(env.SHARD.idFromName(sub1)).fetch(new Request("https://shard.internal/index-entries-import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rows: [e1] }) }));
+    for (let c = 0; c < 4; c += 1) {
+      const catStub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${c}`));
+      await catStub.fetch(new Request("https://catalog.internal/update-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "union_by_v", ring: ring2, evacRemove: S1 }) }));
+    }
+
+    const q1b = await post("/v1/index-query", { table: "union_evt", indexName: "union_by_v", tenantId, values: { v: V1 } }, token);
+    expect(((await q1b.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]); // from sub1
+    const q2b = await post("/v1/index-query", { table: "union_evt", indexName: "union_by_v", tenantId, values: { v: V2 } }, token);
+    expect(((await q2b.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-2"]); // S2 still shadowed
+  });
 });
 
 describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", () => {
