@@ -2209,6 +2209,79 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     });
   });
 
+  // Codex round-13 fix (commit 2 — re-resolve on fence): a queued index-job
+  // retry whose stored target is being evacuated (INDEX_RING_FENCED) must NOT
+  // keep hammering the draining shard — it re-resolves the index's CURRENT ring
+  // (via catalog /index-ring) and delivers to the substitute instead.
+  it("an index_pending_jobs retry that hits INDEX_RING_FENCED re-resolves the current ring and delivers to the substitute", async () => {
+    const shardStale = `idxjob-stale-${crypto.randomUUID()}`;
+    const shardSub = `idxjob-sub-${crypto.randomUUID()}`;
+    const base = `idxjob-base-${crypto.randomUUID()}`;
+
+    // catalog-0 holds the index_rules row; the CURRENT ring already points at
+    // the substitute (as if the evacuation repoint already happened).
+    const catalog0 = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await catalog0.fetch(new Request("https://catalog.internal/list-shards", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+    await runInDurableObject(catalog0, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM index_rules WHERE index_name = 'idxjob_reresolve'");
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idxjob_reresolve",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify([shardSub]),
+      );
+    });
+
+    // Fence the index on the stale target so a write there 409s.
+    const staleStub = env.SHARD.get(env.SHARD.idFromName(shardStale));
+    await staleStub.fetch(new Request("https://shard.internal/fence-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "idxjob_reresolve" }) }));
+
+    // Enqueue a retry job on the base shard whose stored target is the stale
+    // (fenced) shard, carrying the structured identity needed to re-resolve.
+    const baseStub = env.SHARD.get(env.SHARD.idFromName(base));
+    const entrySql =
+      "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+    await baseStub.fetch(
+      new Request("https://shard.internal/enqueue-index-job", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetShardId: shardStale,
+          sql: entrySql,
+          params: ["events", "idxjob_reresolve", JSON.stringify(["alpha"]), "row-rr", shardStale, "t1", new Date().toISOString()],
+          requestId: `rr-${crypto.randomUUID()}`,
+          indexName: "idxjob_reresolve",
+          indexTable: "events",
+          indexKeyJson: JSON.stringify(["alpha"]),
+        }),
+      }),
+    );
+
+    // Flush jobs targeting the stale shard → delivery 409s → re-resolves to the
+    // substitute (the only shard in the current ring) and lands there.
+    const flush = await baseStub.fetch(
+      new Request("https://shard.internal/flush-index-jobs-for-target", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ targetShardId: shardStale }) }),
+    );
+    expect(((await flush.json()) as { remaining: number }).remaining).toBe(0); // job cleared
+
+    // The entry landed on the SUBSTITUTE, not the stale/fenced shard.
+    const subStub = env.SHARD.get(env.SHARD.idFromName(shardSub));
+    await runInDurableObject(subStub, async (_i: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ? AND partition_key = ?", "idxjob_reresolve", "row-rr"));
+      expect(rows).toHaveLength(1);
+    });
+    await runInDurableObject(staleStub, async (_i: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idxjob_reresolve"));
+      expect(rows).toHaveLength(0);
+    });
+    await runInDurableObject(baseStub, async (_i: unknown, state: DurableObjectState) => {
+      const n = (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM index_pending_jobs")) as Array<{ n: number }>)[0].n;
+      expect(n).toBe(0);
+    });
+  });
+
   // Codex full-PR review P2: ring evacuation repointed the LOCAL ring first,
   // then fanned /update-index-ring out to siblings. If a sibling call failed,
   // the next tick read the already-repointed local ring (no longer containing

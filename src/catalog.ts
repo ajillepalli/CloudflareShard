@@ -116,6 +116,7 @@ export class CatalogDO extends DurableObject {
       "/migrate-vbucket-abort": this.handleMigrateVbucketAbort.bind(this),
       "/drain-shard-status": this.handleDrainShardStatus.bind(this),
       "/update-index-ring": this.handleUpdateIndexRing.bind(this),
+      "/index-ring": this.handleIndexRing.bind(this),
     };
   }
 
@@ -675,6 +676,26 @@ export class CatalogDO extends DurableObject {
     this.audit("/drop-index", { indexName: body.indexName });
     this.sql.exec("DELETE FROM index_rules WHERE index_name = ?", body.indexName);
     return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Codex round-13 fix (internal, DO-binding only, un-gated like /list-shards):
+   * returns one index's CURRENT pinned placement ring. Used to RE-RESOLVE an
+   * index write's target after an INDEX_RING_FENCED rejection — the gateway's
+   * best-effort index write and a base shard's index_pending_jobs retry both
+   * fetch the live ring here (index_rules is replicated identically to every
+   * catalog shard, so any shard — canonically catalog-0 — can answer) and
+   * recompute placement onto the substitute. Returns an empty ring for an
+   * unknown index rather than erroring, so a caller can fall back safely. */
+  private async handleIndexRing(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: "Missing indexName" }, 400);
+    }
+    const row = this.one<{ placement_ring_json: string }>(
+      "SELECT placement_ring_json FROM index_rules WHERE index_name = ?",
+      body.indexName,
+    );
+    return json({ indexName: body.indexName, ring: row ? (JSON.parse(row.placement_ring_json) as string[]) : [] });
   }
 
   private async handleListIndexes(): Promise<Response> {

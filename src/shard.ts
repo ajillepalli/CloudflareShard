@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
 import { log } from "./log";
+import { indexShardIdForKey } from "./hash";
 import { INTERNAL_TABLE_NAMES, isDeleteStatement, isMutation } from "./sql-safety";
 import { rowKey } from "./structured-op";
 
@@ -55,6 +56,23 @@ type ExecutePayload = {
    * of stranding the entry on a shard about to be decommissioned. */
   indexName?: string;
 };
+
+/** A queued index-write retry row (index_pending_jobs). The index_* columns are
+ * nullable (added round-13); when present they let a fenced retry re-resolve. */
+type IndexJobRow = {
+  job_id: number;
+  target_shard_id: string;
+  sql: string;
+  params_json: string;
+  request_id: string;
+  attempt_count: number;
+  index_name: string | null;
+  index_table: string | null;
+  index_key_json: string | null;
+};
+
+const INDEX_JOB_COLUMNS =
+  "job_id, target_shard_id, sql, params_json, request_id, attempt_count, index_name, index_table, index_key_json";
 
 type PrepareIntent = {
   sql: string;
@@ -209,15 +227,8 @@ export class ShardDO extends DurableObject {
    * uses this to decide whether to re-arm the alarm sooner than the regular
    * hourly prune cycle. */
   private async processIndexPendingJobs(): Promise<number | null> {
-    const due = this.many<{
-      job_id: number;
-      target_shard_id: string;
-      sql: string;
-      params_json: string;
-      request_id: string;
-      attempt_count: number;
-    }>(
-      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM index_pending_jobs WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?",
+    const due = this.many<IndexJobRow>(
+      `SELECT ${INDEX_JOB_COLUMNS} FROM index_pending_jobs WHERE next_attempt_at <= ? ORDER BY job_id ASC LIMIT ?`,
       new Date().toISOString(),
       INDEX_JOB_BATCH_SIZE,
     );
@@ -232,32 +243,60 @@ export class ShardDO extends DurableObject {
     return next ? new Date(next.next_attempt_at).getTime() : null;
   }
 
+  /** POSTs a job's index-entry write to one shard, labelled with its indexName
+   * so the target enforces the index-ring fence. */
+  private async postIndexJobExecute(job: IndexJobRow, targetShardId: string): Promise<Response> {
+    const id = this.shardEnv.SHARD.idFromName(targetShardId);
+    const stub = this.shardEnv.SHARD.get(id);
+    return stub.fetch("https://shard.internal/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sql: job.sql,
+        params: JSON.parse(job.params_json),
+        requestId: job.request_id,
+        isMutation: true,
+        ...(job.index_name ? { indexName: job.index_name } : {}),
+      }),
+    });
+  }
+
   /** Delivers one queued index-write retry to its target shard and, on success,
    * deletes it; on failure applies exponential backoff. Returns true on
    * delivery. Shared by the alarm loop (processIndexPendingJobs, respecting
    * next_attempt_at) and CatalogDO's ring-evacuation flush
-   * (/flush-index-jobs-for-target, which forces every job for a target now). */
-  private async deliverIndexJob(job: {
-    job_id: number;
-    target_shard_id: string;
-    sql: string;
-    params_json: string;
-    request_id: string;
-    attempt_count: number;
-  }): Promise<boolean> {
+   * (/flush-index-jobs-for-target, which forces every job for a target now).
+   *
+   * Codex round-13 fix: if the stored target rejects INDEX_RING_FENCED (its
+   * ring is being evacuated), RE-RESOLVE the index's current placement ring
+   * from the catalog and deliver to the newly-resolved shard (the substitute)
+   * instead of uselessly retrying the draining target — converting a
+   * stale-target retry into a correct write. */
+  private async deliverIndexJob(job: IndexJobRow): Promise<boolean> {
     try {
-      const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
-      const stub = this.shardEnv.SHARD.get(id);
-      const res = await stub.fetch("https://shard.internal/execute", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          sql: job.sql,
-          params: JSON.parse(job.params_json),
-          requestId: job.request_id,
-          isMutation: true,
-        }),
-      });
+      let res = await this.postIndexJobExecute(job, job.target_shard_id);
+      if (!res.ok && res.status === 409 && job.index_name && job.index_table && job.index_key_json) {
+        let code: string | undefined;
+        try {
+          code = ((await res.clone().json()) as { error?: { code?: string } }).error?.code;
+        } catch {
+          // non-JSON body — leave undefined
+        }
+        if (code === "INDEX_RING_FENCED") {
+          const ring = await this.resolveIndexRing(job.index_name);
+          if (ring.length > 0) {
+            const resolved = indexShardIdForKey(job.index_table, job.index_name, job.index_key_json, ring);
+            if (resolved !== job.target_shard_id) {
+              const retryRes = await this.postIndexJobExecute(job, resolved);
+              if (retryRes.ok) {
+                this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+                return true;
+              }
+              res = retryRes;
+            }
+          }
+        }
+      }
       if (res.ok) {
         this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
         return true;
@@ -282,6 +321,27 @@ export class ShardDO extends DurableObject {
     }
   }
 
+  /** Codex round-13 fix: fetch an index's current pinned ring from the catalog
+   * (catalog-0 — index_rules is replicated to every catalog shard) so a fenced
+   * index-job retry can re-resolve onto the substitute. A deliberate, narrow
+   * ShardDO→CatalogDO read (the migration machinery already permits
+   * CatalogDO→ShardDO calls); returns [] on any failure so the caller falls
+   * back to its normal backoff. */
+  private async resolveIndexRing(indexName: string): Promise<string[]> {
+    try {
+      const stub = this.shardEnv.CATALOG.get(this.shardEnv.CATALOG.idFromName("catalog-0"));
+      const res = await stub.fetch("https://catalog.internal/index-ring", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ indexName }),
+      });
+      if (!res.ok) return [];
+      return ((await res.json()) as { ring?: string[] }).ring ?? [];
+    } catch {
+      return [];
+    }
+  }
+
   /** Milestone 3 (Codex full-PR review P1 E): CatalogDO's ring evacuation calls
    * this on EVERY base shard while draining `targetShardId` as an index shard.
    * It force-delivers every index_pending_job whose target is that shard NOW
@@ -295,15 +355,8 @@ export class ShardDO extends DurableObject {
     if (!body.targetShardId) {
       return json({ error: "Missing targetShardId" }, 400);
     }
-    const jobs = this.many<{
-      job_id: number;
-      target_shard_id: string;
-      sql: string;
-      params_json: string;
-      request_id: string;
-      attempt_count: number;
-    }>(
-      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM index_pending_jobs WHERE target_shard_id = ? ORDER BY job_id ASC",
+    const jobs = this.many<IndexJobRow>(
+      `SELECT ${INDEX_JOB_COLUMNS} FROM index_pending_jobs WHERE target_shard_id = ? ORDER BY job_id ASC`,
       body.targetShardId,
     );
     for (const job of jobs) {
@@ -323,19 +376,30 @@ export class ShardDO extends DurableObject {
    * unreachable), and schedules an alarm soon rather than waiting for the
    * next hourly prune cycle. */
   private async handleEnqueueIndexJob(request: Request): Promise<Response> {
-    const body = (await request.json()) as { targetShardId?: string; sql?: string; params?: unknown[]; requestId?: string };
+    const body = (await request.json()) as {
+      targetShardId?: string;
+      sql?: string;
+      params?: unknown[];
+      requestId?: string;
+      indexName?: string;
+      indexTable?: string;
+      indexKeyJson?: string;
+    };
     if (!body.targetShardId || !body.sql || !body.requestId) {
       return json({ error: "Missing targetShardId, sql, or requestId" }, 400);
     }
     const now = new Date().toISOString();
     this.sql.exec(
-      "INSERT INTO index_pending_jobs (target_shard_id, sql, params_json, request_id, next_attempt_at, attempt_count, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+      "INSERT INTO index_pending_jobs (target_shard_id, sql, params_json, request_id, next_attempt_at, attempt_count, created_at, index_name, index_table, index_key_json) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
       body.targetShardId,
       body.sql,
       JSON.stringify(body.params ?? []),
       body.requestId,
       now,
       now,
+      body.indexName ?? null,
+      body.indexTable ?? null,
+      body.indexKeyJson ?? null,
     );
     const retrySoon = Date.now() + INDEX_JOB_BASE_DELAY_MS;
     const existingAlarm = await this.ctx.storage.getAlarm();
@@ -1159,6 +1223,15 @@ export class ShardDO extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+    // Codex round-13 fix: the structured identity of the index entry a job
+    // writes, so a retry that hits INDEX_RING_FENCED can RE-RESOLVE the index's
+    // current ring and deliver to the substitute rather than uselessly retrying
+    // the stale (draining) target. Nullable/additive: a job enqueued before
+    // this migration lacks them and simply can't re-resolve (it retries its
+    // stored target, the pre-round-13 behavior).
+    this.ensureColumn("index_pending_jobs", "index_name", "TEXT");
+    this.ensureColumn("index_pending_jobs", "index_table", "TEXT");
+    this.ensureColumn("index_pending_jobs", "index_key_json", "TEXT");
 
     // Milestone 3, Chunk 3 (redesigned per review Tier 1 #2/#3): durable
     // record of a dual-write mirror (source -> target during an active
