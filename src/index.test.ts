@@ -1999,6 +1999,63 @@ describe("Worker /v1/tx index-ring write fence (Codex round-14 P1)", () => {
   });
 });
 
+// Codex round-14 P2 (read-visibility during evacuation): ring evacuation
+// repoints the query-visible ring to the substitute BEFORE copying the existing
+// entries. /v1/index-query must dual-look-up the draining shard (via the
+// replicated evacFromShards read-shadow) so a pre-existing key stays visible in
+// that window, then reads only the substitute once evacuation completes.
+describe("Worker /v1/index-query dual-lookup during ring evacuation (Codex round-14 P2)", () => {
+  it("returns a pre-existing row during an in-progress evacuation (ring repointed, entry not yet copied), and still after completion (from the substitute)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("p2dual_evt");
+    await post("/admin/create-index", { indexName: "p2dual_by_v", table: "p2dual_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // A pre-existing indexed row; wait for its async index entry to land on P.
+    await post("/v1/mutate", { op: "insert", table: "p2dual_evt", tenantId, partitionKey: "row-1", values: { v: "alpha" } }, token);
+    await pollIndexRows("p2dual_by_v", (r) => r.length === 1);
+
+    const ring = ((await (await post("/admin/list-indexes", {}, AUTH())).json()) as { indexes: Array<{ indexName: string; placementRing: string[] }> })
+      .indexes.find((i) => i.indexName === "p2dual_by_v")!.placementRing;
+    const indexKeyJson = JSON.stringify(["alpha"]);
+    const P = indexShardIdForKey("p2dual_evt", "p2dual_by_v", indexKeyJson, ring);
+    const substitute = "catalog-0-shard-p2sub";
+    const newRing = ring.map((s) => (s === P ? substitute : s));
+
+    // Force the in-progress evacuation window: repoint the ring P→substitute AND
+    // set the read-shadow evacFromShards=[P] on EVERY catalog, WITHOUT copying
+    // the entry (substitute is still empty). This is exactly the state drain
+    // evacuation is in between its repoint and its copy.
+    for (let c = 0; c < 4; c += 1) {
+      const catStub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${c}`));
+      await catStub.fetch(new Request("https://catalog.internal/update-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "p2dual_by_v", ring: newRing, evacFromShards: [P] }) }));
+    }
+
+    // Query resolves to the (empty) substitute via the repointed ring — but the
+    // dual-lookup still finds the pre-existing entry on the draining shard P.
+    const during = await post("/v1/index-query", { table: "p2dual_evt", indexName: "p2dual_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(during.status).toBe(200);
+    expect(((await during.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]);
+
+    // Complete the evacuation: copy the entry to the substitute, then clear the
+    // read-shadow (evacFromShards=[]) on every catalog. Reads now hit only the
+    // substitute.
+    const entry = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(P)), async (_i: unknown, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at FROM __cf_indexes WHERE index_name = 'p2dual_by_v'")) as Array<Record<string, unknown>>)[0],
+    );
+    await env.SHARD.get(env.SHARD.idFromName(substitute)).fetch(new Request("https://shard.internal/index-entries-import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rows: [entry] }) }));
+    for (let c = 0; c < 4; c += 1) {
+      const catStub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${c}`));
+      await catStub.fetch(new Request("https://catalog.internal/update-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "p2dual_by_v", ring: newRing, evacFromShards: [] }) }));
+    }
+
+    const after = await post("/v1/index-query", { table: "p2dual_evt", indexName: "p2dual_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(after.status).toBe(200);
+    expect(((await after.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]);
+  });
+});
+
 describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", () => {
   it("still finds a matching row after its base row physically moves to a different shard and vbucket_map is flipped to point there (simulating what Chunk 4's migration does), proving hydration re-routes via the entry's recorded tenant_id rather than a stale source_shard_id snapshot", async () => {
     // /admin/init clamps totalVBuckets to a floor of 64 regardless of what's

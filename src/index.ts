@@ -1992,7 +1992,7 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   if (!lookupRes.ok) {
     return new Response(lookupRes.body, { status: lookupRes.status, headers: lookupRes.headers });
   }
-  const lookupBody = (await lookupRes.json()) as { columns: string[]; partitionKeyColumn: string; ring: string[] };
+  const lookupBody = (await lookupRes.json()) as { columns: string[]; partitionKeyColumn: string; ring: string[]; evacFromShards?: string[] };
   const missing = lookupBody.columns.filter((c) => !(c in (body.values as Record<string, unknown>)));
   if (missing.length > 0) {
     return json(
@@ -2034,90 +2034,99 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   // stale index (e.g. after a burst of deletes whose async cleanup hasn't
   // caught up yet) rather than scanning without bound.
   const tenantCatalogShardId = catalogShardIdForTenant(env, body.tenantId);
-  const rows: Array<Record<string, unknown>> = [];
+
+  // Codex round-14 P2 (read-visibility during evacuation): ring evacuation
+  // repoints the query-visible ring to the substitute BEFORE it copies the
+  // draining shard's existing entries. During that window indexShardId (from
+  // the repointed ring) can be the substitute, which doesn't yet hold a
+  // pre-existing key's entry — so a lookup would wrongly return empty. While a
+  // read-shadow (evacFromShards) exists for the index, DUAL-LOOK-UP: query the
+  // current-ring shard AND the draining shard(s), and dedupe by partition_key
+  // (a copied-but-not-yet-deleted entry can appear on both). Once evacuation
+  // completes the shadow clears and reads hit only the substitute.
+  const evacFromShards = lookupBody.evacFromShards ?? [];
+  const indexShardsToQuery = Array.from(new Set([indexShardId, ...evacFromShards]));
+
+  // Gather candidate entries (partition_key, tenant_id) for the exact key from
+  // every relevant index shard, tenant-filtered and deduped by partition_key.
+  // rawScanCap bounds work against a pathologically stale index (e.g. a burst
+  // of deletes whose async cleanup hasn't caught up yet).
   const rawScanCap = limit * 5;
-  let offset = 0;
-  while (rows.length < limit && offset < rawScanCap) {
-    // Review Tier 2 #12: fetch (and therefore hydrate) at most the number of
-    // rows still needed, not a full `limit` every batch — the whole batch is
-    // hydrated, so offset advances by exactly what was fetched (no skip).
-    const remaining = limit - rows.length;
-    const batchLimit = Math.min(remaining, rawScanCap - offset);
-    const indexRes = await routeToShard(env, indexShardId, "/execute", {
-      sql: "SELECT partition_key, tenant_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ? OFFSET ?",
-      params: [body.table, body.indexName, indexKeyJson, batchLimit, offset],
+  const candidateByPk = new Map<string, { partition_key: string; tenant_id: string }>();
+  for (const shard of indexShardsToQuery) {
+    const indexRes = await routeToShard(env, shard, "/execute", {
+      sql: "SELECT partition_key, tenant_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ?",
+      params: [body.table, body.indexName, indexKeyJson, rawScanCap],
       requestId: `index-query-lookup-${crypto.randomUUID()}`,
       isMutation: false,
     });
     if (!indexRes.ok) {
-      return new Response(indexRes.body, { status: indexRes.status, headers: indexRes.headers });
+      // The current-ring shard failing is a real error. A supplementary evac
+      // shard failing (e.g. already decommissioned) is skipped — anything it
+      // held has, by the time it's gone, been copied to the substitute.
+      if (shard === indexShardId) {
+        return new Response(indexRes.body, { status: indexRes.status, headers: indexRes.headers });
+      }
+      continue;
     }
     const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; tenant_id: string }> };
-    const matches = indexBody.rows ?? [];
-    if (matches.length === 0) break; // index exhausted
-
-    // Tenant isolation: only the querying tenant's own entries are hydratable
-    // (an index shard may hold entries for other tenants that share the
-    // indexed value). Filtering here replaces the per-entry /route auth check
-    // the previous implementation relied on.
-    const ownMatches = matches.filter((m) => m.tenant_id === body.tenantId);
-
-    // Review Tier 2 #12: resolve every match's CURRENT shard in ONE
-    // tenant-authenticated /route-batch call, instead of one /route
-    // subrequest per entry serialized through this CatalogDO. Milestone 3,
-    // Chunk 2's re-routing (a base row that migrated is found on its new
-    // shard) is preserved — /route-batch reads the live vbucket_map.
-    const shardByPk = new Map<string, string>();
-    if (ownMatches.length > 0) {
-      const batchRes = await routeToCatalog(
-        env,
-        tenantCatalogShardId,
-        "/route-batch",
-        { table: body.table, tenantId: body.tenantId, partitionKeys: ownMatches.map((m) => m.partition_key) },
-        request.headers.get("authorization") ?? undefined,
-      );
-      if (!batchRes.ok) {
-        return new Response(batchRes.body, { status: batchRes.status, headers: batchRes.headers });
-      }
-      const batchBody = (await batchRes.json()) as { routes: Array<{ partitionKey: string; shardId: string | null }> };
-      for (const r of batchBody.routes) {
-        if (r.shardId) shardByPk.set(r.partitionKey, r.shardId);
-      }
+    for (const m of indexBody.rows ?? []) {
+      if (m.tenant_id !== body.tenantId) continue; // tenant isolation
+      if (!candidateByPk.has(m.partition_key)) candidateByPk.set(m.partition_key, m);
     }
+  }
+  const ownMatches = Array.from(candidateByPk.values()).sort((a, b) =>
+    a.partition_key < b.partition_key ? -1 : a.partition_key > b.partition_key ? 1 : 0,
+  );
 
-    // Each match's hydrate read is independent — resolve the whole batch
-    // concurrently. Promise.all preserves `ownMatches`' order (ORDER BY
-    // partition_key ASC), so the push-until-limit loop below stays stable.
-    const hydrated = await Promise.all(
-      ownMatches.map(async (match): Promise<Record<string, unknown> | null> => {
-        const shardId = shardByPk.get(match.partition_key);
-        if (!shardId) return null; // no mapping (shouldn't happen) — skip
-
-        const rowRes = await routeToShard(env, shardId, "/execute", {
-          sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
-          params: [match.partition_key],
-          requestId: `index-query-hydrate-${crypto.randomUUID()}`,
-          isMutation: false,
-        });
-        if (!rowRes.ok) return null; // base row/shard unreachable — skip rather than fail the whole query
-        const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
-        const row = rowBody.rows?.[0];
-        if (!row) return null; // row deleted since the index entry was written — stale, exclude
-
-        // Staleness re-check (Chunk 2's index maintenance is async): only
-        // surface this row if it still actually matches the queried tuple.
-        const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
-        return stillMatches ? row : null;
-      }),
+  // Resolve every candidate's CURRENT base shard in ONE tenant-authenticated
+  // /route-batch call — Chunk 2's read-time re-routing (a migrated base row is
+  // found on its new shard) is preserved (route-batch reads the live map).
+  const shardByPk = new Map<string, string>();
+  if (ownMatches.length > 0) {
+    const batchRes = await routeToCatalog(
+      env,
+      tenantCatalogShardId,
+      "/route-batch",
+      { table: body.table, tenantId: body.tenantId, partitionKeys: ownMatches.map((m) => m.partition_key) },
+      request.headers.get("authorization") ?? undefined,
     );
-    for (const row of hydrated) {
-      if (row === null) continue;
-      rows.push(row);
-      if (rows.length >= limit) break;
+    if (!batchRes.ok) {
+      return new Response(batchRes.body, { status: batchRes.status, headers: batchRes.headers });
     }
+    const batchBody = (await batchRes.json()) as { routes: Array<{ partitionKey: string; shardId: string | null }> };
+    for (const r of batchBody.routes) {
+      if (r.shardId) shardByPk.set(r.partitionKey, r.shardId);
+    }
+  }
 
-    offset += matches.length;
-    if (matches.length < batchLimit) break; // fewer than requested means exhausted
+  // Hydrate each candidate (concurrently, order preserved) with the staleness
+  // re-check, then take up to `limit`.
+  const hydrated = await Promise.all(
+    ownMatches.map(async (match): Promise<Record<string, unknown> | null> => {
+      const shardId = shardByPk.get(match.partition_key);
+      if (!shardId) return null; // no mapping (shouldn't happen) — skip
+      const rowRes = await routeToShard(env, shardId, "/execute", {
+        sql: `SELECT * FROM ${safeTable} WHERE ${safePkCol} = ?`,
+        params: [match.partition_key],
+        requestId: `index-query-hydrate-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!rowRes.ok) return null; // base row/shard unreachable — skip rather than fail the whole query
+      const rowBody = (await rowRes.json()) as { rows?: Array<Record<string, unknown>> };
+      const row = rowBody.rows?.[0];
+      if (!row) return null; // row deleted since the index entry was written — stale, exclude
+      // Staleness re-check (async index maintenance): only surface a row that
+      // still actually matches the queried tuple.
+      const stillMatches = lookupBody.columns.every((c) => row[c] === queriedValues[c]);
+      return stillMatches ? row : null;
+    }),
+  );
+  const rows: Array<Record<string, unknown>> = [];
+  for (const row of hydrated) {
+    if (row === null) continue;
+    rows.push(row);
+    if (rows.length >= limit) break;
   }
   return json({ rows });
 }
