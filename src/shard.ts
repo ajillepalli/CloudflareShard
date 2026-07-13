@@ -47,6 +47,13 @@ type ExecutePayload = {
    * client that replays its requestId AFTER the vbucket flipped to this
    * target still dedupes (cross-migration idempotency, criterion 2). */
   clientRequestId?: string;
+  /** Codex round-13 fix: set on a __cf_indexes write to name the index whose
+   * ring entry is being written, so this shard can enforce the index-ring write
+   * fence (__cf_fenced_index_rings). When this shard is mid-evacuation for the
+   * index it rejects the write 409 INDEX_RING_FENCED, and the gateway/retry
+   * re-resolves the index's current ring and writes to the substitute instead
+   * of stranding the entry on a shard about to be decommissioned. */
+  indexName?: string;
 };
 
 type PrepareIntent = {
@@ -167,6 +174,8 @@ export class ShardDO extends DurableObject {
       "/vbucket-tables": this.handleVbucketTables.bind(this),
       "/fence-vbucket": this.handleFenceVbucket.bind(this),
       "/unfence-vbucket": this.handleUnfenceVbucket.bind(this),
+      "/fence-index-ring": this.handleFenceIndexRing.bind(this),
+      "/unfence-index-ring": this.handleUnfenceIndexRing.bind(this),
       "/delete-vbucket-rows": this.handleDeleteVbucketRows.bind(this),
       "/unattributed-count": this.handleUnattributedCount.bind(this),
       "/purge-mirror-jobs": this.handlePurgeMirrorJobs.bind(this),
@@ -782,6 +791,36 @@ export class ShardDO extends DurableObject {
     return json({ ok: true, vbucket: body.vbucket });
   }
 
+  /** Codex round-13 fix (internal): ring evacuation step 1 for an index — from
+   * this instant any NEW __cf_indexes write for `indexName` arriving here is
+   * rejected 409 INDEX_RING_FENCED (see handleExecute's index-ring fence
+   * check). Idempotent (INSERT OR REPLACE) so the catalog can re-assert it on
+   * every evacuation tick. */
+  private async handleFenceIndexRing(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: "Missing indexName" }, 400);
+    }
+    this.sql.exec(
+      "INSERT OR REPLACE INTO __cf_fenced_index_rings (index_name, fenced_at) VALUES (?, ?)",
+      body.indexName,
+      new Date().toISOString(),
+    );
+    return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Codex round-13 fix (internal): lifts an index-ring fence. Idempotent.
+   * Called on abort/failure paths (the completion path decommissions the shard,
+   * making the fence moot). */
+  private async handleUnfenceIndexRing(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: "Missing indexName" }, 400);
+    }
+    this.sql.exec("DELETE FROM __cf_fenced_index_rings WHERE index_name = ?", body.indexName);
+    return json({ ok: true, indexName: body.indexName });
+  }
+
   /** Milestone 3, Chunk 4 (internal): removes one vbucket's base rows and
    * provenance from this shard — cutover step 5 on the source after a
    * successful flip, or the target wipe on abort/checksum mismatch. Also
@@ -1165,6 +1204,21 @@ export class ShardDO extends DurableObject {
         fenced_at TEXT NOT NULL
       )
     `);
+
+    // Codex round-13 fix — index-ring WRITE fence. Analogous to the vbucket
+    // cutover fence above, but keyed on index_name: while this shard holds a
+    // fence for an index (because ring evacuation is moving that index's
+    // placement off this shard), any NEW __cf_indexes write for that index that
+    // arrives here is rejected 409 INDEX_RING_FENCED, so an in-flight index
+    // write that resolved the OLD ring before the repoint can only be turned
+    // away (→ the writer re-resolves to the substitute) rather than landing on
+    // a shard about to be decommissioned.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_fenced_index_rings (
+        index_name TEXT PRIMARY KEY,
+        fenced_at  TEXT NOT NULL
+      )
+    `);
   }
 
   /** Add a column if a table predating it doesn't have it yet — mirrors
@@ -1327,6 +1381,24 @@ export class ShardDO extends DurableObject {
           }
         }
 
+        // Codex round-13 fix — index-ring write fence. A __cf_indexes write
+        // labelled with its indexName is rejected while this shard is
+        // evacuating that index's ring, so an in-flight write that resolved the
+        // OLD ring before the repoint can only 409 (→ the writer re-resolves to
+        // the substitute) rather than landing on a shard about to be
+        // decommissioned. Checked AFTER the dedupe above for the same reason as
+        // the vbucket fence: a replay of an already-applied write returns the
+        // cached result, not a spurious 409.
+        if (payload.indexName !== undefined) {
+          const ringFenced = this.one<{ index_name: string }>(
+            "SELECT index_name FROM __cf_fenced_index_rings WHERE index_name = ?",
+            payload.indexName,
+          );
+          if (ringFenced) {
+            return this.indexFencedResponse(payload.indexName);
+          }
+        }
+
         // Raw /v1/sql must respect row locks too — but this only closes the
         // hole for an honestly-labeled caller (see NOT in Scope: nothing
         // verifies the SQL text itself only touches this one row). A mirror
@@ -1461,6 +1533,23 @@ export class ShardDO extends DurableObject {
           code: "VBUCKET_FENCED",
           message: `vbucket ${vbucket} is fenced for migration cutover on this shard.`,
           fix: "Retry — the fence lifts when the migration's map flip completes, and the retry will route to the new shard.",
+        },
+      },
+      409,
+    );
+  }
+
+  /** Codex round-13 fix: shared 409 INDEX_RING_FENCED response — this index's
+   * ring is being evacuated off this shard, so a new entry must not land here.
+   * The writer re-resolves the index's current ring and writes to the
+   * substitute. */
+  private indexFencedResponse(indexName: string): Response {
+    return json(
+      {
+        error: {
+          code: "INDEX_RING_FENCED",
+          message: `index ${indexName}'s ring is being evacuated off this shard.`,
+          fix: "Re-resolve the index's current placement ring and write the entry to the newly-resolved shard.",
         },
       },
       409,

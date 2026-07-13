@@ -126,6 +126,7 @@ export const INTERNAL_TABLE_NAMES = [
   "__cf_row_owners",
   "__cf_mirror_pending",
   "__cf_fenced_vbuckets",
+  "__cf_fenced_index_rings",
 ] as const;
 
 const INTERNAL_TABLE_SET = new Set<string>(INTERNAL_TABLE_NAMES);
