@@ -1175,6 +1175,36 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(((await allowed.json()) as { status: string }).status).toBe("backfilling");
   });
 
+  // Codex full-PR review P1 B: a migration must never target a non-active
+  // shard. INSERT OR IGNORE left a pre-existing 'draining' target in place and
+  // let the migration proceed; once cutover flipped vbucket_map to it, /route
+  // (which rejects a non-active mapping) would 503 that vbucket forever.
+  it("startMigration rejects 409 TARGET_SHARD_NOT_ACTIVE for an explicit target that already exists and is draining, and never flips the map to it", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // A pre-existing DRAINING shard — a valid shard id, but not a legal target.
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO shards (shard_id, status, created_at) VALUES ('shard-draining-tgt', 'draining', ?)",
+        new Date().toISOString(),
+      );
+    });
+
+    const res = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-draining-tgt" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("TARGET_SHARD_NOT_ACTIVE");
+
+    // The vbucket must NOT have been claimed for migration toward the draining shard.
+    const row = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      (Array.from(
+        state.storage.sql.exec("SELECT migration_status, target_shard_id FROM vbucket_map WHERE vbucket = 0"),
+      ) as Array<{ migration_status: string; target_shard_id: string | null }>)[0],
+    );
+    expect(row.migration_status).toBe("none");
+    expect(row.target_shard_id).not.toBe("shard-draining-tgt");
+  });
+
   // Re-review: the cutover wait for prepared 2PC intents was unbounded — a tx
   // prepared-but-never-resolved on the source would block cutover forever with
   // no operator signal. After the bound elapses the migration must surface a
