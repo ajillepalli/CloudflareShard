@@ -11,6 +11,7 @@ import {
   IDENTIFIER_RE,
   participantKey,
   rowKey,
+  SYNTHETIC_INDEX_TABLE_PREFIX,
   UNSET_PARTITION_KEY_COLUMN,
   validateMutation,
   type StructuredMutation,
@@ -1859,7 +1860,7 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
         for (const delta of deltas) {
           const ring = ringByIndex.get(delta.indexName) ?? [];
           if (ring.length === 0) continue; // no pinned ring recorded — nothing safe to write to
-          const syntheticTable = `__cf_indexes:${delta.indexName}`;
+          const syntheticTable = `${SYNTHETIC_INDEX_TABLE_PREFIX}${delta.indexName}`;
           if (delta.oldKeyJson !== null) {
             const oldShardId = indexShardIdForKey(mutation.table, delta.indexName, delta.oldKeyJson, ring);
             addIntent(oldShardId, {
