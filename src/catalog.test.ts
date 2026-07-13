@@ -2121,6 +2121,94 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     expect(statusAfter.status).toBe("complete");
   });
 
+  // Codex full-PR review P1 E: a queued index_pending_job on a DIFFERENT (base)
+  // shard whose targetShardId is the draining shard would, if it fired after the
+  // source delete, write an index entry onto the drained shard (outside the
+  // ring) — a silent /v1/index-query miss. The drain's precheck only inspected
+  // jobs stored ON the draining shard, so this cross-shard job was missed. Ring
+  // evacuation must flush such jobs (cluster-wide) before completing, so their
+  // entry lands on the draining shard while it is still the ring target and is
+  // copied to the substitute.
+  it("flushes a queued index job on another base shard that targets the draining shard, so its entry reaches the substitute (not stranded on the drained shard)", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_evac_e",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+    });
+
+    // A base shard (shard-1) has a QUEUED index-write retry whose target is the
+    // draining shard (shard-0) — it inserts an entry for idx_evac_e/'row-late'.
+    // Seed it directly on shard-1's index_pending_jobs (warm ensureSchema first
+    // with a harmless fetch). No alarm is armed by this direct insert, so the
+    // catalog's evacuation flush is what must deliver it.
+    const shard1 = env.SHARD.get(env.SHARD.idFromName("shard-1"));
+    await shard1.fetch(new Request("https://shard.internal/stats", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+    const entrySql =
+      "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+    const entryParams = ["events", "idx_evac_e", JSON.stringify(["alpha"]), "row-late", "shard-1", "t1", new Date().toISOString()];
+    await runInDurableObject(shard1, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_pending_jobs (target_shard_id, sql, params_json, request_id, next_attempt_at, attempt_count, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+        "shard-0",
+        entrySql,
+        JSON.stringify(entryParams),
+        `late-${crypto.randomUUID()}`,
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+    });
+
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Drive ticks to completion.
+    for (let tick = 0; tick < 6; tick += 1) {
+      const done = await runInDurableObject(stub, async (instance: CatalogDO, state: DurableObjectState) => {
+        await instance.alarm();
+        const ring = JSON.parse(
+          (Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_evac_e'")) as Array<{ placement_ring_json: string }>)[0]
+            .placement_ring_json,
+        ) as string[];
+        return !ring.includes("shard-0");
+      });
+      if (done) break;
+    }
+
+    const ringAfter = (await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      JSON.parse(
+        (Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_evac_e'")) as Array<{ placement_ring_json: string }>)[0]
+          .placement_ring_json,
+      ),
+    )) as string[];
+    expect(ringAfter).not.toContain("shard-0");
+
+    // The late job's entry reached the SUBSTITUTE — not stranded on shard-0.
+    const substitute = ringAfter[0];
+    const substituteStub = env.SHARD.get(env.SHARD.idFromName(substitute));
+    await runInDurableObject(substituteStub, async (_i: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ? AND partition_key = ?", "idx_evac_e", "row-late"));
+      expect(rows).toHaveLength(1);
+    });
+    // No job left queued on the base shard targeting the drained shard.
+    await runInDurableObject(shard1, async (_i: unknown, state: DurableObjectState) => {
+      const n = (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM index_pending_jobs WHERE target_shard_id = 'shard-0'")) as Array<{ n: number }>)[0].n;
+      expect(n).toBe(0);
+    });
+    // And nothing stranded on the drained shard.
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "idx_evac_e"));
+      expect(rows).toHaveLength(0);
+    });
+  });
+
   // Codex full-PR review P2: ring evacuation repointed the LOCAL ring first,
   // then fanned /update-index-ring out to siblings. If a sibling call failed,
   // the next tick read the already-repointed local ring (no longer containing
