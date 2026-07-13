@@ -804,6 +804,67 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("PARTITION_KEY_COLUMN_UNSET");
   });
+
+  // Codex round-14 P2: backfill must place entries over the catalog's PERSISTED
+  // ring, not a locally-recomputed active set. On a retry/resume the live active
+  // set can differ from the pinned ring; placing over the active set would write
+  // entries to shards /v1/index-query (which reads the pinned ring) never looks
+  // at — a silently unqueryable index.
+  it("backfill places entries over the index's PERSISTED ring (not the live active set), so the backfilled row is queryable", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("persistring_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // A base row (with provenance) BEFORE any index exists — only backfill will
+    // write its index entry. Pick a value V whose placement over the full active
+    // set differs from the pinned single-shard ring, so the two rings disagree.
+    const pinnedRing = ["catalog-0-shard-0"];
+    const activeSet = ["catalog-0-shard-0", "catalog-1-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"];
+    let V = "";
+    for (let i = 0; ; i += 1) {
+      const cand = `pr-${i}`;
+      const overActive = indexShardIdForKey("persistring_evt", "persistring_by_v", JSON.stringify([cand]), activeSet);
+      if (overActive !== "catalog-0-shard-0") { V = cand; break; }
+    }
+    await post("/v1/mutate", { op: "insert", table: "persistring_evt", tenantId, partitionKey: "row-1", values: { v: V } }, token);
+
+    // Seed the index as 'building' with a PINNED ring of just catalog-0-shard-0
+    // on every catalog (models an index created when the pool was smaller).
+    for (let c = 0; c < 4; c += 1) {
+      const catStub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${c}`));
+      await catStub.fetch(new Request("https://catalog.internal/list-shards", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+      await runInDurableObject(catStub, async (_i: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec("DELETE FROM index_rules WHERE index_name = 'persistring_by_v'");
+        state.storage.sql.exec(
+          "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'building', ?, ?)",
+          "persistring_by_v",
+          "persistring_evt",
+          JSON.stringify(["v"]),
+          new Date().toISOString(),
+          JSON.stringify(pinnedRing),
+        );
+      });
+    }
+
+    // /admin/create-index resumes: registration is idempotent (ring unchanged),
+    // and backfill must place row-1's entry over the PERSISTED ring
+    // (catalog-0-shard-0), not the recomputed active set.
+    const res = await post("/admin/create-index", { indexName: "persistring_by_v", table: "persistring_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+
+    // Queryable — the entry landed where the pinned ring reads it.
+    const q = await post("/v1/index-query", { table: "persistring_evt", indexName: "persistring_by_v", tenantId, values: { v: V } }, token);
+    expect(q.status).toBe(200);
+    expect(((await q.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]);
+
+    // Physically: the entry is on catalog-0-shard-0 (pinned ring), NOT on the
+    // shard the active-set placement would have chosen.
+    const onPinned = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0")), async (_i: unknown, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM __cf_indexes WHERE index_name = 'persistring_by_v'")) as Array<{ n: number }>)[0].n,
+    );
+    expect(onPinned).toBe(1);
+  });
 });
 
 describe("Worker /admin/drop-index (Milestone 2 Chunk 6)", () => {

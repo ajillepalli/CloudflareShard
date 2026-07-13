@@ -518,6 +518,17 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
   if (registerFailed) return registerFailed;
 
+  // Codex round-14 P2: backfill placement must use the catalog's PERSISTED ring
+  // for this index — never the locally-recomputed active set. On a RETRY of
+  // /admin/create-index (idempotent registration), `shardIds` reflects the live
+  // active set at retry time, which can differ from the ring pinned by the FIRST
+  // call; placing over `shardIds` would then write entries to shards
+  // /v1/index-query (which reads the pinned ring) never looks at. The persisted
+  // ring equals `shardIds` on the first call and the original pinned ring on a
+  // retry; fall back to `shardIds` only if it can't be fetched.
+  const persistedRing = await fetchIndexRing(env, indexName);
+  const placementRing = persistedRing.length > 0 ? persistedRing : shardIds;
+
   // Backfill: scan every data-holding shard's existing rows for this table
   // (active + draining — see dataShardIds above), compute each row's index
   // entry, and write it to its own computed index shard (placed on the active
@@ -594,16 +605,11 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
       const tenantId = freshRow.__cf_tenant_id;
 
       const indexKeyJson = JSON.stringify(columns.map((c) => freshRow[c] ?? null));
-      const indexShardId = indexShardIdForKey(table, indexName, indexKeyJson, shardIds);
-      const writeRes = await routeToShard(env, indexShardId, "/execute", {
-        sql: `INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        params: [table, indexName, indexKeyJson, partitionKey, shardId, tenantId, new Date().toISOString()],
-        requestId: `create-index-backfill-write-${indexName}-${crypto.randomUUID()}`,
-        isMutation: true,
-        // Codex round-13 fix: label so the index-ring fence applies here too.
-        indexName,
-      });
-      if (!writeRes.ok) {
+      // Codex round-14 P2: place over the PERSISTED ring, and on INDEX_RING_FENCED
+      // re-resolve to the substitute instead of hard-failing (a drain may have
+      // fenced a shard after this /admin/create-index captured the ring).
+      const wrote = await backfillWriteIndexEntry(env, table, indexName, indexKeyJson, partitionKey, shardId, tenantId, placementRing);
+      if (!wrote) {
         return json(
           { error: { code: "BACKFILL_WRITE_FAILED", message: `Failed to write index entry for partitionKey ${partitionKey}.` } },
           500,
@@ -1317,6 +1323,43 @@ async function isIndexRingFenced(res: Response): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Codex round-14 P2: a blocking backfill index-entry write that participates in
+ * the index-ring fence. Places the entry over `ring` (the index's PERSISTED
+ * placement ring), labels it with indexName, and on an INDEX_RING_FENCED
+ * rejection RE-RESOLVES the index's current ring and writes to the substitute —
+ * so a drain that fenced a shard after /admin/create-index captured the ring
+ * doesn't hard-fail the backfill or strand the entry on the drained shard.
+ * Returns true on success. */
+async function backfillWriteIndexEntry(
+  env: Env,
+  table: string,
+  indexName: string,
+  indexKeyJson: string,
+  partitionKey: string,
+  sourceShardId: string,
+  tenantId: string,
+  ring: string[],
+): Promise<boolean> {
+  const sql =
+    "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+  const params = [table, indexName, indexKeyJson, partitionKey, sourceShardId, tenantId, new Date().toISOString()];
+  const requestId = `create-index-backfill-write-${indexName}-${crypto.randomUUID()}`;
+  const target = indexShardIdForKey(table, indexName, indexKeyJson, ring);
+  const res = await routeToShard(env, target, "/execute", { sql, params, requestId, isMutation: true, indexName });
+  if (res.ok) return true;
+  if (await isIndexRingFenced(res)) {
+    const fresh = await fetchIndexRing(env, indexName);
+    if (fresh.length > 0) {
+      const resolved = indexShardIdForKey(table, indexName, indexKeyJson, fresh);
+      if (resolved !== target) {
+        const retry = await routeToShard(env, resolved, "/execute", { sql, params, requestId, isMutation: true, indexName });
+        if (retry.ok) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
