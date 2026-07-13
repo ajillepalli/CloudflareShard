@@ -2577,3 +2577,122 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     expect(parked.status).toBe("stalled"); // NOT the livelocking 'migrating-vbuckets'
   });
 });
+
+// Codex round-13 KILLER: an index write that resolved the OLD ring before the
+// repoint (here a delayed/queued LABELLED write to the draining shard) must,
+// once that shard is fenced during a REAL ring evacuation, be turned away
+// (409 INDEX_RING_FENCED) and RE-RESOLVED to the substitute — never stranded on
+// the shard about to be decommissioned. This runs the whole subsystem end to
+// end: fence-first evacuation (commit 3) + the writer/retry re-resolve on fence
+// (commit 2), tied together by a real /drain-shard. It uses catalog-0 directly
+// so the shard's re-resolve (ShardDO→CatalogDO catalog-0 /index-ring) resolves
+// against this same catalog's live, already-repointed ring.
+describe("CatalogDO index-ring write fence — round-13 end-to-end", () => {
+  it("a delayed index write that resolved the old ring lands on the SUBSTITUTE (fence→re-resolve), not stranded on the drained shard; the drain then completes", async () => {
+    // catalog-0 (not a random freshCatalog) so ShardDO.resolveIndexRing, which
+    // canonically asks catalog-0, hits this instance. Single-catalog cluster
+    // (no catalogShardId → siblingCount 0), so ring repoint is local-only.
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4, force: true }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM index_rules WHERE index_name = 'idx_kill'");
+      state.storage.sql.exec("DELETE FROM drain_ring_evac");
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_kill",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0"]),
+      );
+      // Move vbuckets off shard-0 so the drain goes straight to ring evacuation.
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+      // Reset any leftover fence/entries on shard-0's index (fixed DO name).
+    });
+
+    // A real, already-present entry on shard-0 (will be copied to the substitute).
+    const shard0 = env.SHARD.get(env.SHARD.idFromName("shard-0"));
+    await shard0.fetch(new Request("https://shard.internal/stats", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+    await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM __cf_indexes WHERE index_name = 'idx_kill'");
+      state.storage.sql.exec("DELETE FROM __cf_fenced_index_rings WHERE index_name = 'idx_kill'");
+    });
+    await shard0.fetch(
+      new Request("https://shard.internal/index-entries-import", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          rows: [{ table_name: "events", index_name: "idx_kill", index_key_json: JSON.stringify(["alpha"]), partition_key: "row-present", source_shard_id: "shard-1", tenant_id: "t1", updated_at: new Date().toISOString() }],
+        }),
+      }),
+    );
+
+    // Drain shard-0 and drive the ring evacuation to completion. The index is
+    // now fenced on shard-0, the ring is repointed to the substitute, and
+    // shard-0's entries are deleted.
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+    for (let tick = 0; tick < 8; tick += 1) {
+      const done = await runInDurableObject(stub, async (instance: CatalogDO, state: DurableObjectState) => {
+        await instance.alarm();
+        const marker = Array.from(state.storage.sql.exec("SELECT index_name FROM drain_ring_evac WHERE shard_id = 'shard-0'")).length;
+        const ring = JSON.parse(
+          (Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_kill'")) as Array<{ placement_ring_json: string }>)[0].placement_ring_json,
+        ) as string[];
+        return marker === 0 && !ring.includes("shard-0");
+      });
+      if (done) break;
+    }
+
+    const ringAfter = (await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      JSON.parse((Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_kill'")) as Array<{ placement_ring_json: string }>)[0].placement_ring_json),
+    )) as string[];
+    expect(ringAfter).not.toContain("shard-0");
+    const substitute = ringAfter[0];
+
+    // THE KILLER: NOW — after the flip — an index write that had resolved the
+    // OLD ring [shard-0] before the repoint finally arrives (its retry was
+    // queued on base shard-1, still targeting shard-0). Without the fence it
+    // would deliver to the drained shard-0 and be stranded (the ring points at
+    // the substitute, so /v1/index-query would miss it). WITH the fence (left
+    // set on shard-0 through decommission), the delivery 409s INDEX_RING_FENCED
+    // and re-resolves to the substitute.
+    const shard1 = env.SHARD.get(env.SHARD.idFromName("shard-1"));
+    await shard1.fetch(new Request("https://shard.internal/stats", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+    await runInDurableObject(shard1, async (_i: unknown, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM index_pending_jobs");
+      state.storage.sql.exec(
+        "INSERT INTO index_pending_jobs (target_shard_id, sql, params_json, request_id, next_attempt_at, attempt_count, created_at, index_name, index_table, index_key_json) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+        "shard-0",
+        "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        JSON.stringify(["events", "idx_kill", JSON.stringify(["alpha"]), "row-straggler", "shard-1", "t1", new Date().toISOString()]),
+        `strag-${crypto.randomUUID()}`,
+        new Date().toISOString(),
+        new Date().toISOString(),
+        "idx_kill",
+        "events",
+        JSON.stringify(["alpha"]),
+      );
+    });
+    // Deliver the straggler (its retry fires).
+    await shard1.fetch(new Request("https://shard.internal/flush-index-jobs-for-target", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ targetShardId: "shard-0" }) }));
+
+    // The straggler landed on the SUBSTITUTE (fence→re-resolve), NOT shard-0.
+    const substitute2 = ringAfter[0];
+    const subStub = env.SHARD.get(env.SHARD.idFromName(substitute2));
+    const subPks = await runInDurableObject(subStub, async (_i: unknown, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = 'idx_kill' ORDER BY partition_key")) as Array<{ partition_key: string }>).map((r) => r.partition_key),
+    );
+    expect(subPks).toEqual(["row-present", "row-straggler"]); // both reachable via the current ring
+
+    // Nothing stranded on the drained shard, and the retry job is cleared.
+    await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = 'idx_kill'"))).toHaveLength(0);
+    });
+    await runInDurableObject(shard1, async (_i: unknown, state: DurableObjectState) => {
+      const n = (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM index_pending_jobs WHERE target_shard_id = 'shard-0'")) as Array<{ n: number }>)[0].n;
+      expect(n).toBe(0);
+    });
+    const status = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(status.status).toBe("complete");
+  });
+});
