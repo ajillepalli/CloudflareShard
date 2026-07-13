@@ -2090,16 +2090,24 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   const evacFromShards = lookupBody.evacFromShards ?? [];
   const indexShardsToQuery = Array.from(new Set([indexShardId, ...evacFromShards]));
 
-  // Gather candidate entries (partition_key, tenant_id) for the exact key from
-  // every relevant index shard, tenant-filtered and deduped by partition_key.
-  // rawScanCap bounds work against a pathologically stale index (e.g. a burst
-  // of deletes whose async cleanup hasn't caught up yet).
+  // Gather candidate entries (partition_key) for the exact key from every
+  // relevant index shard, deduped by partition_key. rawScanCap bounds work
+  // against a pathologically stale index (e.g. a burst of deletes whose async
+  // cleanup hasn't caught up yet).
+  //
+  // Codex round-15 P1 #2: filter by tenant_id IN THE SQL PREDICATE, before
+  // ORDER BY/LIMIT — never only during hydration. A shared indexed value can
+  // have entries for many tenants; if another tenant owns the first rawScanCap
+  // partition keys for this (table, index, key), a post-scan filter would leave
+  // THIS tenant's matching entries past the cap, never scanned → an empty /
+  // under-filled result despite live rows. Binding tenant_id here makes the cap
+  // apply to this tenant's own entries only, on every shard queried.
   const rawScanCap = limit * 5;
-  const candidateByPk = new Map<string, { partition_key: string; tenant_id: string }>();
+  const candidateByPk = new Map<string, { partition_key: string }>();
   for (const shard of indexShardsToQuery) {
     const indexRes = await routeToShard(env, shard, "/execute", {
-      sql: "SELECT partition_key, tenant_id FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? ORDER BY partition_key ASC LIMIT ?",
-      params: [body.table, body.indexName, indexKeyJson, rawScanCap],
+      sql: "SELECT partition_key FROM __cf_indexes WHERE table_name = ? AND index_name = ? AND index_key_json = ? AND tenant_id = ? ORDER BY partition_key ASC LIMIT ?",
+      params: [body.table, body.indexName, indexKeyJson, body.tenantId, rawScanCap],
       requestId: `index-query-lookup-${crypto.randomUUID()}`,
       isMutation: false,
     });
@@ -2112,9 +2120,8 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
       }
       continue;
     }
-    const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string; tenant_id: string }> };
+    const indexBody = (await indexRes.json()) as { rows?: Array<{ partition_key: string }> };
     for (const m of indexBody.rows ?? []) {
-      if (m.tenant_id !== body.tenantId) continue; // tenant isolation
       if (!candidateByPk.has(m.partition_key)) candidateByPk.set(m.partition_key, m);
     }
   }
