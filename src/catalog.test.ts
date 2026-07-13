@@ -2013,7 +2013,7 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
   // retries on later ticks. Here: force non-convergence, prove the ring is NOT
   // repointed and the drain is not 'complete'; then let the churn stop and prove
   // a later tick converges, repoints, and deletes with no missed entries.
-  it("does NOT repoint the ring while the reconcile is unstable; a later (quiet) tick converges, repoints, and deletes", async () => {
+  it("fences + repoints EARLY but does not delete the source while the copy is unstable; a marker keeps it revisited until a quiet tick converges and deletes", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 3, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
     await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
@@ -2066,21 +2066,34 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
       await instance.alarm();
     });
 
-    // The ring must NOT have been repointed while unstable — still [shard-0].
-    const ringDuring = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+    // Round-13 invariant: the ring IS repointed early (fence protects the
+    // draining shard), but the source is NOT deleted while the copy is unstable,
+    // and a marker keeps the index revisited.
+    const ringDuring = (await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
       JSON.parse(
         (Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_evac_d'")) as Array<{ placement_ring_json: string }>)[0]
           .placement_ring_json,
       ),
+    )) as string[];
+    expect(ringDuring).not.toContain("shard-0"); // repointed early
+    expect(ringDuring).toHaveLength(1);
+    // The index is fenced on the draining shard (so an in-flight write 409s).
+    const fencedDuring = await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec("SELECT index_name FROM __cf_fenced_index_rings WHERE index_name = 'idx_evac_d'")).length > 0,
     );
-    expect(ringDuring).toEqual(["shard-0"]); // NOT repointed
+    expect(fencedDuring).toBe(true);
+    // A marker keeps evacuation in flight (revisit not driven by ring membership).
+    const markerDuring = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec("SELECT index_name FROM drain_ring_evac WHERE shard_id = 'shard-0' AND index_name = 'idx_evac_d'")).length,
+    );
+    expect(markerDuring).toBe(1);
     const statusDuring = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as {
       status: string;
       stallReason: string | null;
     };
     expect(statusDuring.status).not.toBe("complete");
     expect(statusDuring.stallReason).toBe("ring-reconcile-unstable");
-    // Source entries still present and reachable (ring still points at shard-0).
+    // Source entries NOT deleted while unstable (still there to be copied).
     await runInDurableObject(shard0, async (_i: unknown, state: DurableObjectState) => {
       const rows = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ? ORDER BY partition_key", "idx_evac_d")) as Array<{ partition_key: string }>;
       expect(rows.map((r) => r.partition_key)).toEqual(["row-a", "row-b"]);
