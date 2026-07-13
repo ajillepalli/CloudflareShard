@@ -1133,6 +1133,48 @@ describe("CatalogDO migration state transitions (Milestone 3, Chunk 4)", () => {
     expect(stillFenced).toBe(false);
   });
 
+  // Codex full-PR review P1 A: startMigration checked migration_status but not
+  // cleanup_pending. A prior cutover can leave migration_status='none' while
+  // post-flip cleanup (source delete + unfence) is still retrying
+  // (cleanup_pending=1). Starting a new migration then overwrites
+  // cleanup_source_shard_id and can strand the old source's fence forever.
+  // startMigration must reject MIGRATION_CLEANUP_PENDING until cleanup clears.
+  it("startMigration rejects 409 MIGRATION_CLEANUP_PENDING while a prior flip's post-flip cleanup is still pending, and allows it once cleanup clears", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Model the post-flip window: vbucket 0 flipped to 'none' but cleanup is
+    // still pending against the OLD source.
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'none', cleanup_pending = 1, cleanup_source_shard_id = 'shard-old-src', updated_at = ? WHERE vbucket = 0",
+        new Date().toISOString(),
+      );
+    });
+
+    const blocked = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-new-target" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(blocked.status).toBe(409);
+    expect(((await blocked.json()) as { error: { code: string } }).error.code).toBe("MIGRATION_CLEANUP_PENDING");
+
+    // The rejected attempt must NOT have flipped the row into 'backfilling' or
+    // overwritten cleanup_source_shard_id.
+    const afterBlock = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      (Array.from(
+        state.storage.sql.exec("SELECT migration_status, target_shard_id, cleanup_source_shard_id FROM vbucket_map WHERE vbucket = 0"),
+      ) as Array<{ migration_status: string; target_shard_id: string | null; cleanup_source_shard_id: string | null }>)[0],
+    );
+    expect(afterBlock.migration_status).toBe("none");
+    expect(afterBlock.cleanup_source_shard_id).toBe("shard-old-src");
+
+    // Cleanup finishes (clears the flag) — a fresh migration is now accepted.
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE vbucket_map SET cleanup_pending = 0, cleanup_source_shard_id = NULL WHERE vbucket = 0");
+    });
+    const allowed = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-new-target" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(allowed.status).toBe(200);
+    expect(((await allowed.json()) as { status: string }).status).toBe("backfilling");
+  });
+
   // Re-review: the cutover wait for prepared 2PC intents was unbounded — a tx
   // prepared-but-never-resolved on the source would block cutover forever with
   // no operator signal. After the bound elapses the migration must surface a
