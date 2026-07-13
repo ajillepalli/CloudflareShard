@@ -259,6 +259,51 @@ describe("ShardDO /execute input validation", () => {
   });
 });
 
+describe("ShardDO index-ring write fence (Codex round-13)", () => {
+  it("rejects an indexName-labelled __cf_indexes write 409 INDEX_RING_FENCED while the ring is fenced, and allows it again after unfence; idempotent fence/unfence", async () => {
+    const stub = await freshShard();
+    const indexWrite = (requestId: string) =>
+      post("/execute", {
+        sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params: ["events", "idx_fence", JSON.stringify(["alpha"]), "row-1", "shard-src", "t1", new Date().toISOString()],
+        requestId,
+        isMutation: true,
+        indexName: "idx_fence",
+      });
+
+    // Not fenced yet — the write applies.
+    const before = await stub.fetch(indexWrite(`w-${crypto.randomUUID()}`));
+    expect(before.status).toBe(200);
+
+    // Fence the ring (idempotent — assert re-fencing is fine).
+    expect((await stub.fetch(post("/fence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+    expect((await stub.fetch(post("/fence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+
+    // A NEW labelled write is now rejected 409 INDEX_RING_FENCED.
+    const fenced = await stub.fetch(indexWrite(`w-${crypto.randomUUID()}`));
+    expect(fenced.status).toBe(409);
+    expect(((await fenced.json()) as { error: { code: string } }).error.code).toBe("INDEX_RING_FENCED");
+
+    // A write for a DIFFERENT index is unaffected.
+    const other = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params: ["events", "idx_other", JSON.stringify(["beta"]), "row-2", "shard-src", "t1", new Date().toISOString()],
+        requestId: `o-${crypto.randomUUID()}`,
+        isMutation: true,
+        indexName: "idx_other",
+      }),
+    );
+    expect(other.status).toBe(200);
+
+    // Unfence (idempotent) — labelled writes flow again.
+    expect((await stub.fetch(post("/unfence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+    expect((await stub.fetch(post("/unfence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+    const after = await stub.fetch(indexWrite(`w-${crypto.randomUUID()}`));
+    expect(after.status).toBe(200);
+  });
+});
+
 describe("ShardDO route/method guards", () => {
   it("rejects non-POST methods with 405", async () => {
     const stub = await freshShard();
