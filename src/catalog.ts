@@ -1367,6 +1367,16 @@ export class CatalogDO extends DurableObject {
         } catch {
           // Non-JSON body (e.g. a plain-string error) — leave code undefined.
         }
+        // Codex full-PR review P1 A: a MIGRATION_CLEANUP_PENDING rejection is
+        // TRANSIENT — the same alarm's post-flip cleanup loop is already
+        // retrying that vbucket's source delete/unfence and will clear
+        // cleanup_pending on its own, after which the next tick's startMigration
+        // succeeds. Keep ticking (return true) rather than parking the whole
+        // drain behind an operator re-invoke.
+        if (code === "MIGRATION_CLEANUP_PENDING") {
+          log("catalog.drain_waiting_on_cleanup", { shardId, vbucket: next });
+          return true;
+        }
         const reason = code === "VBUCKET_PROVENANCE_INCOMPLETE" ? "provenance" : "migration-blocked";
         this.sql.exec("UPDATE shards SET drain_stall_reason = ? WHERE shard_id = ?", reason, shardId);
         log("catalog.drain_stalled", { shardId, vbucket: next, reason, code });
@@ -1603,8 +1613,8 @@ export class CatalogDO extends DurableObject {
     requestedTargetShardId: string | undefined,
     endpoint: string,
   ): Promise<Response | { fromShard: string; toShard: string; metadataVersion: number }> {
-    const existingMap = this.one<{ shard_id: string; migration_status: string }>(
-      "SELECT shard_id, migration_status FROM vbucket_map WHERE vbucket = ?",
+    const existingMap = this.one<{ shard_id: string; migration_status: string; cleanup_pending: number }>(
+      "SELECT shard_id, migration_status, cleanup_pending FROM vbucket_map WHERE vbucket = ?",
       vbucket,
     );
     if (!existingMap) {
@@ -1617,6 +1627,27 @@ export class CatalogDO extends DurableObject {
             code: "MIGRATION_IN_PROGRESS",
             message: `vbucket ${vbucket} already has a migration in progress (status: ${existingMap.migration_status}).`,
             fix: "Wait for it to finish (/admin/migrate-vbucket-status) or abort it (/admin/migrate-vbucket-abort).",
+          },
+        },
+        409,
+      );
+    }
+    // Codex full-PR review P1 A: a prior cutover can flip migration_status to
+    // 'none' while post-flip cleanup (delete source rows + unfence source) is
+    // still retrying (cleanup_pending=1). Starting a NEW migration for this
+    // vbucket now would overwrite cleanup_source_shard_id on the flip, orphaning
+    // the old source's still-set __cf_fenced_vbuckets entry — and if the new
+    // target happens to equal that old source, it would stay fenced forever
+    // (503/VBUCKET_FENCED on every write). The alarm-driven cleanup is
+    // idempotent and self-healing, so reject until it clears rather than racing
+    // it.
+    if (existingMap.cleanup_pending === 1) {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_CLEANUP_PENDING",
+            message: `vbucket ${vbucket} has post-flip cleanup still pending from a prior migration (source rows delete / unfence not yet confirmed).`,
+            fix: "Wait for the alarm-driven cleanup to finish (it retries automatically; watch cleanup via /admin/migrate-vbucket-status), then retry.",
           },
         },
         409,
@@ -1672,7 +1703,7 @@ export class CatalogDO extends DurableObject {
       UPDATE vbucket_map
       SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?,
           backfill_table = NULL, backfill_after_pk = NULL, updated_at = ?
-      WHERE vbucket = ? AND migration_status = 'none'
+      WHERE vbucket = ? AND migration_status = 'none' AND cleanup_pending = 0
       `,
       targetShard,
       now,
