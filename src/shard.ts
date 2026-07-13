@@ -3,7 +3,7 @@ import { json } from "./http";
 import { log } from "./log";
 import { indexShardIdForKey } from "./hash";
 import { INTERNAL_TABLE_NAMES, isDeleteStatement, isMutation } from "./sql-safety";
-import { rowKey } from "./structured-op";
+import { indexNameFromSyntheticTable, rowKey } from "./structured-op";
 
 type ExecutePayload = {
   sql: string;
@@ -1693,6 +1693,26 @@ export class ShardDO extends DurableObject {
       const fenced = this.one<{ vbucket: number }>("SELECT vbucket FROM __cf_fenced_vbuckets WHERE vbucket = ?", intent.vbucket);
       if (fenced) {
         return this.fencedResponse(intent.vbucket);
+      }
+    }
+
+    // Codex round-14 P1: index-ring write fence for /v1/tx. A synthetic
+    // __cf_indexes intent (table "__cf_indexes:<indexName>") that resolved the
+    // OLD ring before a drain repoint is applied later via /commit, NOT
+    // /execute — so it never hits the /execute index-ring fence and would strand
+    // its entry on the drained shard. A tx can't re-resolve mid-commit, so the
+    // participant VOTES ABORT here (mirroring the base-row vbucket fence above):
+    // the coordinator aborts the whole transaction and the client's retry
+    // recomputes the (now repointed) ring and targets the substitute.
+    for (const intent of intents) {
+      const indexName = indexNameFromSyntheticTable(intent.table);
+      if (indexName === null) continue;
+      const ringFenced = this.one<{ index_name: string }>(
+        "SELECT index_name FROM __cf_fenced_index_rings WHERE index_name = ?",
+        indexName,
+      );
+      if (ringFenced) {
+        return this.indexFencedResponse(indexName);
       }
     }
 

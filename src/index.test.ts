@@ -1,6 +1,6 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { hashKey } from "./hash";
+import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
@@ -1922,6 +1922,80 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     const resB = await post("/v1/index-query", { table: "idx_iso_evt", indexName: "idx_iso_by_v", tenantId: tenantB, values: { v: "shared" }, limit: 50 }, tokenB);
     const bodyB = (await resB.json()) as { rows: Array<{ id: string }> };
     expect(bodyB.rows.map((r) => r.id)).toEqual(["b1"]);
+  });
+});
+
+// Codex round-14 P1: a /v1/tx index write that resolved the OLD ring before a
+// drain repoint is applied via /commit (2PC piggyback), NOT /execute — so it
+// bypassed the /execute index-ring fence and could strand its entry on the
+// drained shard. ShardDO /prepare now votes ABORT when a synthetic __cf_indexes
+// intent's ring is fenced; the client's retry recomputes the (repointed) ring
+// and targets the substitute.
+describe("Worker /v1/tx index-ring write fence (Codex round-14 P1)", () => {
+  it("a /v1/tx whose index delta targets a fenced ring position aborts (retryable, INDEX_RING_FENCED); a retry after repoint lands the entry on the substitute and it is queryable, never on the drained shard", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 8, force: true }, AUTH());
+    await createIndexTestTable("txfence_evt");
+    await post("/admin/create-index", { indexName: "txfence_by_v", table: "txfence_evt", columns: ["v"] }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // The index's pinned ring (all active shards at create-index).
+    const ring = ((await (await post("/admin/list-indexes", {}, AUTH())).json()) as { indexes: Array<{ indexName: string; placementRing: string[] }> })
+      .indexes.find((i) => i.indexName === "txfence_by_v")!.placementRing;
+
+    // Pick a value V whose index entry is placed on P = catalog-0-shard-0 (the
+    // shard we fence). numShards:1 → the tenant's base row is also on P, but the
+    // index-ring fence only rejects the SYNTHETIC index intent, not the base row.
+    const P = "catalog-0-shard-0";
+    let V = "";
+    for (let i = 0; ; i += 1) {
+      const cand = `alpha-${i}`;
+      if (indexShardIdForKey("txfence_evt", "txfence_by_v", JSON.stringify([cand]), ring) === P) {
+        V = cand;
+        break;
+      }
+    }
+
+    // Fence the index ring on P (as a drain evacuation's step-b would).
+    const pStub = env.SHARD.get(env.SHARD.idFromName(P));
+    await pStub.fetch(new Request("https://shard.internal/fence-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "txfence_by_v" }) }));
+
+    // The tx's synthetic index intent targets P → /prepare votes abort → the
+    // WHOLE tx aborts (retryable), and nothing is written.
+    const abortRes = await post("/v1/tx", { mutations: [{ op: "insert", table: "txfence_evt", tenantId, partitionKey: "row-1", values: { v: V } }], requestId: "txfence-1" }, token);
+    expect(abortRes.status).toBe(409);
+    const abortBody = (await abortRes.json()) as { error: { code: string; details?: { error?: { code?: string } } } };
+    expect(abortBody.error.code).toBe("TX_ABORTED");
+    expect(abortBody.error.details?.error?.code).toBe("INDEX_RING_FENCED"); // distinguishable cause
+
+    // Repoint the ring P→substitute on every catalog shard (what drain
+    // evacuation does), keeping P fenced. Then a retry resolves to the substitute.
+    const substitute = "catalog-0-shard-txsub";
+    const newRing = ring.map((s) => (s === P ? substitute : s));
+    for (let c = 0; c < 4; c += 1) {
+      const catStub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${c}`));
+      await catStub.fetch(new Request("https://catalog.internal/update-index-ring", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ indexName: "txfence_by_v", ring: newRing }) }));
+    }
+
+    // Retry with a fresh requestId (the aborted tx id is terminal). The index
+    // delta now resolves to the substitute (not fenced) and commits.
+    const okRes = await post("/v1/tx", { mutations: [{ op: "insert", table: "txfence_evt", tenantId, partitionKey: "row-1", values: { v: V } }], requestId: "txfence-2" }, token);
+    expect(okRes.status).toBe(200);
+
+    // Found by /v1/index-query (hydrated from its base shard).
+    const q = await post("/v1/index-query", { table: "txfence_evt", indexName: "txfence_by_v", tenantId, values: { v: V } }, token);
+    expect(q.status).toBe(200);
+    expect(((await q.json()) as { rows: Array<{ id: string }> }).rows.map((r) => r.id)).toEqual(["row-1"]);
+
+    // The index entry is on the SUBSTITUTE, never on the fenced shard P.
+    const subN = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(substitute)), async (_i: unknown, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM __cf_indexes WHERE index_name = 'txfence_by_v'")) as Array<{ n: number }>)[0].n,
+    );
+    expect(subN).toBe(1);
+    const pN = await runInDurableObject(pStub, async (_i: unknown, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM __cf_indexes WHERE index_name = 'txfence_by_v'")) as Array<{ n: number }>)[0].n,
+    );
+    expect(pN).toBe(0);
   });
 });
 
