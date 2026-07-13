@@ -1906,6 +1906,63 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     expect(body.rows.map((r) => r.id).sort()).toEqual(["z-live-1", "z-live-2"]);
   });
 
+  // Codex round-15 P1 #2: the __cf_indexes scan must filter by the caller's
+  // tenant_id IN THE SQL PREDICATE (before ORDER BY/LIMIT), not only during
+  // hydration. A shared indexed value can have entries for many tenants; if
+  // another tenant owns the first rawScanCap (=limit*5) partition keys, a
+  // post-scan filter leaves this tenant's entries past the cap, unscanned →
+  // empty/under-filled despite live rows.
+  it("filters by tenant in the index scan before the cap, so a tenant whose entries sort after another tenant's cap-filling entries is still returned", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_tenantcap_evt");
+    await post("/admin/create-index", { indexName: "idx_tenantcap_by_v", table: "idx_tenantcap_evt", columns: ["v"] }, AUTH());
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+
+    // Tenant A: two real rows (v="shared") whose partition keys sort AFTER B's.
+    await post("/v1/mutate", { op: "insert", table: "idx_tenantcap_evt", tenantId: tenantA, partitionKey: "z-a-1", values: { v: "shared" } }, tokenA);
+    await post("/v1/mutate", { op: "insert", table: "idx_tenantcap_evt", tenantId: tenantA, partitionKey: "z-a-2", values: { v: "shared" } }, tokenA);
+    const aRows = await pollIndexRows("idx_tenantcap_by_v", (r) => r.length === 2);
+    const indexKeyJson = aRows[0].index_key_json;
+
+    // Find the index shard P that holds A's entries.
+    let P: string | null = null;
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const found = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(shardId)), async (_i: unknown, state: DurableObjectState) =>
+        (Array.from(state.storage.sql.exec("SELECT COUNT(*) AS n FROM __cf_indexes WHERE index_name = 'idx_tenantcap_by_v'")) as Array<{ n: number }>)[0].n > 0,
+      );
+      if (found) { P = shardId; break; }
+    }
+    expect(P).not.toBeNull();
+
+    // Tenant B: seed limit*5 (=10, for limit 2) entries on the SAME shard, SAME
+    // key, whose partition keys sort BEFORE A's "z-..." keys — so under an
+    // active-set-only LIMIT they fill the whole scan window ahead of A's.
+    const tenantB = "tenant-cap-b";
+    await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(P as string)), async (_i: unknown, state: DurableObjectState) => {
+      for (let i = 0; i < 10; i++) {
+        state.storage.sql.exec(
+          "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "idx_tenantcap_evt",
+          "idx_tenantcap_by_v",
+          indexKeyJson,
+          `a-b-${i}`,
+          P,
+          tenantB,
+          new Date().toISOString(),
+        );
+      }
+    });
+
+    // A's query (limit 2 → rawScanCap 10): without the tenant predicate the 10
+    // B entries fill the scan window and A gets an empty result; with it, A's
+    // own entries are scanned and returned — and no B row leaks.
+    const res = await post("/v1/index-query", { table: "idx_tenantcap_evt", indexName: "idx_tenantcap_by_v", tenantId: tenantA, values: { v: "shared" }, limit: 2 }, tokenA);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ id: string }> };
+    expect(body.rows.map((r) => r.id).sort()).toEqual(["z-a-1", "z-a-2"]);
+  });
+
   it("eng-review fix: rejects a query against an index still backfilling, 425 INDEX_BUILDING", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_building_evt");
