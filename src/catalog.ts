@@ -300,6 +300,16 @@ export class CatalogDO extends DurableObject {
     // need one of the old blockIfIndexesExist-era indexes recreated via the
     // documented drop-index/create-index upgrade flow anyway).
     this.ensureColumn("index_rules", "placement_ring_json", "TEXT NOT NULL DEFAULT '[]'");
+    // Codex round-14 P2 (read-visibility during evacuation): the draining
+    // shard(s) whose ring position is mid-evacuation for this index. Set
+    // ATOMICALLY with placement_ring_json by /update-index-ring, so wherever the
+    // ring is repointed to the substitute this shadow marks the old shard whose
+    // not-yet-copied entries must ALSO be read. /v1/index-query dual-looks-up
+    // both while it is non-empty; cleared on evacuation completion. Replicated
+    // to every catalog shard (via the same fan-out) so /lookup-index — which the
+    // gateway routes to the TENANT's catalog, not necessarily the draining one —
+    // can always answer it.
+    this.ensureColumn("index_rules", "evac_from_shards_json", "TEXT NOT NULL DEFAULT '[]'");
 
     // Codex round-13 fix: per-(draining shard, index) ring-evacuation progress.
     // A row means "index_name's ring is being evacuated off shard_id onto
@@ -753,9 +763,9 @@ export class CatalogDO extends DurableObject {
     const authError = await this.checkTenantAuth(body.tenantId, request);
     if (authError) return authError;
 
-    const index = this.one<{ columns_json: string; partition_key_column: string; status: string; placement_ring_json: string }>(
+    const index = this.one<{ columns_json: string; partition_key_column: string; status: string; placement_ring_json: string; evac_from_shards_json: string }>(
       `
-      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status, ir.placement_ring_json AS placement_ring_json
+      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status, ir.placement_ring_json AS placement_ring_json, ir.evac_from_shards_json AS evac_from_shards_json
       FROM index_rules ir
       JOIN table_rules tr ON tr.table_name = ir.table_name
       WHERE ir.index_name = ? AND ir.table_name = ?
@@ -785,6 +795,10 @@ export class CatalogDO extends DurableObject {
       columns: JSON.parse(index.columns_json) as string[],
       partitionKeyColumn: index.partition_key_column,
       ring: JSON.parse(index.placement_ring_json) as string[],
+      // Codex round-14 P2: draining shard(s) whose entries for this index are
+      // mid-evacuation (repointed ring, not-yet-copied) — /v1/index-query
+      // dual-looks-up these alongside the current ring shard.
+      evacFromShards: JSON.parse(index.evac_from_shards_json ?? "[]") as string[],
     });
   }
 
@@ -1413,12 +1427,50 @@ export class CatalogDO extends DurableObject {
    * gate: it's never exposed through the Worker, the same trust model every
    * ShardDO internal route already uses. */
   private async handleUpdateIndexRing(request: Request): Promise<Response> {
-    const body = (await request.json()) as { indexName?: string; ring?: string[] };
+    const body = (await request.json()) as { indexName?: string; ring?: string[]; evacFromShards?: string[] };
     if (!body.indexName || !body.ring) {
       return json({ error: "Missing indexName or ring" }, 400);
     }
-    this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(body.ring), body.indexName);
+    // Codex round-14 P2: set the read-shadow (evacFromShards) ATOMICALLY with
+    // the ring, so any catalog that has the repointed ring also knows the
+    // draining shard whose not-yet-copied entries /v1/index-query must still
+    // read. Absent/empty clears it (evacuation complete).
+    this.sql.exec(
+      "UPDATE index_rules SET placement_ring_json = ?, evac_from_shards_json = ? WHERE index_name = ?",
+      JSON.stringify(body.ring),
+      JSON.stringify(body.evacFromShards ?? []),
+      body.indexName,
+    );
     return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Codex round-14 P2: fan an index's ring (and its read-shadow evacFromShards)
+   * to every SIBLING catalog, then apply locally — the same replication the
+   * ring repoint uses, so ring + shadow stay atomic on every catalog. Throws on
+   * a sibling failure so the drain retries the whole (idempotent) fan-out. */
+  private async fanUpdateIndexRing(indexName: string, ring: string[], evacFromShards: string[]): Promise<void> {
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue; // self applied locally below
+      const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+      const res = await stub.fetch("https://catalog.internal/update-index-ring", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ indexName, ring, evacFromShards }),
+      });
+      if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
+    }
+    // Every sibling applied — now locally (never via a DO self-fetch).
+    this.sql.exec(
+      "UPDATE index_rules SET placement_ring_json = ?, evac_from_shards_json = ? WHERE index_name = ?",
+      JSON.stringify(ring),
+      JSON.stringify(evacFromShards),
+      indexName,
+    );
   }
 
   /** Milestone 3, Chunk 5: one drain-orchestration step for one draining
@@ -1605,30 +1657,19 @@ export class CatalogDO extends DurableObject {
 
       try {
         // (c) Repoint the ring S→substitute (idempotent — only if the current
-        // ring still contains the draining shard). Siblings FIRST, then local,
-        // so a sibling failure throws with local un-repointed and the marker +
-        // fence persisting → retried next tick.
+        // ring still contains the draining shard). Codex round-14 P2: repoint
+        // the ring AND set the read-shadow (evacFromShards=[shardId]) atomically
+        // on every catalog via the same fan-out, so wherever a query sees the
+        // repointed ring it also knows to dual-look-up the draining shard's
+        // not-yet-copied entries. Siblings first, then local — a sibling failure
+        // throws with local un-repointed and the marker + fence persisting →
+        // retried next tick.
         const currentRing = rule ? (JSON.parse(rule.placement_ring_json) as string[]) : [];
         const pos = currentRing.indexOf(shardId);
         if (pos !== -1) {
           const newRing = [...currentRing];
           newRing[pos] = substitute;
-          const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
-            "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
-          );
-          const siblingCount = config?.catalog_shard_count ?? 0;
-          for (let i = 0; i < siblingCount; i += 1) {
-            const siblingId = `catalog-${i}`;
-            if (config?.catalog_shard_id === siblingId) continue;
-            const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
-            const res = await stub.fetch("https://catalog.internal/update-index-ring", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ indexName, ring: newRing }),
-            });
-            if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
-          }
-          this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), indexName);
+          await this.fanUpdateIndexRing(indexName, newRing, [shardId]);
         }
 
         // (d) Flush queued index_pending_jobs targeting the draining shard
@@ -1672,6 +1713,16 @@ export class CatalogDO extends DurableObject {
           anyIncomplete = true;
           continue; // retry the delete next tick
         }
+
+        // Codex round-14 P2: the source entries are gone, so CLEAR the
+        // read-shadow (evacFromShards=[]) on every catalog via the same fan-out
+        // — reads now hit only the substitute. Done BEFORE deleting the marker
+        // and inside the try, so a sibling failure throws → marker persists →
+        // the whole (idempotent) clear retries next tick (never leaving a stale
+        // shadow pointing at a decommissioned shard).
+        const currentRow = this.one<{ placement_ring_json: string }>("SELECT placement_ring_json FROM index_rules WHERE index_name = ?", indexName);
+        const finalRing = currentRow ? (JSON.parse(currentRow.placement_ring_json) as string[]) : [];
+        await this.fanUpdateIndexRing(indexName, finalRing, []);
 
         // Complete — clear the marker. The fence is LEFT in place: the shard is
         // being decommissioned, and a stray late write to it for this index
