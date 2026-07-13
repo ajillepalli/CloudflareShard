@@ -1335,8 +1335,24 @@ export class CatalogDO extends DurableObject {
       shardId,
     );
     if (vbuckets.length > 0) {
-      if (vbuckets.some((v) => v.migration_status !== "none")) {
-        return true; // sequential: the in-flight migration advances via the migration loop
+      const inFlight = vbuckets.filter((v) => v.migration_status !== "none");
+      if (inFlight.length > 0) {
+        // Only 'backfilling'/'cutover' rows are advanced by the alarm's
+        // migration loop each tick. Codex full-PR review P1 C: a vbucket wedged
+        // in 'aborting' (an abort whose cleanup failed) — or any other
+        // unexpected status — is NEVER advanced there, so blanket-returning true
+        // spun the 250ms alarm forever with /drain-shard-status stuck on
+        // 'migrating-vbuckets'. Keep ticking only while a genuinely-advancing
+        // migration is in flight; otherwise PARK with a distinct stall reason so
+        // the alarm stops and the operator knows to retry the abort.
+        const advancing = inFlight.some((v) => v.migration_status === "backfilling" || v.migration_status === "cutover");
+        if (advancing) {
+          return true; // an active migration is progressing via the migration loop
+        }
+        const stuck = inFlight[0];
+        this.sql.exec("UPDATE shards SET drain_stall_reason = 'aborting-migration' WHERE shard_id = ?", shardId);
+        log("catalog.drain_stalled_aborting", { shardId, vbucket: stuck.vbucket, status: stuck.migration_status });
+        return false;
       }
       const activeOthers = this.many<{ shard_id: string }>(
         "SELECT shard_id FROM shards WHERE status = 'active' AND shard_id != ? ORDER BY shard_id ASC",
