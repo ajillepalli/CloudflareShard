@@ -1325,8 +1325,16 @@ export class CatalogDO extends DurableObject {
     // re-scanning every table on the source at the tick cadence — it stays
     // parked until the operator re-invokes /admin/drain-shard (which clears
     // this after they run /admin/backfill-provenance).
+    //
+    // Codex full-PR review P1 D: 'ring-reconcile-unstable' is the ONE
+    // exception — it is a SOFT stall. Ring evacuation now converges (copies
+    // every straggler) BEFORE it repoints, so while unstable the ring still
+    // points at the draining shard (reads resolve, nothing stranded) and the
+    // next tick must REVISIT this index to retry, not hard-park behind an
+    // operator re-invoke. It clears itself once the write churn stops and the
+    // reconcile converges. All other reasons are genuine hard parks.
     const stall = this.one<{ drain_stall_reason: string | null }>("SELECT drain_stall_reason FROM shards WHERE shard_id = ?", shardId);
-    if (stall?.drain_stall_reason) {
+    if (stall?.drain_stall_reason && stall.drain_stall_reason !== "ring-reconcile-unstable") {
       return false;
     }
 
@@ -1415,6 +1423,7 @@ export class CatalogDO extends DurableObject {
     );
     const ringsToEvacuate = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(shardId));
     const clusterActive = ringsToEvacuate.length > 0 ? await this.clusterActiveShards(shardId) : [];
+    let ringUnstable = false;
     for (const rule of ringsToEvacuate) {
       const ring = JSON.parse(rule.placement_ring_json) as string[];
       const pos = ring.indexOf(shardId);
@@ -1431,18 +1440,42 @@ export class CatalogDO extends DurableObject {
         continue;
       }
 
-      // Review Tier 1 #6: an index write racing this evacuation must not be
-      // silently lost. Ordering: (1) copy the draining shard's current
-      // entries to the substitute (so a reader keeps seeing every entry —
-      // the draining shard still has them, no read gap yet); (2) repoint the
-      // ring, so from here every NEW /route resolves this index to the
-      // substitute and no new write targets the draining shard; (3)
-      // RECONCILE — re-copy any entry that landed on the draining shard
-      // during the awaits above (a write whose /route resolved with the old
-      // ring), looping by ascending rowid until a pass finds nothing new;
-      // (4) only then delete the source copies. Because racing writes stop
-      // arriving after the repoint, the reconcile converges.
-      let afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, 0);
+      // Codex full-PR review P1 D (unstable evacuation must stay retryable):
+      // the OLD design repointed the ring BEFORE the reconcile converged, so a
+      // pass that never converged left the ring already repointed — the next
+      // tick no longer saw this index (its ring no longer contains the drained
+      // shard) and never retried, stranding any source-only entries. Restructure
+      // so we CONVERGE FIRST, repoint SECOND.
+      //
+      // Pre-repoint convergence GATE: copy the draining shard's entries to the
+      // substitute, looping by ascending rowid, WHILE the ring still points at
+      // the draining shard. Only when a pass copies zero new entries is the
+      // copy caught up. Under sustained old-ring index writes this never
+      // converges within the pass budget → we DO NOT repoint (reads still
+      // resolve to the draining shard, nothing stranded), mark the soft stall,
+      // and let the next tick retry. Once the churn stops a later tick
+      // converges here and proceeds to repoint+delete.
+      let afterRowid = 0;
+      let convergedPreRepoint = false;
+      for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
+        const before = afterRowid;
+        afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
+        if (afterRowid === before) {
+          convergedPreRepoint = true;
+          break;
+        }
+      }
+      if (!convergedPreRepoint) {
+        // Not safe to repoint yet — leave the ring pointing at the draining
+        // shard (reads work, entries not stranded) and soft-stall so
+        // /drain-shard-status reports NON-'complete'. Keep ticking (ringUnstable
+        // → return true) so a later, quieter tick retries this index.
+        this.sql.exec("UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?", shardId);
+        log("catalog.ring_evacuation_reconcile_unstable", { shardId, indexName: rule.index_name });
+        this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos, reconcileUnstable: true });
+        ringUnstable = true;
+        continue;
+      }
 
       // Substitute at the SAME ring position — every other entry's
       // placement is untouched.
@@ -1479,44 +1512,28 @@ export class CatalogDO extends DurableObject {
       // self-fetch). Reached only after the fan-out fully succeeds.
       this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), rule.index_name);
 
-      // Reconcile pass: catch any entry that raced onto the draining shard
-      // between the initial copy's cursor and the repoint. Converges because
-      // no new write targets the draining shard after the repoint.
-      let reconcileUnstable = false;
+      // Post-repoint reconcile: close the small window between the pre-repoint
+      // convergence check and the repoint completing, in which a write whose
+      // /route still resolved the OLD ring could have landed on the draining
+      // shard. No NEW write targets the draining shard now (ring repointed), so
+      // this provably converges within the pass budget. Only after it does do
+      // we delete the source copies.
+      let postConverged = false;
       for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
         const before = afterRowid;
         afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
-        if (afterRowid === before) break; // stable — nothing new copied
-        if (pass === RING_EVAC_RECONCILE_MAX_PASSES - 1) {
-          // Pathological churn — the reconcile never converged, so the
-          // substitute may still be MISSING entries the draining shard holds.
-          reconcileUnstable = true;
-          log("catalog.ring_evacuation_reconcile_unstable", { shardId, indexName: rule.index_name });
-          this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos, reconcileUnstable: true });
+        if (afterRowid === before) {
+          postConverged = true;
+          break;
         }
       }
-
-      if (reconcileUnstable) {
-        // SKIP the destructive source delete: deleting __cf_indexes rows the
-        // substitute hasn't provably received would lose them. Leave the
-        // source copies in place (the ring is already repointed, so they're
-        // unreachable-but-not-lost) for operator action. Previously the
-        // delete below ran unconditionally — the safety valve was dead code.
-        //
-        // Codex full-PR review P2: the safety valve stopped the DELETE, but the
-        // drain then fell through and /drain-shard-status reported 'complete'
-        // (vbuckets drained + ring repointed away → 0 rings remaining) — so an
-        // operator could decommission a shard that still physically holds index
-        // entries the substitute was never proven to have, a silent index miss.
-        // Park the drain with a distinct stall reason so status reports a
-        // NON-'complete' 'stalled' instead. The source entries stay reachable
-        // only via operator inspection (the ring is repointed), but they are
-        // NOT lost, and the shard is flagged not-done. Cleared when the operator
-        // re-invokes /admin/drain-shard after resolving the write churn.
-        this.sql.exec(
-          "UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?",
-          shardId,
-        );
+      if (!postConverged) {
+        // Extraordinary: even post-repoint (no new writers) the copy didn't
+        // settle — don't delete the source (it may still hold uncopied
+        // entries). Soft-stall so status isn't 'complete'.
+        this.sql.exec("UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?", shardId);
+        log("catalog.ring_evacuation_postrepoint_unstable", { shardId, indexName: rule.index_name });
+        ringUnstable = true;
         continue;
       }
 
@@ -1536,8 +1553,19 @@ export class CatalogDO extends DurableObject {
 
       this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos });
     }
-    // Every ring either fully evacuated or (no-candidate / reconcile-unstable)
-    // left for operator action — nothing here needs another tick.
+    if (ringUnstable) {
+      // At least one ring couldn't converge this tick — keep ticking so a
+      // quieter later tick retries it (the ring is still un-repointed for those
+      // indexes, so ringsToEvacuate re-selects them). The soft stall is already
+      // recorded for /drain-shard-status.
+      return true;
+    }
+    // Every ring fully evacuated (or no-candidate, left for operator capacity).
+    // Clear any prior soft stall now that evacuation settled.
+    this.sql.exec(
+      "UPDATE shards SET drain_stall_reason = NULL WHERE shard_id = ? AND drain_stall_reason = 'ring-reconcile-unstable'",
+      shardId,
+    );
     return false;
   }
 
