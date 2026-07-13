@@ -300,6 +300,25 @@ export class CatalogDO extends DurableObject {
     // need one of the old blockIfIndexesExist-era indexes recreated via the
     // documented drop-index/create-index upgrade flow anyway).
     this.ensureColumn("index_rules", "placement_ring_json", "TEXT NOT NULL DEFAULT '[]'");
+
+    // Codex round-13 fix: per-(draining shard, index) ring-evacuation progress.
+    // A row means "index_name's ring is being evacuated off shard_id onto
+    // substitute; not yet complete." Ring evacuation now FENCES the index on the
+    // draining shard and repoints EARLY (the fence stops new writes to that
+    // shard), so the ring no longer contains the draining shard while evacuation
+    // is still in flight — ringsToEvacuate (ring membership) can no longer be
+    // the source of truth for "revisit this index next tick". This marker is:
+    // advanceDrain revisits every marker for the shard until it deletes the row
+    // on completion. Survives ticks; drives /drain-shard-status too.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS drain_ring_evac (
+        shard_id   TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        substitute TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (shard_id, index_name)
+      )
+    `);
   }
 
   private audit(endpoint: string, requestSummary: Record<string, unknown>): void {
@@ -1253,9 +1272,20 @@ export class CatalogDO extends DurableObject {
       return json({ error: `Shard ${body.shardId} not found` }, 404);
     }
     const vbucketsRemaining = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM vbucket_map WHERE shard_id = ?", body.shardId)?.n ?? 0;
-    const ringsRemaining = this.many<{ placement_ring_json: string }>("SELECT placement_ring_json FROM index_rules").filter((r) =>
-      (JSON.parse(r.placement_ring_json) as string[]).includes(body.shardId!),
-    ).length;
+    // Codex round-13 fix: "rings remaining" is the UNION of indexes still
+    // ring-resident on this shard (not yet fenced/repointed) and indexes with an
+    // open evacuation MARKER (fenced + repointed EARLY, still copying/deleting).
+    // Ring membership alone would read 0 the instant the early repoint lands and
+    // wrongly report 'complete' while the source entries are still being moved.
+    const ringResident = new Set(
+      this.many<{ index_name: string; placement_ring_json: string }>("SELECT index_name, placement_ring_json FROM index_rules")
+        .filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(body.shardId!))
+        .map((r) => r.index_name),
+    );
+    for (const m of this.many<{ index_name: string }>("SELECT index_name FROM drain_ring_evac WHERE shard_id = ?", body.shardId)) {
+      ringResident.add(m.index_name);
+    }
+    const ringsRemaining = ringResident.size;
     const status =
       shard.status !== "draining"
         ? shard.status
@@ -1498,162 +1528,172 @@ export class CatalogDO extends DurableObject {
       return true;
     }
 
-    // Phase 2: ring evacuation.
+    // Phase 2: ring evacuation — FENCE-FIRST, marker-driven (Codex round-13).
+    // The prior converge-before-repoint design could not close the race: an
+    // in-flight index write that resolved the OLD ring before the repoint is
+    // delayed in the gateway's ctx.waitUntil — not yet in __cf_indexes or any
+    // queue — so no "copy existing entries" pass can see it, and it lands on the
+    // drained shard after the source delete. The fix fences the index's ring on
+    // the draining shard (so such a write 409s → the writer re-resolves to the
+    // substitute), repoints EARLY (so re-resolution finds the substitute), then
+    // flushes queued retries, copies, and deletes. Progress is tracked by the
+    // drain_ring_evac MARKER (not ring membership, which the early repoint
+    // clears), so a not-yet-finished index is revisited on later ticks.
     const indexRules = this.many<{ index_name: string; placement_ring_json: string }>(
       "SELECT index_name, placement_ring_json FROM index_rules ORDER BY index_name ASC",
     );
-    const ringsToEvacuate = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(shardId));
-    const clusterActive = ringsToEvacuate.length > 0 ? await this.clusterActiveShards(shardId) : [];
-    let ringUnstable = false;
-    for (const rule of ringsToEvacuate) {
-      const ring = JSON.parse(rule.placement_ring_json) as string[];
-      const pos = ring.indexOf(shardId);
-      if (pos === -1) continue;
+    const ringContains = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(shardId));
+    const markers = this.many<{ index_name: string; substitute: string }>(
+      "SELECT index_name, substitute FROM drain_ring_evac WHERE shard_id = ? ORDER BY index_name ASC",
+      shardId,
+    );
+    const markerByIndex = new Map(markers.map((m) => [m.index_name, m.substitute]));
 
-      const substitute = pickRingSubstitute(rule.index_name, clusterActive.filter((s) => !ring.includes(s)));
-      if (substitute === null) {
-        // The pre-check in handleDrainShard normally prevents this; the
-        // active set may have shrunk since. Leave the ring untouched (reads
-        // keep working against the draining shard) and report via status —
-        // returning false, not true, so the alarm doesn't spin on a
-        // condition only operator action (adding capacity) can change.
-        log("catalog.ring_evacuation_no_candidate", { shardId, indexName: rule.index_name });
-        continue;
-      }
-
-      // Codex full-PR review P1 D (unstable evacuation must stay retryable):
-      // the OLD design repointed the ring BEFORE the reconcile converged, so a
-      // pass that never converged left the ring already repointed — the next
-      // tick no longer saw this index (its ring no longer contains the drained
-      // shard) and never retried, stranding any source-only entries. Restructure
-      // so we CONVERGE FIRST, repoint SECOND.
-      //
-      // Pre-repoint convergence GATE: copy the draining shard's entries to the
-      // substitute, looping by ascending rowid, WHILE the ring still points at
-      // the draining shard. Only when a pass copies zero new entries is the
-      // copy caught up. Under sustained old-ring index writes this never
-      // converges within the pass budget → we DO NOT repoint (reads still
-      // resolve to the draining shard, nothing stranded), mark the soft stall,
-      // and let the next tick retry. Once the churn stops a later tick
-      // converges here and proceeds to repoint+delete.
-      let afterRowid = 0;
-      let convergedPreRepoint = false;
-      for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
-        // Codex full-PR review P1 E: flush queued index_pending_jobs (across
-        // EVERY base shard cluster-wide) that target the draining shard, so any
-        // late retry lands NOW — while the ring still points here — and gets
-        // copied below, instead of firing after the source delete and stranding
-        // an entry on the drained shard. Convergence requires BOTH nothing new
-        // copied AND zero such jobs remaining anywhere.
-        const remainingJobs = await this.flushIndexJobsTargeting(shardId);
-        const before = afterRowid;
-        afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
-        if (afterRowid === before && remainingJobs === 0) {
-          convergedPreRepoint = true;
-          break;
-        }
-      }
-      if (!convergedPreRepoint) {
-        // Not safe to repoint yet — leave the ring pointing at the draining
-        // shard (reads work, entries not stranded) and soft-stall so
-        // /drain-shard-status reports NON-'complete'. Keep ticking (ringUnstable
-        // → return true) so a later, quieter tick retries this index.
-        this.sql.exec("UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?", shardId);
-        log("catalog.ring_evacuation_reconcile_unstable", { shardId, indexName: rule.index_name });
-        this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos, reconcileUnstable: true });
-        ringUnstable = true;
-        continue;
-      }
-
-      // Substitute at the SAME ring position — every other entry's
-      // placement is untouched.
-      const newRing = [...ring];
-      newRing[pos] = substitute;
-
-      // Repoint the ring on every SIBLING catalog FIRST, then locally
-      // (index_rules is replicated identically to all catalog shards;
-      // /update-index-ring is idempotent). Codex full-PR review P2: updating
-      // the LOCAL ring first and THEN fanning out meant that if a sibling call
-      // failed, the next advanceDrain tick read the already-repointed local
-      // ring (which no longer contains the draining shard), skipped this ring
-      // entirely, and left the failed sibling routing index reads/writes to the
-      // drained shard forever. By updating local LAST, a sibling failure throws
-      // with the local ring STILL showing the draining shard, so the next tick
-      // re-selects this ring and retries the whole (idempotent) fan-out until
-      // every catalog is consistent.
-      const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
-        "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    if (ringContains.length === 0 && markers.length === 0) {
+      // Nothing to evacuate — clear any lingering soft stall and finish.
+      this.sql.exec(
+        "UPDATE shards SET drain_stall_reason = NULL WHERE shard_id = ? AND drain_stall_reason = 'ring-reconcile-unstable'",
+        shardId,
       );
-      const siblingCount = config?.catalog_shard_count ?? 0;
-      for (let i = 0; i < siblingCount; i += 1) {
-        const siblingId = `catalog-${i}`;
-        if (config?.catalog_shard_id === siblingId) continue; // self is updated locally below
-        const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
-        const res = await stub.fetch("https://catalog.internal/update-index-ring", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ indexName: rule.index_name, ring: newRing }),
-        });
-        if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
-      }
-      // Every sibling repointed — now repoint locally (never via a DO
-      // self-fetch). Reached only after the fan-out fully succeeds.
-      this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), rule.index_name);
-
-      // Post-repoint reconcile: close the small window between the pre-repoint
-      // convergence check and the repoint completing, in which a write whose
-      // /route still resolved the OLD ring could have landed on the draining
-      // shard. No NEW write targets the draining shard now (ring repointed), so
-      // this provably converges within the pass budget. Only after it does do
-      // we delete the source copies.
-      let postConverged = false;
-      for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
-        // Also flush any jobs queued in the pre-repoint→repoint window (their
-        // target is still the draining shard) so their entries land and get
-        // copied before the delete (P1 E).
-        const remainingJobs = await this.flushIndexJobsTargeting(shardId);
-        const before = afterRowid;
-        afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
-        if (afterRowid === before && remainingJobs === 0) {
-          postConverged = true;
-          break;
-        }
-      }
-      if (!postConverged) {
-        // Extraordinary: even post-repoint (no new writers) the copy didn't
-        // settle — don't delete the source (it may still hold uncopied
-        // entries). Soft-stall so status isn't 'complete'.
-        this.sql.exec("UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?", shardId);
-        log("catalog.ring_evacuation_postrepoint_unstable", { shardId, indexName: rule.index_name });
-        ringUnstable = true;
-        continue;
-      }
-
-      // Now delete the source copies — everything present has been copied to
-      // the substitute, and no new write can arrive (ring repointed).
-      const deleteRes = await this.callShard(shardId, "/execute", {
-        sql: "DELETE FROM __cf_indexes WHERE index_name = ?",
-        params: [rule.index_name],
-        requestId: `ring-evacuate-${rule.index_name}-${shardId}-${crypto.randomUUID()}`,
-        isMutation: true,
-      });
-      if (!deleteRes.ok) {
-        // Ring already repointed — stale rows on the draining shard are
-        // unreachable garbage, not a correctness problem. Log and move on.
-        log("catalog.ring_evacuation_source_cleanup_failed", { shardId, indexName: rule.index_name });
-      }
-
-      this.audit("/drain-shard-ring-evacuated", { shardId, indexName: rule.index_name, substitute, position: pos });
+      return false;
     }
-    if (ringUnstable) {
-      // At least one ring couldn't converge this tick — keep ticking so a
-      // quieter later tick retries it (the ring is still un-repointed for those
-      // indexes, so ringsToEvacuate re-selects them). The soft stall is already
-      // recorded for /drain-shard-status.
+
+    // Candidate substitutes are only needed for indexes not already fenced (a
+    // marker pins its substitute for the index's whole evacuation).
+    const needSubstitute = ringContains.some((r) => !markerByIndex.has(r.index_name));
+    const clusterActive = needSubstitute ? await this.clusterActiveShards(shardId) : [];
+
+    // Union of ring-resident (not yet started) and marked (in flight) indexes.
+    const workIndexNames = Array.from(
+      new Set<string>([...ringContains.map((r) => r.index_name), ...markers.map((m) => m.index_name)]),
+    ).sort();
+
+    let anyIncomplete = false;
+    for (const indexName of workIndexNames) {
+      const rule = indexRules.find((r) => r.index_name === indexName);
+      let substitute = markerByIndex.get(indexName);
+
+      // (a)/(b) Not yet fenced: pick the substitute, FENCE the index on the
+      // draining shard, and record the marker. From this instant any new write
+      // for this index arriving on the draining shard 409s INDEX_RING_FENCED, so
+      // an in-flight write that resolved the old ring can only be turned away
+      // (→ re-resolved to the substitute), never stranded here.
+      if (substitute === undefined) {
+        const ring = rule ? (JSON.parse(rule.placement_ring_json) as string[]) : [];
+        if (ring.indexOf(shardId) === -1) continue; // not resident, no marker
+        const picked = pickRingSubstitute(indexName, clusterActive.filter((s) => !ring.includes(s)));
+        if (picked === null) {
+          // No capacity to substitute — leave the ring intact (reads keep
+          // working against the draining shard) for operator action.
+          log("catalog.ring_evacuation_no_candidate", { shardId, indexName });
+          continue;
+        }
+        const fenceRes = await this.callShard(shardId, "/fence-index-ring", { indexName });
+        if (!fenceRes.ok) {
+          anyIncomplete = true; // couldn't fence — retry next tick
+          continue;
+        }
+        substitute = picked;
+        this.sql.exec(
+          "INSERT OR REPLACE INTO drain_ring_evac (shard_id, index_name, substitute, created_at) VALUES (?, ?, ?, ?)",
+          shardId,
+          indexName,
+          substitute,
+          new Date().toISOString(),
+        );
+      }
+
+      try {
+        // (c) Repoint the ring S→substitute (idempotent — only if the current
+        // ring still contains the draining shard). Siblings FIRST, then local,
+        // so a sibling failure throws with local un-repointed and the marker +
+        // fence persisting → retried next tick.
+        const currentRing = rule ? (JSON.parse(rule.placement_ring_json) as string[]) : [];
+        const pos = currentRing.indexOf(shardId);
+        if (pos !== -1) {
+          const newRing = [...currentRing];
+          newRing[pos] = substitute;
+          const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+            "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+          );
+          const siblingCount = config?.catalog_shard_count ?? 0;
+          for (let i = 0; i < siblingCount; i += 1) {
+            const siblingId = `catalog-${i}`;
+            if (config?.catalog_shard_id === siblingId) continue;
+            const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+            const res = await stub.fetch("https://catalog.internal/update-index-ring", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ indexName, ring: newRing }),
+            });
+            if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
+          }
+          this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(newRing), indexName);
+        }
+
+        // (d) Flush queued index_pending_jobs targeting the draining shard
+        // (cluster-wide). With the fence + repoint in place, a delivered job
+        // 409s → re-resolves to the substitute; an unreachable base shard leaves
+        // remaining > 0 → not done this tick (fence backstops safety meanwhile).
+        const remainingJobs = await this.flushIndexJobsTargeting(shardId);
+        if (remainingJobs > 0) {
+          anyIncomplete = true;
+          continue; // keep marker + fence, retry next tick
+        }
+
+        // (e) Copy the draining shard's entries for this index → substitute,
+        // reconcile to zero-new. The fence guarantees no NEW entry lands on the
+        // draining shard, so this converges (bounded pass budget as a guard).
+        let afterRowid = 0;
+        let converged = false;
+        for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
+          const before = afterRowid;
+          afterRowid = await this.copyIndexEntries(shardId, substitute, indexName, afterRowid);
+          if (afterRowid === before) {
+            converged = true;
+            break;
+          }
+        }
+        if (!converged) {
+          anyIncomplete = true;
+          continue; // retry next tick (marker persists, nothing deleted)
+        }
+
+        // (f) Delete the source copies — everything is on the substitute and no
+        // new write can arrive (fenced + repointed).
+        const deleteRes = await this.callShard(shardId, "/execute", {
+          sql: "DELETE FROM __cf_indexes WHERE index_name = ?",
+          params: [indexName],
+          requestId: `ring-evacuate-${indexName}-${shardId}-${crypto.randomUUID()}`,
+          isMutation: true,
+        });
+        if (!deleteRes.ok) {
+          log("catalog.ring_evacuation_source_cleanup_failed", { shardId, indexName });
+          anyIncomplete = true;
+          continue; // retry the delete next tick
+        }
+
+        // Complete — clear the marker. The fence is LEFT in place: the shard is
+        // being decommissioned, and a stray late write to it for this index
+        // 409s → re-resolves to the substitute (a safe backstop). It is only
+        // explicitly released on an abort/failure path.
+        this.sql.exec("DELETE FROM drain_ring_evac WHERE shard_id = ? AND index_name = ?", shardId, indexName);
+        this.audit("/drain-shard-ring-evacuated", { shardId, indexName, substitute });
+      } catch (error) {
+        // Repoint/copy/delete failure — marker + fence persist; retry next tick.
+        log("catalog.ring_evacuation_tick_failed", { shardId, indexName, message: error instanceof Error ? error.message : String(error) });
+        anyIncomplete = true;
+      }
+    }
+
+    if (anyIncomplete) {
+      // At least one index isn't fully evacuated. Record the soft stall so
+      // /drain-shard-status reports NON-'complete', and keep ticking so a later
+      // tick retries (the marker drives the revisit, not ring membership).
+      this.sql.exec("UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?", shardId);
       return true;
     }
-    // Every ring fully evacuated (or no-candidate, left for operator capacity).
-    // Clear any prior soft stall now that evacuation settled.
+    // Every ring evacuated — clear any prior soft stall.
     this.sql.exec(
       "UPDATE shards SET drain_stall_reason = NULL WHERE shard_id = ? AND drain_stall_reason = 'ring-reconcile-unstable'",
       shardId,
