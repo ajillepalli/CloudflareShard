@@ -1295,6 +1295,66 @@ export class CatalogDO extends DurableObject {
     return Array.from(all).sort();
   }
 
+  /** Every shard id in the cluster, ALL statuses (active + draining), across
+   * this catalog's own pool and every sibling's. Unlike clusterActiveShards
+   * this includes the draining shard and is used only to reach a shard's DATA
+   * (here: to flush its queued index jobs), never for placement/substitution. */
+  private async clusterAllShardIds(): Promise<string[]> {
+    const own = this.many<{ shard_id: string }>("SELECT shard_id FROM shards ORDER BY shard_id ASC").map((s) => s.shard_id);
+    const all = new Set(own);
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue;
+      try {
+        const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+        const res = await stub.fetch("https://catalog.internal/list-shards", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ includeDraining: true }),
+        });
+        if (!res.ok) continue;
+        const body = (await res.json()) as { shardIds: string[] };
+        for (const s of body.shardIds) all.add(s);
+      } catch {
+        // A sibling being unreachable means we may miss some base shards' jobs;
+        // callers treat any shortfall conservatively (block completion).
+      }
+    }
+    return Array.from(all).sort();
+  }
+
+  /** Codex full-PR review P1 E: force-flush every queued index_pending_job
+   * across ALL base shards whose target is the draining shard, and return how
+   * many still remain cluster-wide. A job's target_shard_id is fixed at enqueue
+   * time, so a job that resolved the OLD ring before the repoint would, if left
+   * queued, fire AFTER the source delete and write an index entry onto the now
+   * drained shard (outside the ring) — a silent /v1/index-query miss. Flushing
+   * them while the ring still targets the draining shard makes their entries
+   * land there, where ring evacuation's reconcile then copies them to the
+   * substitute. An unreachable base shard is counted as "still pending" so the
+   * caller never completes evacuation while a late write could still arrive. */
+  private async flushIndexJobsTargeting(drainingShardId: string): Promise<number> {
+    const shardIds = await this.clusterAllShardIds();
+    let remaining = 0;
+    for (const shardId of shardIds) {
+      try {
+        const res = await this.callShard(shardId, "/flush-index-jobs-for-target", { targetShardId: drainingShardId });
+        if (!res.ok) {
+          remaining += 1; // treat an unreachable/erroring base shard as pending
+          continue;
+        }
+        remaining += ((await res.json()) as { remaining: number }).remaining;
+      } catch {
+        remaining += 1;
+      }
+    }
+    return remaining;
+  }
+
   /** Milestone 3, Chunk 5 (internal, catalog-to-catalog): repoints one
    * index's pinned placement ring — the draining catalog fans a completed
    * ring substitution to every sibling catalog shard, since index_rules is
@@ -1458,9 +1518,16 @@ export class CatalogDO extends DurableObject {
       let afterRowid = 0;
       let convergedPreRepoint = false;
       for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
+        // Codex full-PR review P1 E: flush queued index_pending_jobs (across
+        // EVERY base shard cluster-wide) that target the draining shard, so any
+        // late retry lands NOW — while the ring still points here — and gets
+        // copied below, instead of firing after the source delete and stranding
+        // an entry on the drained shard. Convergence requires BOTH nothing new
+        // copied AND zero such jobs remaining anywhere.
+        const remainingJobs = await this.flushIndexJobsTargeting(shardId);
         const before = afterRowid;
         afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
-        if (afterRowid === before) {
+        if (afterRowid === before && remainingJobs === 0) {
           convergedPreRepoint = true;
           break;
         }
@@ -1520,9 +1587,13 @@ export class CatalogDO extends DurableObject {
       // we delete the source copies.
       let postConverged = false;
       for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
+        // Also flush any jobs queued in the pre-repoint→repoint window (their
+        // target is still the draining shard) so their entries land and get
+        // copied before the delete (P1 E).
+        const remainingJobs = await this.flushIndexJobsTargeting(shardId);
         const before = afterRowid;
         afterRowid = await this.copyIndexEntries(shardId, substitute, rule.index_name, afterRowid);
-        if (afterRowid === before) {
+        if (afterRowid === before && remainingJobs === 0) {
           postConverged = true;
           break;
         }

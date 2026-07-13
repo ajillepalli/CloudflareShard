@@ -156,6 +156,7 @@ export class ShardDO extends DurableObject {
       "/prepared-intent-count-for-vbucket": this.handlePreparedIntentCountForVbucket.bind(this),
       "/invalidate-request": this.handleInvalidateRequest.bind(this),
       "/enqueue-index-job": this.handleEnqueueIndexJob.bind(this),
+      "/flush-index-jobs-for-target": this.handleFlushIndexJobsForTarget.bind(this),
       "/enqueue-mirror-job": this.handleEnqueueMirrorJob.bind(this),
       "/mirror-pending-count": this.handleMirrorPendingCount.bind(this),
       "/drain-mirror-jobs": this.handleDrainMirrorJobs.bind(this),
@@ -213,46 +214,97 @@ export class ShardDO extends DurableObject {
     );
 
     for (const job of due) {
-      try {
-        const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
-        const stub = this.shardEnv.SHARD.get(id);
-        const res = await stub.fetch("https://shard.internal/execute", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            sql: job.sql,
-            params: JSON.parse(job.params_json),
-            requestId: job.request_id,
-            isMutation: true,
-          }),
-        });
-        if (res.ok) {
-          this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
-          continue;
-        }
-        throw new Error(`shard responded ${res.status}`);
-      } catch (error) {
-        const attemptCount = job.attempt_count + 1;
-        const delay = Math.min(INDEX_JOB_MAX_DELAY_MS, INDEX_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
-        this.sql.exec(
-          "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
-          attemptCount,
-          new Date(Date.now() + delay).toISOString(),
-          job.job_id,
-        );
-        log("shard.index_job_retry_failed", {
-          jobId: job.job_id,
-          targetShardId: job.target_shard_id,
-          attemptCount,
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
+      await this.deliverIndexJob(job);
     }
 
     const next = this.one<{ next_attempt_at: string }>(
       "SELECT next_attempt_at FROM index_pending_jobs ORDER BY next_attempt_at ASC LIMIT 1",
     );
     return next ? new Date(next.next_attempt_at).getTime() : null;
+  }
+
+  /** Delivers one queued index-write retry to its target shard and, on success,
+   * deletes it; on failure applies exponential backoff. Returns true on
+   * delivery. Shared by the alarm loop (processIndexPendingJobs, respecting
+   * next_attempt_at) and CatalogDO's ring-evacuation flush
+   * (/flush-index-jobs-for-target, which forces every job for a target now). */
+  private async deliverIndexJob(job: {
+    job_id: number;
+    target_shard_id: string;
+    sql: string;
+    params_json: string;
+    request_id: string;
+    attempt_count: number;
+  }): Promise<boolean> {
+    try {
+      const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
+      const stub = this.shardEnv.SHARD.get(id);
+      const res = await stub.fetch("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: job.sql,
+          params: JSON.parse(job.params_json),
+          requestId: job.request_id,
+          isMutation: true,
+        }),
+      });
+      if (res.ok) {
+        this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+        return true;
+      }
+      throw new Error(`shard responded ${res.status}`);
+    } catch (error) {
+      const attemptCount = job.attempt_count + 1;
+      const delay = Math.min(INDEX_JOB_MAX_DELAY_MS, INDEX_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
+      this.sql.exec(
+        "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+        attemptCount,
+        new Date(Date.now() + delay).toISOString(),
+        job.job_id,
+      );
+      log("shard.index_job_retry_failed", {
+        jobId: job.job_id,
+        targetShardId: job.target_shard_id,
+        attemptCount,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /** Milestone 3 (Codex full-PR review P1 E): CatalogDO's ring evacuation calls
+   * this on EVERY base shard while draining `targetShardId` as an index shard.
+   * It force-delivers every index_pending_job whose target is that shard NOW
+   * (ignoring next_attempt_at), so a job that resolved the old ring before the
+   * repoint lands on the draining shard while it is still the ring target (to be
+   * copied to the substitute) rather than firing AFTER the source delete and
+   * stranding an entry on the drained shard. Returns how many still remain for
+   * that target (unreachable ones), so the caller can gate completion on zero. */
+  private async handleFlushIndexJobsForTarget(request: Request): Promise<Response> {
+    const body = (await request.json()) as { targetShardId?: string };
+    if (!body.targetShardId) {
+      return json({ error: "Missing targetShardId" }, 400);
+    }
+    const jobs = this.many<{
+      job_id: number;
+      target_shard_id: string;
+      sql: string;
+      params_json: string;
+      request_id: string;
+      attempt_count: number;
+    }>(
+      "SELECT job_id, target_shard_id, sql, params_json, request_id, attempt_count FROM index_pending_jobs WHERE target_shard_id = ? ORDER BY job_id ASC",
+      body.targetShardId,
+    );
+    for (const job of jobs) {
+      await this.deliverIndexJob(job);
+    }
+    const remaining = this.one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM index_pending_jobs WHERE target_shard_id = ?",
+      body.targetShardId,
+    );
+    return json({ remaining: remaining?.n ?? 0 });
   }
 
   /** Called by the Worker when a best-effort index write (issued via
