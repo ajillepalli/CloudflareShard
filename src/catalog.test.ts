@@ -2253,4 +2253,36 @@ describe("CatalogDO drain v2 ring evacuation (Milestone 3, Chunk 5)", () => {
     expect(parked.stallReason).not.toBe("provenance");
     expect(parked.status).toBe("stalled");
   });
+
+  // Codex full-PR review P1 C: a vbucket wedged in 'aborting' on the draining
+  // shard livelocked the drain — advanceDrain returned true forever (the alarm
+  // only advances 'backfilling'/'cutover'), so the 250ms alarm spun and
+  // /drain-shard-status showed 'migrating-vbuckets', never a stall. The drain
+  // must PARK on a non-advancing in-flight status with a distinct reason.
+  it("a vbucket stuck 'aborting' on the draining shard parks the drain ('aborting-migration' stall), it does not livelock as 'migrating-vbuckets'", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // shard-0 draining, with one of its vbuckets wedged in 'aborting' (an abort
+    // whose cleanup failed). 'aborting' is never advanced by the migration loop.
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE shards SET status = 'draining', drain_stall_reason = NULL WHERE shard_id = 'shard-0'");
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'aborting', target_shard_id = 'shard-1', updated_at = ? WHERE vbucket = 0 AND shard_id = 'shard-0'",
+        new Date().toISOString(),
+      );
+    });
+
+    // A single tick must park the drain, not spin.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    const parked = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as {
+      status: string;
+      stallReason: string | null;
+    };
+    expect(parked.stallReason).toBe("aborting-migration");
+    expect(parked.status).toBe("stalled"); // NOT the livelocking 'migrating-vbuckets'
+  });
 });
