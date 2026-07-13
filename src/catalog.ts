@@ -1688,6 +1688,30 @@ export class CatalogDO extends DurableObject {
     if (targetShard === existingMap.shard_id) {
       return json({ error: `targetShardId must differ from the vbucket's current shard (${existingMap.shard_id}).` }, 400);
     }
+    // Codex full-PR review P1 B: never migrate ONTO a non-active shard. If the
+    // explicit target ALREADY exists it must be 'active' — a 'draining' (or
+    // otherwise non-active) target would, once the map flips to it at cutover,
+    // make /route (which joins shards and rejects a non-active mapping) return
+    // 503 for this vbucket forever. INSERT OR IGNORE below would leave the
+    // pre-existing draining row untouched and let the migration proceed. A
+    // freshly-created target (no row yet) is created 'active' below and is
+    // fine. This runs AFTER the awaited provenance scan above deliberately: a
+    // concurrent drain could have flipped the target to 'draining' during that
+    // await, and there are no further awaits before the claim/INSERT, so this
+    // check is race-safe.
+    const existingTarget = this.one<{ status: string }>("SELECT status FROM shards WHERE shard_id = ?", targetShard);
+    if (existingTarget && existingTarget.status !== "active") {
+      return json(
+        {
+          error: {
+            code: "TARGET_SHARD_NOT_ACTIVE",
+            message: `Target shard ${targetShard} is '${existingTarget.status}', not active — migrating vbucket ${vbucket} onto it would leave the vbucket permanently unroutable after cutover.`,
+            fix: "Choose an active target shard, or wait for / cancel the target's own drain first.",
+          },
+        },
+        409,
+      );
+    }
 
     // Codex review P2 (TOCTOU): the migration_status !== 'none' check above and
     // this state transition are separated by the awaited provenance check, and
