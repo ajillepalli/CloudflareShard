@@ -129,6 +129,31 @@ async function fanOutToAllCatalogs(
   });
 }
 
+/** The single cluster-wide topology lock is held on catalog-0. Acquire it for a
+ * topology operation; returns the operationId, or a Response to propagate to the
+ * caller (409 TOPOLOGY_OPERATION_IN_PROGRESS when another op holds it, 503 if
+ * catalog-0 is unreachable). */
+async function acquireTopologyLock(env: Env, operationType: string): Promise<{ operationId: string } | Response> {
+  const res = await routeToCatalog(env, "catalog-0", "/acquire-topology-lock", { operationType });
+  if (res.status === 409) {
+    return new Response(res.body, { status: 409, headers: res.headers });
+  }
+  if (!res.ok) {
+    return json({ error: { code: "TOPOLOGY_LOCK_UNAVAILABLE", message: "Could not reach the topology lock (catalog-0).", fix: "Retry shortly." } }, 503);
+  }
+  const body = (await res.json()) as { operationId: string };
+  return { operationId: body.operationId };
+}
+
+/** Best-effort release — if it fails, the lease TTL reclaims the lock. */
+async function releaseTopologyLock(env: Env, operationId: string): Promise<void> {
+  try {
+    await routeToCatalog(env, "catalog-0", "/release-topology-lock", { operationId });
+  } catch {
+    // ignore — the lease expires on its own
+  }
+}
+
 async function routeToShard(env: Env, shardId: string, path: string, payload: unknown): Promise<Response> {
   const id = env.SHARD.idFromName(shardId);
   const stub = env.SHARD.get(id);
@@ -397,6 +422,20 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
  * pre-product scale (see design doc Premise 1); a very large table could hit
  * a Worker CPU-time limit, a known simplification, not a silent bug. */
 async function handleAdminCreateIndex(request: Request, env: Env): Promise<Response> {
+  // Topology lock (Stage 2): create-index mutates every catalog's index_rules
+  // and races drain ring-evacuation; serialize it against all other topology
+  // ops. Held for the whole (synchronous) registration + backfill, released in
+  // finally on any exit.
+  const lock = await acquireTopologyLock(env, "create-index");
+  if (lock instanceof Response) return lock;
+  try {
+    return await handleAdminCreateIndexLocked(request, env);
+  } finally {
+    await releaseTopologyLock(env, lock.operationId);
+  }
+}
+
+async function handleAdminCreateIndexLocked(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
   if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
     return json(
@@ -640,19 +679,44 @@ async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Resp
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
   }
-  const res = await routeToCatalog(
-    env,
-    payload.catalogShardId,
-    "/split-vbucket",
-    payload,
-    request.headers.get("authorization") ?? undefined,
-  );
-  return new Response(res.body, { status: res.status, headers: res.headers });
+  // Topology lock: serialize the split's START against every other topology
+  // operation. (The migration it kicks off runs on the catalog alarm and is
+  // protected in flight by the per-vbucket MIGRATION_IN_PROGRESS guard.)
+  const lock = await acquireTopologyLock(env, "split-vbucket");
+  if (lock instanceof Response) return lock;
+  try {
+    const res = await routeToCatalog(
+      env,
+      payload.catalogShardId,
+      "/split-vbucket",
+      payload,
+      request.headers.get("authorization") ?? undefined,
+    );
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } finally {
+    await releaseTopologyLock(env, lock.operationId);
+  }
+}
+
+async function handleAdminMigrateVbucket(request: Request, env: Env): Promise<Response> {
+  const payload = (await request.json()) as { catalogShardId?: string };
+  if (!payload.catalogShardId) {
+    return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
+  }
+  const lock = await acquireTopologyLock(env, "migrate-vbucket");
+  if (lock instanceof Response) return lock;
+  try {
+    const res = await routeToCatalog(env, payload.catalogShardId, "/migrate-vbucket", payload, request.headers.get("authorization") ?? undefined);
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } finally {
+    await releaseTopologyLock(env, lock.operationId);
+  }
 }
 
 /** Milestone 3, Chunk 4: thin forwarders to the owning catalog shard's
  * migration endpoints — the catalog owns the state machine and drives the
- * shard-level export/import/fence orchestration from its own alarm. */
+ * shard-level export/import/fence orchestration from its own alarm. Read-only
+ * status / abort forwarders do NOT take the topology lock. */
 function makeCatalogMigrationForwarder(path: string): (request: Request, env: Env) => Promise<Response> {
   return async (request, env) => {
     const payload = (await request.json()) as { catalogShardId?: string };
@@ -664,7 +728,6 @@ function makeCatalogMigrationForwarder(path: string): (request: Request, env: En
   };
 }
 
-const handleAdminMigrateVbucket = makeCatalogMigrationForwarder("/migrate-vbucket");
 const handleAdminMigrateVbucketStatus = makeCatalogMigrationForwarder("/migrate-vbucket-status");
 const handleAdminMigrateVbucketAbort = makeCatalogMigrationForwarder("/migrate-vbucket-abort");
 // Milestone 3, Chunk 5: progress of a shard drain's two evacuation loops.
@@ -732,6 +795,18 @@ async function handleAdminListIndexes(request: Request, env: Env): Promise<Respo
  * across every shard — the index could be on any shard given hash-based
  * placement, so this fans out rather than targeting one. */
 async function handleAdminDropIndex(request: Request, env: Env): Promise<Response> {
+  // Topology lock (Stage 2): drop-index mutates every catalog's index_rules and
+  // deletes physical entries; serialize it against all other topology ops.
+  const lock = await acquireTopologyLock(env, "drop-index");
+  if (lock instanceof Response) return lock;
+  try {
+    return await handleAdminDropIndexLocked(request, env);
+  } finally {
+    await releaseTopologyLock(env, lock.operationId);
+  }
+}
+
+async function handleAdminDropIndexLocked(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { indexName?: string };
   if (!body.indexName) {
     return json({ error: "Missing indexName" }, 400);
