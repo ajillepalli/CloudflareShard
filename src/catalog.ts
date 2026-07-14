@@ -1567,6 +1567,40 @@ export class CatalogDO extends DurableObject {
     }
   }
 
+  /** Codex final-review P1 #2: a CHECK-ONLY re-verification (does not renew
+   * the lease — that's heartbeatTopologyLockOrPark's job, once per tick) for
+   * gating the cutover's destructive map-flip immediately before it runs. The
+   * alarm heartbeats once per tick, BEFORE advanceMigration is called — but
+   * the cutover branch then awaits several more round trips (fence check,
+   * mirror-drain, prepared-intent poll, checksum verify) before reaching the
+   * flip. If the lease expired or was force-released during those awaits,
+   * another operation could have acquired the lock and be acting on `target`
+   * already; flipping onto it now would be unsafe. Same null/unreachable
+   * conventions as heartbeatTopologyLockOrPark: no operationId means this
+   * migration was never lock-mediated (proceed as before Stage 3); catalog-0
+   * unreachable is treated as NOT held (fail safe). */
+  private async holdsTopologyLockNow(operationId: string | null | undefined): Promise<boolean> {
+    if (!operationId) return true;
+    try {
+      if (this.isCatalogZero()) {
+        const res = await this.handleHoldsTopologyLock(
+          new Request("https://catalog.internal/holds-topology-lock", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ operationId }),
+          }),
+        );
+        if (!res.ok) return false;
+        return ((await res.json()) as { holds: boolean }).holds;
+      }
+      const res = await this.topologyLockZeroFetch("/holds-topology-lock", { operationId });
+      if (!res.ok) return false;
+      return ((await res.json()) as { holds: boolean }).holds;
+    } catch {
+      return false;
+    }
+  }
+
   /** Best-effort release — called once a migration/drain this lock was held
    * for is FULLY complete (or aborted). Never throws; a failed release just
    * leaves the lease to expire on its own TTL. No-op if operationId is
@@ -2864,6 +2898,24 @@ export class CatalogDO extends DurableObject {
           target,
         );
         return true;
+      }
+
+      // Codex final-review P1 #2: re-verify the lock is STILL held by this
+      // operation immediately before the destructive map-flip below — the
+      // alarm heartbeats the lease once per tick, BEFORE advanceMigration is
+      // even called, but everything from the fence check through the
+      // checksum verify above is further awaited round trips where the
+      // lease could have expired or been force-released. Acting on a stale
+      // confirmation here is exactly the dangerous case: another operation
+      // (e.g. a drain) could have acquired the freed lock and already be
+      // acting on `target`, so flipping onto it now could produce a
+      // permanently unroutable vbucket. Do NOT flip this tick — park (no
+      // mutation) and let a later tick, either recovering the SAME lock or
+      // running under a freshly re-acquired one, retry from 'cutover'.
+      const stillHoldsLock = await this.holdsTopologyLockNow(m.topology_lock_operation_id);
+      if (!stillHoldsLock) {
+        log("catalog.migration_flip_aborted_lock_lost", { vbucket: m.vbucket });
+        return true; // stay 'cutover', retry next tick — no mutation this tick
       }
 
       // Step 4: flip the map. From this write on, /route sends everything to
