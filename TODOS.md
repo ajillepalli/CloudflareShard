@@ -2,18 +2,6 @@
 
 ## Architecture
 
-### Ring-evacuation vs. stale fixed-target index writes (residual risk)
-
-**What:** During a shard drain's ring evacuation, `advanceDrain` copies the draining shard's `__cf_indexes` entries to the deterministic substitute, repoints `placement_ring_json` cluster-wide, runs a reconcile loop to catch entries that raced onto the draining shard during the evacuation's async gaps, then deletes the source copies. This closes the dominant race (a write whose `/route` resolved with the old ring landing on the draining shard mid-evacuation is caught by the reconcile loop, since after the repoint no *new* route targets the draining shard). **Residual:** a `index_pending_jobs` retry enqueued before the repoint carries a *fixed* target shard id (the draining shard) and does not re-resolve the ring, so if it fires after the reconcile loop's final pass it writes an entry to the draining shard that the delete then removes — the base row survives but its index entry is lost. The reconcile loop is capped (`RING_EVAC_RECONCILE_MAX_PASSES`); pathological churn leaves source rows in place (unreachable, not deleted) rather than losing them.
-
-**Why not fully closed here:** the complete fix is a ring-version stamped at index-write time, rejected by the index shard if stale, with the writer (including the `index_pending_jobs` retry) re-resolving the ring on rejection — a cross-cutting change to the index-write path, the retry-queue schema, and `/route`. Out of proportion to a rare admin operation (drain) racing an async index-maintenance retry whose target shard is simultaneously being evacuated.
-
-**Mitigations already in place:** index writes are best-effort and self-healing — a subsequent write to the same row re-derives and re-writes the entry against the current ring; and the drain's own feasibility checks plus the reconcile loop bound the window to the narrow interval between the final reconcile pass and the source delete.
-
-**Effort:** M
-**Priority:** P3
-**Depends on:** a ring-version mechanism on the index-write path.
-
 ### Unique-index support for the Index Service
 
 **What:** Support rejecting a write that would violate a declared uniqueness constraint on a registered index, instead of today's non-unique-only model (`__cf_indexes` uses `INSERT OR REPLACE`, no constraint check).
@@ -87,6 +75,14 @@
 **Depends on:** None — a future scope decision, not committed work.
 
 ## Completed
+
+### Ring-evacuation vs. stale fixed-target index writes
+
+**What:** During a shard drain's ring evacuation, `advanceDrain` copies the draining shard's `__cf_indexes` entries to the deterministic substitute, repoints `placement_ring_json` cluster-wide, then deletes the source copies. The originally-shipped version had a residual: a `index_pending_jobs` retry enqueued before the repoint carried a *fixed* target shard id and did not re-resolve the ring, so a retry firing after the reconcile loop's final pass could write an entry to the draining shard that the delete then removed — the base row survived but its index entry was lost.
+
+**Resolution (Milestone 3, index-ring write fence):** built the cross-cutting fix this item originally deferred as out-of-proportion — a per-index write fence (`__cf_fenced_index_rings` on `ShardDO`) rejects any write to `__cf_indexes` for an index mid-evacuation, and every writer (the `/v1/mutate` async writer, the `index_pending_jobs` retry, `/v1/tx`'s 2PC-prepared synthetic index intents, and `/admin/create-index` backfill) re-resolves the index's current ring and redirects to the substitute on a fence rejection instead of writing the stale target. A replicated read-shadow keeps `/v1/index-query` correct during the evacuation window. Also closed: two concurrent-topology-operation races that motivated a further cluster-wide topology-operation lock (serializing drain/split/migrate/create-index/drop-index) — see `CHANGELOG.md`'s 2.0.0.0 entry for the full design.
+
+**Completed:** Milestone 3 (2026-07-14)
 
 ### Evaluate deprecating raw `/v1/sql` mutations in favor of the structured DSL
 
