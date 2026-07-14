@@ -40,6 +40,11 @@ const ADMIN_GATED_ROUTES = new Set([
 // backfill slice, or one cutover attempt that may be waiting on the mirror
 // queue to drain).
 const MIGRATION_TICK_MS = 250;
+// Topology-operation lock lease. Comfortably larger than one alarm tick
+// (MIGRATION_TICK_MS) so a long operation heartbeating each tick never lets its
+// own lease lapse, while a crashed operation's lock still auto-expires quickly
+// enough that the cluster isn't wedged.
+const TOPOLOGY_LOCK_TTL_MS = 30_000;
 // Review Tier 2 #8: cap the backfill work per tick and back off the alarm
 // re-arm when a tick throws, so a large migration resumes from its cursor
 // rather than restarting-and-throwing at 4Hz forever.
@@ -117,6 +122,11 @@ export class CatalogDO extends DurableObject {
       "/drain-shard-status": this.handleDrainShardStatus.bind(this),
       "/update-index-ring": this.handleUpdateIndexRing.bind(this),
       "/index-ring": this.handleIndexRing.bind(this),
+      "/acquire-topology-lock": this.handleAcquireTopologyLock.bind(this),
+      "/heartbeat-topology-lock": this.handleHeartbeatTopologyLock.bind(this),
+      "/release-topology-lock": this.handleReleaseTopologyLock.bind(this),
+      "/topology-lock-status": this.handleTopologyLockStatus.bind(this),
+      "/holds-topology-lock": this.handleHoldsTopologyLock.bind(this),
     };
   }
 
@@ -327,6 +337,24 @@ export class CatalogDO extends DurableObject {
         substitute TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (shard_id, index_name)
+      )
+    `);
+
+    // Durable cluster-wide TOPOLOGY-OPERATION LOCK (approved design). A single
+    // row, held on catalog-0 (the canonical cluster-wide catalog — index_rules
+    // replication and ring re-resolution already treat it as authoritative),
+    // serializes every topology mutation (split, migrate, create/drop index,
+    // drain) so concurrent operations can't corrupt shared ring/shadow/map
+    // state. Lease-based with a TTL refreshed by heartbeat, so a crashed
+    // operation's lock auto-expires instead of blocking forever.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS topology_lock (
+        singleton      INTEGER PRIMARY KEY CHECK (singleton = 1),
+        operation_id   TEXT NOT NULL,
+        operation_type TEXT NOT NULL,
+        acquired_at    TEXT NOT NULL,
+        expires_at     TEXT NOT NULL,
+        heartbeat_at   TEXT NOT NULL
       )
     `);
   }
@@ -725,6 +753,125 @@ export class CatalogDO extends DurableObject {
       body.indexName,
     );
     return json({ indexName: body.indexName, ring: row ? (JSON.parse(row.placement_ring_json) as string[]) : [] });
+  }
+
+  // ─── Topology-operation lock (held on catalog-0) ───────────────────────────
+
+  private topologyLockRow(): { operation_id: string; operation_type: string; acquired_at: string; expires_at: string; heartbeat_at: string } | null {
+    return this.one("SELECT operation_id, operation_type, acquired_at, expires_at, heartbeat_at FROM topology_lock WHERE singleton = 1");
+  }
+
+  private topologyLockExpired(row: { expires_at: string }, nowMs: number): boolean {
+    return nowMs > new Date(row.expires_at).getTime();
+  }
+
+  /** CAS acquire: take the lock if none held or the current one has expired.
+   * Returns {ok, operationId} or 409 TOPOLOGY_OPERATION_IN_PROGRESS. */
+  private async handleAcquireTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationType?: string };
+    if (!body.operationType) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationType." } }, 400);
+    }
+    const now = Date.now();
+    const existing = this.topologyLockRow();
+    if (existing && !this.topologyLockExpired(existing, now)) {
+      return json(
+        {
+          error: {
+            code: "TOPOLOGY_OPERATION_IN_PROGRESS",
+            operationType: existing.operation_type,
+            operationId: existing.operation_id,
+            message: `A topology operation (${existing.operation_type}) is already in progress.`,
+            fix: "Retry after the in-progress operation completes, or /admin/force-release-topology-lock if it is stuck.",
+          },
+        },
+        409,
+      );
+    }
+    const operationId = crypto.randomUUID();
+    const nowIso = new Date(now).toISOString();
+    const expiresIso = new Date(now + TOPOLOGY_LOCK_TTL_MS).toISOString();
+    this.sql.exec(
+      `INSERT OR REPLACE INTO topology_lock (singleton, operation_id, operation_type, acquired_at, expires_at, heartbeat_at)
+       VALUES (1, ?, ?, ?, ?, ?)`,
+      operationId,
+      body.operationType,
+      nowIso,
+      expiresIso,
+      nowIso,
+    );
+    this.audit("/acquire-topology-lock", { operationType: body.operationType, operationId });
+    return json({ ok: true, operationId, operationType: body.operationType, expiresAt: expiresIso });
+  }
+
+  /** Refresh the lease iff this operationId still holds the (non-expired) lock;
+   * else 409 LOCK_LOST — the operation must stop mutating. */
+  private async handleHeartbeatTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationId?: string };
+    if (!body.operationId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
+    }
+    const now = Date.now();
+    const existing = this.topologyLockRow();
+    if (!existing || existing.operation_id !== body.operationId || this.topologyLockExpired(existing, now)) {
+      return json(
+        { error: { code: "LOCK_LOST", message: "This operation no longer holds the topology lock (released, force-released, or expired).", fix: "Stop the operation; it must not keep mutating topology." } },
+        409,
+      );
+    }
+    const expiresIso = new Date(now + TOPOLOGY_LOCK_TTL_MS).toISOString();
+    this.sql.exec(
+      "UPDATE topology_lock SET heartbeat_at = ?, expires_at = ? WHERE singleton = 1 AND operation_id = ?",
+      new Date(now).toISOString(),
+      expiresIso,
+      body.operationId,
+    );
+    return json({ ok: true, operationId: body.operationId, expiresAt: expiresIso });
+  }
+
+  /** Release iff this operationId holds it. Idempotent no-op otherwise (a
+   * stale releaser must never drop a lock a newer operation now holds). */
+  private async handleReleaseTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationId?: string };
+    if (!body.operationId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
+    }
+    const existing = this.topologyLockRow();
+    const held = existing?.operation_id === body.operationId;
+    if (held) {
+      this.sql.exec("DELETE FROM topology_lock WHERE singleton = 1 AND operation_id = ?", body.operationId);
+      this.audit("/release-topology-lock", { operationId: body.operationId });
+    }
+    return json({ ok: true, released: held });
+  }
+
+  /** Current holder (or none) + whether it is expired. */
+  private async handleTopologyLockStatus(): Promise<Response> {
+    const existing = this.topologyLockRow();
+    if (!existing) {
+      return json({ held: false });
+    }
+    return json({
+      held: true,
+      operationId: existing.operation_id,
+      operationType: existing.operation_type,
+      acquiredAt: existing.acquired_at,
+      heartbeatAt: existing.heartbeat_at,
+      expiresAt: existing.expires_at,
+      expired: this.topologyLockExpired(existing, Date.now()),
+    });
+  }
+
+  /** True iff this operationId still holds the non-expired lock — the
+   * pre-destructive-step gate. */
+  private async handleHoldsTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationId?: string };
+    if (!body.operationId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
+    }
+    const existing = this.topologyLockRow();
+    const holds = !!existing && existing.operation_id === body.operationId && !this.topologyLockExpired(existing, Date.now());
+    return json({ holds });
   }
 
   private async handleListIndexes(): Promise<Response> {
