@@ -2025,7 +2025,24 @@ export class CatalogDO extends DurableObject {
         // not-yet-copied entries. Siblings first, then local — a sibling failure
         // throws with local un-repointed and the marker + fence persisting →
         // retried next tick.
-        const currentRing = rule ? (JSON.parse(rule.placement_ring_json) as string[]) : [];
+        //
+        // Codex round-16 defense-in-depth: RE-READ placement_ring_json HERE,
+        // at write time — not `rule` (a snapshot captured at the TOP of this
+        // function, before every await since). A DIFFERENT evacuation of
+        // ANOTHER position in this SAME ring (a sibling catalog's own drain,
+        // or — within this catalog — a later-in-the-same-tick advanceDrain
+        // call for a different draining shard) can apply its own
+        // /update-index-ring during one of those awaits; substituting into a
+        // stale full-array snapshot would silently REVERT that concurrent
+        // substitution back to its old (possibly already-decommissioned)
+        // shard the moment this call's repoint fans out. Re-reading and
+        // substituting only THIS shard's position is safe regardless: this
+        // drain only ever touches the one position it owns.
+        const freshRingRow = this.one<{ placement_ring_json: string }>(
+          "SELECT placement_ring_json FROM index_rules WHERE index_name = ?",
+          indexName,
+        );
+        const currentRing = freshRingRow ? (JSON.parse(freshRingRow.placement_ring_json) as string[]) : [];
         const pos = currentRing.indexOf(shardId);
         if (pos !== -1) {
           const newRing = [...currentRing];

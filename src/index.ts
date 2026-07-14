@@ -543,15 +543,44 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env): Promise
   // idempotent INSERT OR REPLACE). CatalogDO's /create-index is idempotent
   // on the same table+columns specifically so a retry after a partial
   // backfill failure below can call this endpoint again.
-  // Milestone 3, Chunk 2: shardIds IS this index's pinned placement ring —
-  // captured here, at creation time, and sent to CatalogDO to persist as
-  // index_rules.placement_ring_json. Every later placement computation for
-  // this index (write-path maintenance, /v1/index-query, this backfill loop
-  // itself) must reuse this exact array for the index's entire lifetime.
+  // Codex round-16 defense-in-depth: re-verify each shard in the captured
+  // ring is STILL active RIGHT BEFORE it is persisted as the placement ring —
+  // several awaits (introspect's PRAGMA round trip, the table-rules lookups
+  // above) separate the initial /list-shards snapshot (shardIds) from here,
+  // and a concurrent drain — normally excluded by the topology lock, but this
+  // check holds regardless of whether the lock did its job — could have moved
+  // one of them to 'draining' in that window. Pinning a draining shard into a
+  // NEW ring is exactly what the lock exists to prevent, so exclude any shard
+  // that's no longer active rather than trusting the stale snapshot; a
+  // smaller-but-still-valid active-only ring is always safe.
+  const reverifyResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+  const reverifyFailed = firstCatalogFanOutFailure(reverifyResults, "Failed to re-verify active shards before registration.");
+  if (reverifyFailed) return reverifyFailed;
+  const stillActiveShardIds = new Set(reverifyResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds));
+  const verifiedRingShardIds = shardIds.filter((s) => stillActiveShardIds.has(s));
+  if (verifiedRingShardIds.length === 0) {
+    return json(
+      {
+        error: {
+          code: "NO_SHARDS",
+          message: "No active shards remain to place this index's ring on — they all went draining since the initial check.",
+          fix: "Retry once shard topology stabilizes.",
+        },
+      },
+      400,
+    );
+  }
+
+  // Milestone 3, Chunk 2: shardIds (now re-verified into verifiedRingShardIds)
+  // IS this index's pinned placement ring — captured here, at creation time,
+  // and sent to CatalogDO to persist as index_rules.placement_ring_json.
+  // Every later placement computation for this index (write-path maintenance,
+  // /v1/index-query, this backfill loop itself) must reuse this exact array
+  // for the index's entire lifetime.
   const registerResults = await fanOutToAllCatalogs(
     env,
     "/create-index",
-    () => ({ indexName, table, columns, placementRing: shardIds }),
+    () => ({ indexName, table, columns, placementRing: verifiedRingShardIds }),
     request.headers.get("authorization") ?? undefined,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
@@ -563,10 +592,11 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env): Promise
   // active set at retry time, which can differ from the ring pinned by the FIRST
   // call; placing over `shardIds` would then write entries to shards
   // /v1/index-query (which reads the pinned ring) never looks at. The persisted
-  // ring equals `shardIds` on the first call and the original pinned ring on a
-  // retry; fall back to `shardIds` only if it can't be fetched.
+  // ring equals `verifiedRingShardIds` on the first call and the original pinned
+  // ring on a retry; fall back to `verifiedRingShardIds` (never the pre-verification
+  // `shardIds`) only if it can't be fetched.
   const persistedRing = await fetchIndexRing(env, indexName);
-  const placementRing = persistedRing.length > 0 ? persistedRing : shardIds;
+  const placementRing = persistedRing.length > 0 ? persistedRing : verifiedRingShardIds;
 
   // Backfill: scan every data-holding shard's existing rows for this table
   // (active + draining — see dataShardIds above), compute each row's index
@@ -2109,6 +2139,31 @@ async function handleAdminTxForceAbort(request: Request, env: Env): Promise<Resp
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
+/** Stage 4 (approved topology-lock design): admin inspection of the current
+ * cluster-wide topology lock — a thin forwarder to catalog-0's own
+ * /topology-lock-status (the lock's single canonical home). */
+async function handleAdminTopologyLockStatus(request: Request, env: Env): Promise<Response> {
+  const res = await routeToCatalog(env, "catalog-0", "/topology-lock-status", {}, request.headers.get("authorization") ?? undefined);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+/** Stage 4: the operator escape hatch for a stuck topology lock (a crashed
+ * operation that never released it, or one that's still heartbeating but
+ * needs to be forcibly cleared) — the same class of manual override as
+ * /admin/tx-force-abort for a wedged 2PC transaction. Forwards straight to
+ * catalog-0's /release-topology-lock, which deletes the row IFF the given
+ * operationId currently matches (idempotent no-op otherwise — an operator who
+ * doesn't know the exact operationId should read /admin/topology-lock-status
+ * first). */
+async function handleAdminForceReleaseTopologyLock(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { operationId?: string };
+  if (!body.operationId) {
+    return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId.", fix: "Read /admin/topology-lock-status to find the current holder's operationId." } }, 400);
+  }
+  const res = await routeToCatalog(env, "catalog-0", "/release-topology-lock", { operationId: body.operationId }, request.headers.get("authorization") ?? undefined);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
 const MAX_INDEX_QUERY_LIMIT = 100;
 const DEFAULT_INDEX_QUERY_LIMIT = 20;
 
@@ -2396,6 +2451,8 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/migrate-vbucket-status": handleAdminMigrateVbucketStatus,
   "/admin/migrate-vbucket-abort": handleAdminMigrateVbucketAbort,
   "/admin/drain-shard-status": handleAdminDrainShardStatus,
+  "/admin/topology-lock-status": handleAdminTopologyLockStatus,
+  "/admin/force-release-topology-lock": handleAdminForceReleaseTopologyLock,
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,

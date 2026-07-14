@@ -682,3 +682,69 @@ describe("ShardDO index_pending_jobs retry queue (Milestone 2 Chunk 2)", () => {
     });
   });
 });
+
+// Stage 4 of the approved topology-lock design: admin recovery routes.
+describe("Worker topology-operation lock — admin recovery (Stage 4)", () => {
+  function catalog0Lock(path: string, body: unknown) {
+    return env.CATALOG.get(env.CATALOG.idFromName("catalog-0")).fetch(
+      new Request(`https://catalog.internal${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+    );
+  }
+
+  it("/admin/topology-lock-status requires an admin token and reports the current holder (or none)", async () => {
+    await initCluster(1, 64);
+
+    const noAuth = await post("/admin/topology-lock-status", {});
+    expect(noAuth.status).toBe(401);
+
+    const none = await post("/admin/topology-lock-status", {}, AUTH());
+    expect(none.status).toBe(200);
+    expect(((await none.json()) as { held: boolean }).held).toBe(false);
+
+    const acq = await catalog0Lock("/acquire-topology-lock", { operationType: "drain-shard" });
+    const opId = ((await acq.json()) as { operationId: string }).operationId;
+
+    const held = await post("/admin/topology-lock-status", {}, AUTH());
+    expect(held.status).toBe(200);
+    const heldBody = (await held.json()) as { held: boolean; operationId: string; operationType: string };
+    expect(heldBody.held).toBe(true);
+    expect(heldBody.operationId).toBe(opId);
+    expect(heldBody.operationType).toBe("drain-shard");
+  });
+
+  it("/admin/force-release-topology-lock requires an admin token, clears a stuck lock (freeing a blocked topology op), and is a safe idempotent no-op for a non-matching or already-cleared operationId", async () => {
+    await initCluster(1, 64);
+    await createIndexTestTable("forcerelease_evt");
+
+    const acq = await catalog0Lock("/acquire-topology-lock", { operationType: "drain-shard" });
+    const opId = ((await acq.json()) as { operationId: string }).operationId;
+
+    // Blocked while the (simulated-stuck) lock is held.
+    const blocked = await post("/admin/create-index", { indexName: "forcerelease_by_v", table: "forcerelease_evt", columns: ["v"] }, AUTH());
+    expect(blocked.status).toBe(409);
+
+    const noAuth = await post("/admin/force-release-topology-lock", { operationId: opId });
+    expect(noAuth.status).toBe(401);
+
+    // Wrong/non-matching operationId: a safe no-op (does NOT clear the real lock).
+    const wrongId = await post("/admin/force-release-topology-lock", { operationId: "not-the-real-one" }, AUTH());
+    expect(wrongId.status).toBe(200);
+    expect(((await wrongId.json()) as { released: boolean }).released).toBe(false);
+    const stillBlocked = await post("/admin/create-index", { indexName: "forcerelease_by_v", table: "forcerelease_evt", columns: ["v"] }, AUTH());
+    expect(stillBlocked.status).toBe(409);
+
+    // The operator's actual force-release — clears the stuck lock.
+    const force = await post("/admin/force-release-topology-lock", { operationId: opId }, AUTH());
+    expect(force.status).toBe(200);
+    expect(((await force.json()) as { released: boolean }).released).toBe(true);
+
+    // The previously-blocked topology op now succeeds.
+    const now = await post("/admin/create-index", { indexName: "forcerelease_by_v", table: "forcerelease_evt", columns: ["v"] }, AUTH());
+    expect(now.status).toBe(200);
+
+    // Re-releasing the same (now-cleared) operationId is a safe idempotent no-op.
+    const again = await post("/admin/force-release-topology-lock", { operationId: opId }, AUTH());
+    expect(again.status).toBe(200);
+    expect(((await again.json()) as { released: boolean }).released).toBe(false);
+  });
+});

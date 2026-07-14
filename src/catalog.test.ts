@@ -2958,3 +2958,71 @@ describe("CatalogDO topology-operation lock — Stage 3 (long-running operations
     expect(recovered.stallReason).not.toBe("topology-lock-lost");
   });
 });
+
+// Approved design: round-16 defense-in-depth hardening (correct regardless of
+// whether the topology lock did its job) for the two direct concurrency
+// findings.
+describe("CatalogDO ring evacuation — round-16 defense-in-depth: re-read the ring at write time", () => {
+  it("repointing shard-0's OWN ring position does NOT revert a DIFFERENT position's substitution applied concurrently (e.g. a sibling catalog's own drain) during the awaited fence call", async () => {
+    const stub = await freshCatalog();
+    // 5 shards: the ring pins shard-0/1/2, leaving shard-3/4 as active
+    // out-of-ring candidates so a substitute for shard-0's drain can actually
+    // be found (RING_EVACUATION_NO_CANDIDATE otherwise pre-rejects the drain).
+    await stub.fetch(post("/init", { numShards: 5, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'ready', ?, ?)",
+        "idx_r16a",
+        "events",
+        JSON.stringify(["v"]),
+        new Date().toISOString(),
+        JSON.stringify(["shard-0", "shard-1", "shard-2"]),
+      );
+      // Move every vbucket off shard-0 so its drain goes straight to ring
+      // evacuation (phase 2) — no vbucket migration in the way.
+      state.storage.sql.exec("UPDATE vbucket_map SET shard_id = 'shard-1' WHERE shard_id = 'shard-0'");
+    });
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Monkey-patch callShard so shard-0's OWN /fence-index-ring call (step b,
+    // BEFORE the repoint at step c reads the ring) ALSO — as a side effect —
+    // applies a DIFFERENT position's substitution directly, simulating a
+    // sibling catalog's own concurrent drain of shard-2 completing its own
+    // /update-index-ring fan-out during this call's await. THE FIX BEING
+    // TESTED: the repoint step must RE-READ the ring at write time so it only
+    // touches shard-0's own position (0), never reverting shard-2's (position
+    // 2) concurrent substitution back with a stale full-array snapshot.
+    await runInDurableObject(stub, async (instance: CatalogDO, state: DurableObjectState) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __real?: (s: string, p: string, b: unknown) => Promise<Response>;
+      };
+      inst.__real = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) => {
+        const res = await inst.__real!(shardId, path, payload);
+        if (shardId === "shard-0" && path === "/fence-index-ring") {
+          state.storage.sql.exec(
+            "UPDATE index_rules SET placement_ring_json = ? WHERE index_name = 'idx_r16a'",
+            JSON.stringify(["shard-0", "shard-1", "shard-2-concurrent-substitute"]),
+          );
+        }
+        return res;
+      };
+      await instance.alarm();
+    });
+
+    const ringAfter = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      JSON.parse(
+        (Array.from(state.storage.sql.exec("SELECT placement_ring_json FROM index_rules WHERE index_name = 'idx_r16a'")) as Array<{ placement_ring_json: string }>)[0]
+          .placement_ring_json,
+      ) as string[],
+    );
+    // Position 0 (shard-0) was substituted by THIS drain.
+    expect(ringAfter[0]).not.toBe("shard-0");
+    // Position 2's CONCURRENT substitution must survive — not reverted back
+    // to "shard-2" by this drain's stale-snapshot-based write.
+    expect(ringAfter[2]).toBe("shard-2-concurrent-substitute");
+    // Position 1 (untouched by either drain) is unaffected.
+    expect(ringAfter[1]).toBe("shard-1");
+  });
+});
