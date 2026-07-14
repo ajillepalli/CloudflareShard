@@ -254,6 +254,107 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
   });
 });
 
+// Codex final-review P1 #1: create-index's backfill previously acquired the
+// topology lock once and never renewed it for the rest of the (synchronous,
+// potentially long) scan-and-write loop — a large table's backfill could run
+// past the lock's 30s TTL, let the lease expire, and keep writing index
+// entries while a concurrent drain (now free to acquire the lock) started
+// moving rows off a shard the backfill hadn't scanned yet. The fix
+// heartbeats the lock once per data shard (and every N rows within a huge
+// shard) and aborts with TOPOLOGY_LOCK_LOST the moment a heartbeat can't
+// confirm the lease.
+describe("Worker /admin/create-index backfill heartbeats its topology lock (Codex final-review P1 #1)", () => {
+  it("aborts the backfill with TOPOLOGY_LOCK_LOST — writing no further index entries — the moment a mid-backfill heartbeat reports the lock lost, instead of silently completing", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("hblost_evt");
+
+    // One row per catalog shard's tenant — numShards:1 means dataShardIds is
+    // exactly the 4 catalog-*-shard-0 physical shards (ALL_TEST_SHARD_IDS),
+    // so the backfill loop below iterates 4 shards, each with a heartbeat
+    // check at its start — "long enough to need a heartbeat" without
+    // requiring hundreds of rows.
+    const catalogIndexOf: Record<string, number> = { "catalog-0-shard-0": 0, "catalog-1-shard-0": 1, "catalog-2-shard-0": 2, "catalog-3-shard-0": 3 };
+    for (const shardId of Object.keys(catalogIndexOf)) {
+      const tenantId = tenantForCatalogShard(catalogIndexOf[shardId], 4);
+      const token = await registerTenant(tenantId);
+      await post("/v1/mutate", { op: "insert", table: "hblost_evt", tenantId, partitionKey: `row-${shardId}`, values: { v: "x" } }, token);
+    }
+
+    // Monkey-patch catalog-0's own topology-lock heartbeat route (same
+    // established pattern as catalog.test.ts's callShard monkey-patches):
+    // let the FIRST heartbeat through to the real handler (so the backfill
+    // genuinely gets underway and indexes at least one shard), then report
+    // LOCK_LOST for every call after — as a real force-release/expiry would.
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        routes: Record<string, (request: Request) => Promise<Response>>;
+        __realHeartbeat?: (request: Request) => Promise<Response>;
+      };
+      inst.__realHeartbeat = inst.routes["/heartbeat-topology-lock"];
+      let calls = 0;
+      inst.routes["/heartbeat-topology-lock"] = async (request: Request) => {
+        calls += 1;
+        if (calls === 1) return inst.__realHeartbeat!(request);
+        return new Response(
+          JSON.stringify({ error: { code: "LOCK_LOST", message: "simulated lock loss for the regression test" } }),
+          { status: 409, headers: { "content-type": "application/json" } },
+        );
+      };
+    });
+
+    const res = await post("/admin/create-index", { indexName: "hblost_by_v", table: "hblost_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("TOPOLOGY_LOCK_LOST");
+
+    // The shard whose heartbeat succeeded (the first one iterated) was
+    // actually backfilled; every shard iterated AFTER the lock was reported
+    // lost must have NO index entries — the abort must be immediate, not
+    // "finish the current shard then stop".
+    let indexedShards = 0;
+    for (const shardId of Object.keys(catalogIndexOf)) {
+      const rows = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(shardId)), async (_i: unknown, state: DurableObjectState) =>
+        Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "hblost_by_v")) as Array<{ partition_key: string }>,
+      );
+      indexedShards += rows.length;
+    }
+    // Exactly the one shard whose heartbeat was let through — never all 4
+    // (that would mean the lock loss was ignored) and never 0 (that would
+    // mean the fix aborted too early, before doing any real work — this test
+    // is specifically about a heartbeat firing PARTWAY through).
+    expect(indexedShards).toBe(1);
+
+    // The index must never have been marked ready — backfill never finished.
+    const listRes = await post("/admin/list-indexes", {}, AUTH());
+    const listBody = (await listRes.json()) as { indexes: Array<{ indexName: string; status?: string }> };
+    const entry = listBody.indexes.find((i) => i.indexName === "hblost_by_v");
+    expect(entry).toBeDefined();
+    expect(entry?.status).not.toBe("ready");
+
+    // Restore the real heartbeat handler (the same "undo the monkey-patch
+    // before the retry" convention catalog.test.ts uses for callShard) — a
+    // retry must exercise the FIX, not the simulated failure again.
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      const inst = instance as unknown as { routes: Record<string, (request: Request) => Promise<Response>>; __realHeartbeat: (request: Request) => Promise<Response> };
+      inst.routes["/heartbeat-topology-lock"] = inst.__realHeartbeat;
+    });
+
+    // A retry with a fresh, real lock (idempotent registration + backfill)
+    // succeeds normally and indexes every shard's row.
+    const retry = await post("/admin/create-index", { indexName: "hblost_by_v", table: "hblost_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    let indexedAfterRetry = 0;
+    for (const shardId of Object.keys(catalogIndexOf)) {
+      const rows = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(shardId)), async (_i: unknown, state: DurableObjectState) =>
+        Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "hblost_by_v")) as Array<{ partition_key: string }>,
+      );
+      indexedAfterRetry += rows.length;
+    }
+    expect(indexedAfterRetry).toBe(4);
+  });
+});
+
 // Approved design: a durable cluster-wide topology lock (held on catalog-0)
 // serializes all topology mutations. Stage 2 — the short admin ops acquire it.
 describe("Worker topology-operation lock — short admin ops (Stage 2)", () => {
