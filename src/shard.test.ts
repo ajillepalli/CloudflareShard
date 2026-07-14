@@ -259,6 +259,51 @@ describe("ShardDO /execute input validation", () => {
   });
 });
 
+describe("ShardDO index-ring write fence (Codex round-13)", () => {
+  it("rejects an indexName-labelled __cf_indexes write 409 INDEX_RING_FENCED while the ring is fenced, and allows it again after unfence; idempotent fence/unfence", async () => {
+    const stub = await freshShard();
+    const indexWrite = (requestId: string) =>
+      post("/execute", {
+        sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params: ["events", "idx_fence", JSON.stringify(["alpha"]), "row-1", "shard-src", "t1", new Date().toISOString()],
+        requestId,
+        isMutation: true,
+        indexName: "idx_fence",
+      });
+
+    // Not fenced yet — the write applies.
+    const before = await stub.fetch(indexWrite(`w-${crypto.randomUUID()}`));
+    expect(before.status).toBe(200);
+
+    // Fence the ring (idempotent — assert re-fencing is fine).
+    expect((await stub.fetch(post("/fence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+    expect((await stub.fetch(post("/fence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+
+    // A NEW labelled write is now rejected 409 INDEX_RING_FENCED.
+    const fenced = await stub.fetch(indexWrite(`w-${crypto.randomUUID()}`));
+    expect(fenced.status).toBe(409);
+    expect(((await fenced.json()) as { error: { code: string } }).error.code).toBe("INDEX_RING_FENCED");
+
+    // A write for a DIFFERENT index is unaffected.
+    const other = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params: ["events", "idx_other", JSON.stringify(["beta"]), "row-2", "shard-src", "t1", new Date().toISOString()],
+        requestId: `o-${crypto.randomUUID()}`,
+        isMutation: true,
+        indexName: "idx_other",
+      }),
+    );
+    expect(other.status).toBe(200);
+
+    // Unfence (idempotent) — labelled writes flow again.
+    expect((await stub.fetch(post("/unfence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+    expect((await stub.fetch(post("/unfence-index-ring", { indexName: "idx_fence" }))).status).toBe(200);
+    const after = await stub.fetch(indexWrite(`w-${crypto.randomUUID()}`));
+    expect(after.status).toBe(200);
+  });
+});
+
 describe("ShardDO route/method guards", () => {
   it("rejects non-POST methods with 405", async () => {
     const stub = await freshShard();
@@ -380,6 +425,71 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     );
     const countBody = (await countRes.json()) as { rows: Array<{ n: number }> };
     expect(countBody.rows[0].n).toBe(1);
+  });
+
+  // Codex full-PR review P1: a committed 2PC update/delete intent whose extra
+  // `where` matches ZERO rows is a no-op — provenance and the mirror must be
+  // gated on it actually changing a row (changes()>0), mirroring the /v1/sql
+  // and /v1/mutate paths. Otherwise a no-op DELETE strips the __cf_row_owners
+  // entry for a STILL-LIVE row (writeOrDeleteProvenance deletes on any DELETE),
+  // stranding it in a migration.
+  it("a committed 2PC delete intent that matches zero rows preserves provenance and enqueues no mirror", async () => {
+    const stub = await freshShard();
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)");
+
+    // A live, attributed row (vbucket 5).
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["live-row", "keep"],
+        requestId: `ins-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "t1",
+        table: "t",
+        partitionKey: "live-row",
+        vbucket: 5,
+      }),
+    );
+    const provBefore = await runInDurableObject(stub, async (_i: ShardDO, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE table_name = 't' AND partition_key = 'live-row'")).length,
+    );
+    expect(provBefore).toBe(1);
+
+    // 2PC delete intent for live-row whose WHERE matches nothing (v mismatch),
+    // with a mirror target set (as if the vbucket is mid-migration). Commit it.
+    await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: "tx-noop-del",
+        intents: [
+          {
+            sql: "DELETE FROM t WHERE id = ? AND v = ?",
+            params: ["live-row", "does-not-match"],
+            tenantId: "t1",
+            table: "t",
+            partitionKey: "live-row",
+            vbucket: 5,
+            op: "delete",
+            mirrorTargetShardId: "some-target-shard",
+          },
+        ],
+      }),
+    );
+    const commitRes = await stub.fetch(post("/commit", { coordinatorTxId: "tx-noop-del" }));
+    expect(commitRes.status).toBe(200);
+
+    // The still-live row survives (the delete matched nothing).
+    const rowCount = (await (
+      await stub.fetch(post("/execute", { sql: "SELECT COUNT(*) AS n FROM t WHERE id = 'live-row'", requestId: `q-${crypto.randomUUID()}`, isMutation: false }))
+    ).json()) as { rows: Array<{ n: number }> };
+    expect(rowCount.rows[0].n).toBe(1);
+
+    // Provenance is NOT stripped, and no mirror job was enqueued.
+    const after = await runInDurableObject(stub, async (_i: ShardDO, state: DurableObjectState) => ({
+      prov: Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE table_name = 't' AND partition_key = 'live-row'")).length,
+      mirrors: Array.from(state.storage.sql.exec("SELECT job_id FROM __cf_mirror_pending WHERE vbucket = 5")).length,
+    }));
+    expect(after.prov, "no-op delete must NOT strip a live row's provenance").toBe(1);
+    expect(after.mirrors, "no-op delete must NOT enqueue a mirror").toBe(0);
   });
 
   it("abort leaves no trace and is idempotent", async () => {
@@ -693,4 +803,715 @@ describe("ShardDO 2PC: TTL sweep queries the coordinator, never unilaterally abo
     });
   });
 
+});
+
+describe("ShardDO __cf_mirror_pending dual-write retry queue (Milestone 3, Chunk 3)", () => {
+  it("a job enqueued via /enqueue-mirror-job is retried against the target and cleared by alarm(), applying the write there under the original requestId", async () => {
+    const sourceStub = await freshShard();
+    const targetShardName = `mirror-target-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardName));
+
+    // Target needs the table to exist for the mirrored INSERT to apply.
+    await targetStub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+
+    const enqueueRes = await sourceStub.fetch(
+      post("/enqueue-mirror-job", {
+        targetShardId: targetShardName,
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["mirrored-row", "x"],
+        requestId: "req-mirror-original",
+        vbucket: 7,
+      }),
+    );
+    expect(enqueueRes.status).toBe(200);
+
+    const countBefore = await (await sourceStub.fetch(post("/mirror-pending-count", { vbucket: 7 }))).json();
+    expect((countBefore as { count: number }).count).toBe(1);
+
+    await runInDurableObject(sourceStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    const countAfter = await (await sourceStub.fetch(post("/mirror-pending-count", { vbucket: 7 }))).json();
+    expect((countAfter as { count: number }).count).toBe(0);
+
+    const checkRes = await targetStub.fetch(
+      post("/execute", { sql: "SELECT v FROM t WHERE id = ?", params: ["mirrored-row"], requestId: "req-mirror-check", isMutation: false }),
+    );
+    const checkBody = (await checkRes.json()) as { rows: Array<{ v: string }> };
+    expect(checkBody.rows).toHaveLength(1);
+
+    // The write landed under the ORIGINAL requestId: replaying it on the
+    // target dedupes rather than re-executing (the idempotency contract
+    // that makes mirror + backfill + retry safely re-appliable).
+    const replay = await targetStub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["mirrored-row", "x"], requestId: "req-mirror-original", isMutation: true }),
+    );
+    const replayBody = (await replay.json()) as { duplicated: boolean };
+    expect(replayBody.duplicated).toBe(true);
+  });
+
+  it("a mirror job whose target keeps failing stays queued with attempt_count incremented and exponential backoff from 1s, never dropped", async () => {
+    const sourceStub = await freshShard();
+    // Target shard exists but the table doesn't — the mirrored INSERT will
+    // fail with a SQL error (400) on every attempt.
+    const targetShardName = `mirror-failing-${crypto.randomUUID()}`;
+
+    await sourceStub.fetch(
+      post("/enqueue-mirror-job", {
+        targetShardId: targetShardName,
+        sql: "INSERT INTO missing_table (id) VALUES (?)",
+        params: ["never-lands"],
+        requestId: "req-mirror-fail",
+        vbucket: 3,
+      }),
+    );
+
+    await runInDurableObject(sourceStub, async (instance: ShardDO, state: DurableObjectState) => {
+      await instance.alarm();
+      const jobs = Array.from(
+        state.storage.sql.exec("SELECT attempt_count, next_attempt_at FROM __cf_mirror_pending WHERE request_id = ?", "req-mirror-fail"),
+      ) as Array<{ attempt_count: number; next_attempt_at: string }>;
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].attempt_count).toBe(1);
+      // First retry delay = MIRROR_JOB_BASE_DELAY_MS * 2^0 = 1s.
+      const delayMs = new Date(jobs[0].next_attempt_at).getTime() - Date.now();
+      expect(delayMs).toBeGreaterThan(0);
+      expect(delayMs).toBeLessThanOrEqual(1000 + 250);
+
+      // Force it due again and re-run: attempt 2, delay doubles to 2s.
+      state.storage.sql.exec(
+        "UPDATE __cf_mirror_pending SET next_attempt_at = ? WHERE request_id = ?",
+        new Date(Date.now() - 1).toISOString(),
+        "req-mirror-fail",
+      );
+      await instance.alarm();
+      const jobs2 = Array.from(
+        state.storage.sql.exec("SELECT attempt_count, next_attempt_at FROM __cf_mirror_pending WHERE request_id = ?", "req-mirror-fail"),
+      ) as Array<{ attempt_count: number; next_attempt_at: string }>;
+      expect(jobs2).toHaveLength(1);
+      expect(jobs2[0].attempt_count).toBe(2);
+      const delay2Ms = new Date(jobs2[0].next_attempt_at).getTime() - Date.now();
+      expect(delay2Ms).toBeGreaterThan(1000);
+      expect(delay2Ms).toBeLessThanOrEqual(2000 + 250);
+    });
+  });
+
+  it("/enqueue-mirror-job requires targetShardId, sql, requestId, and vbucket", async () => {
+    const stub = await freshShard();
+    const res = await stub.fetch(post("/enqueue-mirror-job", { targetShardId: "t", sql: "SELECT 1", requestId: "r" }));
+    expect(res.status).toBe(400);
+  });
+
+  it("/mirror-pending-count scopes by vbucket so one vbucket's mirror debt doesn't block another's cutover", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/enqueue-mirror-job", { targetShardId: "t1", sql: "SELECT 1", params: [], requestId: "r1", vbucket: 1 }),
+    );
+    await stub.fetch(
+      post("/enqueue-mirror-job", { targetShardId: "t1", sql: "SELECT 1", params: [], requestId: "r2", vbucket: 2 }),
+    );
+
+    const forV1 = (await (await stub.fetch(post("/mirror-pending-count", { vbucket: 1 }))).json()) as { count: number };
+    const forV2 = (await (await stub.fetch(post("/mirror-pending-count", { vbucket: 2 }))).json()) as { count: number };
+    const total = (await (await stub.fetch(post("/mirror-pending-count", {}))).json()) as { count: number };
+    expect(forV1.count).toBe(1);
+    expect(forV2.count).toBe(1);
+    expect(total.count).toBe(2);
+  });
+
+  // Review Tier 1 #3: a mirror delivered via the retry queue must carry
+  // routing context so the TARGET writes its own __cf_row_owners provenance —
+  // otherwise a row whose first appearance on the target is a mirror is
+  // invisible to the cutover checksum's provenance-scoped selection.
+  it("a mirror delivered via retry writes __cf_row_owners provenance on the target (routing context forwarded)", async () => {
+    const sourceStub = await freshShard();
+    const targetShardName = `mirror-prov-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardName));
+    await targetStub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+
+    await sourceStub.fetch(
+      post("/enqueue-mirror-job", {
+        targetShardId: targetShardName,
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["prov-row", "x"],
+        requestId: "__cf:mirror:test",
+        vbucket: 12,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "prov-row",
+      }),
+    );
+    await runInDurableObject(sourceStub, async (instance: ShardDO) => {
+      await instance.alarm();
+    });
+
+    // The target has the base row AND its provenance entry.
+    await runInDurableObject(targetStub, async (_i: ShardDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT tenant_id, vbucket FROM __cf_row_owners WHERE table_name = ? AND partition_key = ?", "t", "prov-row"),
+      ) as Array<{ tenant_id: string; vbucket: number }>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].tenant_id).toBe("tenant-1");
+      expect(rows[0].vbucket).toBe(12);
+    });
+  });
+
+  // Review Tier 1 #2: /drain-mirror-jobs actively delivers every queued
+  // mirror for a vbucket and reports how many remain (cutover uses this
+  // rather than passively waiting on the source's alarm cadence).
+  it("/drain-mirror-jobs delivers all of a vbucket's queued mirrors now and reports remaining", async () => {
+    const sourceStub = await freshShard();
+    const targetShardName = `mirror-drain-${crypto.randomUUID()}`;
+    const targetStub = env.SHARD.get(env.SHARD.idFromName(targetShardName));
+    await targetStub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+    for (let i = 0; i < 3; i += 1) {
+      await sourceStub.fetch(
+        post("/enqueue-mirror-job", {
+          targetShardId: targetShardName,
+          sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+          params: [`d-${i}`, "x"],
+          requestId: `__cf:mirror:d-${i}`,
+          vbucket: 20,
+          tenantId: "tenant-1",
+          table: "t",
+          partitionKey: `d-${i}`,
+        }),
+      );
+    }
+
+    const drainRes = await sourceStub.fetch(post("/drain-mirror-jobs", { vbucket: 20 }));
+    expect(drainRes.status).toBe(200);
+    expect(((await drainRes.json()) as { remaining: number }).remaining).toBe(0);
+
+    const count = (await (await targetStub.fetch(post("/execute", { sql: "SELECT COUNT(*) AS n FROM t", requestId: "c", isMutation: false }))).json()) as {
+      rows: Array<{ n: number }>;
+    };
+    expect(count.rows[0].n).toBe(3);
+  });
+});
+
+describe("ShardDO migration fence and export/import (Milestone 3, Chunk 4)", () => {
+  async function createTable(stub: Awaited<ReturnType<typeof freshShard>>) {
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+  }
+
+  async function insertWithProvenance(stub: Awaited<ReturnType<typeof freshShard>>, id: string, v: string, vbucket: number) {
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: [id, v],
+        requestId: `req-ins-${id}-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: id,
+        vbucket,
+      }),
+    );
+    expect(res.status).toBe(200);
+  }
+
+  it("a fenced vbucket rejects new writes 409 VBUCKET_FENCED, still replays already-applied requestIds, ignores other vbuckets, and accepts again after unfence", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await insertWithProvenance(stub, "pre-fence", "a", 5);
+
+    // Capture the exact requestId of an applied write for the replay check.
+    const appliedRequestId = `req-applied-${crypto.randomUUID()}`;
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["applied-row", "x"],
+        requestId: appliedRequestId,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "applied-row",
+        vbucket: 5,
+      }),
+    );
+
+    const fenceRes = await stub.fetch(post("/fence-vbucket", { vbucket: 5 }));
+    expect(fenceRes.status).toBe(200);
+
+    // New write to the fenced vbucket: rejected, retryable shape.
+    const blocked = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["post-fence", "b"],
+        requestId: `req-blocked-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "post-fence",
+        vbucket: 5,
+      }),
+    );
+    expect(blocked.status).toBe(409);
+    const blockedBody = (await blocked.json()) as { error: { code: string } };
+    expect(blockedBody.error.code).toBe("VBUCKET_FENCED");
+
+    // Replay of an ALREADY-APPLIED requestId returns the cached result, not
+    // a spurious fence rejection.
+    const replay = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["applied-row", "x"],
+        requestId: appliedRequestId,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "applied-row",
+        vbucket: 5,
+      }),
+    );
+    expect(replay.status).toBe(200);
+    expect(((await replay.json()) as { duplicated: boolean }).duplicated).toBe(true);
+
+    // A different vbucket on the same shard is unaffected.
+    const otherVb = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["other-vb", "c"],
+        requestId: `req-other-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "other-vb",
+        vbucket: 6,
+      }),
+    );
+    expect(otherVb.status).toBe(200);
+
+    // 2PC prepare against the fenced vbucket is rejected too.
+    const prepBlocked = await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: `tx-fenced-${crypto.randomUUID()}`,
+        intents: [
+          { sql: "INSERT INTO t (id, v) VALUES (?, ?)", params: ["tx-row", "d"], tenantId: "tenant-1", table: "t", partitionKey: "tx-row", vbucket: 5, op: "insert" },
+        ],
+      }),
+    );
+    expect(prepBlocked.status).toBe(409);
+    expect(((await prepBlocked.json()) as { error: { code: string } }).error.code).toBe("VBUCKET_FENCED");
+
+    await stub.fetch(post("/unfence-vbucket", { vbucket: 5 }));
+    const afterUnfence = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["post-unfence", "e"],
+        requestId: `req-unfenced-${crypto.randomUUID()}`,
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "post-unfence",
+        vbucket: 5,
+      }),
+    );
+    expect(afterUnfence.status).toBe(200);
+  });
+
+  it("export pages stably by partition key, import is idempotent, and source/target checksums match after a full copy", async () => {
+    const source = await freshShard();
+    const targetName = `migrate-target-${crypto.randomUUID()}`;
+    const target = env.SHARD.get(env.SHARD.idFromName(targetName));
+    await createTable(source);
+    await createTable(target);
+
+    // 5 rows in vbucket 9, 1 row in another vbucket that must NOT export.
+    for (let i = 0; i < 5; i += 1) {
+      await insertWithProvenance(source, `row-${i}`, `v${i}`, 9);
+    }
+    await insertWithProvenance(source, "row-other", "vx", 10);
+
+    // Page with limit 2: 2 + 2 + 1.
+    const pages: Array<Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>> = [];
+    let afterPk = "";
+    for (;;) {
+      const res = await source.fetch(
+        post("/migrate-export", { vbucket: 9, table: "t", partitionKeyColumn: "id", afterPartitionKey: afterPk, limit: 2 }),
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }> };
+      if (body.rows.length === 0) break;
+      pages.push(body.rows);
+      afterPk = body.rows[body.rows.length - 1].partitionKey;
+
+      const importRes = await target.fetch(post("/migrate-import", { vbucket: 9, table: "t", rows: body.rows }));
+      expect(importRes.status).toBe(200);
+      if (body.rows.length < 2) break;
+    }
+    expect(pages.map((p) => p.length)).toEqual([2, 2, 1]);
+    const exportedKeys = pages.flat().map((r) => r.partitionKey);
+    expect(exportedKeys).toEqual(["row-0", "row-1", "row-2", "row-3", "row-4"]); // stable ASC order, no row-other
+
+    // Re-import the first page — idempotent, no duplicates.
+    const reimport = await target.fetch(post("/migrate-import", { vbucket: 9, table: "t", rows: pages[0] }));
+    expect(reimport.status).toBe(200);
+
+    const countRes = await target.fetch(
+      post("/execute", { sql: "SELECT COUNT(*) AS n FROM t", requestId: `req-count-${crypto.randomUUID()}`, isMutation: false }),
+    );
+    expect(((await countRes.json()) as { rows: Array<{ n: number }> }).rows[0].n).toBe(5);
+
+    // Checksums agree between source and target for the migrated vbucket.
+    const srcSum = (await (
+      await source.fetch(post("/migrate-checksum", { vbucket: 9, table: "t", partitionKeyColumn: "id" }))
+    ).json()) as { checksum: string; rowCount: number };
+    const tgtSum = (await (
+      await target.fetch(post("/migrate-checksum", { vbucket: 9, table: "t", partitionKeyColumn: "id" }))
+    ).json()) as { checksum: string; rowCount: number };
+    expect(srcSum.rowCount).toBe(5);
+    expect(tgtSum.rowCount).toBe(5);
+    expect(tgtSum.checksum).toBe(srcSum.checksum);
+
+    // And a divergence IS detected: mutate one target row, checksum differs.
+    await target.fetch(
+      post("/execute", { sql: "UPDATE t SET v = 'tampered' WHERE id = 'row-0'", requestId: `req-tamper-${crypto.randomUUID()}`, isMutation: true }),
+    );
+    const tamperedSum = (await (
+      await target.fetch(post("/migrate-checksum", { vbucket: 9, table: "t", partitionKeyColumn: "id" }))
+    ).json()) as { checksum: string };
+    expect(tamperedSum.checksum).not.toBe(srcSum.checksum);
+  });
+
+  it("/delete-vbucket-rows removes exactly one vbucket's rows + provenance and /unattributed-count reports rows lacking provenance", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await insertWithProvenance(stub, "keep-me", "a", 1);
+    await insertWithProvenance(stub, "delete-me", "b", 2);
+    // A provenance-less row (pre-Chunk-0 write).
+    await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id, v) VALUES ('no-prov', 'c')", requestId: `req-noprov-${crypto.randomUUID()}`, isMutation: true }),
+    );
+
+    const unattributed = (await (
+      await stub.fetch(post("/unattributed-count", { tables: [{ table: "t", partitionKeyColumn: "id" }] }))
+    ).json()) as { count: number };
+    expect(unattributed.count).toBe(1);
+
+    const delRes = await stub.fetch(
+      post("/delete-vbucket-rows", { vbucket: 2, tables: [{ table: "t", partitionKeyColumn: "id" }] }),
+    );
+    expect(delRes.status).toBe(200);
+
+    const remaining = await stub.fetch(
+      post("/execute", { sql: "SELECT id FROM t ORDER BY id", requestId: `req-remaining-${crypto.randomUUID()}`, isMutation: false }),
+    );
+    const remainingBody = (await remaining.json()) as { rows: Array<{ id: string }> };
+    expect(remainingBody.rows.map((r) => r.id)).toEqual(["keep-me", "no-prov"]);
+
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      const prov = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE vbucket = 2"));
+      expect(prov).toHaveLength(0);
+      const kept = Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_row_owners WHERE vbucket = 1"));
+      expect(kept).toHaveLength(1);
+    });
+  });
+
+  // Review Tier 2 #11: __cf_row_owners must carry the (vbucket, table_name,
+  // partition_key) index so migrate-export/checksum/delete/vbucket-tables are
+  // range scans, not full table scans. Guard that it exists and the planner
+  // uses it for a vbucket-scoped lookup.
+  it("__cf_row_owners has the (vbucket, table_name, partition_key) index and a vbucket-scoped query uses it", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `s-${crypto.randomUUID()}`, isMutation: true }),
+    );
+    await runInDurableObject(stub, async (_i: ShardDO, state: DurableObjectState) => {
+      const idx = Array.from(
+        state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_cf_row_owners_vb'"),
+      );
+      expect(idx).toHaveLength(1);
+      const plan = Array.from(
+        state.storage.sql.exec("EXPLAIN QUERY PLAN SELECT partition_key FROM __cf_row_owners WHERE vbucket = 5 AND table_name = 't'"),
+      ) as Array<{ detail: string }>;
+      expect(plan.some((r) => r.detail.includes("idx_cf_row_owners_vb"))).toBe(true);
+    });
+  });
+
+  // Review Tier 2 #9: the checksum is computed incrementally (per-page sha256,
+  // then sha256 of the page digests) so it stays O(page) memory on a large
+  // vbucket. A multi-page vbucket must still produce IDENTICAL checksums on
+  // two shards holding identical data, and differ under any divergence.
+  it("checksum of a multi-page vbucket (> one page) matches between two shards with identical data and differs under divergence", async () => {
+    const a = await freshShard();
+    const b = await freshShard();
+    const N = 1200; // spans 3 pages (MIGRATE_PAGE_SIZE = 500)
+    for (const stub of [a, b]) {
+      await createTable(stub);
+      // Bulk-seed identical base rows + provenance (vbucket 5) via one CTE each.
+      await stub.fetch(
+        post("/execute", {
+          sql: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${N}) INSERT INTO t (id, v) SELECT printf('p%05d', n), 'val' || n FROM seq`,
+          requestId: `seed-rows-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      );
+      await stub.fetch(
+        post("/execute", {
+          sql: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ${N}) INSERT INTO __cf_row_owners (table_name, partition_key, tenant_id, vbucket, updated_at) SELECT 't', printf('p%05d', n), 'tenant-1', 5, '2026-01-01T00:00:00.000Z' FROM seq`,
+          requestId: `seed-prov-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      );
+    }
+
+    const checksumOf = async (stub: Awaited<ReturnType<typeof freshShard>>) =>
+      (await (await stub.fetch(post("/migrate-checksum", { vbucket: 5, table: "t", partitionKeyColumn: "id" }))).json()) as {
+        checksum: string;
+        rowCount: number;
+      };
+
+    const ca = await checksumOf(a);
+    const cb = await checksumOf(b);
+    expect(ca.rowCount).toBe(N);
+    expect(cb.rowCount).toBe(ca.rowCount);
+    expect(cb.checksum).toBe(ca.checksum);
+
+    // Diverge one row deep in the middle (page 2) — checksum must change.
+    await b.fetch(post("/execute", { sql: "UPDATE t SET v = 'tampered' WHERE id = 'p00600'", requestId: `tamper-${crypto.randomUUID()}`, isMutation: true }));
+    const cbTampered = await checksumOf(b);
+    expect(cbTampered.checksum).not.toBe(ca.checksum);
+    expect(cbTampered.rowCount).toBe(ca.rowCount); // same count, different content
+  });
+
+  // Review Tier 3 test-coverage gap: /migrate-import's failure branch (target
+  // physically lacks the table backfill is trying to populate) was only
+  // exercised implicitly by tests where the table always existed.
+  it("/migrate-import returns 500 MIGRATE_IMPORT_FAILED when the target lacks the table", async () => {
+    const source = await freshShard();
+    const target = await freshShard(); // deliberately never createTable(target)
+    await createTable(source);
+    await insertWithProvenance(source, "row-1", "v1", 3);
+
+    const exportRes = await source.fetch(post("/migrate-export", { vbucket: 3, table: "t", partitionKeyColumn: "id" }));
+    expect(exportRes.status).toBe(200);
+    const exportBody = (await exportRes.json()) as {
+      rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
+    };
+    expect(exportBody.rows).toHaveLength(1);
+
+    const importRes = await target.fetch(post("/migrate-import", { vbucket: 3, table: "t", rows: exportBody.rows }));
+    expect(importRes.status).toBe(500);
+    const importBody = (await importRes.json()) as { error: { code: string } };
+    expect(importBody.error.code).toBe("MIGRATE_IMPORT_FAILED");
+  });
+});
+
+describe("ShardDO /index-entries-export cursor paging (Milestone 3, Chunk 5)", () => {
+  // Review Tier 3 test-coverage gap: ring evacuation's cursor paging
+  // (afterRowid) was only ever exercised with everything fitting in one page
+  // (catalog.test.ts's evacuation tests use 1-2 entries). Forces a multi-page
+  // walk with limit 1 across 4 entries and confirms the cursor produces every
+  // entry exactly once, in stable rowid order — no duplicates, no gaps.
+  it("pages a multi-entry index by rowid cursor with limit 1 and no duplicates or gaps", async () => {
+    const stub = await freshShard();
+    const rows = [1, 2, 3, 4].map((n) => ({
+      table_name: "events",
+      index_name: "idx_paged",
+      index_key_json: JSON.stringify([`k${n}`]),
+      partition_key: `row-${n}`,
+      source_shard_id: "shard-0",
+      tenant_id: "t1",
+      updated_at: new Date().toISOString(),
+    }));
+    const importRes = await stub.fetch(post("/index-entries-import", { rows }));
+    expect(importRes.status).toBe(200);
+
+    const collected: string[] = [];
+    let afterRowid = 0;
+    for (let guard = 0; guard < 10; guard += 1) {
+      const res = await stub.fetch(post("/index-entries-export", { indexName: "idx_paged", afterRowid, limit: 1 }));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ rowid: number; partition_key: string }> };
+      if (body.rows.length === 0) break;
+      expect(body.rows).toHaveLength(1); // limit respected — one entry per page
+      collected.push(...body.rows.map((r) => r.partition_key));
+      afterRowid = body.rows[body.rows.length - 1].rowid;
+    }
+    expect(collected).toEqual(["row-1", "row-2", "row-3", "row-4"]); // stable order, no dup/gap
+    expect(new Set(collected).size).toBe(collected.length);
+  });
+});
+
+describe("ShardDO row provenance (Milestone 3, Chunk 0)", () => {
+  async function createTable(stub: Awaited<ReturnType<typeof freshShard>>) {
+    await stub.fetch(
+      post("/execute", { sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)", requestId: `req-schema-${crypto.randomUUID()}`, isMutation: true }),
+    );
+  }
+
+  async function provenanceRows(stub: Awaited<ReturnType<typeof freshShard>>, table: string, partitionKey: string) {
+    return runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      return Array.from(
+        state.storage.sql.exec(
+          "SELECT table_name, partition_key, tenant_id, vbucket FROM __cf_row_owners WHERE table_name = ? AND partition_key = ?",
+          table,
+          partitionKey,
+        ),
+      ) as Array<{ table_name: string; partition_key: string; tenant_id: string; vbucket: number }>;
+    });
+  }
+
+  it("an insert with full routing context writes a __cf_row_owners entry", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["row-1", "a"],
+        requestId: "req-prov-1",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-1",
+        vbucket: 42,
+      }),
+    );
+    expect(res.status).toBe(200);
+
+    const rows = await provenanceRows(stub, "t", "row-1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].tenant_id).toBe("tenant-1");
+    expect(rows[0].vbucket).toBe(42);
+  });
+
+  it("a delete with full routing context removes the __cf_row_owners entry", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["row-2", "a"],
+        requestId: "req-prov-2",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-2",
+        vbucket: 7,
+      }),
+    );
+    expect(await provenanceRows(stub, "t", "row-2")).toHaveLength(1);
+
+    await stub.fetch(
+      post("/execute", {
+        sql: "DELETE FROM t WHERE id = ?",
+        params: ["row-2"],
+        requestId: "req-prov-3",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-2",
+        vbucket: 7,
+      }),
+    );
+    expect(await provenanceRows(stub, "t", "row-2")).toHaveLength(0);
+  });
+
+  it("an update with full routing context keeps a single provenance entry (no duplicate row)", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    await stub.fetch(
+      post("/execute", {
+        sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+        params: ["row-3", "a"],
+        requestId: "req-prov-4",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-3",
+        vbucket: 1,
+      }),
+    );
+    await stub.fetch(
+      post("/execute", {
+        sql: "UPDATE t SET v = ? WHERE id = ?",
+        params: ["b", "row-3"],
+        requestId: "req-prov-5",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "row-3",
+        vbucket: 1,
+      }),
+    );
+    const rows = await provenanceRows(stub, "t", "row-3");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].vbucket).toBe(1);
+  });
+
+  it("a write missing routing context (e.g. schema DDL) does not write provenance", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    const res = await stub.fetch(
+      post("/execute", { sql: "INSERT INTO t (id, v) VALUES ('row-4', 'x')", requestId: "req-prov-6", isMutation: true }),
+    );
+    expect(res.status).toBe(200);
+    expect(await provenanceRows(stub, "t", "row-4")).toHaveLength(0);
+  });
+
+  it("a mutation whose where clause matches nothing (0 rows affected) does not write provenance", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+    const res = await stub.fetch(
+      post("/execute", {
+        sql: "UPDATE t SET v = ? WHERE id = ?",
+        params: ["never-lands", "no-such-row"],
+        requestId: "req-prov-7",
+        isMutation: true,
+        tenantId: "tenant-1",
+        table: "t",
+        partitionKey: "no-such-row",
+        vbucket: 3,
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await provenanceRows(stub, "t", "no-such-row")).toHaveLength(0);
+  });
+
+  it("a 2PC-committed base-row intent writes provenance, but a piggybacked synthetic intent without op/vbucket does not", async () => {
+    const stub = await freshShard();
+    await createTable(stub);
+
+    const commitRes = await stub.fetch(
+      post("/prepare", {
+        coordinatorTxId: "tx-prov-1",
+        intents: [
+          {
+            sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+            params: ["row-5", "a"],
+            tenantId: "tenant-1",
+            table: "t",
+            partitionKey: "row-5",
+            vbucket: 9,
+            op: "insert",
+          },
+          {
+            // Mirrors a synthetic __cf_indexes-maintenance intent: no op/vbucket.
+            sql: "INSERT INTO t (id, v) VALUES (?, ?)",
+            params: ["row-6", "b"],
+            tenantId: "tenant-1",
+            table: "t",
+            partitionKey: "row-6",
+          },
+        ],
+      }),
+    );
+    expect(commitRes.status).toBe(200);
+    await stub.fetch(post("/commit", { coordinatorTxId: "tx-prov-1" }));
+
+    expect(await provenanceRows(stub, "t", "row-5")).toHaveLength(1);
+    expect(await provenanceRows(stub, "t", "row-6")).toHaveLength(0);
+  });
 });

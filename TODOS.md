@@ -26,17 +26,17 @@
 **Priority:** P3
 **Depends on:** Milestone 1 shipping with real usage data available.
 
-### Evaluate deprecating raw `/v1/sql` mutations in favor of the structured DSL
+### Structured tenant read API + physical `tenant_id`
 
-**What:** Decide whether the raw-SQL mutation path and the new structured-mutation DSL (`/v1/mutate`, `/v1/tx`) should coexist long-term, or whether raw SQL mutations should be deprecated/admin-only once the structured path covers the common cases.
+**What:** Add a structured, isolation-enforced tenant READ path — a partition-scoped `SELECT` (single vbucket) that the shard executes with an enforced `tenant_id` predicate — to replace the general tenant read path removed when `/v1/sql` became admin-only. Today tenants can only read via `/v1/index-query` (secondary-index lookups); there is no way to do a partition-scoped scan of one's own rows.
 
-**Why:** Codex flagged that two first-class write paths with different row-ownership guarantees (raw SQL: trust-based; structured: enforced) is a non-auditable correctness story and a security-footgun risk — a caller could always fall back to the weaker path. Milestone 2's `/plan-eng-review` added a third reason: raw `/v1/sql` mutations bypass every index-maintenance mechanism entirely, silently desyncing any index on a table they touch — Milestone 2's Chunk 1 closes this specific hole with a 409 rejection, but it's the same underlying dual-write-path problem surfacing again.
+**Why:** Removing raw tenant `/v1/sql` (see Completed) closed a cross-tenant read leak but left tenants with no general read path. The blocker for a safe one is physical: **base rows carry no `tenant_id` column** (SPEC §14) — the logical identity lives only in `__cf_row_owners`, so a shard can't add `WHERE tenant_id = ?` to a tenant's `SELECT`, and two tenants' rows can share a vbucket. A safe tenant read therefore needs base rows to carry a physical `tenant_id` (written on every mutation, indexed), after which the gateway can offer a structured partition-scoped read that injects the tenant predicate the same way `/v1/mutate` injects the partition-key predicate.
 
-**Context:** Milestone 2 (Index Service) will also depend on structured mutations for index maintenance, which may tip the balance toward deprecating raw SQL mutations entirely. Not urgent for Milestone 1 since raw `/v1/sql` isn't used for coordinated transactions, but worth deciding before the dual-path pattern calcifies into tenant-facing API surface people build against.
+**Context:** This is the replacement for the removed read path, not a nice-to-have — without it tenants cannot read arbitrary rows at all. Adding a physical `tenant_id` is a schema/write-path change (touches `/v1/mutate`, `/v1/tx` apply, and migration import) and should be scoped with the read API together.
 
-**Effort:** M
-**Priority:** P3
-**Depends on:** Milestone 2 (Index Service) — revisit once its structured-mutation dependency is clear.
+**Effort:** L
+**Priority:** P2
+**Depends on:** physical `tenant_id` on base rows (schema + write paths).
 
 ### CLI/SDK wrapper or write-path consolidation
 
@@ -50,41 +50,17 @@
 **Priority:** P3
 **Depends on:** None — can be decided independently, informed by real developer feedback post-Milestone-1.
 
-### Choose an OSS license
-
-**What:** Pick and add a LICENSE file (MIT/Apache-2.0/etc.) now that the distribution model is resolved to self-hosted/OSS-first.
-
-**Why:** A public self-hosted template without a stated license leaves adopters unsure what they're allowed to do with the code.
-
-**Context:** Surfaced as a deferred item during the `/office-hours` session that resolved the distribution/positioning decision (2026-07-09). Small, independent decision — doesn't block Milestone 1 implementation.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None.
-
 ### Automatic split heuristics
 
 **What:** Auto-detect a hot or oversized shard and trigger a split, instead of requiring a manual `/admin/split-vbucket` call.
 
 **Why:** The project's own README has listed this as an unbuilt "next production step" since the MVP was first written.
 
-**Context:** Natural v3 item once Approach B's Milestones 1 and 2 ship. Building heuristics before the underlying split mechanism is proven would be premature — heuristics tuning only makes sense once splits themselves are reliable.
+**Context:** Natural v3 item once Approach B's Milestones 1 and 2 ship. Building heuristics before the underlying split mechanism is proven would be premature — heuristics tuning only makes sense once splits themselves are reliable. **Update (Milestone 3, 2026-07-10):** the mechanism now fully exists — `/admin/split-vbucket` performs a real online migration (dual-write backfill, fenced checksum-verified cutover) and `/admin/drain-shard` fully evacuates a shard. What remains is exactly this TODO's original scope: deciding *when* to trigger a split (shard size / QPS / latency thresholds, per SPEC §11's trigger conditions), which needs real usage data to tune against.
 
 **Effort:** L
 **Priority:** P3
-**Depends on:** Milestone 1 (Transaction Coordinator) and Milestone 2 (Index Service).
-
-### Index-entry topology: physical source_shard_id vs. logical identity + read-time routing
-
-**What:** Decide whether `__cf_indexes` entries store the physical `source_shard_id` they were written on (current Milestone 2 design), or store logical identity `(tenantId, table, partitionKey)` and resolve the owning shard at read time instead.
-
-**Why:** Storing `source_shard_id` bakes topology into the data — every split, drain, or backfill has to rewrite index entries just because placement changed. The logical-identity alternative avoids that rewrite cost at the price of an extra routing hop on every index query. Flagged by an independent Codex outside-voice pass during Milestone 2's `/plan-eng-review`.
-
-**Context:** Real enough to matter once splits start happening on a table with a live index, but deciding now (before Chunk 2/5 implementation experience exists) would be premature — noted as an Open Question in the Milestone 2 design doc for those chunks to weigh directly, not deferred past Milestone 2 entirely. **Update (post-implementation `/plan-eng-review`, 2026-07-09):** the branch-diff eng-review pass confirmed the concrete failure this topology choice risks — index-shard placement (`indexShardIdForKey`) hashes over the *active* shard list, recomputed fresh on every read/write, so draining a shard changes the hash divisor for nearly every existing index key and orphans `__cf_indexes` entries written under the old shard count. Milestone 2 shipped the cheap mitigation (`CatalogDO./drain-shard` now rejects 409 `SHARD_DRAIN_BLOCKED_BY_INDEXES` while any index is registered cluster-wide) rather than resolving the topology question itself — this TODO is still open and now has a concrete trigger: revisit once draining a cluster that also needs live indexes is an actual requirement, not just a hypothetical.
-
-**Effort:** S (a design decision, not implementation work itself)
-**Priority:** P3
-**Depends on:** Milestone 2 Chunks 2 and 5 (async maintenance, drain interaction).
+**Depends on:** ~~Milestone 1 (Transaction Coordinator) and Milestone 2 (Index Service).~~ Mechanism shipped (Milestone 3); heuristics need production usage data.
 
 ### Cross-tenant/cross-shard analytics aggregation
 
@@ -99,6 +75,44 @@
 **Depends on:** None — a future scope decision, not committed work.
 
 ## Completed
+
+### Ring-evacuation vs. stale fixed-target index writes
+
+**What:** During a shard drain's ring evacuation, `advanceDrain` copies the draining shard's `__cf_indexes` entries to the deterministic substitute, repoints `placement_ring_json` cluster-wide, then deletes the source copies. The originally-shipped version had a residual: a `index_pending_jobs` retry enqueued before the repoint carried a *fixed* target shard id and did not re-resolve the ring, so a retry firing after the reconcile loop's final pass could write an entry to the draining shard that the delete then removed — the base row survived but its index entry was lost.
+
+**Resolution (Milestone 3, index-ring write fence):** built the cross-cutting fix this item originally deferred as out-of-proportion — a per-index write fence (`__cf_fenced_index_rings` on `ShardDO`) rejects any write to `__cf_indexes` for an index mid-evacuation, and every writer (the `/v1/mutate` async writer, the `index_pending_jobs` retry, `/v1/tx`'s 2PC-prepared synthetic index intents, and `/admin/create-index` backfill) re-resolves the index's current ring and redirects to the substitute on a fence rejection instead of writing the stale target. A replicated read-shadow keeps `/v1/index-query` correct during the evacuation window. Also closed: two concurrent-topology-operation races that motivated a further cluster-wide topology-operation lock (serializing drain/split/migrate/create-index/drop-index) — see `CHANGELOG.md`'s 2.0.0.0 entry for the full design.
+
+**Completed:** Milestone 3 (2026-07-14)
+
+### Evaluate deprecating raw `/v1/sql` mutations in favor of the structured DSL
+
+**What:** Decide whether raw-SQL and the structured DSL (`/v1/mutate`, `/v1/tx`) coexist long-term, or whether raw SQL should be deprecated/admin-only.
+
+**Why:** Two first-class write paths with different row-ownership guarantees (raw SQL: trust-based; structured: enforced) is a non-auditable correctness story and a security footgun — a caller could always fall back to the weaker path — and raw `/v1/sql` mutations also bypass every index-maintenance mechanism.
+
+**Resolution (Milestone 3 — went further than "mutations"):** raw `/v1/sql` is now **fully admin-only — reads AND writes**, not just mutations. The per-tenant write guard against a passthrough SQL string proved structurally unwinnable (six leaked bypasses), and there is no safe tenant `SELECT` while base rows carry no physical `tenant_id` (a partition-scoped raw read could return another tenant's rows in the same vbucket). The trust-based tenant path was removed entirely: tenants write via `/v1/mutate` + `/v1/tx` and read via `/v1/index-query`; `/v1/sql` requires `ADMIN_TOKEN` (operator/debugging), with a residual guardrail blocking operator writes to internal bookkeeping tables. The follow-on "Structured tenant read API + physical `tenant_id`" item (Architecture) tracks the replacement read path.
+
+**Completed:** Milestone 3 (2026-07-12)
+
+### Index-entry topology: physical source_shard_id vs. logical identity + read-time routing
+
+**What:** Decide whether `__cf_indexes` entries store the physical `source_shard_id` they were written on (the Milestone 2 design), or store logical identity and resolve the owning shard at read time instead.
+
+**Why:** Storing `source_shard_id` bakes topology into the data — every split, drain, or backfill has to rewrite index entries just because placement changed. Flagged by an independent Codex outside-voice pass during Milestone 2's `/plan-eng-review`; the post-implementation eng-review confirmed the concrete failure (index placement hashing over the *live* active shard set orphans entries on any shard-count change), which Milestone 2 mitigated by 409-blocking both topology operations while any index existed.
+
+**Resolution (Milestone 3, Chunk 2 — logical identity won, plus a pinning the question didn't originally include):** `__cf_indexes` entries now carry `tenant_id`, and `/v1/index-query` hydration re-routes per entry at read time (`hash(tenant_id:table:partition_key)` → `vbucket_map` → current shard) — moved base rows are always found, and no topology change ever rewrites entries for placement's sake. Index-shard *placement* is additionally pinned per index (`index_rules.placement_ring_json`, captured at `/admin/create-index`), so the live shard set never re-hashes existing entries; a drained ring member is substituted deterministically with its entries copied (Chunk 5). Both former 409 blocks (`SPLIT_BLOCKED_BY_INDEXES`, `SHARD_DRAIN_BLOCKED_BY_INDEXES`) are removed. The accepted cost is the predicted one: one extra routing hop per hydrated match on `/v1/index-query`.
+
+**Completed:** Milestone 3 (2026-07-10)
+
+### Choose an OSS license
+
+**What:** Pick and add a LICENSE file (MIT/Apache-2.0/etc.) now that the distribution model is resolved to self-hosted/OSS-first.
+
+**Why:** A public self-hosted template without a stated license leaves adopters unsure what they're allowed to do with the code.
+
+**Resolution:** Apache-2.0, added at the repo root in Milestone 3's docs chunk — the explicit patent grant suits infrastructure software that adopters embed in their own deployments.
+
+**Completed:** Milestone 3 (2026-07-10)
 
 ### Distribution/positioning decision
 

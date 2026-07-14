@@ -5,7 +5,20 @@ import { sha256Hex } from "./auth";
 
 type BeginParticipant = {
   shardId: string;
-  intents: Array<{ sql: string; params: unknown[]; tenantId: string; table: string; partitionKey: string }>;
+  intents: Array<{
+    sql: string;
+    params: unknown[];
+    tenantId: string;
+    table: string;
+    partitionKey: string;
+    /** Milestone 3, Chunk 3: present when this intent's vbucket is
+     * mid-migration — the coordinator mirrors the committed intent to this
+     * target shard post-commit, enqueuing on the source shard's
+     * __cf_mirror_pending on failure. Never present on a synthetic
+     * __cf_indexes-maintenance intent. */
+    mirrorTargetShardId?: string;
+    vbucket?: number;
+  }>;
 };
 
 type BeginPayload = {

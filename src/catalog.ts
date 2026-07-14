@@ -1,9 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
-import { hashKey } from "./hash";
+import { hashKey, pickRingSubstitute } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
+import { MIGRATE_PAGE_SIZE } from "./shard";
+import { ensureCreateTableIfNotExists } from "./sql-safety";
 import { IDENTIFIER_RE, UNSET_PARTITION_KEY_COLUMN } from "./structured-op";
+
+// Review Tier 1 #6: how many reconcile passes ring evacuation makes to catch
+// entries that raced onto the draining shard after the ring repoint before
+// giving up (leaving them in place, unreachable-but-not-lost).
+const RING_EVAC_RECONCILE_MAX_PASSES = 10;
 
 const ADMIN_GATED_ROUTES = new Set([
   "/status",
@@ -20,16 +27,71 @@ const ADMIN_GATED_ROUTES = new Set([
   "/list-indexes",
   "/drop-index",
   "/mark-index-ready",
+  "/list-tenants",
+  "/vbucket-map",
+  "/migrate-vbucket",
+  "/migrate-vbucket-status",
+  "/migrate-vbucket-abort",
+  "/drain-shard-status",
 ]);
+
+// Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
+// loop — each tick advances every in-flight migration one step (a bounded
+// backfill slice, or one cutover attempt that may be waiting on the mirror
+// queue to drain).
+const MIGRATION_TICK_MS = 250;
+// Topology-operation lock lease. Comfortably larger than one alarm tick
+// (MIGRATION_TICK_MS) so a long operation heartbeating each tick never lets its
+// own lease lapse, while a crashed operation's lock still auto-expires quickly
+// enough that the cluster isn't wedged.
+const TOPOLOGY_LOCK_TTL_MS = 30_000;
+// Review Tier 2 #8: cap the backfill work per tick and back off the alarm
+// re-arm when a tick throws, so a large migration resumes from its cursor
+// rather than restarting-and-throwing at 4Hz forever.
+const MIGRATION_BACKFILL_PAGES_PER_TICK = 8;
+const MIGRATION_TICK_MAX_MS = 30000;
+// Re-review: bound the cutover wait for the source's prepared 2PC intents to
+// drain. A tx prepared-but-never-resolved (coordinator wedged on an
+// unreachable participant, so the sweep sees it 'prepared' forever) would
+// otherwise block this vbucket's cutover indefinitely with no operator
+// signal. After this long, the migration surfaces a distinct
+// 'cutover-blocked-on-prepared-intents' status via /migrate-vbucket-status
+// (naming the txId) so an operator can /admin/tx-force-abort it. The tick
+// keeps polling rather than aborting — a genuinely slow-but-live tx still
+// completes on its own and clears the marker.
+const CUTOVER_PREPARED_WAIT_MAX_MS = 30000;
+
+type MigrationRow = {
+  vbucket: number;
+  shard_id: string;
+  target_shard_id: string | null;
+  migration_status: string;
+  migration_rows_copied: number;
+  topology_lock_operation_id?: string | null;
+};
 
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly adminToken?: string;
+  private readonly catalogEnv: Cloudflare.Env;
   private readonly routes: Record<string, (request: Request) => Promise<Response>>;
+  /** See ShardDO.schemaEnsured — one schema pass per in-memory instance. */
+  private schemaEnsured = false;
+  /** Milestone 3, Chunk 4: DO handlers interleave at await points, so a
+   * scheduled alarm() and any other concurrent invocation could both run
+   * advanceMigration against the same vbucket on stale row snapshots —
+   * worst case, a stale cutover tick observing post-flip state "detects" a
+   * checksum mismatch and wipes just-migrated data. One tick at a time per
+   * instance; a tick that finds the latch held just reschedules. */
+  private migrationTickInFlight = false;
+  /** Review Tier 2 #8: consecutive throwing orchestration ticks, for the
+   * alarm re-arm backoff. Reset on a clean tick or when nothing's active. */
+  private migrationTickFailureStreak = 0;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.catalogEnv = env;
     this.adminToken =
       typeof (env as { ADMIN_TOKEN?: unknown }).ADMIN_TOKEN === "string"
         ? (env as { ADMIN_TOKEN: string }).ADMIN_TOKEN
@@ -38,6 +100,7 @@ export class CatalogDO extends DurableObject {
       "/init": this.handleInit.bind(this),
       "/register-table": this.handleRegisterTable.bind(this),
       "/route": this.handleRoute.bind(this),
+      "/route-batch": this.handleRouteBatch.bind(this),
       "/list-shards": this.handleListShards.bind(this),
       "/status": this.handleStatus.bind(this),
       "/list-tables": this.handleListTables.bind(this),
@@ -52,7 +115,36 @@ export class CatalogDO extends DurableObject {
       "/lookup-index": this.handleLookupIndex.bind(this),
       "/drop-index": this.handleDropIndex.bind(this),
       "/mark-index-ready": this.handleMarkIndexReady.bind(this),
+      "/list-tenants": this.handleListTenants.bind(this),
+      "/vbucket-map": this.handleVbucketMap.bind(this),
+      "/migrate-vbucket": this.handleMigrateVbucket.bind(this),
+      "/migrate-vbucket-status": this.handleMigrateVbucketStatus.bind(this),
+      "/migrate-vbucket-abort": this.handleMigrateVbucketAbort.bind(this),
+      "/drain-shard-status": this.handleDrainShardStatus.bind(this),
+      "/update-index-ring": this.handleUpdateIndexRing.bind(this),
+      "/index-ring": this.handleIndexRing.bind(this),
+      "/acquire-topology-lock": this.handleAcquireTopologyLock.bind(this),
+      "/heartbeat-topology-lock": this.handleHeartbeatTopologyLock.bind(this),
+      "/release-topology-lock": this.handleReleaseTopologyLock.bind(this),
+      "/topology-lock-status": this.handleTopologyLockStatus.bind(this),
+      "/holds-topology-lock": this.handleHoldsTopologyLock.bind(this),
     };
+  }
+
+  /** Milestone 3, Chunk 4: CatalogDO drives ShardDO's internal migration
+   * endpoints directly (export/import/fence/checksum) — a deliberate,
+   * spec'd exception to the earlier "CatalogDO and ShardDO never call each
+   * other" convention: the catalog owns the migration state machine (it
+   * already owns vbucket_map), and orchestration from a stateless Worker
+   * request would die with the request. */
+  private async callShard(shardId: string, path: string, payload: unknown): Promise<Response> {
+    const id = this.catalogEnv.SHARD.idFromName(shardId);
+    const stub = this.catalogEnv.SHARD.get(id);
+    return stub.fetch(`https://shard.internal${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   }
 
   /** Add a column if a table predating it doesn't have it yet — CREATE TABLE IF
@@ -66,6 +158,8 @@ export class CatalogDO extends DurableObject {
   }
 
   private ensureSchema(): void {
+    if (this.schemaEnsured) return;
+    this.schemaEnsured = true;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS cluster_config (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -84,6 +178,18 @@ export class CatalogDO extends DurableObject {
         created_at TEXT NOT NULL
       )
     `);
+    // Review Tier 2 #10: when a drain's vbucket migration is blocked by the
+    // provenance gate, the drain parks here rather than re-scanning every
+    // table on the source at the 250ms tick cadence forever. Cleared when the
+    // operator re-invokes /admin/drain-shard (after /admin/backfill-provenance).
+    this.ensureColumn("shards", "drain_stall_reason", "TEXT");
+    // Approved design (Stage 3): the topology-lock operationId a drain of this
+    // shard is holding for its ENTIRE multi-tick duration (heartbeated each
+    // tick by advanceDrain, released only on full completion). NULL for a
+    // drain never mediated by the Worker's /admin/drain-shard (e.g. tests that
+    // call this DO's /drain-shard directly) — those keep behaving exactly as
+    // before Stage 3 (no lock tracking).
+    this.ensureColumn("shards", "topology_lock_operation_id", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS vbucket_map (
@@ -93,6 +199,60 @@ export class CatalogDO extends DurableObject {
         updated_at TEXT NOT NULL
       )
     `);
+    // Milestone 3, Chunk 3: per-vbucket migration state machine
+    // (none|backfilling|cutover) plus the migration's target shard. While
+    // status != 'none', /route returns {targetShardId, migrationStatus}
+    // alongside the authoritative source shardId, and the gateway mirrors
+    // every write to the target after source success (same requestId — the
+    // target's applied_requests dedupe makes mirror + backfill + retry all
+    // safely re-appliable in any order). Reads stay on source until Chunk
+    // 4's cutover flips shard_id.
+    this.ensureColumn("vbucket_map", "migration_status", "TEXT NOT NULL DEFAULT 'none'");
+    this.ensureColumn("vbucket_map", "target_shard_id", "TEXT");
+    // Chunk 4's status endpoint reports rowsCopied/startedAt; kept on the
+    // same row rather than a separate migrations table — one migration per
+    // vbucket at a time is an invariant (409 MIGRATION_IN_PROGRESS).
+    this.ensureColumn("vbucket_map", "migration_rows_copied", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("vbucket_map", "migration_started_at", "TEXT");
+    // Review Tier 2 #8: a persisted backfill cursor (current table + last
+    // partition key copied) so a large vbucket's backfill resumes across
+    // alarm ticks instead of restarting from page zero and re-exceeding the
+    // per-invocation subrequest cap every 250ms forever.
+    this.ensureColumn("vbucket_map", "backfill_table", "TEXT");
+    this.ensureColumn("vbucket_map", "backfill_after_pk", "TEXT");
+    // Re-review: cutover-entry timestamp and a stall marker, so the
+    // prepared-2PC-intent cutover wait can be bounded and surfaced via
+    // /migrate-vbucket-status instead of livelocking silently.
+    this.ensureColumn("vbucket_map", "cutover_started_at", "TEXT");
+    this.ensureColumn("vbucket_map", "cutover_stall_reason", "TEXT");
+    // Codex review P1 (correctness): set only when a migration's target shard
+    // is FRESHLY created (a split target that never received the create-table
+    // fan-out). Its first backfill tick then provisions every registered
+    // table's schema on it — including tables with zero rows in this vbucket,
+    // which the row-export path alone would skip. A drain to an existing shard
+    // (which already has every table) leaves this 0, so the backfill does NOT
+    // re-issue a provision call per registered table per vbucket (that would
+    // be O(tables x vbuckets) subrequests and swamp a single alarm tick).
+    this.ensureColumn("vbucket_map", "provision_pending", "INTEGER NOT NULL DEFAULT 0");
+    // Codex full-PR review P2: post-flip source cleanup (delete rows + unfence)
+    // must be RETRYABLE. Set atomically with the map flip (status back to
+    // 'none'); the alarm processes cleanup_pending=1 rows independently of
+    // migration_status and clears the flag only once BOTH shard calls succeed,
+    // so a failed unfence/delete can't leave the source permanently
+    // stale-fenced or with undeleted rows while status reports 'complete'.
+    // cleanup_source_shard_id remembers the old source (the flip nulls
+    // target_shard_id and moves shard_id to the target).
+    this.ensureColumn("vbucket_map", "cleanup_pending", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("vbucket_map", "cleanup_source_shard_id", "TEXT");
+    // Approved design (Stage 3): the topology-lock operationId this migration
+    // is holding from /admin/migrate-vbucket's (or /admin/split-vbucket's, or
+    // a drain's phase-1 sub-migration's) START all the way through cutover AND
+    // post-flip cleanup — heartbeated each tick, released only once cleanup
+    // fully completes (or on /admin/migrate-vbucket-abort). NULL for a
+    // migration never mediated by the Worker (e.g. tests that call this DO's
+    // /migrate-vbucket or /split-vbucket directly) — those keep behaving
+    // exactly as before Stage 3 (no lock tracking).
+    this.ensureColumn("vbucket_map", "topology_lock_operation_id", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS table_rules (
@@ -105,6 +265,13 @@ export class CatalogDO extends DurableObject {
     // rows need a non-NULL default to backfill against — a bare NOT NULL with
     // no default fails immediately on ALTER TABLE against a table with rows.
     this.ensureColumn("table_rules", "partition_key_column", `TEXT NOT NULL DEFAULT '${UNSET_PARTITION_KEY_COLUMN}'`);
+    // Milestone 3, Chunk 5: the table's CREATE TABLE statement, captured at
+    // /admin/create-table — a shard created mid-life (split target) has none
+    // of the tables that were fanned out at create-table time, so migration
+    // backfill applies this to the target before importing. Nullable: a
+    // table registered before this column existed simply can't be
+    // auto-provisioned on new shards (operator applies schema manually).
+    this.ensureColumn("table_rules", "schema_sql", "TEXT");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -147,6 +314,64 @@ export class CatalogDO extends DurableObject {
         columns_json TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'building',
         created_at TEXT NOT NULL
+      )
+    `);
+    // Milestone 3, Chunk 2: the ordered shard-id array active at the moment
+    // this index was created (/admin/create-index), pinned for the index's
+    // entire lifetime — indexShardIdForKey (hash.ts) hashes over THIS array,
+    // never the live/current active shard set, so /admin/split-vbucket
+    // (grows the active set) and /admin/drain-shard (shrinks it, modulo
+    // Chunk 5's ring-evacuation rule) can't silently orphan existing
+    // __cf_indexes entries by changing the modulo out from under them.
+    // Default '[]' only matters for a row that predates this column (would
+    // need one of the old blockIfIndexesExist-era indexes recreated via the
+    // documented drop-index/create-index upgrade flow anyway).
+    this.ensureColumn("index_rules", "placement_ring_json", "TEXT NOT NULL DEFAULT '[]'");
+    // Codex round-14 P2 (read-visibility during evacuation): the draining
+    // shard(s) whose ring position is mid-evacuation for this index. Set
+    // ATOMICALLY with placement_ring_json by /update-index-ring, so wherever the
+    // ring is repointed to the substitute this shadow marks the old shard whose
+    // not-yet-copied entries must ALSO be read. /v1/index-query dual-looks-up
+    // both while it is non-empty; cleared on evacuation completion. Replicated
+    // to every catalog shard (via the same fan-out) so /lookup-index — which the
+    // gateway routes to the TENANT's catalog, not necessarily the draining one —
+    // can always answer it.
+    this.ensureColumn("index_rules", "evac_from_shards_json", "TEXT NOT NULL DEFAULT '[]'");
+
+    // Codex round-13 fix: per-(draining shard, index) ring-evacuation progress.
+    // A row means "index_name's ring is being evacuated off shard_id onto
+    // substitute; not yet complete." Ring evacuation now FENCES the index on the
+    // draining shard and repoints EARLY (the fence stops new writes to that
+    // shard), so the ring no longer contains the draining shard while evacuation
+    // is still in flight — ringsToEvacuate (ring membership) can no longer be
+    // the source of truth for "revisit this index next tick". This marker is:
+    // advanceDrain revisits every marker for the shard until it deletes the row
+    // on completion. Survives ticks; drives /drain-shard-status too.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS drain_ring_evac (
+        shard_id   TEXT NOT NULL,
+        index_name TEXT NOT NULL,
+        substitute TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (shard_id, index_name)
+      )
+    `);
+
+    // Durable cluster-wide TOPOLOGY-OPERATION LOCK (approved design). A single
+    // row, held on catalog-0 (the canonical cluster-wide catalog — index_rules
+    // replication and ring re-resolution already treat it as authoritative),
+    // serializes every topology mutation (split, migrate, create/drop index,
+    // drain) so concurrent operations can't corrupt shared ring/shadow/map
+    // state. Lease-based with a TTL refreshed by heartbeat, so a crashed
+    // operation's lock auto-expires instead of blocking forever.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS topology_lock (
+        singleton      INTEGER PRIMARY KEY CHECK (singleton = 1),
+        operation_id   TEXT NOT NULL,
+        operation_type TEXT NOT NULL,
+        acquired_at    TEXT NOT NULL,
+        expires_at     TEXT NOT NULL,
+        heartbeat_at   TEXT NOT NULL
       )
     `);
   }
@@ -319,6 +544,7 @@ export class CatalogDO extends DurableObject {
       table: string;
       partitioning?: string;
       partitionKeyColumn?: string;
+      schemaSql?: string;
     };
 
     if (!body.table) {
@@ -345,13 +571,14 @@ export class CatalogDO extends DurableObject {
 
     this.sql.exec(
       `
-      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at)
-      VALUES (?, ?, ?, ?)
+      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql)
+      VALUES (?, ?, ?, ?, ?)
       `,
       body.table,
       body.partitioning ?? "hash",
       body.partitionKeyColumn,
       new Date().toISOString(),
+      body.schemaSql ?? null,
     );
 
     const version = this.bumpMetadataVersion();
@@ -401,7 +628,7 @@ export class CatalogDO extends DurableObject {
    * /admin/create-table applies the shard-level schema before registering
    * in table_rules (src/index.ts's handleAdminCreateTable). */
   private async handleCreateIndex(request: Request): Promise<Response> {
-    const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
+    const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[]; placementRing?: string[] };
     if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
       return json(
         {
@@ -458,13 +685,14 @@ export class CatalogDO extends DurableObject {
       );
     }
 
-    this.audit("/create-index", { indexName: body.indexName, table: body.table, columns: body.columns });
+    this.audit("/create-index", { indexName: body.indexName, table: body.table, columns: body.columns, placementRing: body.placementRing });
     this.sql.exec(
-      "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at) VALUES (?, ?, ?, 'building', ?)",
+      "INSERT INTO index_rules (index_name, table_name, columns_json, status, created_at, placement_ring_json) VALUES (?, ?, ?, 'building', ?, ?)",
       body.indexName,
       body.table,
       JSON.stringify(body.columns),
       new Date().toISOString(),
+      JSON.stringify(body.placementRing ?? []),
     );
 
     return json({ ok: true, indexName: body.indexName, table: body.table, columns: body.columns });
@@ -524,9 +752,155 @@ export class CatalogDO extends DurableObject {
     return json({ ok: true, indexName: body.indexName });
   }
 
+  /** Codex round-13 fix (internal, DO-binding only, un-gated like /list-shards):
+   * returns one index's CURRENT pinned placement ring. Used to RE-RESOLVE an
+   * index write's target after an INDEX_RING_FENCED rejection — the gateway's
+   * best-effort index write and a base shard's index_pending_jobs retry both
+   * fetch the live ring here (index_rules is replicated identically to every
+   * catalog shard, so any shard — canonically catalog-0 — can answer) and
+   * recompute placement onto the substitute. Returns an empty ring for an
+   * unknown index rather than erroring, so a caller can fall back safely. */
+  private async handleIndexRing(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: "Missing indexName" }, 400);
+    }
+    const row = this.one<{ placement_ring_json: string }>(
+      "SELECT placement_ring_json FROM index_rules WHERE index_name = ?",
+      body.indexName,
+    );
+    return json({ indexName: body.indexName, ring: row ? (JSON.parse(row.placement_ring_json) as string[]) : [] });
+  }
+
+  // ─── Topology-operation lock (held on catalog-0) ───────────────────────────
+
+  private topologyLockRow(): { operation_id: string; operation_type: string; acquired_at: string; expires_at: string; heartbeat_at: string } | null {
+    return this.one("SELECT operation_id, operation_type, acquired_at, expires_at, heartbeat_at FROM topology_lock WHERE singleton = 1");
+  }
+
+  private topologyLockExpired(row: { expires_at: string }, nowMs: number): boolean {
+    return nowMs > new Date(row.expires_at).getTime();
+  }
+
+  /** CAS acquire: take the lock if none held or the current one has expired.
+   * Returns {ok, operationId} or 409 TOPOLOGY_OPERATION_IN_PROGRESS. */
+  private async handleAcquireTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationType?: string };
+    if (!body.operationType) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationType." } }, 400);
+    }
+    const now = Date.now();
+    const existing = this.topologyLockRow();
+    if (existing && !this.topologyLockExpired(existing, now)) {
+      return json(
+        {
+          error: {
+            code: "TOPOLOGY_OPERATION_IN_PROGRESS",
+            operationType: existing.operation_type,
+            operationId: existing.operation_id,
+            message: `A topology operation (${existing.operation_type}) is already in progress.`,
+            fix: "Retry after the in-progress operation completes, or /admin/force-release-topology-lock if it is stuck.",
+          },
+        },
+        409,
+      );
+    }
+    const operationId = crypto.randomUUID();
+    const nowIso = new Date(now).toISOString();
+    const expiresIso = new Date(now + TOPOLOGY_LOCK_TTL_MS).toISOString();
+    this.sql.exec(
+      `INSERT OR REPLACE INTO topology_lock (singleton, operation_id, operation_type, acquired_at, expires_at, heartbeat_at)
+       VALUES (1, ?, ?, ?, ?, ?)`,
+      operationId,
+      body.operationType,
+      nowIso,
+      expiresIso,
+      nowIso,
+    );
+    this.audit("/acquire-topology-lock", { operationType: body.operationType, operationId });
+    return json({ ok: true, operationId, operationType: body.operationType, expiresAt: expiresIso });
+  }
+
+  /** Refresh the lease iff this operationId still holds the (non-expired) lock;
+   * else 409 LOCK_LOST — the operation must stop mutating. */
+  private async handleHeartbeatTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationId?: string };
+    if (!body.operationId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
+    }
+    const now = Date.now();
+    const existing = this.topologyLockRow();
+    if (!existing || existing.operation_id !== body.operationId || this.topologyLockExpired(existing, now)) {
+      return json(
+        { error: { code: "LOCK_LOST", message: "This operation no longer holds the topology lock (released, force-released, or expired).", fix: "Stop the operation; it must not keep mutating topology." } },
+        409,
+      );
+    }
+    const expiresIso = new Date(now + TOPOLOGY_LOCK_TTL_MS).toISOString();
+    this.sql.exec(
+      "UPDATE topology_lock SET heartbeat_at = ?, expires_at = ? WHERE singleton = 1 AND operation_id = ?",
+      new Date(now).toISOString(),
+      expiresIso,
+      body.operationId,
+    );
+    return json({ ok: true, operationId: body.operationId, expiresAt: expiresIso });
+  }
+
+  /** Release iff this operationId holds it. Idempotent no-op otherwise (a
+   * stale releaser must never drop a lock a newer operation now holds). */
+  private async handleReleaseTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationId?: string };
+    if (!body.operationId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
+    }
+    const existing = this.topologyLockRow();
+    const held = existing?.operation_id === body.operationId;
+    if (held) {
+      this.sql.exec("DELETE FROM topology_lock WHERE singleton = 1 AND operation_id = ?", body.operationId);
+      this.audit("/release-topology-lock", { operationId: body.operationId });
+    }
+    return json({ ok: true, released: held });
+  }
+
+  /** Current holder (or none) + whether it is expired. */
+  private async handleTopologyLockStatus(): Promise<Response> {
+    const existing = this.topologyLockRow();
+    if (!existing) {
+      return json({ held: false });
+    }
+    return json({
+      held: true,
+      operationId: existing.operation_id,
+      operationType: existing.operation_type,
+      acquiredAt: existing.acquired_at,
+      heartbeatAt: existing.heartbeat_at,
+      expiresAt: existing.expires_at,
+      expired: this.topologyLockExpired(existing, Date.now()),
+    });
+  }
+
+  /** True iff this operationId still holds the non-expired lock — the
+   * pre-destructive-step gate. */
+  private async handleHoldsTopologyLock(request: Request): Promise<Response> {
+    const body = (await request.json()) as { operationId?: string };
+    if (!body.operationId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
+    }
+    const existing = this.topologyLockRow();
+    const holds = !!existing && existing.operation_id === body.operationId && !this.topologyLockExpired(existing, Date.now());
+    return json({ holds });
+  }
+
   private async handleListIndexes(): Promise<Response> {
-    const indexes = this.many<{ index_name: string; table_name: string; columns_json: string; status: string; created_at: string }>(
-      "SELECT index_name, table_name, columns_json, status, created_at FROM index_rules ORDER BY index_name ASC",
+    const indexes = this.many<{
+      index_name: string;
+      table_name: string;
+      columns_json: string;
+      status: string;
+      created_at: string;
+      placement_ring_json: string;
+    }>(
+      "SELECT index_name, table_name, columns_json, status, created_at, placement_ring_json FROM index_rules ORDER BY index_name ASC",
     );
     return json({
       indexes: indexes.map((i) => ({
@@ -535,6 +909,7 @@ export class CatalogDO extends DurableObject {
         columns: JSON.parse(i.columns_json) as string[],
         status: i.status,
         createdAt: i.created_at,
+        placementRing: JSON.parse(i.placement_ring_json) as string[],
       })),
     });
   }
@@ -552,9 +927,9 @@ export class CatalogDO extends DurableObject {
     const authError = await this.checkTenantAuth(body.tenantId, request);
     if (authError) return authError;
 
-    const index = this.one<{ columns_json: string; partition_key_column: string; status: string }>(
+    const index = this.one<{ columns_json: string; partition_key_column: string; status: string; placement_ring_json: string; evac_from_shards_json: string }>(
       `
-      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status
+      SELECT ir.columns_json AS columns_json, tr.partition_key_column AS partition_key_column, ir.status AS status, ir.placement_ring_json AS placement_ring_json, ir.evac_from_shards_json AS evac_from_shards_json
       FROM index_rules ir
       JOIN table_rules tr ON tr.table_name = ir.table_name
       WHERE ir.index_name = ? AND ir.table_name = ?
@@ -580,7 +955,15 @@ export class CatalogDO extends DurableObject {
         425,
       );
     }
-    return json({ columns: JSON.parse(index.columns_json) as string[], partitionKeyColumn: index.partition_key_column });
+    return json({
+      columns: JSON.parse(index.columns_json) as string[],
+      partitionKeyColumn: index.partition_key_column,
+      ring: JSON.parse(index.placement_ring_json) as string[],
+      // Codex round-14 P2: draining shard(s) whose entries for this index are
+      // mid-evacuation (repointed ring, not-yet-copied) — /v1/index-query
+      // dual-looks-up these alongside the current ring shard.
+      evacFromShards: JSON.parse(index.evac_from_shards_json ?? "[]") as string[],
+    });
   }
 
   /** Data-plane tenant auth check: does the caller's bearer token match the
@@ -601,6 +984,14 @@ export class CatalogDO extends DurableObject {
         },
         401,
       );
+    }
+    // Admin bypass: the operator (ADMIN_TOKEN) may /route as ANY tenant — used
+    // by the now-admin-only /v1/sql path (which still passes body.tenantId for
+    // routing/hashing but is authenticated as the operator, not the tenant).
+    // Harmless for the tenant-facing endpoints (admin is a superuser) and does
+    // not weaken tenant auth: a tenant token must still match its own hash.
+    if (this.adminToken && timingSafeEqual(token, this.adminToken)) {
+      return null;
     }
 
     const row = this.one<{ token_hash: string; revoked_at: string | null }>(
@@ -765,13 +1156,17 @@ export class CatalogDO extends DurableObject {
       partition_key_column: string | null;
       shard_id: string;
       status: string;
+      migration_status: string;
+      target_shard_id: string | null;
     }>(
       `
       SELECT
         (SELECT table_name FROM table_rules WHERE table_name = ?) AS table_registered,
         (SELECT partition_key_column FROM table_rules WHERE table_name = ?) AS partition_key_column,
         vm.shard_id AS shard_id,
-        s.status AS status
+        s.status AS status,
+        vm.migration_status AS migration_status,
+        vm.target_shard_id AS target_shard_id
       FROM vbucket_map vm
       JOIN shards s ON s.shard_id = vm.shard_id
       WHERE vm.vbucket = ?
@@ -802,11 +1197,15 @@ export class CatalogDO extends DurableObject {
     // check this itself — see the Milestone 2 eng review's correction), and
     // lets /v1/mutate's async index maintenance (Chunk 2) know which columns
     // each registered index actually covers.
-    const indexRows = this.many<{ index_name: string; columns_json: string }>(
-      "SELECT index_name, columns_json FROM index_rules WHERE table_name = ?",
+    const indexRows = this.many<{ index_name: string; columns_json: string; placement_ring_json: string }>(
+      "SELECT index_name, columns_json, placement_ring_json FROM index_rules WHERE table_name = ?",
       body.table,
     );
-    const indexes = indexRows.map((r) => ({ indexName: r.index_name, columns: JSON.parse(r.columns_json) as string[] }));
+    const indexes = indexRows.map((r) => ({
+      indexName: r.index_name,
+      columns: JSON.parse(r.columns_json) as string[],
+      ring: JSON.parse(r.placement_ring_json) as string[],
+    }));
 
     return json({
       shardId: mapped.shard_id,
@@ -816,14 +1215,97 @@ export class CatalogDO extends DurableObject {
       partitionKeyColumn: mapped.partition_key_column,
       indexNames: indexes.map((i) => i.indexName),
       indexes,
+      // Milestone 3, Chunk 3: while this vbucket is migrating, the gateway
+      // applies every write to the source (shardId above — still
+      // authoritative) and then mirrors it to targetShardId with the same
+      // requestId. 'none' status omits both fields, keeping the pre-M3
+      // response shape byte-identical for non-migrating vbuckets.
+      ...(mapped.migration_status !== "none" && mapped.target_shard_id
+        ? { migrationStatus: mapped.migration_status, targetShardId: mapped.target_shard_id }
+        : {}),
     });
   }
 
-  private async handleListShards(): Promise<Response> {
+  /** Review Tier 2 #12: resolve MANY (tenant, table, partitionKey) tuples to
+   * their current shards in ONE tenant-authenticated call — /v1/index-query
+   * hydration used to make one /route subrequest per matched entry (up to
+   * 100+ per query, all serialized through this one CatalogDO). Auth is
+   * checked once for the whole batch (all tuples share the caller's tenant).
+   * Only the shard mapping is returned (no per-tuple index/metadata payload),
+   * since the caller already resolved the index. */
+  private async handleRouteBatch(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string; tenantId?: string; partitionKeys?: string[] };
+    if (!body.table || !body.tenantId || !body.partitionKeys) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing table, tenantId, or partitionKeys." } }, 400);
+    }
+    const authError = await this.checkTenantAuth(body.tenantId, request);
+    if (authError) return authError;
+
+    const config = this.one<{ total_vbuckets: number }>("SELECT total_vbuckets FROM cluster_config WHERE singleton = 1");
+    if (!config) {
+      return json({ error: "Cluster not initialized. Call /admin/init first." }, 400);
+    }
+    const vbucketToShard = new Map(
+      this.many<{ vbucket: number; shard_id: string }>("SELECT vbucket, shard_id FROM vbucket_map").map((r) => [r.vbucket, r.shard_id]),
+    );
+    const routes = body.partitionKeys.map((pk) => {
+      const vbucket = hashKey(`${body.tenantId}:${body.table}:${pk}`) % config.total_vbuckets;
+      return { partitionKey: pk, shardId: vbucketToShard.get(vbucket) ?? null };
+    });
+    return json({ routes });
+  }
+
+  /** Default: ACTIVE shards only — the placement-ring / substitution pool. A
+   * draining shard must never be pinned into a new ring or chosen as a
+   * substitute target, so ring-building callers (clusterActiveShards, the
+   * create-index placement ring) rely on this default and pass no body.
+   *
+   * With `{ includeDraining: true }`: also returns DRAINING shards — a
+   * draining shard still physically holds its base rows until its vbuckets
+   * finish migrating, so any operation that must SEE every existing row
+   * (backfill-provenance's re-attribution scan, create-index's backfill scan)
+   * needs it. This is purely about seeing a draining shard's DATA; it does not
+   * make the shard a candidate for placement. */
+  private async handleListShards(request: Request): Promise<Response> {
+    let includeDraining = false;
+    try {
+      const body = (await request.json()) as { includeDraining?: boolean };
+      includeDraining = body?.includeDraining === true;
+    } catch {
+      // No/blank body — default to active-only.
+    }
+    const statuses = includeDraining ? ["active", "draining"] : ["active"];
+    const placeholders = statuses.map(() => "?").join(", ");
     const shards = this.many<{ shard_id: string }>(
-      "SELECT shard_id FROM shards WHERE status = 'active' ORDER BY shard_id ASC",
+      `SELECT shard_id FROM shards WHERE status IN (${placeholders}) ORDER BY shard_id ASC`,
+      ...statuses,
     );
     return json({ shardIds: shards.map((s) => s.shard_id) });
+  }
+
+  /** Milestone 3, Chunk 1: candidate tenant identities for this catalog
+   * shard's row-provenance re-attribution — /admin/backfill-provenance tries
+   * every one of these against every unattributed row's hash to find which
+   * tenant(s) could have written it. Returns tenantId only, never
+   * token_hash — this route exists purely to enumerate identities, not to
+   * authenticate anything. */
+  private async handleListTenants(): Promise<Response> {
+    const tenants = this.many<{ tenant_id: string }>("SELECT tenant_id FROM tenant_auth ORDER BY tenant_id ASC");
+    return json({ tenantIds: tenants.map((t) => t.tenant_id) });
+  }
+
+  /** Milestone 3, Chunk 1: the full vbucket -> shard_id map for this catalog
+   * shard, plus total_vbuckets — /admin/backfill-provenance and
+   * /admin/set-row-owner fetch this once per catalog shard (rather than one
+   * round trip per candidate tenant per row) to test "does this candidate
+   * tenant's hash land on this specific shard" locally. */
+  private async handleVbucketMap(): Promise<Response> {
+    const config = this.one<{ total_vbuckets: number }>("SELECT total_vbuckets FROM cluster_config WHERE singleton = 1");
+    if (!config) {
+      return json({ error: "Cluster not initialized. Call /admin/init first." }, 400);
+    }
+    const rows = this.many<{ vbucket: number; shard_id: string }>("SELECT vbucket, shard_id FROM vbucket_map ORDER BY vbucket ASC");
+    return json({ totalVBuckets: config.total_vbuckets, map: rows.map((r) => ({ vbucket: r.vbucket, shardId: r.shard_id })) });
   }
 
   private async handleStatus(): Promise<Response> {
@@ -876,8 +1358,19 @@ export class CatalogDO extends DurableObject {
     });
   }
 
+  /** Milestone 3, Chunk 5 (drain v2): marking a shard draining now also
+   * kicks off full evacuation — every vbucket mapped to it is migrated off
+   * sequentially via Chunk 4's primitive, then any index whose pinned
+   * placement ring contains it gets the shard substituted out (deterministic
+   * rule: the active shard not already in that ring with the smallest
+   * hashKey(indexName + ":" + shardId), entries copied before the ring
+   * repoints, source copies deleted after). Both loops run from this
+   * catalog's alarm; /drain-shard-status exposes progress. The old blanket
+   * SHARD_DRAIN_BLOCKED_BY_INDEXES 409 stays removed (Chunk 2): pinned
+   * rings make draining a non-ring shard trivially safe, and ring
+   * evacuation now covers the rest. */
   private async handleDrainShard(request: Request): Promise<Response> {
-    const body = (await request.json()) as { shardId: string };
+    const body = (await request.json()) as { shardId: string; operationId?: string };
     if (!body.shardId) {
       return json({ error: "Missing shardId" }, 400);
     }
@@ -890,104 +1383,1776 @@ export class CatalogDO extends DurableObject {
       return json({ error: `Shard ${body.shardId} not found` }, 404);
     }
 
-    // Eng-review fix: index-shard placement (indexShardIdForKey) hashes over
-    // the globally active shard set, recomputed fresh on every read/write —
-    // unlike base-row routing, which uses a persistent vbucket->shard
-    // mapping unaffected by shard-count changes. Draining a shard changes
-    // that active set, which changes the hash modulo for nearly every
-    // existing index key, silently orphaning __cf_indexes entries with no
-    // migration path.
-    const drainBlocked = this.blockIfIndexesExist(
-      "SHARD_DRAIN_BLOCKED_BY_INDEXES",
-      "Cannot drain a shard while any secondary index is registered — draining would silently orphan existing index entries.",
-      "Drop all registered indexes (/admin/drop-index) first, drain the shard, then recreate the indexes so backfill uses the post-drain shard set.",
+    // Ring-evacuation feasibility, BEFORE durably marking anything:
+    // rejecting up front beats discovering mid-drain (from an alarm with no
+    // caller to answer to) that the evacuation can't finish. Candidates are
+    // gathered CLUSTER-wide (rings span every catalog shard's pool, and an
+    // index's ring pins ALL shards active at its creation — the only viable
+    // substitutes are shards added afterwards, e.g. by a split). A shard
+    // that still owns vbuckets but has no local migration target is NOT
+    // rejected here: marking it draining (503 for new work) without moving
+    // data yet is exactly the pre-M3 behavior, and the vbucket loop resumes
+    // as soon as capacity exists.
+    const indexRules = this.many<{ index_name: string; placement_ring_json: string }>(
+      "SELECT index_name, placement_ring_json FROM index_rules",
     );
-    if (drainBlocked) return drainBlocked;
+    const ringsContaining = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(body.shardId));
+    if (ringsContaining.length > 0) {
+      const clusterActive = await this.clusterActiveShards(body.shardId);
+      for (const rule of ringsContaining) {
+        const ring = JSON.parse(rule.placement_ring_json) as string[];
+        const candidates = clusterActive.filter((s) => !ring.includes(s));
+        if (candidates.length === 0) {
+          return json(
+            {
+              error: {
+                code: "RING_EVACUATION_NO_CANDIDATE",
+                message: `Index ${rule.index_name}'s placement ring contains ${body.shardId} and no active shard outside that ring exists to substitute in.`,
+                fix: "Add an active shard (/admin/split-vbucket) or drop and recreate the index, then retry the drain.",
+              },
+            },
+            409,
+          );
+        }
+      }
+    }
 
     this.audit("/drain-shard", { shardId: body.shardId });
 
-    this.sql.exec("UPDATE shards SET status = 'draining' WHERE shard_id = ?", body.shardId);
+    // Clear any provenance stall (review Tier 2 #10): re-invoking /drain-shard
+    // is the operator's "I've backfilled provenance, resume" signal.
+    this.sql.exec("UPDATE shards SET status = 'draining', drain_stall_reason = NULL WHERE shard_id = ?", body.shardId);
+
+    // Approved design (Stage 3): a FRESH drain start (this shard wasn't
+    // already draining) records the topology-lock operationId the Worker
+    // acquired for this call — advanceDrain heartbeats it every tick and holds
+    // it for the drain's ENTIRE multi-tick duration, releasing only on full
+    // completion. A RE-INVOKE of an already-draining shard (the "I've fixed
+    // the stall, resume" signal above) must NOT overwrite it: the original
+    // drain's lock is still held and heartbeating; the Worker's re-invoke
+    // call did not (and structurally could not, since the lock only allows
+    // one holder) acquire a new one for this same drain.
+    if (existing.status !== "draining" && body.operationId) {
+      this.sql.exec("UPDATE shards SET topology_lock_operation_id = ? WHERE shard_id = ?", body.operationId, body.shardId);
+    }
 
     const version = this.bumpMetadataVersion();
-    return json({ ok: true, shardId: body.shardId, metadataVersion: version });
-  }
 
-  /** Eng-review fix (Codex-found): index-shard placement hashes over the
-   * active shard set — /split-vbucket grows that set by inserting a new
-   * 'active' shard (below), the same hazard /drain-shard's block exists for,
-   * just via growth instead of shrinkage. Shared with handleDrainShard so
-   * both active-shard-count-changing operations get the identical guard. */
-  private blockIfIndexesExist(code: string, message: string, fix: string): Response | null {
-    // index_rules is fanned out identically to every catalog shard by
-    // /create-index, so this catalog shard's row count is representative of
-    // whether ANY index exists cluster-wide.
-    const anyIndex = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM index_rules");
-    if ((anyIndex?.n ?? 0) > 0) {
-      return json({ error: { code, message, fix } }, 409);
+    // Kick the evacuation loop; re-calling /drain-shard on an
+    // already-draining shard is an idempotent way to re-arm it.
+    const soon = Date.now() + MIGRATION_TICK_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > soon) {
+      await this.ctx.storage.setAlarm(soon);
     }
-    return null;
+
+    return json({ ok: true, shardId: body.shardId, metadataVersion: version, evacuationStarted: true });
   }
 
+  /** Milestone 3, Chunk 5 (POST /drain-shard-status {shardId}). */
+  private async handleDrainShardStatus(request: Request): Promise<Response> {
+    const body = (await request.json()) as { shardId?: string };
+    if (!body.shardId) {
+      return json({ error: "Missing shardId" }, 400);
+    }
+    const shard = this.one<{ status: string; drain_stall_reason: string | null }>(
+      "SELECT status, drain_stall_reason FROM shards WHERE shard_id = ?",
+      body.shardId,
+    );
+    if (!shard) {
+      return json({ error: `Shard ${body.shardId} not found` }, 404);
+    }
+    const vbucketsRemaining = this.one<{ n: number }>("SELECT COUNT(*) AS n FROM vbucket_map WHERE shard_id = ?", body.shardId)?.n ?? 0;
+    // Codex round-13 fix: "rings remaining" is the UNION of indexes still
+    // ring-resident on this shard (not yet fenced/repointed) and indexes with an
+    // open evacuation MARKER (fenced + repointed EARLY, still copying/deleting).
+    // Ring membership alone would read 0 the instant the early repoint lands and
+    // wrongly report 'complete' while the source entries are still being moved.
+    const ringResident = new Set(
+      this.many<{ index_name: string; placement_ring_json: string }>("SELECT index_name, placement_ring_json FROM index_rules")
+        .filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(body.shardId!))
+        .map((r) => r.index_name),
+    );
+    for (const m of this.many<{ index_name: string }>("SELECT index_name FROM drain_ring_evac WHERE shard_id = ?", body.shardId)) {
+      ringResident.add(m.index_name);
+    }
+    const ringsRemaining = ringResident.size;
+    const status =
+      shard.status !== "draining"
+        ? shard.status
+        : // Review Tier 2 #10: a drain parked on the provenance gate reports a
+          // distinct status so the operator knows to run
+          // /admin/backfill-provenance and re-invoke /admin/drain-shard.
+          shard.drain_stall_reason === "provenance"
+          ? "stalled-provenance"
+          : // Re-review item E: any other stall reason (e.g. a vbucket wedged
+            // in 'aborting', or an unreachable shard) is also parked — report
+            // it as generically stalled (stallReason carries the specifics)
+            // rather than the misleading 'migrating-vbuckets'.
+            shard.drain_stall_reason
+            ? "stalled"
+            : vbucketsRemaining > 0
+              ? "migrating-vbuckets"
+              : ringsRemaining > 0
+                ? "evacuating-rings"
+                : "complete";
+    return json({ shardId: body.shardId, vbucketsRemaining, ringsRemaining, status, stallReason: shard.drain_stall_reason });
+  }
+
+  // ─── Topology-operation lock client (Stage 3: long-running operations) ────
+  // The lock lives on ONE physical DO — "catalog-0" — regardless of which
+  // catalog shard THIS instance is; the Worker's acquireTopologyLock always
+  // acquires against that same physical DO (see index.ts). These helpers let
+  // a long-running migration/drain (which may be advancing on ANY catalog
+  // shard's own alarm) heartbeat/release that lock from wherever it's ticking.
+
+  /** True iff THIS CatalogDO instance IS the physical "catalog-0" — the
+   * lock's canonical home. Lets the heartbeat/release helpers below call the
+   * route handlers DIRECTLY (plain in-process method calls) instead of
+   * self-fetching a stub for its own identity, which is both unnecessary
+   * overhead and — observed empirically — unreliable when the caller is
+   * itself already executing inside a non-standard dispatch context (e.g. the
+   * test harness's runInDurableObject, which invokes DO methods directly
+   * rather than through a normal request; a self-fetch issued from within
+   * that context does not reliably reach this same instance's storage).
+   *
+   * Compares DO IDENTITY (this.ctx.id vs. idFromName("catalog-0")), not
+   * cluster_config.catalog_shard_id — that config field is only ever set when
+   * /init is called through the Worker's multi-catalog fan-out (which always
+   * passes catalogShardId), so a catalog-0 instance /init'd directly (bypassing
+   * the Worker, e.g. many catalog.test.ts unit tests) would otherwise be
+   * mis-detected as NOT itself, triggering the very self-fetch this exists to
+   * avoid. */
+  private isCatalogZero(): boolean {
+    const catalogZeroId = this.catalogEnv.CATALOG.idFromName("catalog-0");
+    return this.ctx.id.toString() === catalogZeroId.toString();
+  }
+
+  /** POSTs to catalog-0's internal topology-lock route (used only when THIS
+   * instance is NOT catalog-0 — see isCatalogZero). */
+  private async topologyLockZeroFetch(path: string, body: unknown): Promise<Response> {
+    const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName("catalog-0"));
+    return stub.fetch(`https://catalog.internal${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  /** True iff the lock is still held for `operationId` (heartbeating/refreshing
+   * its lease as a side effect) — or `operationId` is null/undefined, meaning
+   * this migration/drain was never mediated by the Worker's lock-acquiring
+   * admin handlers (e.g. a test driving this DO's routes directly), in which
+   * case there is nothing to check and the caller proceeds exactly as it did
+   * before Stage 3. Catalog-0 being unreachable is treated as LOST (fail
+   * safe: stop mutating rather than risk racing a topology op we can no
+   * longer confirm exclusivity against). */
+  private async heartbeatTopologyLockOrPark(operationId: string | null | undefined): Promise<boolean> {
+    if (!operationId) return true;
+    try {
+      if (this.isCatalogZero()) {
+        const res = await this.handleHeartbeatTopologyLock(
+          new Request("https://catalog.internal/heartbeat-topology-lock", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ operationId }),
+          }),
+        );
+        return res.ok;
+      }
+      const res = await this.topologyLockZeroFetch("/heartbeat-topology-lock", { operationId });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Codex final-review P1 #2: a CHECK-ONLY re-verification (does not renew
+   * the lease — that's heartbeatTopologyLockOrPark's job, once per tick) for
+   * gating the cutover's destructive map-flip immediately before it runs. The
+   * alarm heartbeats once per tick, BEFORE advanceMigration is called — but
+   * the cutover branch then awaits several more round trips (fence check,
+   * mirror-drain, prepared-intent poll, checksum verify) before reaching the
+   * flip. If the lease expired or was force-released during those awaits,
+   * another operation could have acquired the lock and be acting on `target`
+   * already; flipping onto it now would be unsafe. Same null/unreachable
+   * conventions as heartbeatTopologyLockOrPark: no operationId means this
+   * migration was never lock-mediated (proceed as before Stage 3); catalog-0
+   * unreachable is treated as NOT held (fail safe). */
+  private async holdsTopologyLockNow(operationId: string | null | undefined): Promise<boolean> {
+    if (!operationId) return true;
+    try {
+      if (this.isCatalogZero()) {
+        const res = await this.handleHoldsTopologyLock(
+          new Request("https://catalog.internal/holds-topology-lock", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ operationId }),
+          }),
+        );
+        if (!res.ok) return false;
+        return ((await res.json()) as { holds: boolean }).holds;
+      }
+      const res = await this.topologyLockZeroFetch("/holds-topology-lock", { operationId });
+      if (!res.ok) return false;
+      return ((await res.json()) as { holds: boolean }).holds;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Best-effort release — called once a migration/drain this lock was held
+   * for is FULLY complete (or aborted). Never throws; a failed release just
+   * leaves the lease to expire on its own TTL. No-op if operationId is
+   * null/undefined (nothing was ever held). */
+  private async releaseTopologyLockRemote(operationId: string | null | undefined): Promise<void> {
+    if (!operationId) return;
+    try {
+      if (this.isCatalogZero()) {
+        await this.handleReleaseTopologyLock(
+          new Request("https://catalog.internal/release-topology-lock", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ operationId }),
+          }),
+        );
+        return;
+      }
+      await this.topologyLockZeroFetch("/release-topology-lock", { operationId });
+    } catch {
+      // Lease expires on its own.
+    }
+  }
+
+  /** True iff `operationId` is currently recorded as an ACTIVE drain's lock —
+   * i.e. this vbucket's migration is a SUB-migration a drain's phase-1
+   * started (inheriting the drain's own operationId, see advanceDrain), and
+   * the enclosing drain — not this one vbucket completing — owns the lock's
+   * lifecycle. */
+  private isOperationOwnedByActiveDrain(operationId: string): boolean {
+    const row = this.one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM shards WHERE topology_lock_operation_id = ?",
+      operationId,
+    );
+    return (row?.n ?? 0) > 0;
+  }
+
+  /** Release-on-MIGRATION-completion. Approved design (Stage 3) hand-off
+   * nuance: a drain's phase-1 sub-migrations inherit the DRAIN's own
+   * operationId (so alarm()'s per-row heartbeat still gates their
+   * advancement) — but that migration completing is NOT the whole drain
+   * completing (there may be more vbuckets, then ring evacuation, still to
+   * go). Releasing here unconditionally would drop the drain's lock the
+   * moment its FIRST sub-migration finishes. Skip the release when the
+   * operationId is still an active drain's lock; only a genuinely
+   * standalone migration (/admin/migrate-vbucket, /admin/split-vbucket) or
+   * one already vacated by its drain releases here. */
+  private async releaseMigrationTopologyLock(operationId: string | null | undefined): Promise<void> {
+    if (!operationId) return;
+    if (this.isOperationOwnedByActiveDrain(operationId)) return;
+    await this.releaseTopologyLockRemote(operationId);
+  }
+
+  /** Milestone 3, Chunk 5: the union of active shard ids across EVERY
+   * catalog shard (self + siblings via each one's /list-shards) — ring
+   * evacuation needs cluster-wide candidates because placement rings span
+   * all catalogs' shard pools, while this CatalogDO's own `shards` table
+   * only knows its own. */
+  private async clusterActiveShards(excludeShardId: string): Promise<string[]> {
+    const own = this.many<{ shard_id: string }>(
+      "SELECT shard_id FROM shards WHERE status = 'active' AND shard_id != ? ORDER BY shard_id ASC",
+      excludeShardId,
+    ).map((s) => s.shard_id);
+    const all = new Set(own);
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue; // self, already counted
+      try {
+        const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+        const res = await stub.fetch("https://catalog.internal/list-shards", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        if (!res.ok) continue;
+        const body = (await res.json()) as { shardIds: string[] };
+        for (const s of body.shardIds) {
+          if (s !== excludeShardId) all.add(s);
+        }
+      } catch {
+        // A sibling being unreachable narrows the candidate pool; it never
+        // invents a wrong substitute.
+      }
+    }
+    return Array.from(all).sort();
+  }
+
+  /** Every shard id in the cluster, ALL statuses (active + draining), across
+   * this catalog's own pool and every sibling's. Unlike clusterActiveShards
+   * this includes the draining shard and is used only to reach a shard's DATA
+   * (here: to flush its queued index jobs), never for placement/substitution. */
+  private async clusterAllShardIds(): Promise<string[]> {
+    const own = this.many<{ shard_id: string }>("SELECT shard_id FROM shards ORDER BY shard_id ASC").map((s) => s.shard_id);
+    const all = new Set(own);
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue;
+      try {
+        const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+        const res = await stub.fetch("https://catalog.internal/list-shards", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ includeDraining: true }),
+        });
+        if (!res.ok) continue;
+        const body = (await res.json()) as { shardIds: string[] };
+        for (const s of body.shardIds) all.add(s);
+      } catch {
+        // A sibling being unreachable means we may miss some base shards' jobs;
+        // callers treat any shortfall conservatively (block completion).
+      }
+    }
+    return Array.from(all).sort();
+  }
+
+  /** Codex full-PR review P1 E: force-flush every queued index_pending_job
+   * across ALL base shards whose target is the draining shard, and return how
+   * many still remain cluster-wide. A job's target_shard_id is fixed at enqueue
+   * time, so a job that resolved the OLD ring before the repoint would, if left
+   * queued, fire AFTER the source delete and write an index entry onto the now
+   * drained shard (outside the ring) — a silent /v1/index-query miss. Flushing
+   * them while the ring still targets the draining shard makes their entries
+   * land there, where ring evacuation's reconcile then copies them to the
+   * substitute. An unreachable base shard is counted as "still pending" so the
+   * caller never completes evacuation while a late write could still arrive. */
+  private async flushIndexJobsTargeting(drainingShardId: string): Promise<number> {
+    const shardIds = await this.clusterAllShardIds();
+    let remaining = 0;
+    for (const shardId of shardIds) {
+      try {
+        const res = await this.callShard(shardId, "/flush-index-jobs-for-target", { targetShardId: drainingShardId });
+        if (!res.ok) {
+          remaining += 1; // treat an unreachable/erroring base shard as pending
+          continue;
+        }
+        remaining += ((await res.json()) as { remaining: number }).remaining;
+      } catch {
+        remaining += 1;
+      }
+    }
+    return remaining;
+  }
+
+  /** Milestone 3, Chunk 5 (internal, catalog-to-catalog): repoints one
+   * index's pinned placement ring — the draining catalog fans a completed
+   * ring substitution to every sibling catalog shard, since index_rules is
+   * replicated identically to all of them. DO-binding-only route, no admin
+   * gate: it's never exposed through the Worker, the same trust model every
+   * ShardDO internal route already uses. */
+  private async handleUpdateIndexRing(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      indexName?: string;
+      ring?: string[];
+      evacFromShards?: string[];
+      evacAdd?: string;
+      evacRemove?: string;
+    };
+    if (!body.indexName || !body.ring) {
+      return json({ error: "Missing indexName or ring" }, 400);
+    }
+    this.applyIndexRingUpdate(body.indexName, body.ring, {
+      set: body.evacFromShards,
+      add: body.evacAdd,
+      remove: body.evacRemove,
+    });
+    return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Applies a ring repoint and a read-shadow (evac_from_shards_json) change
+   * ATOMICALLY on THIS catalog. The shadow op is one of:
+   *  - set:    replace the whole shadow (legacy/full-set callers);
+   *  - add:    MERGE a draining shard into the existing shadow;
+   *  - remove: drop only that shard, leaving any others;
+   *  - none:   leave the shadow unchanged.
+   * Codex round-15 P1 #1: add/remove (not a singleton set) is what keeps the
+   * shadow the UNION of ALL concurrent same-index evacuations' draining shards —
+   * a second drain's repoint must not overwrite (and drop) the first's shadow,
+   * or /v1/index-query silently stops dual-reading the first draining shard. The
+   * read-modify-write is atomic on a single-threaded DO (no awaits here). */
+  private applyIndexRingUpdate(
+    indexName: string,
+    ring: string[],
+    shadow: { set?: string[]; add?: string; remove?: string },
+  ): void {
+    this.sql.exec("UPDATE index_rules SET placement_ring_json = ? WHERE index_name = ?", JSON.stringify(ring), indexName);
+    if (shadow.set !== undefined) {
+      this.sql.exec("UPDATE index_rules SET evac_from_shards_json = ? WHERE index_name = ?", JSON.stringify(shadow.set), indexName);
+    } else if (shadow.add !== undefined || shadow.remove !== undefined) {
+      const row = this.one<{ evac_from_shards_json: string }>("SELECT evac_from_shards_json FROM index_rules WHERE index_name = ?", indexName);
+      const cur = new Set<string>((row ? (JSON.parse(row.evac_from_shards_json) as string[]) : []));
+      if (shadow.add !== undefined) cur.add(shadow.add);
+      if (shadow.remove !== undefined) cur.delete(shadow.remove);
+      this.sql.exec("UPDATE index_rules SET evac_from_shards_json = ? WHERE index_name = ?", JSON.stringify([...cur].sort()), indexName);
+    }
+    // else: leave the shadow untouched.
+  }
+
+  /** Codex round-14 P2 / round-15 P1 #1: fan an index's ring repoint and a
+   * read-shadow change to every SIBLING catalog, then apply locally — the same
+   * replication path so ring + shadow stay atomic on every catalog. `shadow`
+   * carries the merge op (add/remove/set) so concurrent same-index evacuations
+   * union their draining shards rather than clobber each other. Throws on a
+   * sibling failure so the drain retries the whole (idempotent) fan-out. */
+  private async fanUpdateIndexRing(
+    indexName: string,
+    ring: string[],
+    shadow: { set?: string[]; add?: string; remove?: string },
+  ): Promise<void> {
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue; // self applied locally below
+      const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+      const res = await stub.fetch("https://catalog.internal/update-index-ring", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ indexName, ring, evacFromShards: shadow.set, evacAdd: shadow.add, evacRemove: shadow.remove }),
+      });
+      if (!res.ok) throw new Error(`update-index-ring failed on ${siblingId}: ${res.status}`);
+    }
+    // Every sibling applied — now locally (never via a DO self-fetch).
+    this.applyIndexRingUpdate(indexName, ring, shadow);
+  }
+
+  /** Milestone 3, Chunk 5: one drain-orchestration step for one draining
+   * shard, called from alarm(). Returns true while more ticks are needed.
+   *
+   * Phase 1 — vbuckets: migrate every vbucket mapped to the draining shard
+   * off it, strictly sequentially (one in-flight migration at a time),
+   * targets rotated deterministically across the remaining active shards.
+   * Phase 2 — rings: for each index whose pinned ring contains the shard,
+   * substitute deterministically (pickRingSubstitute), copy the draining
+   * shard's entries for that index to the substitute, repoint the ring on
+   * every catalog shard, then delete the source copies. */
+  private async advanceDrain(shardId: string): Promise<boolean> {
+    // Review Tier 2 #10: a drain parked on the provenance gate does NOT keep
+    // re-scanning every table on the source at the tick cadence — it stays
+    // parked until the operator re-invokes /admin/drain-shard (which clears
+    // this after they run /admin/backfill-provenance).
+    //
+    // Codex full-PR review P1 D: 'ring-reconcile-unstable' is the ONE
+    // exception — it is a SOFT stall. Ring evacuation now converges (copies
+    // every straggler) BEFORE it repoints, so while unstable the ring still
+    // points at the draining shard (reads resolve, nothing stranded) and the
+    // next tick must REVISIT this index to retry, not hard-park behind an
+    // operator re-invoke. It clears itself once the write churn stops and the
+    // reconcile converges. All other reasons are genuine hard parks.
+    const stall = this.one<{ drain_stall_reason: string | null; topology_lock_operation_id: string | null }>(
+      "SELECT drain_stall_reason, topology_lock_operation_id FROM shards WHERE shard_id = ?",
+      shardId,
+    );
+    if (stall?.drain_stall_reason && stall.drain_stall_reason !== "ring-reconcile-unstable" && stall.drain_stall_reason !== "topology-lock-lost") {
+      return false;
+    }
+
+    // Approved design (Stage 3): a long-running drain heartbeats the topology
+    // lock it acquired at start on every tick. If the lock is lost (force-
+    // released, or its lease somehow lapsed), STOP mutating immediately —
+    // every destructive step below (migration flips, source deletes, ring
+    // deletes) lives inside the calls this early-return skips — and park with
+    // a distinguishable stall reason rather than risk racing a topology
+    // operation that may now be running against the same shards. A
+    // 'topology-lock-lost' park is a SOFT stall like ring-reconcile-unstable
+    // (see the check above): the alarm keeps revisiting it in case the lock
+    // situation resolves, rather than requiring an operator re-invoke.
+    const drainOperationId = stall?.topology_lock_operation_id ?? null;
+    const stillHeld = await this.heartbeatTopologyLockOrPark(drainOperationId);
+    if (!stillHeld) {
+      this.sql.exec("UPDATE shards SET drain_stall_reason = 'topology-lock-lost' WHERE shard_id = ?", shardId);
+      log("catalog.drain_topology_lock_lost", { shardId, operationId: drainOperationId });
+      return true; // keep ticking — revisit next tick in case the lock is restored
+    }
+    if (stall?.drain_stall_reason === "topology-lock-lost") {
+      // The lock came back (heartbeat above succeeded) — clear the soft stall
+      // and fall through to resume normal evacuation this same tick.
+      this.sql.exec("UPDATE shards SET drain_stall_reason = NULL WHERE shard_id = ?", shardId);
+    }
+
+    const vbuckets = this.many<{ vbucket: number; migration_status: string }>(
+      "SELECT vbucket, migration_status FROM vbucket_map WHERE shard_id = ? ORDER BY vbucket ASC",
+      shardId,
+    );
+    if (vbuckets.length > 0) {
+      const inFlight = vbuckets.filter((v) => v.migration_status !== "none");
+      if (inFlight.length > 0) {
+        // Only 'backfilling'/'cutover' rows are advanced by the alarm's
+        // migration loop each tick. Codex full-PR review P1 C: a vbucket wedged
+        // in 'aborting' (an abort whose cleanup failed) — or any other
+        // unexpected status — is NEVER advanced there, so blanket-returning true
+        // spun the 250ms alarm forever with /drain-shard-status stuck on
+        // 'migrating-vbuckets'. Keep ticking only while a genuinely-advancing
+        // migration is in flight; otherwise PARK with a distinct stall reason so
+        // the alarm stops and the operator knows to retry the abort.
+        const advancing = inFlight.some((v) => v.migration_status === "backfilling" || v.migration_status === "cutover");
+        if (advancing) {
+          return true; // an active migration is progressing via the migration loop
+        }
+        const stuck = inFlight[0];
+        this.sql.exec("UPDATE shards SET drain_stall_reason = 'aborting-migration' WHERE shard_id = ?", shardId);
+        log("catalog.drain_stalled_aborting", { shardId, vbucket: stuck.vbucket, status: stuck.migration_status });
+        return false;
+      }
+      const activeOthers = this.many<{ shard_id: string }>(
+        "SELECT shard_id FROM shards WHERE status = 'active' AND shard_id != ? ORDER BY shard_id ASC",
+        shardId,
+      ).map((s) => s.shard_id);
+      if (activeOthers.length === 0) {
+        // Nowhere to move data within this catalog's pool — behave like the
+        // pre-M3 drain (marked draining, no data moved) rather than spinning
+        // the alarm forever. Re-calling /admin/drain-shard after adding
+        // capacity resumes the evacuation.
+        log("catalog.drain_stalled_no_target", { shardId, vbucketsRemaining: vbuckets.length });
+        return false;
+      }
+      const next = vbuckets[0].vbucket;
+      const target = activeOthers[next % activeOthers.length];
+      // The sub-migration inherits the DRAIN's own topology-lock operationId
+      // (not a fresh acquire — the drain already holds the one lock for its
+      // whole duration) so alarm()'s migration loop heartbeats the same lock
+      // while this vbucket's migration is advancing.
+      const started = await this.startMigration(next, target, "/drain-shard-migrate", drainOperationId ?? undefined);
+      if (started instanceof Response) {
+        // Park the drain so the alarm stops re-running the full-table
+        // provenance scan every tick (review Tier 2 #10). Re-review item E:
+        // record the ACTUAL reason rather than always claiming 'provenance' —
+        // an incomplete-provenance rejection is fixed by
+        // /admin/backfill-provenance, but a MIGRATION_IN_PROGRESS (e.g. a
+        // vbucket wedged in 'aborting') or an unreachable-shard 502 is not, so
+        // mislabeling it sends the operator down the wrong path.
+        let code: string | undefined;
+        try {
+          code = ((await started.clone().json()) as { error?: { code?: string } }).error?.code;
+        } catch {
+          // Non-JSON body (e.g. a plain-string error) — leave code undefined.
+        }
+        // Codex full-PR review P1 A: a MIGRATION_CLEANUP_PENDING rejection is
+        // TRANSIENT — the same alarm's post-flip cleanup loop is already
+        // retrying that vbucket's source delete/unfence and will clear
+        // cleanup_pending on its own, after which the next tick's startMigration
+        // succeeds. Keep ticking (return true) rather than parking the whole
+        // drain behind an operator re-invoke.
+        if (code === "MIGRATION_CLEANUP_PENDING") {
+          log("catalog.drain_waiting_on_cleanup", { shardId, vbucket: next });
+          return true;
+        }
+        const reason = code === "VBUCKET_PROVENANCE_INCOMPLETE" ? "provenance" : "migration-blocked";
+        this.sql.exec("UPDATE shards SET drain_stall_reason = ? WHERE shard_id = ?", reason, shardId);
+        log("catalog.drain_stalled", { shardId, vbucket: next, reason, code });
+        return false;
+      }
+      // Advance it immediately — a quiet vbucket completes this same tick.
+      const row = this.one<MigrationRow>(
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, topology_lock_operation_id FROM vbucket_map WHERE vbucket = ?",
+        next,
+      );
+      if (row && row.migration_status !== "none") {
+        await this.advanceMigration(row);
+      }
+      return true;
+    }
+
+    // Phase 2: ring evacuation — FENCE-FIRST, marker-driven (Codex round-13).
+    // The prior converge-before-repoint design could not close the race: an
+    // in-flight index write that resolved the OLD ring before the repoint is
+    // delayed in the gateway's ctx.waitUntil — not yet in __cf_indexes or any
+    // queue — so no "copy existing entries" pass can see it, and it lands on the
+    // drained shard after the source delete. The fix fences the index's ring on
+    // the draining shard (so such a write 409s → the writer re-resolves to the
+    // substitute), repoints EARLY (so re-resolution finds the substitute), then
+    // flushes queued retries, copies, and deletes. Progress is tracked by the
+    // drain_ring_evac MARKER (not ring membership, which the early repoint
+    // clears), so a not-yet-finished index is revisited on later ticks.
+    const indexRules = this.many<{ index_name: string; placement_ring_json: string }>(
+      "SELECT index_name, placement_ring_json FROM index_rules ORDER BY index_name ASC",
+    );
+    const ringContains = indexRules.filter((r) => (JSON.parse(r.placement_ring_json) as string[]).includes(shardId));
+    const markers = this.many<{ index_name: string; substitute: string }>(
+      "SELECT index_name, substitute FROM drain_ring_evac WHERE shard_id = ? ORDER BY index_name ASC",
+      shardId,
+    );
+    const markerByIndex = new Map(markers.map((m) => [m.index_name, m.substitute]));
+
+    if (ringContains.length === 0 && markers.length === 0) {
+      // Nothing to evacuate — clear any lingering soft stall and finish.
+      this.sql.exec(
+        "UPDATE shards SET drain_stall_reason = NULL WHERE shard_id = ? AND drain_stall_reason IN ('ring-reconcile-unstable', 'topology-lock-lost')",
+        shardId,
+      );
+      // Fully complete (vbuckets evacuated, no rings ever pinned this shard) —
+      // release the topology lock this drain has held since start.
+      await this.releaseDrainTopologyLock(shardId);
+      return false;
+    }
+
+    // Candidate substitutes are only needed for indexes not already fenced (a
+    // marker pins its substitute for the index's whole evacuation).
+    const needSubstitute = ringContains.some((r) => !markerByIndex.has(r.index_name));
+    const clusterActive = needSubstitute ? await this.clusterActiveShards(shardId) : [];
+
+    // Union of ring-resident (not yet started) and marked (in flight) indexes.
+    const workIndexNames = Array.from(
+      new Set<string>([...ringContains.map((r) => r.index_name), ...markers.map((m) => m.index_name)]),
+    ).sort();
+
+    let anyIncomplete = false;
+    for (const indexName of workIndexNames) {
+      const rule = indexRules.find((r) => r.index_name === indexName);
+      let substitute = markerByIndex.get(indexName);
+
+      // (a)/(b) Not yet fenced: pick the substitute, FENCE the index on the
+      // draining shard, and record the marker. From this instant any new write
+      // for this index arriving on the draining shard 409s INDEX_RING_FENCED, so
+      // an in-flight write that resolved the old ring can only be turned away
+      // (→ re-resolved to the substitute), never stranded here.
+      if (substitute === undefined) {
+        const ring = rule ? (JSON.parse(rule.placement_ring_json) as string[]) : [];
+        if (ring.indexOf(shardId) === -1) continue; // not resident, no marker
+        const picked = pickRingSubstitute(indexName, clusterActive.filter((s) => !ring.includes(s)));
+        if (picked === null) {
+          // No capacity to substitute — leave the ring intact (reads keep
+          // working against the draining shard) for operator action.
+          log("catalog.ring_evacuation_no_candidate", { shardId, indexName });
+          continue;
+        }
+        const fenceRes = await this.callShard(shardId, "/fence-index-ring", { indexName });
+        if (!fenceRes.ok) {
+          anyIncomplete = true; // couldn't fence — retry next tick
+          continue;
+        }
+        substitute = picked;
+        this.sql.exec(
+          "INSERT OR REPLACE INTO drain_ring_evac (shard_id, index_name, substitute, created_at) VALUES (?, ?, ?, ?)",
+          shardId,
+          indexName,
+          substitute,
+          new Date().toISOString(),
+        );
+      }
+
+      try {
+        // (c) Repoint the ring S→substitute (idempotent — only if the current
+        // ring still contains the draining shard). Codex round-14 P2: repoint
+        // the ring AND set the read-shadow (evacFromShards=[shardId]) atomically
+        // on every catalog via the same fan-out, so wherever a query sees the
+        // repointed ring it also knows to dual-look-up the draining shard's
+        // not-yet-copied entries. Siblings first, then local — a sibling failure
+        // throws with local un-repointed and the marker + fence persisting →
+        // retried next tick.
+        //
+        // Codex round-16 defense-in-depth: RE-READ placement_ring_json HERE,
+        // at write time — not `rule` (a snapshot captured at the TOP of this
+        // function, before every await since). A DIFFERENT evacuation of
+        // ANOTHER position in this SAME ring (a sibling catalog's own drain,
+        // or — within this catalog — a later-in-the-same-tick advanceDrain
+        // call for a different draining shard) can apply its own
+        // /update-index-ring during one of those awaits; substituting into a
+        // stale full-array snapshot would silently REVERT that concurrent
+        // substitution back to its old (possibly already-decommissioned)
+        // shard the moment this call's repoint fans out. Re-reading and
+        // substituting only THIS shard's position is safe regardless: this
+        // drain only ever touches the one position it owns.
+        const freshRingRow = this.one<{ placement_ring_json: string }>(
+          "SELECT placement_ring_json FROM index_rules WHERE index_name = ?",
+          indexName,
+        );
+        const currentRing = freshRingRow ? (JSON.parse(freshRingRow.placement_ring_json) as string[]) : [];
+        const pos = currentRing.indexOf(shardId);
+        if (pos !== -1) {
+          const newRing = [...currentRing];
+          newRing[pos] = substitute;
+          // Codex round-15 P1 #1: MERGE this draining shard into the shadow
+          // (never overwrite) so a concurrent evacuation of another shard in the
+          // same index's ring keeps its own shadow entry.
+          await this.fanUpdateIndexRing(indexName, newRing, { add: shardId });
+        }
+
+        // (d) Flush queued index_pending_jobs targeting the draining shard
+        // (cluster-wide). With the fence + repoint in place, a delivered job
+        // 409s → re-resolves to the substitute; an unreachable base shard leaves
+        // remaining > 0 → not done this tick (fence backstops safety meanwhile).
+        const remainingJobs = await this.flushIndexJobsTargeting(shardId);
+        if (remainingJobs > 0) {
+          anyIncomplete = true;
+          continue; // keep marker + fence, retry next tick
+        }
+
+        // (e) Copy the draining shard's entries for this index → substitute,
+        // reconcile to zero-new. The fence guarantees no NEW entry lands on the
+        // draining shard, so this converges (bounded pass budget as a guard).
+        let afterRowid = 0;
+        let converged = false;
+        for (let pass = 0; pass < RING_EVAC_RECONCILE_MAX_PASSES; pass += 1) {
+          const before = afterRowid;
+          afterRowid = await this.copyIndexEntries(shardId, substitute, indexName, afterRowid);
+          if (afterRowid === before) {
+            converged = true;
+            break;
+          }
+        }
+        if (!converged) {
+          anyIncomplete = true;
+          continue; // retry next tick (marker persists, nothing deleted)
+        }
+
+        // (f) Delete the source copies — everything is on the substitute and no
+        // new write can arrive (fenced + repointed).
+        const deleteRes = await this.callShard(shardId, "/execute", {
+          sql: "DELETE FROM __cf_indexes WHERE index_name = ?",
+          params: [indexName],
+          requestId: `ring-evacuate-${indexName}-${shardId}-${crypto.randomUUID()}`,
+          isMutation: true,
+        });
+        if (!deleteRes.ok) {
+          log("catalog.ring_evacuation_source_cleanup_failed", { shardId, indexName });
+          anyIncomplete = true;
+          continue; // retry the delete next tick
+        }
+
+        // Codex round-14 P2: the source entries are gone, so CLEAR the
+        // read-shadow (evacFromShards=[]) on every catalog via the same fan-out
+        // — reads now hit only the substitute. Done BEFORE deleting the marker
+        // and inside the try, so a sibling failure throws → marker persists →
+        // the whole (idempotent) clear retries next tick (never leaving a stale
+        // shadow pointing at a decommissioned shard).
+        const currentRow = this.one<{ placement_ring_json: string }>("SELECT placement_ring_json FROM index_rules WHERE index_name = ?", indexName);
+        const finalRing = currentRow ? (JSON.parse(currentRow.placement_ring_json) as string[]) : [];
+        // Codex round-15 P1 #1: REMOVE only this drain's shard from the shadow,
+        // leaving any concurrent evacuation's shard still shadowed.
+        await this.fanUpdateIndexRing(indexName, finalRing, { remove: shardId });
+
+        // Complete — clear the marker. The fence is LEFT in place: the shard is
+        // being decommissioned, and a stray late write to it for this index
+        // 409s → re-resolves to the substitute (a safe backstop). It is only
+        // explicitly released on an abort/failure path.
+        this.sql.exec("DELETE FROM drain_ring_evac WHERE shard_id = ? AND index_name = ?", shardId, indexName);
+        this.audit("/drain-shard-ring-evacuated", { shardId, indexName, substitute });
+      } catch (error) {
+        // Repoint/copy/delete failure — marker + fence persist; retry next tick.
+        log("catalog.ring_evacuation_tick_failed", { shardId, indexName, message: error instanceof Error ? error.message : String(error) });
+        anyIncomplete = true;
+      }
+    }
+
+    if (anyIncomplete) {
+      // At least one index isn't fully evacuated. Record the soft stall so
+      // /drain-shard-status reports NON-'complete', and keep ticking so a later
+      // tick retries (the marker drives the revisit, not ring membership).
+      this.sql.exec("UPDATE shards SET drain_stall_reason = 'ring-reconcile-unstable' WHERE shard_id = ?", shardId);
+      return true;
+    }
+    // Every ring evacuated — clear any prior soft stall.
+    this.sql.exec(
+      "UPDATE shards SET drain_stall_reason = NULL WHERE shard_id = ? AND drain_stall_reason IN ('ring-reconcile-unstable', 'topology-lock-lost')",
+      shardId,
+    );
+    // Fully complete (vbuckets evacuated AND every ring evacuated) — release
+    // the topology lock this drain has held since start.
+    await this.releaseDrainTopologyLock(shardId);
+    return false;
+  }
+
+  /** Releases (best-effort) and clears the topology-lock operationId a NOW-
+   * COMPLETE drain of `shardId` was holding. No-op if none was ever recorded
+   * (e.g. a drain never mediated by the Worker). */
+  private async releaseDrainTopologyLock(shardId: string): Promise<void> {
+    const row = this.one<{ topology_lock_operation_id: string | null }>(
+      "SELECT topology_lock_operation_id FROM shards WHERE shard_id = ?",
+      shardId,
+    );
+    if (!row?.topology_lock_operation_id) return;
+    await this.releaseTopologyLockRemote(row.topology_lock_operation_id);
+    this.sql.exec("UPDATE shards SET topology_lock_operation_id = NULL WHERE shard_id = ?", shardId);
+  }
+
+  /** Copies one index's __cf_indexes entries from `fromShard` to `toShard`
+   * with rowid > afterRowid, paged, and returns the highest rowid copied (or
+   * afterRowid unchanged if nothing). Used by ring evacuation's initial copy
+   * and its reconcile loop. */
+  private async copyIndexEntries(fromShard: string, toShard: string, indexName: string, afterRowid: number): Promise<number> {
+    let cursor = afterRowid;
+    for (;;) {
+      const exportRes = await this.callShard(fromShard, "/index-entries-export", { indexName, afterRowid: cursor, limit: MIGRATE_PAGE_SIZE });
+      if (!exportRes.ok) throw new Error(`index-entries-export failed on ${fromShard}: ${exportRes.status}`);
+      const rows = ((await exportRes.json()) as { rows: Array<{ rowid: number }> }).rows;
+      if (rows.length === 0) break;
+      const importRes = await this.callShard(toShard, "/index-entries-import", { rows });
+      if (!importRes.ok) throw new Error(`index-entries-import failed on ${toShard}: ${importRes.status}`);
+      cursor = rows[rows.length - 1].rowid;
+      if (rows.length < MIGRATE_PAGE_SIZE) break;
+    }
+    return cursor;
+  }
+
+  /** Milestone 3, Chunk 4: /admin/split-vbucket keeps its name and request
+   * shape, but "split" now means "create the target shard and start a real
+   * data migration" instead of repointing vbucket_map and stranding every
+   * row already on the source (the pre-M3 behavior). The response gains
+   * migrationStarted: true; routing flips only when the migration's fenced
+   * cutover completes (steps 1-5 in advanceMigration). */
   private async handleSplitVbucket(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       vbucket: number;
       newShardId?: string;
+      operationId?: string;
     };
 
     if (!Number.isInteger(body.vbucket) || body.vbucket < 0) {
       return json({ error: "vbucket must be a non-negative integer" }, 400);
     }
 
-    const existingMap = this.one<{ shard_id: string }>(
-      "SELECT shard_id FROM vbucket_map WHERE vbucket = ?",
-      body.vbucket,
+    // Milestone 3, Chunk 2: splitting no longer blocks on index presence
+    // (the previous 409 SPLIT_BLOCKED_BY_INDEXES is removed) — index
+    // placement hashes over each index's own pinned placement_ring_json,
+    // so adding a new active shard never changes existing index placement.
+    const started = await this.startMigration(body.vbucket, body.newShardId, "/split-vbucket", body.operationId);
+    if (started instanceof Response) return started;
+
+    return json({
+      ok: true,
+      vbucket: body.vbucket,
+      fromShard: started.fromShard,
+      toShard: started.toShard,
+      metadataVersion: started.metadataVersion,
+      migrationStarted: true,
+    });
+  }
+
+  /** Milestone 3, Chunk 4 (POST /migrate-vbucket {vbucket, targetShardId?}).
+   * Same primitive /split-vbucket now builds on, with the target shard
+   * explicit/optional rather than always fresh. */
+  private async handleMigrateVbucket(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number; targetShardId?: string; operationId?: string };
+    if (body.vbucket === undefined || !Number.isInteger(body.vbucket) || body.vbucket < 0) {
+      return json({ error: "vbucket must be a non-negative integer" }, 400);
+    }
+    const started = await this.startMigration(body.vbucket, body.targetShardId, "/migrate-vbucket", body.operationId);
+    if (started instanceof Response) return started;
+    return json({
+      ok: true,
+      vbucket: body.vbucket,
+      fromShard: started.fromShard,
+      toShard: started.toShard,
+      status: "backfilling",
+    });
+  }
+
+  /** Registered tables eligible for migration — a table still carrying the
+   * UNSET sentinel can't be exported (no partition-key column to page on). */
+  private migratableTables(): Array<{ table: string; partitionKeyColumn: string; schemaSql: string | null }> {
+    return this.many<{ table_name: string; partition_key_column: string; schema_sql: string | null }>(
+      "SELECT table_name, partition_key_column, schema_sql FROM table_rules ORDER BY table_name ASC",
+    )
+      .filter((t) => t.partition_key_column !== UNSET_PARTITION_KEY_COLUMN)
+      .map((t) => ({ table: t.table_name, partitionKeyColumn: t.partition_key_column, schemaSql: t.schema_sql }));
+  }
+
+  /** Shared migration-start guard + state transition for /split-vbucket and
+   * /migrate-vbucket. Returns a Response on rejection. */
+  private async startMigration(
+    vbucket: number,
+    requestedTargetShardId: string | undefined,
+    endpoint: string,
+    operationId?: string,
+  ): Promise<Response | { fromShard: string; toShard: string; metadataVersion: number }> {
+    const existingMap = this.one<{ shard_id: string; migration_status: string; cleanup_pending: number }>(
+      "SELECT shard_id, migration_status, cleanup_pending FROM vbucket_map WHERE vbucket = ?",
+      vbucket,
     );
     if (!existingMap) {
-      return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+      return json({ error: `vbucket ${vbucket} has no mapping` }, 404);
+    }
+    if (existingMap.migration_status !== "none") {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_IN_PROGRESS",
+            message: `vbucket ${vbucket} already has a migration in progress (status: ${existingMap.migration_status}).`,
+            fix: "Wait for it to finish (/admin/migrate-vbucket-status) or abort it (/admin/migrate-vbucket-abort).",
+          },
+        },
+        409,
+      );
+    }
+    // Codex full-PR review P1 A: a prior cutover can flip migration_status to
+    // 'none' while post-flip cleanup (delete source rows + unfence source) is
+    // still retrying (cleanup_pending=1). Starting a NEW migration for this
+    // vbucket now would overwrite cleanup_source_shard_id on the flip, orphaning
+    // the old source's still-set __cf_fenced_vbuckets entry — and if the new
+    // target happens to equal that old source, it would stay fenced forever
+    // (503/VBUCKET_FENCED on every write). The alarm-driven cleanup is
+    // idempotent and self-healing, so reject until it clears rather than racing
+    // it.
+    if (existingMap.cleanup_pending === 1) {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_CLEANUP_PENDING",
+            message: `vbucket ${vbucket} has post-flip cleanup still pending from a prior migration (source rows delete / unfence not yet confirmed).`,
+            fix: "Wait for the alarm-driven cleanup to finish (it retries automatically; watch cleanup via /admin/migrate-vbucket-status), then retry.",
+          },
+        },
+        409,
+      );
     }
 
-    const splitBlocked = this.blockIfIndexesExist(
-      "SPLIT_BLOCKED_BY_INDEXES",
-      "Cannot split a vbucket while any secondary index is registered — splitting adds a new active shard, changing index-shard placement and orphaning existing index entries.",
-      "Drop all registered indexes (/admin/drop-index) first, split, then recreate the indexes so backfill uses the post-split shard set.",
-    );
-    if (splitBlocked) return splitBlocked;
-
-    this.audit("/split-vbucket", { vbucket: body.vbucket, newShardId: body.newShardId, fromShard: existingMap.shard_id });
+    // Provenance gate: every row on the source shard must be attributable
+    // to a (tenant, vbucket) before ANY vbucket can migrate off it —
+    // /migrate-export selects rows via __cf_row_owners, so an unattributed
+    // row would silently be left behind rather than fail loudly here.
+    const tables = this.migratableTables();
+    if (tables.length > 0) {
+      const unattributedRes = await this.callShard(existingMap.shard_id, "/unattributed-count", { tables });
+      if (!unattributedRes.ok) {
+        return json({ error: `Failed to check provenance completeness on shard ${existingMap.shard_id}.` }, 502);
+      }
+      const unattributed = ((await unattributedRes.json()) as { count: number }).count;
+      if (unattributed > 0) {
+        return json(
+          {
+            error: {
+              code: "VBUCKET_PROVENANCE_INCOMPLETE",
+              message: `Source shard ${existingMap.shard_id} has ${unattributed} row(s) with no provenance entry — migration would leave them behind.`,
+              unattributedRows: unattributed,
+              fix: "Run /admin/backfill-provenance (and /admin/set-row-owner for any ambiguous rows), then retry.",
+            },
+          },
+          409,
+        );
+      }
+    }
 
     const config = this.one<{ catalog_shard_id: string | null }>(
       "SELECT catalog_shard_id FROM cluster_config WHERE singleton = 1",
     );
     const shardPrefix = config?.catalog_shard_id ? `${config.catalog_shard_id}-` : "";
-    const targetShard = body.newShardId ?? `${shardPrefix}shard-split-${Date.now()}`;
-    this.sql.exec(
-      `
-      INSERT OR IGNORE INTO shards (shard_id, status, created_at)
-      VALUES (?, 'active', ?)
-      `,
-      targetShard,
-      new Date().toISOString(),
-    );
+    const targetShard = requestedTargetShardId ?? `${shardPrefix}shard-split-${Date.now()}`;
+    if (targetShard === existingMap.shard_id) {
+      return json({ error: `targetShardId must differ from the vbucket's current shard (${existingMap.shard_id}).` }, 400);
+    }
+    // Codex full-PR review P1 B: never migrate ONTO a non-active shard. If the
+    // explicit target ALREADY exists it must be 'active' — a 'draining' (or
+    // otherwise non-active) target would, once the map flips to it at cutover,
+    // make /route (which joins shards and rejects a non-active mapping) return
+    // 503 for this vbucket forever. INSERT OR IGNORE below would leave the
+    // pre-existing draining row untouched and let the migration proceed. A
+    // freshly-created target (no row yet) is created 'active' below and is
+    // fine. This runs AFTER the awaited provenance scan above deliberately: a
+    // concurrent drain could have flipped the target to 'draining' during that
+    // await, and there are no further awaits before the claim/INSERT, so this
+    // check is race-safe.
+    const existingTarget = this.one<{ status: string }>("SELECT status FROM shards WHERE shard_id = ?", targetShard);
+    if (existingTarget && existingTarget.status !== "active") {
+      return json(
+        {
+          error: {
+            code: "TARGET_SHARD_NOT_ACTIVE",
+            message: `Target shard ${targetShard} is '${existingTarget.status}', not active — migrating vbucket ${vbucket} onto it would leave the vbucket permanently unroutable after cutover.`,
+            fix: "Choose an active target shard, or wait for / cancel the target's own drain first.",
+          },
+        },
+        409,
+      );
+    }
 
-    const version = this.bumpMetadataVersion();
+    // Codex review P2 (TOCTOU): the migration_status !== 'none' check above and
+    // this state transition are separated by the awaited provenance check, and
+    // DO handlers interleave at await points — so two concurrent
+    // /admin/migrate-vbucket (or /split-vbucket) calls for the same vbucket can
+    // BOTH pass the check. Claim the migration with a CONDITIONAL update (only
+    // from 'none') and check changes(); if we lost the race, bail 409 BEFORE
+    // creating the target shard, so the loser leaves no orphaned target state
+    // and never overwrites the winner's target_shard_id.
+    const now = new Date().toISOString();
     this.sql.exec(
       `
       UPDATE vbucket_map
-      SET shard_id = ?, map_version = ?, updated_at = ?
-      WHERE vbucket = ?
+      SET migration_status = 'backfilling', target_shard_id = ?, migration_rows_copied = 0, migration_started_at = ?,
+          backfill_table = NULL, backfill_after_pk = NULL, updated_at = ?, topology_lock_operation_id = ?
+      WHERE vbucket = ? AND migration_status = 'none' AND cleanup_pending = 0
       `,
       targetShard,
-      version,
+      now,
+      now,
+      operationId ?? null,
+      vbucket,
+    );
+    const claimed = this.one<{ n: number }>("SELECT changes() AS n");
+    if ((claimed?.n ?? 0) === 0) {
+      return json(
+        {
+          error: {
+            code: "MIGRATION_IN_PROGRESS",
+            message: `vbucket ${vbucket} already has a migration in progress (a concurrent request won the race).`,
+            fix: "Wait for it to finish (/admin/migrate-vbucket-status) or abort it (/admin/migrate-vbucket-abort).",
+          },
+        },
+        409,
+      );
+    }
+
+    this.audit(endpoint, { vbucket, fromShard: existingMap.shard_id, toShard: targetShard });
+    // Only the winner creates the target shard and bumps the map version.
+    this.sql.exec(
+      "INSERT OR IGNORE INTO shards (shard_id, status, created_at) VALUES (?, 'active', ?)",
+      targetShard,
+      now,
+    );
+    // P1 (correctness): a brand-new target shard (INSERT actually inserted)
+    // never got the create-table fan-out — mark it for full schema
+    // provisioning on the first backfill tick; an existing target (INSERT
+    // ignored) already has every table, so it's left 0.
+    const targetIsFresh = (this.one<{ n: number }>("SELECT changes() AS n")?.n ?? 0) > 0;
+    this.sql.exec("UPDATE vbucket_map SET provision_pending = ? WHERE vbucket = ?", targetIsFresh ? 1 : 0, vbucket);
+    const version = this.bumpMetadataVersion();
+
+    const soon = Date.now() + MIGRATION_TICK_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > soon) {
+      await this.ctx.storage.setAlarm(soon);
+    }
+
+    return { fromShard: existingMap.shard_id, toShard: targetShard, metadataVersion: version };
+  }
+
+  /** Milestone 3, Chunk 4: alarm-driven migration orchestration. Each tick
+   * advances every in-flight migration one step; the alarm re-arms while any
+   * remains active. */
+  async alarm(): Promise<void> {
+    this.ensureSchema();
+    if (this.migrationTickInFlight) {
+      // Another tick (scheduled alarm vs. a concurrent invocation) is
+      // already advancing migrations — don't interleave with it on stale
+      // row snapshots; just make sure a future tick happens.
+      await this.ctx.storage.setAlarm(Date.now() + MIGRATION_TICK_MS);
+      return;
+    }
+    this.migrationTickInFlight = true;
+    let anyActive = false;
+    let anyThrew = false;
+    try {
+      const migrating = this.many<MigrationRow>(
+        // Review Tier 1 #4: the alarm's migration loop drives only active
+        // migrations ('backfilling'/'cutover'); an 'aborting' row is finished
+        // by a retried /admin/migrate-vbucket-abort, not here.
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, topology_lock_operation_id FROM vbucket_map WHERE migration_status IN ('backfilling', 'cutover') ORDER BY vbucket ASC",
+      );
+      for (const m of migrating) {
+        try {
+          // Approved design (Stage 3): a migration mediated by the Worker
+          // holds the topology lock from start through post-flip cleanup,
+          // heartbeated every tick. If the lock is lost, STOP mutating this
+          // tick — every destructive step (checksum-mismatch rewind, the map
+          // flip, post-flip cleanup) lives inside advanceMigration, so skipping
+          // the call protects all of them — and keep ticking so a later tick
+          // notices if the lock situation resolves.
+          const stillHeld = await this.heartbeatTopologyLockOrPark(m.topology_lock_operation_id);
+          if (!stillHeld) {
+            log("catalog.migration_topology_lock_lost", { vbucket: m.vbucket });
+            anyActive = true;
+            continue;
+          }
+          const stillActive = await this.advanceMigration(m);
+          anyActive = anyActive || stillActive;
+        } catch (error) {
+          // Leave the migration in its current state and retry next tick —
+          // every step is idempotent (INSERT OR REPLACE imports,
+          // re-assertable fence, re-comparable checksums; the backfill cursor
+          // resumes rather than restarts, review Tier 2 #8).
+          log("catalog.migration_tick_failed", {
+            vbucket: m.vbucket,
+            status: m.migration_status,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          anyActive = true;
+          anyThrew = true;
+        }
+      }
+
+      // Codex full-PR review P2: retry post-flip source cleanup independently
+      // of migration_status. After a flip the row is 'none' (not in the
+      // migrating set above), so a failed step-5 delete/unfence would otherwise
+      // never be retried, leaving the source stale-fenced or with undeleted
+      // rows while status reports 'complete'. cleanup_pending drives the retry.
+      const cleanups = this.many<{ vbucket: number; cleanup_source_shard_id: string | null; topology_lock_operation_id: string | null }>(
+        "SELECT vbucket, cleanup_source_shard_id, topology_lock_operation_id FROM vbucket_map WHERE cleanup_pending = 1 ORDER BY vbucket ASC",
+      );
+      const cleanupTables = cleanups.length > 0 ? this.migratableTables() : [];
+      for (const c of cleanups) {
+        if (!c.cleanup_source_shard_id) {
+          // Nothing to clean against — clear the flag so it can't loop forever.
+          // The migration is effectively done — release its topology lock too
+          // (unless an enclosing drain still owns it — see
+          // releaseMigrationTopologyLock).
+          await this.releaseMigrationTopologyLock(c.topology_lock_operation_id);
+          this.sql.exec("UPDATE vbucket_map SET cleanup_pending = 0, topology_lock_operation_id = NULL WHERE vbucket = ?", c.vbucket);
+          continue;
+        }
+        try {
+          const stillPending = await this.runPostFlipCleanup(c.vbucket, c.cleanup_source_shard_id, cleanupTables, c.topology_lock_operation_id);
+          anyActive = anyActive || stillPending;
+        } catch (error) {
+          log("catalog.cleanup_tick_failed", { vbucket: c.vbucket, message: error instanceof Error ? error.message : String(error) });
+          anyActive = true;
+          anyThrew = true;
+        }
+      }
+
+      // Milestone 3, Chunk 5: drive shard drains (vbucket evacuation, then
+      // ring evacuation) for every draining shard.
+      const draining = this.many<{ shard_id: string }>("SELECT shard_id FROM shards WHERE status = 'draining' ORDER BY shard_id ASC");
+      for (const d of draining) {
+        try {
+          const stillActive = await this.advanceDrain(d.shard_id);
+          anyActive = anyActive || stillActive;
+        } catch (error) {
+          log("catalog.drain_tick_failed", {
+            shardId: d.shard_id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          anyActive = true;
+          anyThrew = true;
+        }
+      }
+    } finally {
+      this.migrationTickInFlight = false;
+    }
+    if (anyActive) {
+      // Review Tier 2 #8: exponential backoff on a throwing tick (e.g. a
+      // shard transiently over its subrequest budget) instead of hammering
+      // at the 250ms base cadence; reset the streak on a clean tick.
+      if (anyThrew) {
+        this.migrationTickFailureStreak += 1;
+      } else {
+        this.migrationTickFailureStreak = 0;
+      }
+      const delay =
+        this.migrationTickFailureStreak === 0
+          ? MIGRATION_TICK_MS
+          : Math.min(MIGRATION_TICK_MAX_MS, MIGRATION_TICK_MS * 2 ** this.migrationTickFailureStreak);
+      await this.ctx.storage.setAlarm(Date.now() + delay);
+    } else {
+      this.migrationTickFailureStreak = 0;
+    }
+  }
+
+  /** One orchestration step for one migrating vbucket. Returns true while
+   * the migration still needs future ticks.
+   *
+   * backfilling: run a full export/import pass (paged, per table), then
+   * enter cutover — step 1's formal ordering: set migration_status='cutover'
+   * and synchronously fence the source.
+   *
+   * cutover (steps 2-5): re-assert the fence (idempotent, heals a crash
+   * between the status write and the fence write), wait for the source's
+   * mirror queue to drain to zero for this vbucket, verify per-table content
+   * checksums, then flip vbucket_map, unfence, and delete the source copy.
+   * A checksum mismatch aborts back to 'backfilling' (fence lifted, target
+   * wiped) per the spec's step-3 rule. */
+  private async advanceMigration(m: MigrationRow): Promise<boolean> {
+    if (!m.target_shard_id) {
+      // Unreachable by construction (startMigration always sets both), but
+      // fail safe: clear the inconsistent state rather than looping forever.
+      this.sql.exec("UPDATE vbucket_map SET migration_status = 'none' WHERE vbucket = ?", m.vbucket);
+      return false;
+    }
+    const source = m.shard_id;
+    const target = m.target_shard_id;
+    const tables = this.migratableTables();
+
+    if (m.migration_status === "backfilling") {
+      // Only tables that actually own rows of this vbucket on the source
+      // need exporting — every other registered table has nothing to page.
+      // Ordered by table_name (migratableTables orders) so the persisted
+      // cursor's table position is stable across ticks.
+      const vbTablesRes = await this.callShard(source, "/vbucket-tables", { vbucket: m.vbucket });
+      if (!vbTablesRes.ok) throw new Error(`vbucket-tables failed on ${source}: ${vbTablesRes.status}`);
+      const vbTables = new Set(((await vbTablesRes.json()) as { tables: string[] }).tables);
+      const exportTables = tables.filter((t) => vbTables.has(t.table));
+
+      // Review Tier 2 #8: resume from the persisted cursor and copy at most
+      // MIGRATION_BACKFILL_PAGES_PER_TICK pages this tick, so a large vbucket
+      // doesn't exceed the DO's per-invocation subrequest cap (which would
+      // throw and restart from page zero every tick forever).
+      const cursor = this.one<{ backfill_table: string | null; backfill_after_pk: string | null }>(
+        "SELECT backfill_table, backfill_after_pk FROM vbucket_map WHERE vbucket = ?",
+        m.vbucket,
+      );
+      let idx = cursor?.backfill_table ? exportTables.findIndex((t) => t.table === cursor.backfill_table) : 0;
+      let afterPk = "";
+      if (idx >= 0 && cursor?.backfill_table) {
+        afterPk = cursor.backfill_after_pk ?? "";
+      } else {
+        idx = 0; // cursor's table no longer present (e.g. dropped) — restart
+      }
+
+      // P1 correctness (Codex review): when the target is a freshly created
+      // split shard (provision_pending set by startMigration), provision
+      // schema_sql for EVERY registered table with a captured schema — NOT just
+      // the ones that have rows in this vbucket. A registered table with zero
+      // rows here is absent from exportTables, so coupling provisioning to the
+      // export loop would never create it on the fresh target, and the first
+      // later write to it on the moved vbucket would fail `no such table` (a
+      // mirror job for it would also stay queued forever). Gated on
+      // provision_pending (not merely the initial tick) so a drain to an
+      // EXISTING shard — which already has every table — issues zero provision
+      // calls, keeping this O(1) rather than O(tables x vbuckets) subrequests.
+      // The stable requestId makes it idempotent; only clear the flag once all
+      // succeed so a thrown tick retries.
+      const provisionPending =
+        (this.one<{ provision_pending: number }>("SELECT provision_pending FROM vbucket_map WHERE vbucket = ?", m.vbucket)?.provision_pending ?? 0) === 1;
+      if (provisionPending) {
+        for (const t of tables) {
+          if (!t.schemaSql) continue;
+          const schemaRes = await this.callShard(target, "/execute", {
+            // Idempotent DDL so re-execution against a table that already
+            // physically exists is a no-op, not a 400. Its requestId is its OWN
+            // namespace (migrate-provision-, NOT create-table-): reusing
+            // /admin/create-table's requestId would collide in applied_requests
+            // — that row is hashed over the UNMODIFIED schema, so this
+            // IF-NOT-EXISTS-modified SQL would 409 "different sql" while the
+            // (common, within-7-day-TTL) row is still present. Stable per
+            // (table, target) so a resumed migration's retries still dedup.
+            sql: ensureCreateTableIfNotExists(t.schemaSql),
+            requestId: `migrate-provision-${t.table}-${target}`,
+            isMutation: true,
+          });
+          if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
+        }
+        this.sql.exec(
+          "UPDATE vbucket_map SET provision_pending = 0 WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+          m.vbucket,
+          target,
+        );
+      }
+
+      let copied = 0;
+      let pages = 0;
+      while (idx < exportTables.length && pages < MIGRATION_BACKFILL_PAGES_PER_TICK) {
+        const t = exportTables[idx];
+        // Provision THIS table's schema on the target before its first page —
+        // required for the import to succeed if the target lacks it (a fresh
+        // split shard, or an existing shard missing a table). Bounded to
+        // exportTables (tables that actually have rows in this vbucket), so a
+        // drain to an existing shard stays O(tables-with-rows), not O(all
+        // registered tables). Stable requestId dedupes across resumed ticks.
+        // (Zero-row tables, absent from exportTables, are covered separately by
+        // the provision_pending pass above — but only on a fresh target.)
+        if (afterPk === "" && t.schemaSql) {
+          const schemaRes = await this.callShard(target, "/execute", {
+            // Idempotent DDL + its OWN requestId namespace — see the
+            // provision_pending pass above. IF NOT EXISTS covers a table that
+            // physically exists under a fresh (or TTL-pruned) dedup row; the
+            // migrate-provision- prefix avoids colliding with
+            // /admin/create-table's applied_requests row (hashed over the
+            // UNMODIFIED schema), which would otherwise 409 within its TTL.
+            sql: ensureCreateTableIfNotExists(t.schemaSql),
+            requestId: `migrate-provision-${t.table}-${target}`,
+            isMutation: true,
+          });
+          if (!schemaRes.ok) throw new Error(`schema provisioning failed on ${target} for ${t.table}: ${schemaRes.status}`);
+        }
+        const exportRes = await this.callShard(source, "/migrate-export", {
+          vbucket: m.vbucket,
+          table: t.table,
+          partitionKeyColumn: t.partitionKeyColumn,
+          afterPartitionKey: afterPk,
+          limit: MIGRATE_PAGE_SIZE,
+        });
+        if (!exportRes.ok) throw new Error(`migrate-export failed on ${source} for ${t.table}: ${exportRes.status}`);
+        const rows = ((await exportRes.json()) as {
+          rows: Array<{ partitionKey: string; tenantId: string; row: Record<string, unknown> }>;
+        }).rows;
+        pages += 1;
+        if (rows.length > 0) {
+          const importRes = await this.callShard(target, "/migrate-import", { vbucket: m.vbucket, table: t.table, rows });
+          if (!importRes.ok) throw new Error(`migrate-import failed on ${target} for ${t.table}: ${importRes.status}`);
+          copied += rows.length;
+          afterPk = rows[rows.length - 1].partitionKey;
+        }
+        if (rows.length < MIGRATE_PAGE_SIZE) {
+          idx += 1; // this table is exhausted — advance to the next
+          afterPk = "";
+        }
+      }
+
+      // Persist progress. Conditional on the row still being THIS migration —
+      // an abort landing during the awaits above must not have its cursor
+      // resurrected.
+      if (idx < exportTables.length) {
+        // More to copy — save the cursor and come back next tick.
+        this.sql.exec(
+          "UPDATE vbucket_map SET migration_rows_copied = migration_rows_copied + ?, backfill_table = ?, backfill_after_pk = ?, updated_at = ? WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+          copied,
+          exportTables[idx].table,
+          afterPk,
+          new Date().toISOString(),
+          m.vbucket,
+          target,
+        );
+        return true;
+      }
+      // Fully backfilled — clear the cursor and proceed to cutover.
+      this.sql.exec(
+        "UPDATE vbucket_map SET migration_rows_copied = migration_rows_copied + ?, backfill_table = NULL, backfill_after_pk = NULL WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+        copied,
+        m.vbucket,
+        target,
+      );
+
+      // Cutover step 1: status first (spec's stated order), then the fence,
+      // synchronously in the same tick. A crash between the two writes is
+      // healed by the cutover branch re-asserting the fence every tick.
+      // Conditional on the row still being THIS migration — an
+      // /admin/migrate-vbucket-abort that landed during the (awaited)
+      // backfill pass above must not be resurrected into cutover.
+      this.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'cutover', cutover_started_at = ?, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ? AND migration_status = 'backfilling' AND target_shard_id = ?",
+        new Date().toISOString(),
+        new Date().toISOString(),
+        m.vbucket,
+        target,
+      );
+      const advanced = this.one<{ n: number }>("SELECT changes() AS n");
+      if ((advanced?.n ?? 0) === 0) {
+        log("catalog.migration_advance_skipped_stale", { vbucket: m.vbucket, expected: "backfilling" });
+        return false;
+      }
+      const fenceRes = await this.callShard(source, "/fence-vbucket", { vbucket: m.vbucket });
+      if (!fenceRes.ok) throw new Error(`fence-vbucket failed on ${source}: ${fenceRes.status}`);
+      // Attempt the cutover immediately in the same tick — for a quiet
+      // vbucket (empty mirror queue, checksums already equal) the whole
+      // migration completes in one pass; a busy one just returns true from
+      // the cutover branch and polls again next tick. Chunk 5's sequential
+      // shard drain leans on this so N vbuckets don't take 2N ticks.
+      return this.advanceMigration({ ...m, migration_status: "cutover" });
+    }
+
+    if (m.migration_status === "cutover") {
+      // Re-assert the fence (idempotent INSERT OR REPLACE) — guarantees it
+      // exists even if the previous tick crashed after the status write.
+      const fenceRes = await this.callShard(source, "/fence-vbucket", { vbucket: m.vbucket });
+      if (!fenceRes.ok) throw new Error(`fence-vbucket failed on ${source}: ${fenceRes.status}`);
+
+      // Step 2: the source's mirror queue for this vbucket must reach zero.
+      // ACTIVELY drive the drain (review Tier 1 #2) rather than passively
+      // wait on the source shard's alarm cadence — /drain-mirror-jobs
+      // attempts every queued mirror now and reports how many remain
+      // (unreachable targets stay, retried next tick). Now that mirrors are
+      // enqueued atomically with the write, this count includes every
+      // outstanding mirror, so once it's zero no slow mirror can still land
+      // on the target after the flip.
+      const mirrorRes = await this.callShard(source, "/drain-mirror-jobs", { vbucket: m.vbucket });
+      if (!mirrorRes.ok) throw new Error(`drain-mirror-jobs failed on ${source}: ${mirrorRes.status}`);
+      const mirrorDepth = ((await mirrorRes.json()) as { remaining: number }).remaining;
+      if (mirrorDepth > 0) {
+        return true; // poll again next tick
+      }
+
+      // Review Tier 1 #7: don't flip while the source has a prepared 2PC
+      // intent touching this vbucket. A tx that prepared BEFORE the migration
+      // started carries no mirror target, so a commit landing after the flip
+      // would strand its write on the old source. The fence (set above)
+      // blocks NEW prepares, so this count only decreases; once it's zero all
+      // such txs have committed (applied to the source with provenance, so
+      // the checksum below catches any source/target divergence and re-copies
+      // it) or aborted. Wait for that rather than racing the flip.
+      const preparedRes = await this.callShard(source, "/prepared-intent-count-for-vbucket", { vbucket: m.vbucket });
+      if (!preparedRes.ok) throw new Error(`prepared-intent-count failed on ${source}: ${preparedRes.status}`);
+      const preparedBody = (await preparedRes.json()) as { count: number; txIds?: string[] };
+      const preparedCount = preparedBody.count;
+      if (preparedCount > 0) {
+        // Re-review: bound this wait. Once it exceeds CUTOVER_PREPARED_WAIT_MAX_MS,
+        // mark the migration so /migrate-vbucket-status surfaces a distinct
+        // 'cutover-blocked-on-prepared-intents' status (naming the txId), giving
+        // the operator an escape (/admin/tx-force-abort) instead of a silent
+        // livelock. Still poll rather than abort — a slow-but-live tx recovers.
+        const startedRow = this.one<{ cutover_started_at: string | null }>(
+          "SELECT cutover_started_at FROM vbucket_map WHERE vbucket = ?",
+          m.vbucket,
+        );
+        // Adversarial re-review: cutover_started_at is a nullable column added
+        // after cutover existed, so a migration ALREADY in 'cutover' at deploy
+        // time (or one that reached cutover before this field was populated)
+        // has NULL here. A NULL must NOT mean "never times out" — that would
+        // reintroduce the exact livelock this bound closes. Stamp the clock
+        // NOW (start it from this tick) so the bound engages on a later tick.
+        let startedAt: number;
+        if (startedRow?.cutover_started_at) {
+          startedAt = new Date(startedRow.cutover_started_at).getTime();
+        } else {
+          startedAt = Date.now();
+          this.sql.exec(
+            "UPDATE vbucket_map SET cutover_started_at = ?, updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND cutover_started_at IS NULL",
+            new Date(startedAt).toISOString(),
+            new Date().toISOString(),
+            m.vbucket,
+          );
+        }
+        if (Date.now() - startedAt > CUTOVER_PREPARED_WAIT_MAX_MS) {
+          log("catalog.migration_cutover_blocked_on_prepared_intents", {
+            vbucket: m.vbucket,
+            preparedCount,
+            txIds: preparedBody.txIds,
+            waitedMs: Date.now() - startedAt,
+          });
+          this.sql.exec(
+            "UPDATE vbucket_map SET cutover_stall_reason = 'prepared-intents', updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover'",
+            new Date().toISOString(),
+            m.vbucket,
+          );
+        }
+        return true; // poll again next tick
+      }
+      // Prepared intents drained — clear any stall marker set above before
+      // proceeding to the checksum/flip.
+      this.sql.exec(
+        "UPDATE vbucket_map SET cutover_stall_reason = NULL WHERE vbucket = ? AND cutover_stall_reason IS NOT NULL",
+        m.vbucket,
+      );
+
+      // Step 3: per-table content checksums must match for EVERY registered
+      // table (the spec's verify rule) — computed in one batched round trip
+      // per shard rather than one per table.
+      const [srcRes, tgtRes] = await Promise.all([
+        this.callShard(source, "/migrate-checksums", { vbucket: m.vbucket, tables }),
+        this.callShard(target, "/migrate-checksums", { vbucket: m.vbucket, tables }),
+      ]);
+      if (!srcRes.ok || !tgtRes.ok) throw new Error("migrate-checksums failed");
+      const srcSums = ((await srcRes.json()) as { checksums: Record<string, { checksum: string }> }).checksums;
+      const tgtSums = ((await tgtRes.json()) as { checksums: Record<string, { checksum: string }> }).checksums;
+      // The checksum round-trips above are await points — re-read the row
+      // and bail if the migration was aborted (or otherwise changed) while
+      // they were in flight, BEFORE acting on the comparison. Acting on a
+      // stale view here is the dangerous case: a wipe against a migration
+      // that no longer exists, or a flip for one that was aborted.
+      const fresh = this.one<{ migration_status: string; shard_id: string; target_shard_id: string | null }>(
+        "SELECT migration_status, shard_id, target_shard_id FROM vbucket_map WHERE vbucket = ?",
+        m.vbucket,
+      );
+      if (!fresh || fresh.migration_status !== "cutover" || fresh.shard_id !== source || fresh.target_shard_id !== target) {
+        log("catalog.migration_cutover_skipped_stale", { vbucket: m.vbucket });
+        return fresh !== null && fresh.migration_status !== "none";
+      }
+
+      const mismatched = tables.find((t) => srcSums[t.table]?.checksum !== tgtSums[t.table]?.checksum);
+      if (mismatched) {
+        log("catalog.migration_checksum_mismatch", { vbucket: m.vbucket, table: mismatched.table, source, target });
+        // Abort this cutover attempt: fence lifted, target wiped, status
+        // back to backfilling (a later tick re-copies and retries). Purge
+        // the source's queued mirrors for this vbucket too — their content
+        // is re-derived by the next backfill pass, and left queued they'd
+        // fire against the just-wiped target out of order.
+        //
+        // Codex full-PR review P2: check ALL THREE cleanup calls and do NOT
+        // rewind to 'backfilling' unless every one succeeded — return true so
+        // this stays in 'cutover' and the next tick retries the (idempotent)
+        // cleanup. A transient /unfence-vbucket failure that still rewound
+        // would leave the source FENCED while status said 'backfilling', so the
+        // next backfill/cutover ran against a fenced source (writes 409); a
+        // failed purge/wipe would leave stale mirror jobs / target rows to
+        // corrupt the retry.
+        const unfenceRes = await this.callShard(source, "/unfence-vbucket", { vbucket: m.vbucket });
+        if (!unfenceRes.ok) {
+          log("catalog.mismatch_cleanup_unfence_failed", { vbucket: m.vbucket, source, status: unfenceRes.status });
+          return true; // stay 'cutover', retry cleanup next tick — no rewind while fenced
+        }
+        const purgeRes = await this.callShard(source, "/purge-mirror-jobs", { vbucket: m.vbucket });
+        if (!purgeRes.ok) {
+          log("catalog.mismatch_cleanup_purge_failed", { vbucket: m.vbucket, source, status: purgeRes.status });
+          return true;
+        }
+        const wipeRes = await this.callShard(target, "/delete-vbucket-rows", { vbucket: m.vbucket, tables });
+        if (!wipeRes.ok) {
+          log("catalog.mismatch_cleanup_wipe_failed", { vbucket: m.vbucket, target, status: wipeRes.status });
+          return true;
+        }
+        this.sql.exec(
+          // Re-review item D: reset migration_rows_copied to 0 alongside the
+          // rewind. The target's copy was just wiped, so the next backfill
+          // pass re-copies from scratch; without the reset /migrate-vbucket-status
+          // rowsCopied inflated by a full vbucket's worth on every retry.
+          "UPDATE vbucket_map SET migration_status = 'backfilling', migration_rows_copied = 0, cutover_started_at = NULL, cutover_stall_reason = NULL, updated_at = ? WHERE vbucket = ? AND migration_status = 'cutover' AND target_shard_id = ?",
+          new Date().toISOString(),
+          m.vbucket,
+          target,
+        );
+        return true;
+      }
+
+      // Codex final-review P1 #2: re-verify the lock is STILL held by this
+      // operation immediately before the destructive map-flip below — the
+      // alarm heartbeats the lease once per tick, BEFORE advanceMigration is
+      // even called, but everything from the fence check through the
+      // checksum verify above is further awaited round trips where the
+      // lease could have expired or been force-released. Acting on a stale
+      // confirmation here is exactly the dangerous case: another operation
+      // (e.g. a drain) could have acquired the freed lock and already be
+      // acting on `target`, so flipping onto it now could produce a
+      // permanently unroutable vbucket. Do NOT flip this tick — park (no
+      // mutation) and let a later tick, either recovering the SAME lock or
+      // running under a freshly re-acquired one, retry from 'cutover'.
+      const stillHoldsLock = await this.holdsTopologyLockNow(m.topology_lock_operation_id);
+      if (!stillHoldsLock) {
+        log("catalog.migration_flip_aborted_lock_lost", { vbucket: m.vbucket });
+        return true; // stay 'cutover', retry next tick — no mutation this tick
+      }
+
+      // Step 4: flip the map. From this write on, /route sends everything to
+      // the target; the fence still blocks any straggler write that resolved
+      // its route pre-flip and arrives at the source. Conditional, and step
+      // 5's destructive source delete only runs if THIS tick actually
+      // performed the flip.
+      // Step 4: flip the map AND arm the retryable post-flip cleanup atomically.
+      // Codex full-PR review P2: the map flip and cleanup_pending flag are set
+      // in ONE UPDATE so there's no window where the flip committed but nothing
+      // records that the source still needs cleaning — if step 5 below then
+      // fails, the alarm's cleanup loop (keyed on cleanup_pending) retries it
+      // independently of migration_status (which is now 'none').
+      const version = this.bumpMetadataVersion();
+      this.sql.exec(
+        `
+        UPDATE vbucket_map
+        SET shard_id = ?, migration_status = 'none', target_shard_id = NULL, map_version = ?,
+            cutover_started_at = NULL, cutover_stall_reason = NULL,
+            cleanup_pending = 1, cleanup_source_shard_id = ?, updated_at = ?
+        WHERE vbucket = ? AND migration_status = 'cutover' AND shard_id = ? AND target_shard_id = ?
+        `,
+        target,
+        version,
+        source,
+        new Date().toISOString(),
+        m.vbucket,
+        source,
+        target,
+      );
+      const flipped = this.one<{ n: number }>("SELECT changes() AS n");
+      if ((flipped?.n ?? 0) === 0) {
+        log("catalog.migration_flip_skipped_stale", { vbucket: m.vbucket });
+        return false;
+      }
+
+      this.audit("/migrate-vbucket-complete", { vbucket: m.vbucket, fromShard: source, toShard: target, metadataVersion: version });
+      // Step 5: attempt the (retryable) source cleanup now; if a call fails,
+      // cleanup_pending stays 1 and the alarm retries it next tick.
+      return this.runPostFlipCleanup(m.vbucket, source, tables, m.topology_lock_operation_id);
+    }
+
+    return false;
+  }
+
+  /** Post-flip source cleanup, made RETRYABLE via cleanup_pending (set
+   * atomically in the flip UPDATE). The map is already flipped — reads/writes
+   * route to the target — so this is pure cleanup that can retry indefinitely
+   * without affecting routing. Deletes the migrated vbucket's rows + provenance
+   * from the old source and unfences it; BOTH are idempotent (re-runnable).
+   * Ordering (Codex P1 silent-loss fix): delete WHILE the source is still
+   * fenced, then unfence LAST, so a straggler that resolved the old route can
+   * only 409 during the window rather than being accepted-then-dropped. Clears
+   * cleanup_pending only once BOTH succeed; on any failure leaves it set and
+   * returns true so the caller/alarm keeps ticking. */
+  private async runPostFlipCleanup(
+    vbucket: number,
+    sourceShardId: string,
+    tables: Array<{ table: string; partitionKeyColumn: string; schemaSql: string | null }>,
+    topologyLockOperationId?: string | null,
+  ): Promise<boolean> {
+    const deleteRes = await this.callShard(sourceShardId, "/delete-vbucket-rows", { vbucket, tables });
+    if (!deleteRes.ok) {
+      log("catalog.post_flip_cleanup_delete_failed", { vbucket, sourceShardId, status: deleteRes.status });
+      return true; // retry next tick — cleanup_pending stays set
+    }
+    const unfenceRes = await this.callShard(sourceShardId, "/unfence-vbucket", { vbucket });
+    if (!unfenceRes.ok) {
+      log("catalog.post_flip_cleanup_unfence_failed", { vbucket, sourceShardId, status: unfenceRes.status });
+      return true; // retry — source stays fenced (delete already done) until unfence succeeds
+    }
+    // Approved design (Stage 3): cleanup completing is the migration's TRUE
+    // end — release the topology lock it held since /admin/migrate-vbucket (or
+    // /admin/split-vbucket) started it. If this migration is a drain's
+    // sub-migration (inherited the drain's own operationId), the enclosing
+    // drain still owns the lock's lifecycle — releaseMigrationTopologyLock
+    // detects that and skips the release.
+    await this.releaseMigrationTopologyLock(topologyLockOperationId);
+    this.sql.exec(
+      "UPDATE vbucket_map SET cleanup_pending = 0, cleanup_source_shard_id = NULL, topology_lock_operation_id = NULL, updated_at = ? WHERE vbucket = ? AND cleanup_pending = 1",
       new Date().toISOString(),
+      vbucket,
+    );
+    return false;
+  }
+
+  /** Milestone 3, Chunk 4 (POST /migrate-vbucket-status {vbucket}). */
+  private async handleMigrateVbucketStatus(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+    const row = this.one<MigrationRow & { migration_started_at: string | null; cutover_stall_reason: string | null }>(
+      "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, migration_started_at, cutover_stall_reason FROM vbucket_map WHERE vbucket = ?",
       body.vbucket,
     );
+    if (!row) {
+      return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+    }
+    let mirrorQueueDepth = 0;
+    if (row.migration_status !== "none") {
+      const mirrorRes = await this.callShard(row.shard_id, "/mirror-pending-count", { vbucket: body.vbucket });
+      if (mirrorRes.ok) {
+        mirrorQueueDepth = ((await mirrorRes.json()) as { count: number }).count;
+      }
+    }
+
+    // Re-review: surface a bounded cutover stalled on prepared 2PC intents as a
+    // distinct status naming the offending txId(s), so an operator can
+    // /admin/tx-force-abort the wedged transaction instead of watching the
+    // migration livelock in 'cutover' forever.
+    let status = row.migration_status;
+    let blockedTxIds: string[] | undefined;
+    if (row.cutover_stall_reason === "prepared-intents" && row.migration_status === "cutover") {
+      status = "cutover-blocked-on-prepared-intents";
+      const preparedRes = await this.callShard(row.shard_id, "/prepared-intent-count-for-vbucket", { vbucket: body.vbucket });
+      if (preparedRes.ok) {
+        blockedTxIds = ((await preparedRes.json()) as { txIds?: string[] }).txIds;
+      }
+    }
 
     return json({
-      ok: true,
-      vbucket: body.vbucket,
-      fromShard: existingMap.shard_id,
-      toShard: targetShard,
-      metadataVersion: version,
+      vbucket: row.vbucket,
+      status,
+      fromShard: row.shard_id,
+      toShard: row.target_shard_id,
+      rowsCopied: row.migration_rows_copied,
+      mirrorQueueDepth,
+      startedAt: row.migration_started_at,
+      ...(blockedTxIds ? { blockedTxIds } : {}),
     });
+  }
+
+  /** Milestone 3, Chunk 4 (POST /migrate-vbucket-abort {vbucket}). Safe at
+   * any point before the map flip — the source never stopped being
+   * authoritative, so aborting is purely: wipe the target's copy of this
+   * vbucket (rows + provenance), lift the fence, clear the migration state.
+   * After the flip there is nothing left to abort (the source copy is
+   * deleted); rolling back is a fresh migration in the other direction.
+   *
+   * Review Tier 1 #4: cleanup transitions the row to an intermediate
+   * 'aborting' status (target_shard_id retained) BEFORE unfence/purge/wipe,
+   * and only clears to 'none' after all three succeed. A crash or failure
+   * mid-cleanup leaves the row 'aborting', not 'none' — so a retried abort
+   * RESUMES the (idempotent) cleanup and lifts the fence, instead of
+   * returning 409 MIGRATION_ALREADY_COMMITTED and stranding the source
+   * fenced forever. */
+  private async handleMigrateVbucketAbort(request: Request): Promise<Response> {
+    const body = (await request.json()) as { vbucket?: number };
+    if (body.vbucket === undefined) {
+      return json({ error: "Missing vbucket" }, 400);
+    }
+
+    // Take the same latch the orchestration ticks use: an in-flight tick
+    // interleaves with this handler at await points, and a tick's cutover
+    // branch re-asserts the fence — racing that with the unfence below
+    // could leave a permanent fence on an aborted migration. Waiting the
+    // tick out (they're short) makes abort-vs-tick strictly sequential.
+    while (this.migrationTickInFlight) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    this.migrationTickInFlight = true;
+    try {
+      const row = this.one<MigrationRow>(
+        "SELECT vbucket, shard_id, target_shard_id, migration_status, migration_rows_copied, topology_lock_operation_id FROM vbucket_map WHERE vbucket = ?",
+        body.vbucket,
+      );
+      if (!row) {
+        return json({ error: `vbucket ${body.vbucket} has no mapping` }, 404);
+      }
+      // 'none' means the migration already committed (map flipped) or never
+      // started; there's nothing to abort. An 'aborting' row is a previously
+      // interrupted abort — resume its cleanup below rather than reject.
+      if (row.migration_status === "none" || !row.target_shard_id) {
+        return json(
+          {
+            error: {
+              code: "MIGRATION_ALREADY_COMMITTED",
+              message: `vbucket ${body.vbucket} has no active migration — it either already committed (map flipped) or was never started.`,
+              fix: "A committed migration is reversed by migrating the vbucket back with /admin/migrate-vbucket.",
+            },
+          },
+          409,
+        );
+      }
+
+      this.audit("/migrate-vbucket-abort", { vbucket: body.vbucket, fromShard: row.shard_id, toShard: row.target_shard_id });
+
+      const tables = this.migratableTables();
+      // Move to the intermediate 'aborting' state (keeping target_shard_id) —
+      // survives a crash so a retry knows the target to finish wiping. The
+      // alarm's migration loop ignores 'aborting' the same as 'none'.
+      if (row.migration_status !== "aborting") {
+        this.sql.exec(
+          "UPDATE vbucket_map SET migration_status = 'aborting', updated_at = ? WHERE vbucket = ?",
+          new Date().toISOString(),
+          body.vbucket,
+        );
+      }
+      // Cleanup, all idempotent so a resumed abort re-runs it safely:
+      // unfence the source, purge its queued-but-unsent mirrors (a stale
+      // mirror firing after the wipe would recreate unattributed junk on the
+      // target), then wipe the target's copy. Every step's result is checked —
+      // Codex review P2: a swallowed /unfence-vbucket failure that then cleared
+      // to 'none' would strand the source permanently VBUCKET_FENCED with no
+      // 'aborting' state left to resume from. On ANY failure, leave the row
+      // 'aborting' and return 502 so a retried abort re-runs the (idempotent)
+      // remaining cleanup.
+      const unfenceRes = await this.callShard(row.shard_id, "/unfence-vbucket", { vbucket: body.vbucket });
+      if (!unfenceRes.ok) {
+        return json({ error: `Failed to unfence source shard ${row.shard_id} — abort not completed, retry.` }, 502);
+      }
+      const purgeRes = await this.callShard(row.shard_id, "/purge-mirror-jobs", { vbucket: body.vbucket });
+      if (!purgeRes.ok) {
+        return json({ error: `Failed to purge mirror jobs on source shard ${row.shard_id} — abort not completed, retry.` }, 502);
+      }
+      const wipeRes = await this.callShard(row.target_shard_id, "/delete-vbucket-rows", { vbucket: body.vbucket, tables });
+      if (!wipeRes.ok) {
+        // Leave the row 'aborting' — a retried abort resumes and completes the wipe.
+        return json({ error: `Failed to wipe target shard ${row.target_shard_id} — abort not completed, retry.` }, 502);
+      }
+
+      // Cleanup fully succeeded — only now clear to 'none'. Approved design
+      // (Stage 3): an abort is also a migration's TRUE end — release the
+      // topology lock it held since start (unless an enclosing drain still
+      // owns it, e.g. an operator aborting one of a drain's in-flight
+      // sub-migrations directly).
+      await this.releaseMigrationTopologyLock(row.topology_lock_operation_id);
+      this.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'none', target_shard_id = NULL, migration_rows_copied = 0, migration_started_at = NULL, backfill_table = NULL, backfill_after_pk = NULL, cutover_started_at = NULL, cutover_stall_reason = NULL, topology_lock_operation_id = NULL, updated_at = ? WHERE vbucket = ?",
+        new Date().toISOString(),
+        body.vbucket,
+      );
+
+      return json({ ok: true, vbucket: body.vbucket, status: "aborted" });
+    } finally {
+      this.migrationTickInFlight = false;
+    }
   }
 }
