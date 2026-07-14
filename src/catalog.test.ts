@@ -2759,3 +2759,202 @@ describe("CatalogDO topology-operation lock (Stage 1 mechanism)", () => {
     expect((await stub.fetch(post("/heartbeat-topology-lock", { operationId: opId2 }))).status).toBe(409);
   });
 });
+
+// Approved design: Stage 3 wires the topology lock into the LONG-running
+// migration/drain state machines — held for the whole multi-tick operation,
+// heartbeated every tick, released only on full completion (or park if lost).
+describe("CatalogDO topology-operation lock — Stage 3 (long-running operations)", () => {
+  // The lock always lives on the PHYSICAL "catalog-0" DO (CatalogDO detects
+  // "am I catalog-0" by DO identity, not by cluster_config — see
+  // isCatalogZero) regardless of which catalog instance is running the
+  // migration/drain. freshCatalog() mints a random-named catalog for test
+  // isolation, so the tests below acquire/inspect/release the lock against
+  // the REAL catalog-0 stub — exactly what the Worker's acquireTopologyLock
+  // does in production — while driving the migration/drain on the
+  // freshCatalog() instance itself.
+  function catalogZero() {
+    return env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  }
+
+  it("a Worker-mediated migration heartbeats the topology lock every tick and releases it only once cleanup (the migration's TRUE end) completes", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const lockStub = catalogZero();
+
+    const acq = (await (await lockStub.fetch(post("/acquire-topology-lock", { operationType: "migrate-vbucket" }))).json()) as { operationId: string };
+    const opId = acq.operationId;
+
+    const mig = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-lockheld-target", operationId: opId }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(mig.status).toBe(200);
+
+    // The lock is recorded on the vbucket_map row and still held mid-flight.
+    const midRow = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT topology_lock_operation_id FROM vbucket_map WHERE vbucket = 0")) as Array<{ topology_lock_operation_id: string | null }>)[0],
+    );
+    expect(midRow.topology_lock_operation_id).toBe(opId);
+    expect(((await (await lockStub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(true);
+
+    // Drive the migration to completion (backfill -> cutover -> flip -> cleanup).
+    for (let tick = 0; tick < 15; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const s = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+      if (s.status === "none") break;
+    }
+    const final = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+    expect(final.status).toBe("none"); // completed
+
+    // The lock was released — held by no one now — and the row's reference cleared.
+    expect(((await (await lockStub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(false);
+    expect(((await (await lockStub.fetch(post("/topology-lock-status", {}))).json()) as { held: boolean }).held).toBe(false);
+    const afterRow = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+      (Array.from(state.storage.sql.exec("SELECT topology_lock_operation_id FROM vbucket_map WHERE vbucket = 0")) as Array<{ topology_lock_operation_id: string | null }>)[0],
+    );
+    expect(afterRow.topology_lock_operation_id).toBeNull();
+  });
+
+  it("if the topology lock is released out from under an in-flight migration (force-release), the next tick PARKS (no mutation) instead of continuing; the lock is then free for a new operation", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const lockStub = catalogZero();
+
+    const acq = (await (await lockStub.fetch(post("/acquire-topology-lock", { operationType: "migrate-vbucket" }))).json()) as { operationId: string };
+    const opId = acq.operationId;
+    const mig = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-lostlock-target", operationId: opId }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(mig.status).toBe(200);
+    const before = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string; rowsCopied: number };
+    expect(before.status).toBe("backfilling"); // freshly started, no tick driven yet
+
+    // Simulate an operator force-releasing the lock (Stage 4's
+    // /admin/force-release-topology-lock does exactly this at the route
+    // level; released here directly since that's a Worker-level admin route)
+    // BEFORE this migration ever gets a tick — the fresh case of "lost from
+    // the very start of its lifecycle."
+    const rel = await lockStub.fetch(post("/release-topology-lock", { operationId: opId }));
+    expect(((await rel.json()) as { released: boolean }).released).toBe(true);
+
+    // The next tick must NOT advance this migration at all — it has no lock.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const after = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string; rowsCopied: number };
+    expect(after.status).toBe(before.status); // no state transition
+    expect(after.rowsCopied).toBe(before.rowsCopied); // no further copying
+
+    // The lock itself is genuinely free again — a brand-new operation can
+    // acquire it (this migration's own stale operationId can never heartbeat
+    // successfully again, by design — an operator must intervene).
+    const acq2 = await lockStub.fetch(post("/acquire-topology-lock", { operationType: "create-index" }));
+    expect(acq2.status).toBe(200);
+  });
+
+  it("a drain HOLDS its topology lock across multiple sub-migrations (one vbucket's own migration completing does NOT prematurely release it) and releases only on the drain's TRUE completion", async () => {
+    const stub = await freshCatalog();
+    // 2 vbuckets on shard-0, one active target — the drain migrates them
+    // SEQUENTIALLY, so vbucket 0's migration can fully complete while vbucket
+    // 1 (and the drain overall) is still in flight.
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 2 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const lockStub = catalogZero();
+
+    const acq = (await (await lockStub.fetch(post("/acquire-topology-lock", { operationType: "drain-shard" }))).json()) as { operationId: string };
+    const opId = acq.operationId;
+    const drainRes = await stub.fetch(post("/drain-shard", { shardId: "shard-0", operationId: opId }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(drainRes.status).toBe(200);
+
+    const shardRow = () =>
+      runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+        (Array.from(state.storage.sql.exec("SELECT topology_lock_operation_id FROM shards WHERE shard_id = 'shard-0'")) as Array<{ topology_lock_operation_id: string | null }>)[0],
+      );
+    expect((await shardRow()).topology_lock_operation_id).toBe(opId);
+
+    // Drive ticks; stop the instant vbucket 0's OWN migration is done (status
+    // 'none') but the drain overall is NOT complete yet (shard.status still
+    // 'draining' — 2 vbuckets, only 1 fully migrated).
+    let vbucket0Done = false;
+    for (let tick = 0; tick < 30 && !vbucket0Done; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const row = await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+        (Array.from(state.storage.sql.exec("SELECT migration_status FROM vbucket_map WHERE vbucket = 0")) as Array<{ migration_status: string }>)[0],
+      );
+      if (row.migration_status === "none") vbucket0Done = true;
+    }
+    expect(vbucket0Done).toBe(true);
+
+    // THE REGRESSION THIS GUARDS: vbucket 0's sub-migration completing must
+    // NOT have released the drain's shared lock — the drain (vbucket 1, then
+    // ring evacuation if any) still needs it.
+    expect(((await (await lockStub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(true);
+    expect((await shardRow()).topology_lock_operation_id).toBe(opId);
+
+    // Drive to the drain's actual completion. /init clamps totalVBuckets to a
+    // floor of 64 regardless of what's requested, so shard-0 (half of a
+    // 2-shard round robin) starts this loop owning ~30 vbuckets — one
+    // migrates per tick sequentially, so the budget must comfortably exceed
+    // that count. /drain-shard-status's "complete" is a pure read (derived
+    // from vbuckets/rings remaining hitting zero) that can turn true ONE tick
+    // before advanceDrain itself re-runs with vbuckets.length===0 and
+    // performs the actual release — so wait for the LOCK to clear too, not
+    // just the status string.
+    let complete = false;
+    for (let tick = 0; tick < 85 && !complete; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`));
+      const statusBody = (await statusRes.json()) as { status: string };
+      const holds = ((await (await lockStub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds;
+      if (statusBody.status === "complete" && !holds) complete = true;
+    }
+    expect(complete).toBe(true);
+
+    // NOW it's released.
+    expect(((await (await lockStub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(false);
+    expect((await shardRow()).topology_lock_operation_id).toBeNull();
+  });
+
+  it("a drain that loses its topology lock parks with a distinguishable 'topology-lock-lost' stall (not 'complete'/'migrating-vbuckets') and does not mutate; recovers if the SAME operationId is restored", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 2 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const lockStub = catalogZero();
+
+    const acq = (await (await lockStub.fetch(post("/acquire-topology-lock", { operationType: "drain-shard" }))).json()) as { operationId: string };
+    const opId = acq.operationId;
+    await stub.fetch(post("/drain-shard", { shardId: "shard-0", operationId: opId }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Force-release out from under the drain.
+    await lockStub.fetch(post("/release-topology-lock", { operationId: opId }));
+
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const parked = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as {
+      status: string;
+      stallReason: string | null;
+    };
+    expect(parked.stallReason).toBe("topology-lock-lost");
+    expect(parked.status).not.toBe("complete");
+    expect(parked.status).not.toBe("migrating-vbuckets"); // distinguishable, not misleadingly "just working"
+
+    // Restoring a lock recorded under this exact operationId (a direct
+    // simulation of "the lock situation resolved") lets the very next tick's
+    // heartbeat succeed again, clearing the soft stall.
+    await runInDurableObject(lockStub, async (_i: CatalogDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO topology_lock (singleton, operation_id, operation_type, acquired_at, expires_at, heartbeat_at) VALUES (1, ?, 'drain-shard', ?, ?, ?)",
+        opId,
+        now,
+        new Date(Date.now() + 30_000).toISOString(),
+        now,
+      );
+    });
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const recovered = (await (await stub.fetch(post("/drain-shard-status", { shardId: "shard-0" }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { stallReason: string | null };
+    expect(recovered.stallReason).not.toBe("topology-lock-lost");
+  });
+});
