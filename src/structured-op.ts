@@ -37,6 +37,19 @@ export function rowKey(tenantId: string, table: string, partitionKey: string): s
   return JSON.stringify([tenantId, table, partitionKey]);
 }
 
+/** A /v1/tx synthetic __cf_indexes-maintenance intent carries this `table`
+ * prefix followed by the index name (see index.ts's addIntent for synthetic
+ * index deltas). Shared so the gateway that builds it and ShardDO's /prepare
+ * index-ring fence check that reads it can't drift on the format. */
+export const SYNTHETIC_INDEX_TABLE_PREFIX = "__cf_indexes:";
+
+/** Returns the index name if `table` is a synthetic __cf_indexes intent table
+ * (`__cf_indexes:<indexName>`), else null. */
+export function indexNameFromSyntheticTable(table: string | null | undefined): string | null {
+  if (typeof table !== "string" || !table.startsWith(SYNTHETIC_INDEX_TABLE_PREFIX)) return null;
+  return table.slice(SYNTHETIC_INDEX_TABLE_PREFIX.length);
+}
+
 /** Distinct-row grouping key for a mutation. See rowKey(). */
 export function participantKey(m: StructuredMutation): string {
   return rowKey(m.tenantId, m.table, m.partitionKey);
