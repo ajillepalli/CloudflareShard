@@ -32,6 +32,18 @@ export interface Env {
 const DEFAULT_CATALOG_SHARD_COUNT = 4;
 const SHARD_FANOUT_CONCURRENCY = 10;
 const MAX_TX_PARTICIPANT_KEYS = 8;
+// Codex final-review P1 #1: create-index's backfill holds the topology lock
+// for its entire (synchronous, potentially long) scan-and-write loop, but
+// only ever refreshed the lease once, at acquisition. A large table's
+// backfill can run past the lock's 30s TTL with no renewal, letting the
+// lease expire mid-backfill — a concurrent drain could then acquire it and
+// start moving rows off a shard this backfill hasn't scanned yet (migration
+// import doesn't create index entries, so those rows would be permanently
+// missing from the new index). Re-heartbeat at a cadence far tighter than
+// the TTL: once per data shard (bounding the gap even when a shard has very
+// few rows) AND every N rows within a shard's scan (bounding a single huge
+// shard).
+const BACKFILL_HEARTBEAT_ROW_INTERVAL = 200;
 
 /** Maps over items in bounded-size batches so a large shard count can't fire
  * unbounded simultaneous Durable Object calls in one request. */
@@ -151,6 +163,23 @@ async function releaseTopologyLock(env: Env, operationId: string): Promise<void>
     await routeToCatalog(env, "catalog-0", "/release-topology-lock", { operationId });
   } catch {
     // ignore — the lease expires on its own
+  }
+}
+
+/** Codex final-review P1 #1: refresh this operation's lease mid-flight (a
+ * long-running Worker-side loop — e.g. create-index's backfill — that isn't
+ * ticked by CatalogDO's own alarm still needs to renew the same lock it
+ * acquired up front). Returns false — LOCK LOST — on a non-2xx response
+ * (expired, force-released, or reacquired by another operation) OR if
+ * catalog-0 can't be reached at all; fail-safe, matching
+ * heartbeatTopologyLockOrPark's convention in catalog.ts: an unconfirmable
+ * lock must be treated the same as a lost one, never as "still fine". */
+async function heartbeatTopologyLock(env: Env, operationId: string): Promise<boolean> {
+  try {
+    const res = await routeToCatalog(env, "catalog-0", "/heartbeat-topology-lock", { operationId });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -429,13 +458,13 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   const lock = await acquireTopologyLock(env, "create-index");
   if (lock instanceof Response) return lock;
   try {
-    return await handleAdminCreateIndexLocked(request, env);
+    return await handleAdminCreateIndexLocked(request, env, lock.operationId);
   } finally {
     await releaseTopologyLock(env, lock.operationId);
   }
 }
 
-async function handleAdminCreateIndexLocked(request: Request, env: Env): Promise<Response> {
+async function handleAdminCreateIndexLocked(request: Request, env: Env, operationId: string): Promise<Response> {
   const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
   if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
     return json(
@@ -602,7 +631,33 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env): Promise
   // (active + draining — see dataShardIds above), compute each row's index
   // entry, and write it to its own computed index shard (placed on the active
   // ring via indexShardIdForKey(..., shardIds)).
+  //
+  // Codex final-review P1 #1: this loop holds the topology lock acquired once
+  // in handleAdminCreateIndex, for its ENTIRE (synchronous) duration — a large
+  // table can run well past the lock's 30s TTL with no renewal otherwise. Two
+  // heartbeat points below re-confirm the lease: once per shard (so even a
+  // backfill spread across many small shards keeps refreshing) and every
+  // BACKFILL_HEARTBEAT_ROW_INTERVAL rows (so a single huge shard does too). A
+  // failed heartbeat means the lease is gone — expired, force-released, or
+  // reacquired by another topology op — so this ABORTS rather than risk
+  // writing more index entries while a concurrent drain/migration may already
+  // be moving rows this backfill hasn't scanned yet off their source shard
+  // (migration import never creates index entries, so those rows would be
+  // silently, permanently missing from the new index).
+  let rowsSinceHeartbeat = 0;
   for (const shardId of dataShardIds) {
+    if (!(await heartbeatTopologyLock(env, operationId))) {
+      return json(
+        {
+          error: {
+            code: "TOPOLOGY_LOCK_LOST",
+            message: `The topology lock backing this backfill was lost before scanning shard ${shardId} (expired, force-released, or reacquired by another operation).`,
+            fix: "Retry /admin/create-index once any concurrent topology operation completes (idempotent on registration and on already-written entries).",
+          },
+        },
+        409,
+      );
+    }
     const safeTable = `"${table}"`;
     const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
     const scanRes = await routeToShard(env, shardId, "/execute", {
@@ -618,6 +673,22 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env): Promise
     }
     const scanBody = (await scanRes.json()) as { rows: Array<Record<string, unknown>> };
     for (const row of scanBody.rows) {
+      rowsSinceHeartbeat += 1;
+      if (rowsSinceHeartbeat >= BACKFILL_HEARTBEAT_ROW_INTERVAL) {
+        rowsSinceHeartbeat = 0;
+        if (!(await heartbeatTopologyLock(env, operationId))) {
+          return json(
+            {
+              error: {
+                code: "TOPOLOGY_LOCK_LOST",
+                message: `The topology lock backing this backfill was lost partway through shard ${shardId} (expired, force-released, or reacquired by another operation).`,
+                fix: "Retry /admin/create-index once any concurrent topology operation completes (idempotent on registration and on already-written entries).",
+              },
+            },
+            409,
+          );
+        }
+      }
       const partitionKey = String(row[pkCol]);
 
       // Re-read this row's CURRENT values immediately before writing its
