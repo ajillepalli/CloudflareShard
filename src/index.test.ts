@@ -1,5 +1,5 @@
-import { SELF, env, runInDurableObject } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
@@ -51,6 +51,20 @@ async function registerTenant(tenantId: string): Promise<string> {
   const body = (await res.json()) as { token: string };
   return `Bearer ${body.token}`;
 }
+
+// This file drives the whole cluster over FIXED-name Durable Objects (catalog-0…,
+// shard-0…) via SELF.fetch, and DO storage PERSISTS across `it` blocks — so data
+// one test writes (base rows, index entries, multi-tenant seeds, extra shards)
+// leaks into later tests. That non-determinism surfaced as the late-file
+// /v1/scatter "caps results" test intermittently failing only in a full-file
+// run. reset() is @cloudflare/vitest-pool-workers' documented per-test DO-storage
+// wipe (same isolation catalog.test.ts already uses); afterEach means every test
+// starts from clean storage. No test here depends on state persisting ACROSS
+// `it` blocks — the existing beforeEach cleanups are per-test setup, which still
+// runs before each test after the wipe.
+afterEach(async () => {
+  await reset();
+});
 
 describe("Worker multi-catalog-shard fan-out", () => {
   it("/admin/init initializes every catalog shard, not just one", async () => {
@@ -3733,7 +3747,12 @@ describe("Milestone 2 Chunk 7: benchmark — indexed /v1/mutate write latency an
         expect(jobs).toHaveLength(0);
       });
     }
-  }, 20000);
+    // Wall-clock budget only (the p50 regression bar above is the actual
+    // assertion, unaffected by this): 40 sequential gateway round trips this
+    // late in the file already sit near the cumulative-latency ceiling
+    // (vitest.config.ts), and per-test reset() adds a little more, so the old
+    // 20s budget was too tight. Widened; a genuine hang still blows past it.
+  }, 40000);
 });
 
 describe("Milestone 3 Chunk 6: migration benchmark (observational — no pass/fail thresholds)", () => {
