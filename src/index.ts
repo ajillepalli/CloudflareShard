@@ -679,22 +679,27 @@ async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Resp
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
   }
-  // Topology lock: serialize the split's START against every other topology
-  // operation. (The migration it kicks off runs on the catalog alarm and is
-  // protected in flight by the per-vbucket MIGRATION_IN_PROGRESS guard.)
+  // Stage 2/3: acquire the topology lock for the split's START, then HAND IT
+  // OFF to the vbucket-migration state machine on success — CatalogDO stores
+  // the operationId on the vbucket_map row and its alarm heartbeats/releases
+  // it for the migration's whole multi-tick duration (Stage 3). Only release
+  // here if the catalog call did NOT actually start a migration (nothing to
+  // hand off to, e.g. MIGRATION_IN_PROGRESS or a validation failure).
   const lock = await acquireTopologyLock(env, "split-vbucket");
   if (lock instanceof Response) return lock;
+  let handedOff = false;
   try {
     const res = await routeToCatalog(
       env,
       payload.catalogShardId,
       "/split-vbucket",
-      payload,
+      { ...payload, operationId: lock.operationId },
       request.headers.get("authorization") ?? undefined,
     );
+    handedOff = res.ok;
     return new Response(res.body, { status: res.status, headers: res.headers });
   } finally {
-    await releaseTopologyLock(env, lock.operationId);
+    if (!handedOff) await releaseTopologyLock(env, lock.operationId);
   }
 }
 
@@ -703,13 +708,16 @@ async function handleAdminMigrateVbucket(request: Request, env: Env): Promise<Re
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
   }
+  // Same hand-off pattern as split-vbucket above.
   const lock = await acquireTopologyLock(env, "migrate-vbucket");
   if (lock instanceof Response) return lock;
+  let handedOff = false;
   try {
-    const res = await routeToCatalog(env, payload.catalogShardId, "/migrate-vbucket", payload, request.headers.get("authorization") ?? undefined);
+    const res = await routeToCatalog(env, payload.catalogShardId, "/migrate-vbucket", { ...payload, operationId: lock.operationId }, request.headers.get("authorization") ?? undefined);
+    handedOff = res.ok;
     return new Response(res.body, { status: res.status, headers: res.headers });
   } finally {
-    await releaseTopologyLock(env, lock.operationId);
+    if (!handedOff) await releaseTopologyLock(env, lock.operationId);
   }
 }
 
@@ -1101,14 +1109,42 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
     );
   }
 
-  const res = await routeToCatalog(
-    env,
-    payload.catalogShardId,
-    "/drain-shard",
-    payload,
-    request.headers.get("authorization") ?? undefined,
-  );
-  return new Response(res.body, { status: res.status, headers: res.headers });
+  // Stage 3: a drain is a LONG operation (many alarm ticks) — the lock is
+  // acquired for a FRESH start and HANDED OFF to advanceDrain's whole
+  // multi-tick duration (CatalogDO stores it on the shards row; heartbeated
+  // each tick, released only on full completion). A RE-INVOKE of an
+  // ALREADY-draining shard (the "I've fixed the stall, resume" signal) must
+  // NOT acquire a NEW lock — that drain already holds its own lock, and a
+  // fresh acquire attempt would 409 against it. Check current status first to
+  // tell the two apart.
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const statusRes = await routeToCatalog(env, payload.catalogShardId, "/drain-shard-status", { shardId: payload.shardId }, authorization);
+  let alreadyDraining = false;
+  if (statusRes.ok) {
+    const statusBody = (await statusRes.clone().json()) as { status?: string };
+    alreadyDraining = statusBody.status !== "active";
+  }
+
+  let lockOperationId: string | undefined;
+  if (!alreadyDraining) {
+    const lock = await acquireTopologyLock(env, "drain-shard");
+    if (lock instanceof Response) return lock;
+    lockOperationId = lock.operationId;
+  }
+  let handedOff = false;
+  try {
+    const res = await routeToCatalog(
+      env,
+      payload.catalogShardId,
+      "/drain-shard",
+      lockOperationId ? { ...payload, operationId: lockOperationId } : payload,
+      authorization,
+    );
+    handedOff = res.ok;
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } finally {
+    if (lockOperationId && !handedOff) await releaseTopologyLock(env, lockOperationId);
+  }
 }
 
 async function handleAdminAuditLog(request: Request, env: Env): Promise<Response> {
