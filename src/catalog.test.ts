@@ -2696,3 +2696,66 @@ describe("CatalogDO index-ring write fence — round-13 end-to-end", () => {
     expect(status.status).toBe("complete");
   });
 });
+
+// Approved design: a durable cluster-wide topology-operation lock serializes
+// every topology mutation. Stage 1 — the lock mechanism on CatalogDO.
+describe("CatalogDO topology-operation lock (Stage 1 mechanism)", () => {
+  it("CAS acquire: a live lock blocks a second acquire (409); heartbeat/release/holds/status behave; an expired lock is takeable", async () => {
+    const stub = await freshCatalog();
+
+    // Acquire.
+    const acq = await stub.fetch(post("/acquire-topology-lock", { operationType: "drain-shard" }));
+    expect(acq.status).toBe(200);
+    const acqBody = (await acq.json()) as { ok: boolean; operationId: string };
+    expect(acqBody.ok).toBe(true);
+    const opId = acqBody.operationId;
+
+    // A second acquire while held → 409 with the holder's info.
+    const dup = await stub.fetch(post("/acquire-topology-lock", { operationType: "create-index" }));
+    expect(dup.status).toBe(409);
+    const dupBody = (await dup.json()) as { error: { code: string; operationType: string; operationId: string } };
+    expect(dupBody.error.code).toBe("TOPOLOGY_OPERATION_IN_PROGRESS");
+    expect(dupBody.error.operationType).toBe("drain-shard");
+    expect(dupBody.error.operationId).toBe(opId);
+
+    // holds: true for the holder, false for a stranger.
+    expect(((await (await stub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(true);
+    expect(((await (await stub.fetch(post("/holds-topology-lock", { operationId: "someone-else" }))).json()) as { holds: boolean }).holds).toBe(false);
+
+    // status reflects the holder.
+    const st = (await (await stub.fetch(post("/topology-lock-status", {}))).json()) as { held: boolean; operationId: string; expired: boolean };
+    expect(st.held).toBe(true);
+    expect(st.operationId).toBe(opId);
+    expect(st.expired).toBe(false);
+
+    // heartbeat: correct id refreshes; wrong id → LOCK_LOST.
+    expect((await stub.fetch(post("/heartbeat-topology-lock", { operationId: opId }))).status).toBe(200);
+    const hbBad = await stub.fetch(post("/heartbeat-topology-lock", { operationId: "not-me" }));
+    expect(hbBad.status).toBe(409);
+    expect(((await hbBad.json()) as { error: { code: string } }).error.code).toBe("LOCK_LOST");
+
+    // release: wrong id is a no-op (lock still held); correct id frees it.
+    expect(((await (await stub.fetch(post("/release-topology-lock", { operationId: "not-me" }))).json()) as { released: boolean }).released).toBe(false);
+    expect(((await (await stub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(true);
+    expect(((await (await stub.fetch(post("/release-topology-lock", { operationId: opId }))).json()) as { released: boolean }).released).toBe(true);
+    expect(((await (await stub.fetch(post("/topology-lock-status", {}))).json()) as { held: boolean }).held).toBe(false);
+
+    // After release a fresh acquire succeeds.
+    const acq2 = await stub.fetch(post("/acquire-topology-lock", { operationType: "migrate-vbucket" }));
+    expect(acq2.status).toBe(200);
+    const opId2 = ((await acq2.json()) as { operationId: string }).operationId;
+
+    // An EXPIRED lock is takeable: force expiry, then a new acquire succeeds and
+    // the old holder no longer holds it.
+    await runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE topology_lock SET expires_at = ? WHERE singleton = 1", new Date(Date.now() - 1000).toISOString());
+    });
+    expect(((await (await stub.fetch(post("/holds-topology-lock", { operationId: opId2 }))).json()) as { holds: boolean }).holds).toBe(false); // expired
+    const acq3 = await stub.fetch(post("/acquire-topology-lock", { operationType: "split-vbucket" }));
+    expect(acq3.status).toBe(200);
+    const opId3 = ((await acq3.json()) as { operationId: string }).operationId;
+    expect(opId3).not.toBe(opId2);
+    // The stale holder's heartbeat now fails (someone else holds it).
+    expect((await stub.fetch(post("/heartbeat-topology-lock", { operationId: opId2 }))).status).toBe(409);
+  });
+});
