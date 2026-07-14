@@ -12,7 +12,12 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 - Online vBucket migration (Milestone 3): dual-write backfill, fenced 5-step cutover with
   per-table content checksums, safe abort — `/admin/split-vbucket` performs a real data
   move, and `/admin/drain-shard` fully evacuates a shard (vbuckets first, then
-  index-placement rings via deterministic substitution).
+  index-placement rings via deterministic substitution, protected by a per-index write
+  fence so no index entry is stranded on a shard mid-evacuation).
+- A durable, TTL'd topology-operation lock (Milestone 3) serializes drain/split/migrate/
+  create-index/drop-index so two concurrent cluster-reshaping operations can't race each
+  other's preconditions; `/admin/topology-lock-status` and
+  `/admin/force-release-topology-lock` give an operator visibility and recovery.
 - Mutation idempotency via requestId, rejecting replay with a mismatched SQL/params pair instead of returning a stale result.
 
 ## Project layout
