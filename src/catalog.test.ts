@@ -2849,6 +2849,117 @@ describe("CatalogDO topology-operation lock — Stage 3 (long-running operations
     expect(acq2.status).toBe(200);
   });
 
+  // Codex final-review P1 #2: the alarm heartbeats the lease once per tick,
+  // BEFORE advanceMigration is even called — but the cutover branch then
+  // awaits several MORE round trips (fence, mirror-drain, prepared-intent
+  // poll, checksum verify) before reaching the destructive map-flip. A lease
+  // that expires or is force-released during THAT window was, before this
+  // fix, never re-checked: the flip proceeded anyway, even though another
+  // operation could by then have acquired the freed lock and be acting on
+  // the target shard. The fix re-verifies the lock immediately before the
+  // flip UPDATE and parks (no mutation) if it's gone.
+  it("re-verifies the topology lock immediately before the migration's cutover map-flip; a lease lost during the awaited checksum-verify window (between it and the flip) aborts the flip instead of acting on now-unsafe state, and a later attempt with a valid lock completes normally", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const lockStub = catalogZero();
+
+    const acq = (await (await lockStub.fetch(post("/acquire-topology-lock", { operationType: "migrate-vbucket" }))).json()) as { operationId: string };
+    const opId = acq.operationId;
+    const mig = await stub.fetch(post("/migrate-vbucket", { vbucket: 0, targetShardId: "shard-flipcheck-target", operationId: opId }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(mig.status).toBe(200);
+
+    const rowSnapshot = () =>
+      runInDurableObject(stub, async (_i: CatalogDO, state: DurableObjectState) =>
+        (Array.from(
+          state.storage.sql.exec("SELECT shard_id, migration_status, target_shard_id FROM vbucket_map WHERE vbucket = 0"),
+        ) as Array<{ shard_id: string; migration_status: string; target_shard_id: string | null }>)[0],
+      );
+
+    // Monkey-patch callShard (same established pattern as the round-16
+    // ring-evacuation test above and the migrate-vbucket-abort retry test)
+    // so the checksum-verify round trip ALSO — as a side effect — force-
+    // releases the topology lock (a real force-release is exactly what an
+    // operator/Stage-4 admin route would do). This simulates the lease being
+    // lost during the awaited window between the checksum verify and the
+    // flip UPDATE, without needing real wall-clock time to pass or a genuine
+    // concurrent request to race against. The release is issued via the
+    // instance's OWN topologyLockZeroFetch (the same internal cross-DO-call
+    // path heartbeatTopologyLockOrPark already uses successfully from inside
+    // an alarm() tick) rather than the externally-captured `lockStub` —
+    // Workers' per-call I/O-context isolation means a DO stub obtained
+    // OUTSIDE this runInDurableObject invocation cannot be fetched from
+    // INSIDE it; the instance's own env-scoped stub can. The monkey-patch
+    // install AND every tick that might exercise it must also run inside
+    // this SAME runInDurableObject call for the same reason.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        callShard: (s: string, p: string, b: unknown) => Promise<Response>;
+        __realCallShard?: (s: string, p: string, b: unknown) => Promise<Response>;
+        alarm: () => Promise<void>;
+        topologyLockZeroFetch: (path: string, body: unknown) => Promise<Response>;
+      };
+      inst.__realCallShard = inst.callShard.bind(instance);
+      inst.callShard = async (shardId, path, payload) => {
+        const res = await inst.__realCallShard!(shardId, path, payload);
+        if (path === "/migrate-checksums") {
+          await inst.topologyLockZeroFetch("/release-topology-lock", { operationId: opId });
+        }
+        return res;
+      };
+
+      // Drive ticks — backfill (no rows, no registered tables here — same
+      // empty-migration shape the "heartbeats every tick" test above uses)
+      // completes and cascades into cutover in the same tick
+      // (advanceMigration's own recursive fallthrough for a quiet vbucket),
+      // so the checksum-verify side effect fires and is re-checked well
+      // within this budget.
+      for (let tick = 0; tick < 15; tick += 1) {
+        await inst.alarm();
+      }
+    });
+
+    // The lock is confirmed genuinely expired (the side effect fired)...
+    expect(((await (await lockStub.fetch(post("/holds-topology-lock", { operationId: opId }))).json()) as { holds: boolean }).holds).toBe(false);
+
+    // ...and — the fix under test — the flip did NOT happen: the row is
+    // still 'cutover' against the SOURCE shard, never the target. Before the
+    // fix, this assertion fails (the flip ran anyway on a stale lock check).
+    const parkedRow = await rowSnapshot();
+    expect(parkedRow.migration_status).toBe("cutover");
+    expect(parkedRow.shard_id).not.toBe("shard-flipcheck-target");
+    expect(parkedRow.target_shard_id).toBe("shard-flipcheck-target");
+
+    // Restore the real callShard (no more simulated expiry), then simulate
+    // "the lock situation resolved" exactly like the drain-recovery test
+    // above: restore a fresh, valid lease under the SAME operationId.
+    await runInDurableObject(stub, async (instance: CatalogDO) => {
+      const inst = instance as unknown as { callShard: unknown; __realCallShard: unknown };
+      inst.callShard = inst.__realCallShard;
+    });
+    await runInDurableObject(lockStub, async (_i: CatalogDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO topology_lock (singleton, operation_id, operation_type, acquired_at, expires_at, heartbeat_at) VALUES (1, ?, 'migrate-vbucket', ?, ?, ?)",
+        opId,
+        now,
+        new Date(Date.now() + 30_000).toISOString(),
+        now,
+      );
+    });
+
+    // A later tick, now under a valid lock, completes the flip normally.
+    for (let tick = 0; tick < 15; tick += 1) {
+      await runInDurableObject(stub, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const s = (await (await stub.fetch(post("/migrate-vbucket-status", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`))).json()) as { status: string };
+      if (s.status === "none") break;
+    }
+    const finalRow = await rowSnapshot();
+    expect(finalRow.migration_status).toBe("none");
+    expect(finalRow.shard_id).toBe("shard-flipcheck-target");
+  });
+
   it("a drain HOLDS its topology lock across multiple sub-migrations (one vbucket's own migration completing does NOT prematurely release it) and releases only on the drain's TRUE completion", async () => {
     const stub = await freshCatalog();
     // 2 vbuckets on shard-0, one active target — the drain migrates them
