@@ -177,6 +177,42 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.scan.shardCount).toBe(2);
   });
 
+  // Codex P3 fix: /tenant-scan-page used to SELECT b.*, ro.partition_key AS
+  // __cf_scan_pk -- if a tenant's table had a real column literally named
+  // __cf_scan_pk, the alias collided with it and the destructure that pulled
+  // the alias back out silently dropped that column's real data. The fix
+  // reads the partition key directly off the row by its known
+  // partitionKeyColumn name instead of using any synthetic alias.
+  it("returns a row's real __cf_scan_pk column value intact, even though that name used to collide with the (now-removed) synthetic partition-key alias", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_collide_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_collide_evt (id TEXT PRIMARY KEY, __cf_scan_pk TEXT, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const insertRes = await post(
+      "/v1/mutate",
+      { op: "insert", table: "scan_collide_evt", tenantId, partitionKey: "row-1", values: { __cf_scan_pk: "distinct-real-value", v: "x" } },
+      token,
+    );
+    expect(insertRes.status).toBe(200);
+
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_collide_evt" }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ id: string; __cf_scan_pk: string; v: string }> };
+    expect(body.rows).toHaveLength(1);
+    expect(body.rows[0].id).toBe("row-1");
+    expect(body.rows[0].__cf_scan_pk).toBe("distinct-real-value");
+    expect(body.rows[0].v).toBe("x");
+  });
+
   it("paginates to exhaustion with no duplicates and no gaps, even when a page truncates a shard's contribution mid-list (criterion 3)", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
     await createIndexTestTable("scan_page_evt");
