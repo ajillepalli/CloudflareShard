@@ -743,21 +743,45 @@ export class ShardDO extends DurableObject {
       return json({ rows: [] });
     }
 
-    // Codex P3 fix: no synthetic aliased partition-key column. The previous
-    // `ro.partition_key AS __cf_scan_pk` collided with, and silently
-    // overwrote in the destructure below, a real column literally named
-    // `__cf_scan_pk` on the tenant's table — that column's actual data was
-    // dropped from the returned row. The caller already knows
-    // partitionKeyColumn for this table (it's part of this very request), so
-    // the partition key is read directly off the returned row by its real
-    // column name instead of relying on a synthetic alias at all.
-    const raw = this.many<Record<string, unknown>>(
+    // Codex P2 fix (regression from the P3 fix above): the P3 fix replaced
+    // the synthetic `ro.partition_key AS __cf_scan_pk` alias with reading the
+    // partition key directly off the returned row via `row[partitionKeyColumn]`
+    // (b.*'s own value) — but that's wrong whenever partitionKeyColumn has
+    // SQLite type affinity that coerces values. E.g. an INTEGER PRIMARY KEY
+    // column storing tenant keys "9"/"10" returns b.*'s value as the integers
+    // 9/10, while __cf_row_owners.partition_key (used for the cursor's
+    // `WHERE ... > ?` predicate and its ORDER BY on the NEXT call) keeps the
+    // original TEXT form. A page cursor built from the coerced value would
+    // then be compared, lexicographically, against __cf_row_owners' text
+    // values on the next call — string "10" sorts before "9", silently
+    // skipping rows a numeric comparison wouldn't.
+    //
+    // Fixed by splitting into two queries instead of one JOIN, which also
+    // keeps the P3 fix's guarantee (no synthetic alias at all, so no
+    // SQL-level merge and thus no collision with a real column is even
+    // possible):
+    //   1. __cf_row_owners ALONE gives the canonical, never-coerced partition
+    //      keys for this page — this is what the cursor must be built from.
+    //   2. Each base row is then looked up by its own exact key value — b.*'s
+    //      own untouched data. This is deliberately N single-key lookups
+    //      rather than one batched `IN (...)` query zipped back up by value:
+    //      zipping-by-value means comparing the canonical TEXT key against
+    //      String(baseRow[partitionKeyColumn]) — but that reintroduces the
+    //      exact coercion problem this fix closes whenever the affinity
+    //      round-trip isn't lossless (e.g. an INTEGER PRIMARY KEY silently
+    //      drops a leading zero: "01" is stored as 1, and String(1) is "1",
+    //      which no longer equals the canonical "01" key it came from — a
+    //      value-based zip would then wrongly treat that row as missing and
+    //      drop it from the page). Looking each key up individually needs no
+    //      matching at all: the key used for the lookup IS the key returned,
+    //      by construction. TENANT_SCAN_PAGE_SIZE (100) caps how many such
+    //      lookups a single call can trigger, so this stays cheap.
+    const ownerRows = this.many<{ partition_key: string }>(
       `
-      SELECT b.*
-      FROM __cf_row_owners ro
-      JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
-      WHERE ro.tenant_id = ? AND ro.table_name = ? AND ro.partition_key > ?
-      ORDER BY ro.partition_key ASC
+      SELECT partition_key
+      FROM __cf_row_owners
+      WHERE tenant_id = ? AND table_name = ? AND partition_key > ?
+      ORDER BY partition_key ASC
       LIMIT ?
       `,
       body.tenantId,
@@ -766,7 +790,17 @@ export class ShardDO extends DurableObject {
       limit,
     );
 
-    const rows = raw.map((r) => ({ partitionKey: String(r[body.partitionKeyColumn as string]), row: r }));
+    const rows: Array<{ partitionKey: string; row: Record<string, unknown> }> = [];
+    for (const ownerRow of ownerRows) {
+      const partitionKey = ownerRow.partition_key;
+      // partitionKeyColumn is guaranteed unique (checkPartitionKeyUnique gates
+      // /v1/table-scan on this — see index.ts), so at most one base row can
+      // match. No match (e.g. a race: the row was deleted between the two
+      // queries) is simply omitted rather than erroring or returning a null row.
+      const baseRow = this.many<Record<string, unknown>>(`SELECT * FROM "${safeTable}" WHERE "${safePk}" = ?`, partitionKey)[0];
+      if (baseRow === undefined) continue;
+      rows.push({ partitionKey, row: baseRow });
+    }
     return json({ rows });
   }
 
