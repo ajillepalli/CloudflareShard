@@ -334,6 +334,47 @@ describe("ShardDO error boundary", () => {
   });
 });
 
+// Codex P2 fix: /tenant-scan-page used to catch ALL SQL errors from its JOIN
+// query and return {rows: []} for every one of them -- indistinguishable from
+// the one legitimate case (table not physically present on this shard). A
+// genuine failure (e.g. a fractional LIMIT, or a missing/renamed column) must
+// instead surface as a real, non-200 error so the Worker's fan-out logic
+// (any !res.ok shard response fails the whole /v1/table-scan request 502
+// SHARD_UNREACHABLE -- see index.table-scan.test.ts's existing
+// "fails the whole request 502 SHARD_UNREACHABLE" test) can detect it, rather
+// than silently returning a partial/empty result mislabeled as success.
+describe("ShardDO /tenant-scan-page error handling (Codex P2 fix)", () => {
+  it("still returns an empty successful page when the table is not physically present on this shard (no regression)", async () => {
+    const stub = await freshShard();
+    const res = await stub.fetch(
+      post("/tenant-scan-page", { table: "never_created_evt", partitionKeyColumn: "id", tenantId: "tenant-1" }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: unknown[] };
+    expect(body.rows).toEqual([]);
+  });
+
+  it("does NOT swallow a genuine SQL error as {rows: []} -- a fractional limit reaching this route directly returns a non-200 error", async () => {
+    const stub = await freshShard();
+    await stub.fetch(
+      post("/execute", {
+        sql: "CREATE TABLE IF NOT EXISTS scan_p2_evt (id TEXT PRIMARY KEY, v TEXT)",
+        requestId: "scan-p2-create",
+        isMutation: true,
+      }),
+    );
+    // Bypasses the Worker's own (now-added) integer validation to exercise
+    // this route's own robustness directly, per the fix's test plan.
+    const res = await stub.fetch(
+      post("/tenant-scan-page", { table: "scan_p2_evt", partitionKeyColumn: "id", tenantId: "tenant-1", limit: 2.5 }),
+    );
+    expect(res.status).not.toBe(200);
+    const body = (await res.json()) as { rows?: unknown[]; error?: unknown };
+    expect(body.rows).toBeUndefined();
+    expect(body.error).toBeDefined();
+  });
+});
+
 describe("ShardDO applied_requests pruning", () => {
   it("prunes rows older than the TTL when the alarm fires", async () => {
     const id = env.SHARD.idFromName(`shard-prune-${crypto.randomUUID()}`);

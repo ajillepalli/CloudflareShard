@@ -26,18 +26,6 @@
 **Priority:** P3
 **Depends on:** Milestone 1 shipping with real usage data available.
 
-### Structured tenant read API + physical `tenant_id`
-
-**What:** Add a structured, isolation-enforced tenant READ path — a partition-scoped `SELECT` (single vbucket) that the shard executes with an enforced `tenant_id` predicate — to replace the general tenant read path removed when `/v1/sql` became admin-only. Today tenants can only read via `/v1/index-query` (secondary-index lookups); there is no way to do a partition-scoped scan of one's own rows.
-
-**Why:** Removing raw tenant `/v1/sql` (see Completed) closed a cross-tenant read leak but left tenants with no general read path. The blocker for a safe one is physical: **base rows carry no `tenant_id` column** (SPEC §14) — the logical identity lives only in `__cf_row_owners`, so a shard can't add `WHERE tenant_id = ?` to a tenant's `SELECT`, and two tenants' rows can share a vbucket. A safe tenant read therefore needs base rows to carry a physical `tenant_id` (written on every mutation, indexed), after which the gateway can offer a structured partition-scoped read that injects the tenant predicate the same way `/v1/mutate` injects the partition-key predicate.
-
-**Context:** This is the replacement for the removed read path, not a nice-to-have — without it tenants cannot read arbitrary rows at all. Adding a physical `tenant_id` is a schema/write-path change (touches `/v1/mutate`, `/v1/tx` apply, and migration import) and should be scoped with the read API together.
-
-**Effort:** L
-**Priority:** P2
-**Depends on:** physical `tenant_id` on base rows (schema + write paths).
-
 ### CLI/SDK wrapper or write-path consolidation
 
 **What:** Decide whether `/v1/sql`, `/v1/mutate`, and `/v1/tx` should stay three separate raw-HTTP contracts developers learn individually, or whether a CLI/SDK wrapper (or eventual deprecation of raw SQL mutations) is needed to keep the developer experience coherent as the write-path count grows.
@@ -75,6 +63,16 @@
 **Depends on:** None — a future scope decision, not committed work.
 
 ## Completed
+
+### Structured tenant read API + physical `tenant_id`
+
+**What:** Add a structured, isolation-enforced tenant READ path — a partition-scoped `SELECT` (single vbucket) that the shard executes with an enforced `tenant_id` predicate — to replace the general tenant read path removed when `/v1/sql` became admin-only. Today tenants can only read via `/v1/index-query` (secondary-index lookups); there is no way to do a partition-scoped scan of one's own rows.
+
+**Why:** Removing raw tenant `/v1/sql` (see Completed) closed a cross-tenant read leak but left tenants with no general read path. The blocker for a safe one is physical: **base rows carry no `tenant_id` column** (SPEC §14) — the logical identity lives only in `__cf_row_owners`, so a shard can't add `WHERE tenant_id = ?` to a tenant's `SELECT`, and two tenants' rows can share a vbucket. The originally assumed fix was a physical `tenant_id` column on every base row (written on every mutation, indexed), after which the gateway could offer a structured partition-scoped read that injects the tenant predicate the same way `/v1/mutate` injects the partition-key predicate.
+
+**Resolution (Milestone 4 — supersedes the physical-column premise): `POST /v1/table-scan`, built on the existing `__cf_row_owners` join instead of a new physical column.** Milestone 3, Chunk 0 already added `__cf_row_owners` — a per-shard `(table_name, partition_key) -> (tenant_id, vbucket)` table, written transactionally with every base-row write — to recover a migrating row's logical identity. That table already carries exactly the `tenant_id` predicate a safe tenant read needs; the only missing piece was a query shape and an index to make filtering by it efficient, not a schema change to every application table. `/v1/table-scan` lists a tenant's own rows in a table (no arbitrary filtering — just `table + tenantId + cursor + limit`, the same safe-by-construction pattern `compileMutation` established for writes) by joining the base table against `__cf_row_owners ro WHERE ro.tenant_id = ? AND ro.table_name = ?` (new composite index `idx_cf_row_owners_tenant_scan`), paged by `partition_key`, fanned out across the tenant's catalog-shard pool and merged with a cursor invariant that advances a shard's position only to what was actually returned (never dropping a row to truncation). This is strictly less invasive than the original plan: no write-path change, no new column on any tenant table, and it reuses infrastructure that already existed for an unrelated reason (migration). The tradeoff carried forward unchanged from Milestone 3: a row with no `__cf_row_owners` entry (pre-Chunk-0, unbackfilled) stays invisible to every tenant's scan until `/admin/backfill-provenance` runs (surfaced via the response's `provenance.complete` flag, backed by a new `table_rules.provenance_complete` cache column) — and §14's pre-existing partition-key-collision limitation (two tenants sharing a key on the same shard) is inherited, not fixed or worsened: filtering by `tenant_id` first is necessary but not sufficient for isolation, since the join still keys purely by partition-key value — so `table_rules.partition_key_unique` (computed automatically, never client-supplied) gates the route itself, rejecting 409 `PARTITION_KEY_NOT_UNIQUE` for any table where the partition key isn't verified unique, rather than relying on the `tenant_id` filter alone.
+
+**Completed:** Milestone 4 (2026-07-14)
 
 ### Ring-evacuation vs. stale fixed-target index writes
 
