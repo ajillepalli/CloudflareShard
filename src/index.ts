@@ -321,6 +321,114 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
  * construction, so one check suffices. Fails closed (false) on any
  * introspection error — callers must treat "unable to verify" as "not safe to
  * scan", matching table_rules.partition_key_unique's fail-closed default. */
+/** Depth-tracked split of a comma-separated list, only splitting on commas at
+ * nesting depth 0 -- so a type's own parens (e.g. `DECIMAL(10,2)`) or a
+ * table-level constraint's parenthesized column list (e.g.
+ * `PRIMARY KEY (a, b)`) don't get split apart. Shared by
+ * extractColumnCollation below to isolate a CREATE TABLE statement's
+ * individual column/constraint definitions. */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === "," && depth === 0) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** Parses `columnName`'s explicit `COLLATE <name>` clause out of a CREATE
+ * TABLE statement's stored text (sqlite_master.sql) -- see
+ * partitionKeyColumnIsBinaryCollation's doc comment for why this text-parsing
+ * approach is necessary (no PRAGMA exposes a column's collation). Isolates
+ * the top-level column/constraint definitions inside the statement's outer
+ * parens (depth-tracked, so it survives typed columns and nested table-level
+ * constraint column lists), skips table-level constraints (PRIMARY KEY,
+ * UNIQUE, FOREIGN KEY, CHECK, CONSTRAINT) by their leading keyword, and
+ * matches the remaining column definitions by their own leading identifier
+ * (quoted `"..."`/`` `...` ``/`[...]` or bare, case-insensitive -- SQLite
+ * identifiers are case-insensitive). Returns the collation name
+ * (upper-cased) if an explicit COLLATE clause is present on that column's own
+ * definition; null if the column definition was confidently isolated and has
+ * NO explicit COLLATE (SQLite's safe BINARY default applies); undefined if
+ * the column definition couldn't be confidently isolated at all (caller must
+ * fail closed / treat as unsafe), mirroring extractCreateTableName's
+ * regex-parsing convention in sql-safety.ts for a different sub-problem. */
+function extractColumnCollation(createTableSql: string, columnName: string): string | null | undefined {
+  const openIdx = createTableSql.indexOf("(");
+  if (openIdx === -1) return undefined;
+  let depth = 0;
+  let closeIdx = -1;
+  for (let i = openIdx; i < createTableSql.length; i++) {
+    if (createTableSql[i] === "(") depth++;
+    else if (createTableSql[i] === ")") {
+      depth--;
+      if (depth === 0) {
+        closeIdx = i;
+        break;
+      }
+    }
+  }
+  if (closeIdx === -1) return undefined;
+  const body = createTableSql.slice(openIdx + 1, closeIdx);
+  const tableConstraintKeywords = /^(primary\s+key|unique|foreign\s+key|check|constraint)\b/i;
+  const identRe = /^("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))/;
+  for (const rawPart of splitTopLevel(body)) {
+    const part = rawPart.trim();
+    if (tableConstraintKeywords.test(part)) continue; // table-level constraint, not a column def
+    const identMatch = identRe.exec(part);
+    if (!identMatch) continue;
+    const ident = (identMatch[2] ?? identMatch[3] ?? identMatch[4] ?? identMatch[5] ?? "").toLowerCase();
+    if (ident !== columnName.toLowerCase()) continue;
+    const collateMatch = /\bcollate\s+(\w+)/i.exec(part);
+    return collateMatch ? collateMatch[1].toUpperCase() : null;
+  }
+  return undefined; // no matching column definition found -- fail closed
+}
+
+/** Codex P1 fix (COLLATE-based cross-tenant leak, same class as the
+ * partial-index bypass this function already guards against below):
+ * PRAGMA table_info/index_list/index_info never expose a column's or index's
+ * COLLATION -- a column declared with a non-BINARY collation (e.g.
+ * `id TEXT PRIMARY KEY COLLATE NOCASE`) passes checkPartitionKeyUnique's
+ * other checks (it genuinely IS unique under NOCASE comparison), but
+ * __cf_row_owners is keyed by the LITERAL partition-key string, and hashKey
+ * (which decides a row's shard) is case-sensitive too. Two case-variant keys
+ * ("a", "A") hash to different shards, each independently satisfies ITS OWN
+ * shard's NOCASE uniqueness constraint (no local collision -- sharding
+ * physically separates the two rows), yet a NOCASE-aware read would treat
+ * them as the same logical key -- reopening the exact cross-tenant leak this
+ * function exists to close, just via collation instead of
+ * composite-key/partial-index aliasing. SQLite's default TEXT collation (no
+ * explicit COLLATE clause) is already BINARY, which is exactly what
+ * /tenant-scan-page's unqualified `ORDER BY partition_key` /
+ * `partition_key > ?` / `"pk" = ?` comparisons rely on -- only an EXPLICIT
+ * non-BINARY COLLATE clause on the column is unsafe. Fails closed (false) on
+ * anything ambiguous, matching this function's fail-closed philosophy
+ * everywhere else. */
+async function partitionKeyColumnIsBinaryCollation(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
+  const tableSqlRes = await routeToShard(env, shardId, "/execute", {
+    sql: `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
+    params: [table],
+    requestId: `partition-key-unique-tablesql-${table}-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (!tableSqlRes.ok) return false;
+  const tableSqlBody = (await tableSqlRes.json()) as { rows?: Array<{ sql: string | null }> };
+  const tableSql = tableSqlBody.rows?.[0]?.sql ?? null;
+  if (tableSql === null) return false;
+  const collation = extractColumnCollation(tableSql, partitionKeyColumn);
+  if (collation === undefined) return false;
+  return collation === null || collation === "BINARY";
+}
+
 async function checkPartitionKeyUnique(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
   const tableInfoRes = await routeToShard(env, shardId, "/execute", {
     sql: `PRAGMA table_info("${table}")`,
@@ -332,7 +440,12 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
   const columns = tableInfoBody.rows ?? [];
   const pkColumns = columns.filter((c) => c.pk !== 0);
   if (pkColumns.length === 1 && pkColumns[0].name === partitionKeyColumn) {
-    return true;
+    // Codex P1 fix (collation gate): the PK constraint alone is not enough --
+    // see partitionKeyColumnIsBinaryCollation's doc comment. An explicit
+    // non-BINARY COLLATE on this column fails the whole check; there's no
+    // "keep checking other candidates" fallback for the sole-PK case the way
+    // there is for unique indexes below.
+    return await partitionKeyColumnIsBinaryCollation(env, shardId, table, partitionKeyColumn);
   }
 
   const indexListRes = await routeToShard(env, shardId, "/execute", {
@@ -382,6 +495,26 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
       // Partial index — not sufficient on its own. Keep checking other
       // unique indexes rather than returning false immediately, in case a
       // later (non-partial) unique index on this same column also exists.
+      continue;
+    }
+
+    // Codex P1 fix (collation gate): mirrors the partial-index check just
+    // above -- same "keep checking other candidates" pattern, applied to
+    // collation instead of a WHERE predicate. idxColumns.length === 1 was
+    // already confirmed above, so any COLLATE clause found anywhere in this
+    // index's own stored SQL necessarily applies to partitionKeyColumn (the
+    // only column it indexes) -- an explicit override there takes precedence
+    // over the column's own declaration. When the index's SQL has no
+    // COLLATE of its own (including a NULL sql -- e.g. the auto-index
+    // backing an inline `col TEXT UNIQUE COLLATE NOCASE` column constraint,
+    // which carries no collation info of its own at all), it inherits
+    // partitionKeyColumn's own declared collation, so that's checked
+    // instead. See partitionKeyColumnIsBinaryCollation's doc comment for why
+    // a non-BINARY collation here is unsafe.
+    const indexCollation = indexSql !== null ? (/\bcollate\s+(\w+)/i.exec(indexSql)?.[1]?.toUpperCase() ?? null) : null;
+    if (indexCollation !== null) {
+      if (indexCollation !== "BINARY") continue;
+    } else if (!(await partitionKeyColumnIsBinaryCollation(env, shardId, table, partitionKeyColumn))) {
       continue;
     }
     return true;
@@ -2679,6 +2812,28 @@ export function decodeTableScanCursor(raw: string): TableScanCursor | null {
   }
 }
 
+/** Compares two strings the way SQLite's default BINARY collation does: a
+ * byte-by-byte comparison of their UTF-8 encoding. JS's native `<`/`>`
+ * compares UTF-16 code units instead, which diverges from UTF-8 byte order
+ * for non-BMP Unicode (surrogate-pair) characters relative to certain BMP
+ * characters — e.g. U+E000 sorts before U+10000 in UTF-8 bytes but AFTER it
+ * under naive UTF-16 code-unit comparison. Table-scan pagination depends on
+ * matching SQLite's actual `ORDER BY partition_key` order exactly (see
+ * /tenant-scan-page's `ORDER BY partition_key ASC` / `partition_key > ?` in
+ * shard.ts, which run under SQLite's default BINARY collation), since a
+ * mismatch can silently skip a row the cursor advances past. Returns <0, 0,
+ * or >0, matching the memcmp/strcmp convention Array.prototype.sort expects. */
+export function compareBinaryCollation(a: string, b: string): number {
+  const encoder = new TextEncoder();
+  const bytesA = encoder.encode(a);
+  const bytesB = encoder.encode(b);
+  const len = Math.min(bytesA.length, bytesB.length);
+  for (let i = 0; i < len; i++) {
+    if (bytesA[i] !== bytesB[i]) return bytesA[i] - bytesB[i];
+  }
+  return bytesA.length - bytesB.length;
+}
+
 type ShardScanPage = {
   shardId: string;
   rows: Array<{ partitionKey: string; row: Record<string, unknown> }>;
@@ -2735,8 +2890,8 @@ export function mergeTableScanPages(
     for (const r of page.rows) all.push({ shardId: page.shardId, partitionKey: r.partitionKey, row: r.row });
   }
   all.sort((a, b) => {
-    if (a.partitionKey < b.partitionKey) return -1;
-    if (a.partitionKey > b.partitionKey) return 1;
+    const pkCmp = compareBinaryCollation(a.partitionKey, b.partitionKey);
+    if (pkCmp !== 0) return pkCmp;
     return a.shardId < b.shardId ? -1 : a.shardId > b.shardId ? 1 : 0;
   });
   const truncated = all.slice(0, overallLimit);
@@ -2755,7 +2910,7 @@ export function mergeTableScanPages(
   // kept in the truncated response.
   for (const entry of truncated) {
     const current = nextShardCursors[entry.shardId] ?? "";
-    if (entry.partitionKey > current) nextShardCursors[entry.shardId] = entry.partitionKey;
+    if (compareBinaryCollation(entry.partitionKey, current) > 0) nextShardCursors[entry.shardId] = entry.partitionKey;
   }
   // Invariant (a): a shard whose owner query fully consumed its LIMIT may
   // hold more owner rows beyond this batch, and it's safe to resume scanning
@@ -2798,7 +2953,7 @@ export function mergeTableScanPages(
       // touched it (there's no entry of its in `truncated` either way).
       // Nothing to hold back for — always safe, and necessary, to advance
       // past everything scanned.
-      if (page.lastOwnerKeyScanned > current) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+      if (compareBinaryCollation(page.lastOwnerKeyScanned, current) > 0) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
       continue;
     }
     const deliveredCount = deliveredCountByShard[page.shardId] ?? 0;
@@ -2810,7 +2965,7 @@ export function mergeTableScanPages(
     // Everything this shard fetched made it into the response — safe to
     // advance past a trailing skipped-owner-row gap beyond the last
     // delivered row too.
-    if (page.lastOwnerKeyScanned > current) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+    if (compareBinaryCollation(page.lastOwnerKeyScanned, current) > 0) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
   }
 
   // nextCursor must be present whenever there's ANY reason to believe more

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { hashKey } from "./hash";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { decodeTableScanCursor, encodeTableScanCursor, mergeTableScanPages } from "./index";
+import { compareBinaryCollation, decodeTableScanCursor, encodeTableScanCursor, mergeTableScanPages } from "./index";
 import { isInternalTableName } from "./sql-safety";
 import {
   AUTH,
@@ -71,6 +71,37 @@ describe("table-scan cursor + merge helpers (unit)", () => {
     // Fix (cursor table-binding, P2): missing `table` is rejected too, same as
     // any other malformed shape.
     expect(decodeTableScanCursor(btoa(JSON.stringify({ shardCursors: { a: "b" } })))).toBeNull();
+  });
+
+  // Fix (P1, Codex PR review): JS's native `<`/`>` compares UTF-16 code
+  // units, which diverges from SQLite's real BINARY collation (a byte-by-byte
+  // comparison of the UTF-8 encoding) for non-BMP Unicode characters relative
+  // to certain BMP characters. /tenant-scan-page's `ORDER BY partition_key
+  // ASC` / `partition_key > ?` (shard.ts) run under BINARY collation, so
+  // mergeTableScanPages must match that byte order exactly, not JS's.
+  it("orders strings the way SQLite's BINARY collation over UTF-8 bytes does, diverging from naive JS `<`/`.sort()` for non-BMP characters", () => {
+    // U+E000 (a BMP private-use character, one UTF-16 code unit 0xE000) vs
+    // U+10000 (the first non-BMP codepoint, encoded in UTF-16 as the
+    // surrogate pair 0xD800 0xDC00). Naive JS `<`/`>` compares UTF-16 code
+    // units: 0xD800 < 0xE000, so U+10000 sorts BEFORE U+E000 under plain JS
+    // comparison. But the UTF-8 byte encodings are U+E000 -> EE 80 80 and
+    // U+10000 -> F0 90 80 80 -- EE < F0, so U+E000 actually sorts BEFORE
+    // U+10000 under SQLite's real BINARY-collation byte order. The two
+    // orderings directly disagree.
+    const bmp = "\uE000";
+    const nonBmp = "\u{10000}";
+    expect(bmp > nonBmp).toBe(true); // naive JS: bmp sorts AFTER non-BMP
+    expect(compareBinaryCollation(bmp, nonBmp)).toBeLessThan(0); // BINARY collation: bmp sorts BEFORE non-BMP
+    expect(compareBinaryCollation(nonBmp, bmp)).toBeGreaterThan(0);
+    expect(compareBinaryCollation(bmp, bmp)).toBe(0);
+    expect(compareBinaryCollation("ab", "a")).toBeGreaterThan(0); // shorter-prefix-sorts-first on a common-prefix tie
+
+    // A larger mixed set, sorted by each approach, must genuinely disagree,
+    // and compareBinaryCollation's result must match true UTF-8 byte order.
+    const unsorted = ["\u{1F600}", "\uE000", "a", "\u{10000}"];
+    const byteOrderExpected = ["a", "\uE000", "\u{10000}", "\u{1F600}"]; // 0x61 < 0xEE... < 0xF0 0x90... < 0xF0 0x9F...
+    expect([...unsorted].sort()).not.toEqual(byteOrderExpected); // confirms plain JS .sort() genuinely diverges here
+    expect([...unsorted].sort(compareBinaryCollation)).toEqual(byteOrderExpected);
   });
 
   it("advances a shard's cursor only to the last row from that shard actually kept after truncation — never to a row that was fetched but cut (the data-loss-avoiding invariant)", () => {
@@ -216,6 +247,33 @@ describe("table-scan cursor + merge helpers (unit)", () => {
     expect(isInternalTableName("__cf_indexes")).toBe(true);
     expect(isInternalTableName("sqlite_master")).toBe(true);
     expect(isInternalTableName("events")).toBe(false);
+  });
+
+  // Fix (P1, Codex PR review): regression test for the UTF-8 byte-order bug
+  // at the merge-helper level. shard-a's own /tenant-scan-page query would
+  // ACTUALLY return these two rows in this order ("\uE000" then "\u{10000}"
+  // -- true SQLite BINARY-collation order, see the compareBinaryCollation
+  // test above), but the pre-fix `all.sort()` (plain JS `<`/`>`) ranked
+  // "\u{10000}" first instead. With overallLimit(1) forcing truncation to
+  // just one row, the bug would keep the WRONG row ("nonbmp") and advance
+  // shard-a's cursor to "\u{10000}" -- which then PERMANENTLY excludes
+  // "\uE000" from ever being fetched again, since a real
+  // `partition_key > "\u{10000}"` query under BINARY collation does not
+  // match "\uE000" (its bytes sort before, not after). The fix must keep the
+  // true-first row ("bmp") and advance the cursor only that far.
+  it("regression (UTF-8 byte-order fix): a non-BMP-adjacent partition key is not permanently skipped by truncation + cursor advancement", () => {
+    const pages = [
+      {
+        shardId: "shard-a",
+        rows: [
+          { partitionKey: "\uE000", row: { id: "bmp" } },
+          { partitionKey: "\u{10000}", row: { id: "nonbmp" } },
+        ],
+      },
+    ];
+    const { rows, nextShardCursors } = mergeTableScanPages(pages, 1, 2, {});
+    expect(rows.map((r) => r.id)).toEqual(["bmp"]);
+    expect(nextShardCursors).toEqual({ "shard-a": "\uE000" });
   });
 });
 
@@ -835,6 +893,65 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     expect(res.status).toBe(200);
   });
 
+  // Fix (P1, Codex PR review): PRAGMA table_info/index_list/index_info never
+  // expose a column's COLLATION -- a column declared `TEXT PRIMARY KEY
+  // COLLATE NOCASE` passed the old checkPartitionKeyUnique (it genuinely IS
+  // unique under NOCASE comparison), but __cf_row_owners keys rows by the
+  // LITERAL partition-key string and hashKey (routing) is case-sensitive
+  // too, so "a" and "A" can land on different shards, each independently
+  // satisfying its own shard's NOCASE uniqueness locally -- reopening the
+  // cross-tenant leak this gate exists to close, just via collation instead
+  // of a non-unique column or partial index.
+  it("rejects partitionKeyColumn when it's declared with an explicit non-BINARY COLLATE, even though it's the sole PRIMARY KEY (collation gate)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_pk_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_pk_evt (id TEXT PRIMARY KEY COLLATE NOCASE, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    // Schema creation itself is never blocked by the collation check.
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_pk_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Companion to the fix above, exercising the OTHER path checkPartitionKeyUnique
+  // takes (a UNIQUE constraint/index rather than the sole PRIMARY KEY): a
+  // non-PK column declared `TEXT UNIQUE COLLATE NOCASE` backs its uniqueness
+  // with an (often auto-created, unnamed) index whose sqlite_master.sql text
+  // can be NULL -- carrying no collation info of its own -- so the collation
+  // check must fall back to the column's own CREATE TABLE declaration, not
+  // just the index's text, to catch this case.
+  it("rejects partitionKeyColumn when its UNIQUE constraint is declared with an explicit non-BINARY COLLATE (unique-index path, collation gate)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_uniq_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE NOCASE, v TEXT)",
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_uniq_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
   // Codex-found P1 (re-review of the P1 fix above): PRAGMA index_list reports
   // unique=1 for a PARTIAL unique index too (CREATE UNIQUE INDEX ... WHERE
   // <predicate>), and PRAGMA index_info never exposes the predicate at all —
@@ -1173,6 +1290,47 @@ describe("Worker /v1/table-scan E2E (Milestone 4)", () => {
     expect(calls).toBeGreaterThan(1);
     expect(calls).toBeLessThanOrEqual(5);
     expect(collected.map((r) => r.id).sort()).toEqual(["row-4", "row-5"]);
+    expect(new Set(collected.map((r) => r.id)).size).toBe(2);
+  });
+
+  // Fix (P1, Codex PR review), reproduced end-to-end: "\uE000" (a BMP
+  // private-use character) sorts BEFORE "\u{10000}" (the first non-BMP
+  // codepoint) under SQLite's real BINARY collation (UTF-8 bytes EE 80 80 <
+  // F0 90 80 80), which is exactly what /tenant-scan-page's `ORDER BY
+  // partition_key ASC` uses -- but naive JS `<`/`>` (UTF-16 code units)
+  // disagrees, so the pre-fix mergeTableScanPages could rank them the wrong
+  // way around. limit:1 forces every page to truncate down to a single row,
+  // exercising exactly the cursor-advancement path the fix corrects: a
+  // regression would have kept "\u{10000}"'s row first and advanced the
+  // cursor past it, permanently excluding "\uE000"'s row from ever being
+  // fetched again.
+  it("regression (UTF-8 byte-order fix, E2E): a non-BMP partition key sorted next to a BMP private-use key is not skipped during real paginated /v1/table-scan", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_utf8_order_evt";
+    await createIndexTestTable(table);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const bmpKey = "\uE000";
+    const nonBmpKey = "\u{10000}";
+    await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: bmpKey, values: { v: "bmp" } }, token);
+    await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: nonBmpKey, values: { v: "nonbmp" } }, token);
+
+    const collected: Array<{ id: string; v: string }> = [];
+    let cursor: string | undefined;
+    let calls = 0;
+    for (let call = 0; call < 5; call += 1) {
+      calls += 1;
+      const res = await post("/v1/table-scan", { tenantId, table, limit: 1, cursor: cursor ?? null }, token);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ id: string; v: string }>; nextCursor?: string };
+      collected.push(...body.rows);
+      if (!body.nextCursor) break;
+      cursor = body.nextCursor;
+    }
+
+    expect(calls).toBeLessThanOrEqual(5);
+    expect(collected.map((r) => r.v).sort()).toEqual(["bmp", "nonbmp"]);
     expect(new Set(collected.map((r) => r.id)).size).toBe(2);
   });
 });
