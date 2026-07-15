@@ -148,12 +148,18 @@ Indexed (Milestone 4) `(tenant_id, table_name, partition_key)` — `idx_cf_row_o
 
 `POST /tenant-scan-page` (Milestone 4, internal — ShardDO route driven by the Worker's
 `POST /v1/table-scan`): `{table, partitionKeyColumn, tenantId, afterPartitionKey, limit}` ->
-`{rows: [{partitionKey, row}]}`. Joins the base table against `__cf_row_owners` filtered by
-`tenant_id` + `table_name`, paged by `partition_key > afterPartitionKey` (mirrors
-`/migrate-export`'s join pattern, filtered by tenant instead of vbucket). `limit` is clamped
-to `min(requested, 100)` — the per-shard page cap, independent of `/v1/table-scan`'s overall
-response limit (up to 500), which is enforced by merging across shards. A table not
-physically present on this shard returns `{rows: []}` (same established
+`{rows: [{partitionKey, row}], ownerRowsScanned, lastOwnerKeyScanned?}`. Joins the base table
+against `__cf_row_owners` filtered by `tenant_id` + `table_name`, paged by
+`partition_key > afterPartitionKey` (mirrors `/migrate-export`'s join pattern, filtered by
+tenant instead of vbucket). `limit` is clamped to `min(requested, 100)` — the per-shard page
+cap, independent of `/v1/table-scan`'s overall response limit (up to 500), which is enforced
+by merging across shards. `ownerRowsScanned` (the raw `__cf_row_owners` row count before any
+base-row lookups) and `lastOwnerKeyScanned` (that query's last returned partition key) report
+this shard's true scan position separately from `rows.length` — a base row deleted between
+the owner-row read and the base-table lookup drops that row from `rows` without shrinking
+`ownerRowsScanned`, so the Worker's "did this shard's own page get fully consumed" check
+can't be corrupted by a skip (round-4 fix; see §7's cursor invariant). A table not physically
+present on this shard returns `{rows: [], ownerRowsScanned: 0}` (same established
 `/migrate-export` precedent).
 
 Table: __cf_mirror_pending (Milestone 3, Chunk 3 — dual-write retry queue, on the SOURCE shard)
@@ -476,7 +482,7 @@ Response (200):
 - provenance: `{complete: boolean, fix?: string}` (`fix` present only when `complete` is `false`)
 - scan: `{catalogShardId, shardCount, successCount, scanMs}`
 
-Errors: 400 `MISSING_FIELDS` / `LIMIT_EXCEEDED` (limit > 500); 401 (tenant token doesn't match
+Errors: 400 `MISSING_FIELDS` / `LIMIT_EXCEEDED` (`limit` isn't a positive integer, or exceeds 500); 401 (tenant token doesn't match
 `tenantId`, identical to `/v1/index-query`'s check); 404 `TABLE_NOT_REGISTERED`; 409
 `PARTITION_KEY_COLUMN_UNSET`; 409 `PARTITION_KEY_NOT_UNIQUE` (`table_rules.partition_key_unique`
 isn't 1 for this table — see §5 and the paragraph below); 403 `INTERNAL_TABLE_ACCESS_FORBIDDEN`
@@ -495,9 +501,12 @@ raw-SQL pattern that failed for the removed tenant read path (see §14 and `TODO
 Completed section). Auth reuses `CatalogDO.checkTenantAuth` exactly as `/v1/index-query`
 does (via a new combined `/lookup-table-scan` route playing the same role `/lookup-index`
 does: auth check + `table_rules` gate in one round trip). Resolves the tenant's catalog
-shard (`catalogShardIdForTenant`) and its *active* shard pool (`/list-shards`), then fans out
-to every shard's internal `POST /tenant-scan-page` (§6) at `SHARD_FANOUT_CONCURRENCY`
-concurrency (the same constant/`batchedMap` helper reused throughout this codebase).
+shard (`catalogShardIdForTenant`) and its shard pool (`/list-shards` with `{includeDraining:
+true}` — a tenant's rows still physically exist on a shard mid-`/admin/drain-shard` until
+its vbuckets finish migrating, so excluding draining shards would silently omit them; matches
+`/admin/backfill-provenance` and index-creation's existing pattern), then fans out to every
+shard's internal `POST /tenant-scan-page` (§6) at `SHARD_FANOUT_CONCURRENCY` concurrency (the
+same constant/`batchedMap` helper reused throughout this codebase).
 
 **Partition-key-uniqueness precondition (structural, not incidental).** `/tenant-scan-page`
 keys its `__cf_row_owners` join purely by partition-key VALUE, filtered by
@@ -515,8 +524,10 @@ checks this flag on every call (via `/lookup-table-scan`) and rejects 409
 route safely, not a soft recommendation.
 
 **Cursor and the "advance only on emit" invariant (the largest correctness risk in this
-feature).** The opaque `cursor` is a base64-JSON `{shardCursors: {[shardId]: afterPartitionKey}}`
-— one position per shard in the pool at issuance time; a shard absent from the map starts at
+feature).** The opaque `cursor` is a base64-JSON `{table, shardCursors: {[shardId]:
+afterPartitionKey}}` — `table` binds the cursor to the table it was issued against (a cursor
+from scanning one table is rejected 400 `INVALID_CURSOR` if replayed against another) and
+`shardCursors` holds one position per shard in the pool at issuance time; a shard absent from the map starts at
 `""` (scan from the beginning). Results from every shard are merged ascending by
 `partition_key` (ties broken by `shardId` ascending — a same-`partition_key` tie across two
 different shards for the same tenant/table cannot happen in steady state, since a given key
@@ -742,7 +753,9 @@ for a never-created index.
 
 - Writes must be single-shard and require partitionKey.
 - Reads without partitionKey are rejected on /v1/sql.
-- Fan-out reads allowed only through /v1/scatter and should be capped.
+- Admin fan-out reads allowed only through /v1/scatter and should be capped. /v1/table-scan
+  (Milestone 4) is a separate, tenant-scoped fan-out read, bounded to one tenant's own rows
+  across its catalog shard's pool rather than every shard cluster-wide.
 
 ## 13) Observability (required for production)
 
