@@ -531,6 +531,71 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     expect(res.status).toBe(200);
   });
 
+  // Codex-found P1 (re-review of the P1 fix above): PRAGMA index_list reports
+  // unique=1 for a PARTIAL unique index too (CREATE UNIQUE INDEX ... WHERE
+  // <predicate>), and PRAGMA index_info never exposes the predicate at all —
+  // so checkPartitionKeyUnique used to treat a partial unique index as
+  // full-table uniqueness, leaving the cross-tenant leak reachable via this
+  // path (duplicate values ARE allowed for rows outside the predicate).
+  it("rejects a PARTIAL unique index on partitionKeyColumn as insufficient uniqueness, but still accepts a genuine FULL unique index on the same column (no regression)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_partial_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_partial_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, active INTEGER, v TEXT)",
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // No unique index at all yet -> gated 409.
+    const beforeAnyIndex = await post("/v1/table-scan", { tenantId, table: "scan_pku_partial_evt" }, token);
+    expect(beforeAnyIndex.status).toBe(409);
+
+    // Add a PARTIAL unique index directly on the shard's own SQLite storage —
+    // this can't be expressed via /admin/create-table's single-CREATE-TABLE
+    // schema field, so we reach into the ShardDO directly (established
+    // pattern elsewhere in this file/catalog.test.ts).
+    const shardStub = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
+    await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_partial ON scan_pku_partial_evt(user_id) WHERE active = 1");
+    });
+
+    // Re-trigger verification for the same column via /admin/set-partition-key-column
+    // — must STILL be gated 409: a partial unique index does not guarantee
+    // uniqueness for rows outside its predicate.
+    const setWithPartial = await post(
+      "/admin/set-partition-key-column",
+      { table: "scan_pku_partial_evt", partitionKeyColumn: "user_id" },
+      AUTH(),
+    );
+    expect(setWithPartial.status).toBe(200);
+    const scanWithPartial = await post("/v1/table-scan", { tenantId, table: "scan_pku_partial_evt" }, token);
+    expect(scanWithPartial.status).toBe(409);
+    const partialBody = (await scanWithPartial.json()) as { error: { code: string } };
+    expect(partialBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+
+    // Replace it with a genuine FULL (non-partial) unique index on the same
+    // column — must now be accepted.
+    await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DROP INDEX ux_scan_pku_partial");
+      state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_full ON scan_pku_partial_evt(user_id)");
+    });
+    const setWithFull = await post(
+      "/admin/set-partition-key-column",
+      { table: "scan_pku_partial_evt", partitionKeyColumn: "user_id" },
+      AUTH(),
+    );
+    expect(setWithFull.status).toBe(200);
+    const scanWithFull = await post("/v1/table-scan", { tenantId, table: "scan_pku_partial_evt" }, token);
+    expect(scanWithFull.status).toBe(200);
+  });
+
   it("lets /admin/create-table succeed for a schema whose partitionKeyColumn is NOT unique (schema creation isn't blocked), but rejects /v1/table-scan on it with 409 PARTITION_KEY_NOT_UNIQUE", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(

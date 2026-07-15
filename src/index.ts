@@ -290,9 +290,39 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
     if (!indexInfoRes.ok) continue;
     const indexInfoBody = (await indexInfoRes.json()) as { rows?: Array<{ name: string }> };
     const idxColumns = indexInfoBody.rows ?? [];
-    if (idxColumns.length === 1 && idxColumns[0].name === partitionKeyColumn) {
-      return true;
+    if (idxColumns.length !== 1 || idxColumns[0].name !== partitionKeyColumn) {
+      continue;
     }
+
+    // Codex P1 fix (partial-unique-index bypass): PRAGMA index_list reports
+    // unique=1 for a PARTIAL unique index too (e.g. `CREATE UNIQUE INDEX ux ON
+    // t(col) WHERE active = 1`), and PRAGMA index_info never exposes the
+    // predicate — so without this check a partial unique index would be
+    // accepted as full-table uniqueness when it isn't (duplicate values ARE
+    // allowed for rows outside the predicate), reopening the exact
+    // cross-tenant leak this function exists to close. SQLite doesn't expose
+    // "is this index partial" via any PRAGMA boolean; the reliable signal is
+    // the index's own stored CREATE INDEX text in sqlite_master (same
+    // regex-text-parsing pattern as extractCreateTableName in sql-safety.ts).
+    // A NULL sql (an auto-created index backing a UNIQUE column constraint,
+    // or an implicit PRIMARY KEY index) is never partial, so that case is
+    // safe to accept.
+    const indexSqlRes = await routeToShard(env, shardId, "/execute", {
+      sql: `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
+      params: [idx.name],
+      requestId: `partition-key-unique-indexsql-${table}-${idx.name}-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    if (!indexSqlRes.ok) continue;
+    const indexSqlBody = (await indexSqlRes.json()) as { rows?: Array<{ sql: string | null }> };
+    const indexSql = indexSqlBody.rows?.[0]?.sql ?? null;
+    if (indexSql !== null && /\bwhere\b/i.test(indexSql)) {
+      // Partial index — not sufficient on its own. Keep checking other
+      // unique indexes rather than returning false immediately, in case a
+      // later (non-partial) unique index on this same column also exists.
+      continue;
+    }
+    return true;
   }
   return false;
 }
