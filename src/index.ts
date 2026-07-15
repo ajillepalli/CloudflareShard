@@ -5,7 +5,7 @@ import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
-import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableName, isMutation, mutationTargetIsInternal } from "./sql-safety";
+import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableName, isMutation, mutationTargetIsInternal, normalizeTableName } from "./sql-safety";
 import {
   compileMutation,
   IDENTIFIER_RE,
@@ -2679,7 +2679,15 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   // Defense-in-depth (structurally unreachable in practice — table_rules
   // should never contain a __cf_*/sqlite_* name — checked explicitly anyway,
   // per the spec). Cheap and needs no network round trip, so it runs first.
-  if (isInternalTableName(body.table)) {
+  // Codex P2 fix: isInternalTableName expects a NORMALIZED (unquoted,
+  // lowercased) name — passing the raw request value let a case variant
+  // (e.g. "SQLite_master", "__CF_row_owners") slip past this guard, the same
+  // bug class (case-sensitivity bypass of an internal-table guard) that took
+  // several review rounds to fully close on /v1/sql earlier in this
+  // project's history. normalizeTableName is the same normalization
+  // mutationTargetIsInternal already applies before its own
+  // isInternalTableName check, for consistency.
+  if (isInternalTableName(normalizeTableName(body.table))) {
     return json(
       {
         error: {
