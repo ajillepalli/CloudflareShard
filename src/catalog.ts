@@ -274,6 +274,26 @@ export class CatalogDO extends DurableObject {
     // backfill applies this to the target before importing. Nullable: a
     // table registered before this column existed simply can't be
     // auto-provisioned on new shards (operator applies schema manually).
+    //
+    // PR review round 11 (fundamental fix, replacing rounds 6-10's escalating
+    // guard patches): schema_sql can only ever be trustworthy alongside a
+    // probe-verified partition_key_unique=1 (see that column's comment below)
+    // when the two were established TOGETHER, atomically, by
+    // /admin/create-table's own push-then-verify flow (handleAdminCreateTable
+    // in index.ts) — it pushes this exact DDL to every shard, THEN verifies
+    // uniqueness against a shard that just received it, so the two are
+    // structurally guaranteed to correspond. Every OTHER path that can set
+    // partition_key_unique=1 — /admin/register-table's own live probe
+    // (handleRegisterTable below) and /admin/set-partition-key-column
+    // (handleSetPartitionKeyColumn below) — verifies against whatever
+    // ALREADY physically exists on a live shard, completely disconnected
+    // from whatever schema_sql text happens to be on file, and so NULLS
+    // schema_sql in the same operation whenever it sets partition_key_unique
+    // = 1. Trade-off: a table verified via one of those two routes (not
+    // /admin/create-table) can be table-scan-eligible but has schema_sql =
+    // NULL — a future split/migration backfill can't auto-provision it on a
+    // new target shard from stored DDL; the table must already exist there
+    // some other way, or an operator handles it manually.
     this.ensureColumn("table_rules", "schema_sql", "TEXT");
     // Tenant-scoped table scan (POST /v1/table-scan): cached provenance-
     // completeness flag, mirroring index_rules.status's building/ready cache.
@@ -282,8 +302,17 @@ export class CatalogDO extends DurableObject {
     // this table across every catalog shard and shard it touched; never reset
     // to 0 automatically (a completed table stays complete — only pre-
     // existing legacy rows can be unattributed, and every write since Chunk 0
-    // is already provenance-tracked). /admin/create-table sets it to 1 at
-    // creation (a brand-new table has no legacy rows to backfill).
+    // is already provenance-tracked). Always starts at 0, including for a
+    // table just created via /admin/create-table (PR review round 11, P2
+    // fix): that route's DDL is CREATE TABLE IF NOT EXISTS, which silently
+    // no-ops if the table name already physically existed with pre-existing
+    // legacy rows never covered by __cf_row_owners — auto-certifying
+    // provenance_complete=1 at creation time regardless (the old behavior)
+    // would hide that collision behind a false `provenance.complete: true`
+    // on /v1/table-scan. A genuinely brand-new (empty) table's first
+    // /admin/backfill-provenance run trivially finds zero orphaned/ambiguous
+    // rows and certifies it complete through this normal mechanism instead —
+    // same end state, one extra (cheap, near-no-op) admin call.
     this.ensureColumn("table_rules", "provenance_complete", "INTEGER NOT NULL DEFAULT 0");
     // Codex P1 fix (cross-tenant table-scan leak): cached "is partitionKeyColumn
     // actually UNIQUE or the table's sole PRIMARY KEY" flag. __cf_row_owners
@@ -570,7 +599,12 @@ export class CatalogDO extends DurableObject {
       table: string;
       partitioning?: string;
       partitionKeyColumn?: string;
-      schemaSql?: string;
+      // PR review round 11: string | null | undefined, not a bare
+      // `schemaSql?: string` — the three states are distinguishable and each
+      // means something different below. See schemaSqlToStore's comment for
+      // the full contract (omitted = preserve, null = explicit clear, string
+      // = store this).
+      schemaSql?: string | null;
       provenanceComplete?: boolean;
       partitionKeyUnique?: boolean;
     };
@@ -635,45 +669,6 @@ export class CatalogDO extends DurableObject {
         409,
       );
     }
-    // PR review round 8: table_rules.schema_sql is exactly what a future
-    // split/migration backfill executes verbatim to provision this table on
-    // a freshly-created target shard (see ensureSchema's comment above the
-    // schema_sql column). partition_key_unique, once cached as 1, was
-    // verified against the CURRENTLY LIVE shard schema — not against
-    // schema_sql text. If an already-verified table's schema_sql could still
-    // be silently overwritten with a DIFFERENT CREATE TABLE statement (e.g.
-    // one that drops the partition key's UNIQUE/PK constraint), a future
-    // split target provisioned from that new schema_sql could come up
-    // without the constraint while partition_key_unique still reads 1 —
-    // reopening the exact cross-tenant /v1/table-scan leak that flag exists
-    // to prevent. Same "monotonic, once-verified, frozen" pattern as the
-    // partition_key_column guard directly above: identical resubmission
-    // (idempotent re-registration) stays allowed, but a genuinely different
-    // schema_sql is rejected outright once uniqueness has been certified. A
-    // table whose partition_key_unique is still 0 (never verified, or not
-    // yet) has no such invariant to protect, so its schema_sql remains
-    // freely updatable. Compared against what's currently STORED, not the
-    // freshly-computed body.partitionKeyUnique — the Worker layer
-    // (handleAdminRegisterTable) recomputes partitionKeyUnique fresh against
-    // the CURRENT partitionKeyColumn on every call, so it reflects a NEW
-    // verification, not necessarily the OLD cached one this guard protects.
-    if (
-      existing &&
-      existing.partition_key_unique === 1 &&
-      typeof body.schemaSql === "string" &&
-      body.schemaSql !== existing.schema_sql
-    ) {
-      return json(
-        {
-          error: {
-            code: "SCHEMA_SQL_ALREADY_VERIFIED",
-            message: `Table ${body.table} already has a verified unique partition key; schema_sql cannot be changed.`,
-            fix: "Registering again with the identical schema_sql is fine, but changing it after partition_key_unique verification is not supported: a future split/migration target provisioned from a different schema_sql could silently lack the certified constraint.",
-          },
-        },
-        409,
-      );
-    }
     // partition_key_unique is NOT preserved like provenance_complete above —
     // it's a property of the CURRENT partitionKeyColumn, which can itself
     // change (via /set-partition-key-column), so a re-register must take
@@ -682,16 +677,41 @@ export class CatalogDO extends DurableObject {
     // the caller didn't verify (e.g. /admin/register-table's raw passthrough).
     const partitionKeyUnique = body.partitionKeyUnique === true ? 1 : 0;
 
-    // PR review round 9: an OMITTED body.schemaSql (undefined, e.g. a
-    // metadata-only re-registration that doesn't bother resending it) is not
-    // a "differing string" so the round-8 guard above doesn't reject it —
-    // but body.schemaSql ?? null would still have silently nulled out an
-    // already-verified table's stored schema_sql here, defeating that same
-    // guard's whole purpose. Fall back to the existing row's schema_sql
-    // first; only fall through to null when there was never a stored value
-    // (a genuine first-ever registration with no schemaSql provided). When
-    // body.schemaSql IS a string, it passes through untouched either way —
-    // this fallback only ever takes effect when it's undefined.
+    // PR review round 11 (fundamental fix, replacing rounds 8/9's reject/
+    // preserve guard pair): schema_sql is exactly what a future split/
+    // migration backfill executes verbatim to provision this table on a
+    // freshly-created target shard (see ensureSchema's comment above the
+    // schema_sql column) — it can only ever be trustworthy alongside a
+    // probe-verified partition_key_unique=1 when the two were established
+    // TOGETHER, atomically, by /admin/create-table's own push-then-verify
+    // flow (handleAdminCreateTable, which always sends its own just-pushed
+    // schema string here). This route's partitionKeyUnique (computed by the
+    // Worker's handleAdminRegisterTable, whenever it runs its own live-shard
+    // probe) verifies against whatever ALREADY physically exists right now —
+    // structurally disconnected from whatever schema_sql text this or a
+    // PRIOR call stored. Rounds 8/9 tried to protect that gap by rejecting a
+    // differing schema_sql once verified, and preserving it across an
+    // omitted one — but that still let a probe-verified partition_key_unique
+    // = 1 end up paired with a schema_sql from an earlier, unrelated call
+    // (finding 1) and let an empty-string schemaSql slip through ungated
+    // (finding 2). Simpler invariant: schema_sql can never be non-null
+    // alongside a partition_key_unique=1 that THIS route's own probe just
+    // produced — handleAdminRegisterTable is responsible for signaling which
+    // of three things it wants:
+    //   - omit the "schemaSql" property entirely → preserve whatever's
+    //     already stored, untouched (used when this call didn't just verify
+    //     uniqueness, so there's nothing unsafe about leaving it as-is);
+    //   - "schemaSql": null → explicitly clear it (used when this call's own
+    //     probe just verified partition_key_unique=1 — the caller has no
+    //     opinion on whether the stored text corresponds, so it must not be
+    //     preserved);
+    //   - "schemaSql": "<a string>" → store it as submitted (this call
+    //     supplied real schema text of its own).
+    // A bare `??` can't tell "omitted" apart from "explicitly null" (both
+    // are nullish), hence the explicit `in` presence check rather than a
+    // fallback chain.
+    const schemaSqlToStore = "schemaSql" in body ? (body.schemaSql ?? null) : (existing?.schema_sql ?? null);
+
     this.sql.exec(
       `
       INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql, provenance_complete, partition_key_unique)
@@ -701,7 +721,7 @@ export class CatalogDO extends DurableObject {
       body.partitioning ?? "hash",
       body.partitionKeyColumn,
       new Date().toISOString(),
-      body.schemaSql ?? existing?.schema_sql ?? null,
+      schemaSqlToStore,
       provenanceComplete,
       partitionKeyUnique,
     );
@@ -767,12 +787,31 @@ export class CatalogDO extends DurableObject {
     // caller's freshly-computed value for the NEW column, defaulting to 0
     // (unverified) if it didn't verify.
     const partitionKeyUnique = body.partitionKeyUnique === true ? 1 : 0;
-    this.sql.exec(
-      "UPDATE table_rules SET partition_key_column = ?, partition_key_unique = ? WHERE table_name = ?",
-      body.partitionKeyColumn,
-      partitionKeyUnique,
-      body.table,
-    );
+    // PR review round 11: this is the OTHER route (besides
+    // handleRegisterTable's own probe) that can independently set
+    // partition_key_unique=1 via a live-shard check — same as that route,
+    // there's no way to guarantee whatever schema_sql happens to already be
+    // on file corresponds to the column THIS call just verified, so it must
+    // be nulled in the SAME statement whenever partitionKeyUnique verifies
+    // true. Left untouched when it's 0 — nothing unsafe about an unverified
+    // table keeping whatever schema text is on file, since
+    // /admin/create-table's push-then-verify flow is the only path allowed
+    // to pair a real schema_sql with partition_key_unique=1.
+    if (partitionKeyUnique === 1) {
+      this.sql.exec(
+        "UPDATE table_rules SET partition_key_column = ?, partition_key_unique = ?, schema_sql = NULL WHERE table_name = ?",
+        body.partitionKeyColumn,
+        partitionKeyUnique,
+        body.table,
+      );
+    } else {
+      this.sql.exec(
+        "UPDATE table_rules SET partition_key_column = ?, partition_key_unique = ? WHERE table_name = ?",
+        body.partitionKeyColumn,
+        partitionKeyUnique,
+        body.table,
+      );
+    }
 
     const version = this.bumpMetadataVersion();
     return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn, metadataVersion: version });

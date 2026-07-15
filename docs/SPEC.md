@@ -86,12 +86,21 @@ Table: table_rules
 - partition_key_column TEXT NOT NULL (default sentinel `__unset__` for pre-upgrade rows)
 - schema_sql TEXT (the CREATE TABLE statement captured at /admin/create-table — Milestone 3
   migration backfill applies it to a target shard created after the original fan-out,
-  e.g. a split target; NULL for tables registered before this column existed)
+  e.g. a split target; NULL for tables registered before this column existed. PR review
+  round 11: can only ever be non-NULL alongside a probe-verified `partition_key_unique = 1`
+  via `/admin/create-table`'s own atomic push-then-verify flow — see that column below and
+  §7's `/admin/register-table`/`/admin/set-partition-key-column` entries for the invariant
+  and its documented trade-off)
 - provenance_complete INTEGER NOT NULL DEFAULT 0 (Milestone 4: 1 once a full-cluster
   /admin/backfill-provenance run has reported zero orphaned/ambiguous rows for this table;
-  never reset to 0 automatically. /admin/create-table sets it to 1 at creation — a
-  brand-new table has no legacy rows to backfill. Read by POST /v1/table-scan's
-  `provenance.complete` response field.)
+  never reset to 0 automatically. PR review round 11: `/admin/create-table` no longer
+  auto-sets this to 1 at creation — its DDL is `CREATE TABLE IF NOT EXISTS`, which silently
+  no-ops if the table name already physically existed with legacy rows predating row
+  provenance, so auto-certifying complete regardless would hide that collision behind a
+  false `provenance.complete: true`. A newly created table now starts at 0 like any other
+  table and earns certification through the normal `/admin/backfill-provenance` mechanism
+  (trivially, for a genuinely brand-new/empty table — nothing to find). Read by
+  POST /v1/table-scan's `provenance.complete` response field.)
 - partition_key_unique INTEGER NOT NULL DEFAULT 0 (Milestone 4: 1 iff `partition_key_column`
   is verified backed by a real `UNIQUE` constraint, sole `PRIMARY KEY`, or a non-partial
   UNIQUE index — merely being part of a composite unique key, or "unique" only via a
@@ -238,40 +247,41 @@ took `partitionKeyColumn` unconditionally, silently repointing the column throug
 round 6's guard didn't cover — the same stale-`__cf_row_owners`-provenance / cross-tenant leak
 described below, just reachable through a second endpoint.
 
-**Rejects changing `schema_sql` once `partition_key_unique` is verified (PR review round 8).**
-`table_rules.schema_sql` is exactly what a future split/migration backfill executes verbatim to
-provision this table on a freshly-created target shard (see `/admin/create-table` below), while
-`partition_key_unique` (§5) is verified against the CURRENTLY LIVE shard schema, not against
-`schema_sql` text. If a table already has `partition_key_unique = 1` cached and the request
-supplies a `schemaSql` that differs from what's currently stored, the call is rejected with 409
-`SCHEMA_SQL_ALREADY_VERIFIED` and `table_rules` is left untouched — otherwise a caller could
-submit a schema that drops the partition key's UNIQUE/PRIMARY KEY constraint for an
-already-verified table, and a future split target provisioned from that drifted `schema_sql`
-would come up without the constraint while `partition_key_unique` still reads 1, reopening the
-exact cross-tenant `POST /v1/table-scan` leak that flag exists to prevent. Re-registering with
-the *identical* `schemaSql` remains allowed (idempotent re-registration), and a table whose
-`partition_key_unique` is still 0 (unverified) can have its `schemaSql` changed freely — the
-restriction only applies once uniqueness has actually been certified.
+**`schema_sql` can only ever pair with a probe-verified `partition_key_unique = 1` via
+`/admin/create-table` (PR review round 11 fundamental fix, replacing rounds 8-10's escalating
+guard patches).** `table_rules.schema_sql` is exactly what a future split/migration backfill
+executes verbatim to provision this table on a freshly-created target shard (see
+`/admin/create-table` below). It can only ever be trustworthy alongside `partition_key_unique
+= 1` when the two were established TOGETHER, atomically, by `/admin/create-table`'s own
+push-then-verify flow — it pushes this exact DDL to every shard, THEN verifies uniqueness
+against a shard that just received it, so the two are structurally guaranteed to correspond.
+`/admin/register-table`'s own live probe (`checkPartitionKeyUnique`, run against whatever
+ALREADY physically exists on a representative shard right now) is structurally disconnected
+from whatever `schemaSql` text this or an earlier call submitted for storage, so it can never
+make the same guarantee. Earlier rounds tried to patch this gap with reject/preserve guards
+compared against the previously-stored value (round 8's `SCHEMA_SQL_ALREADY_VERIFIED`
+rejection, round 9's preserve-on-omission fallback, round 10's skip-the-probe-when-schemaSql-
+present rule) — each closed one call sequence while leaving another reachable (a second,
+schemaSql-omitting call could still verify `partition_key_unique = true` while an earlier
+call's stored `schema_sql` sat there unconfirmed; a client-supplied empty-string `schemaSql`
+slipped past the "is schemaSql present" check while still landing as a stored non-NULL
+garbage value). The round-11 fix is a simpler invariant instead of more comparisons: whenever
+`/admin/register-table`'s OWN probe verifies `partition_key_unique = 1` in a given call (which
+only happens when `schemaSql` is omitted or empty in that same call — a real `schemaSql`
+always skips the probe and demotes `partition_key_unique` to 0, per round 10's original,
+still-correct behavior), `schema_sql` is explicitly NULLed in that same write, regardless of
+what was previously stored — this route's live-state check can never vouch for arbitrary
+stored text. `/admin/set-partition-key-column` (below) applies the identical rule for its own
+probe. Submitting a real `schemaSql` in any `/admin/register-table` call always stores it as
+submitted and always demotes `partition_key_unique` to 0 in the same write — there is no
+longer a 409 rejection for "changing schema_sql on an already-verified table," since the
+demotion itself means there is never a stale-pairing risk to guard against.
 
-**Never produces a verified `partition_key_unique` when `schemaSql` is also submitted (PR
-review round 10).** The live-schema probe described above (`checkPartitionKeyUnique`, run
-against whatever ALREADY physically exists on a representative shard right now) and the
-`schemaSql` text submitted in the same call (stored for a future split/migration target to
-execute verbatim) are two structurally disconnected sources that are only ever assumed to
-correspond, never checked against each other. Without this guard, a table that already
-physically exists somewhere with a genuinely unique constraint, but is being registered here
-for the FIRST time, could be registered with a `schemaSql` that's weaker than (and doesn't
-preserve) that live constraint — the probe would still verify `partition_key_unique = 1`
-against the real live shard, while the stored `schema_sql` a future split target provisions
-from lacks the constraint entirely. Rounds 8-9's guards above don't catch this because there's
-no prior `table_rules` row to compare against on a first registration. Instead: whenever
-`schemaSql` is present (a non-empty string) anywhere in the request, `/admin/register-table`
-skips the live probe entirely and always stores `partition_key_unique = 0`, regardless of what
-the probe would otherwise compute. A table registered this way can only become verified later
-via a separate, subsequent `POST /admin/set-partition-key-column` call (which re-verifies fresh
-against the live shard and has no `schemaSql` field to go stale against) — or by using
-`POST /admin/create-table`'s own atomic push-schema-then-verify flow instead, which doesn't go
-through this code path at all.
+**Trade-off.** A table verified via `/admin/register-table`'s or `/admin/set-partition-key-
+column`'s own live probe (not `/admin/create-table`) can be table-scan-eligible
+(`partition_key_unique = 1`) but ends up with `schema_sql = NULL` — a future split/migration
+backfill can't auto-provision that table on a new target shard from stored DDL; the table
+must already exist there some other way, or an operator applies the schema manually.
 
 POST /admin/create-table
 Request:
@@ -286,7 +296,21 @@ Response:
 Also computes and caches `table_rules.partition_key_unique` (§5) from the schema just
 created, checked against the same representative shard as the column-exists validation above
 — this is what gates whether `POST /v1/table-scan` will later accept this table (409
-`PARTITION_KEY_NOT_UNIQUE` if not verified unique).
+`PARTITION_KEY_NOT_UNIQUE` if not verified unique). This is the ONE route whose
+`partition_key_unique = 1` is always paired with a real, non-NULL `schema_sql` — see the
+round-11 invariant above.
+
+**No longer auto-certifies `provenance_complete` (PR review round 11, P2 fix).** Previously
+set `provenanceComplete: true` unconditionally when registering the table it just created —
+wrong when `table` already physically existed (its DDL is `CREATE TABLE IF NOT EXISTS`, which
+silently no-ops against a pre-existing table with legacy rows predating row-provenance
+tracking), since it would certify `provenance_complete = 1` regardless, hiding those legacy
+rows' absence from `__cf_row_owners` behind a false `provenance.complete: true` on
+`POST /v1/table-scan`. A newly created table now starts at `provenance_complete = 0` like any
+other table (see §5); a genuinely brand-new (empty) table's first `POST /admin/backfill-
+provenance` run trivially finds zero orphaned/ambiguous rows and certifies it complete through
+the normal mechanism — same end state as before for the legitimate case, one extra (cheap,
+near-no-op) admin call, with no false-positive risk for a colliding table name.
 
 POST /admin/set-partition-key-column (ADMIN_TOKEN)
 Request:
@@ -297,6 +321,11 @@ Response:
 - ok
 - table
 - partitionKeyColumn
+
+Also nulls out any previously-stored `schema_sql` in the same `UPDATE` whenever this call's own
+probe verifies `partition_key_unique = 1` (PR review round 11) — this route's live-state check
+can't guarantee whatever `schema_sql` happens to already be on file corresponds to the column it
+just verified, so it must not be left in place. Left untouched when unverified (0).
 
 Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409. Also recomputes `table_rules.partition_key_unique` (§5) for the newly-set column.
 
@@ -741,7 +770,10 @@ Phases:
    same queue on failure. Meanwhile the catalog pages `/migrate-export` (rows selected via
    `__cf_row_owners`, 500-row pages, stable partition-key cursor) into `/migrate-import`
    (INSERT OR REPLACE + provenance, idempotent). If the target shard was created mid-life
-   (a split target), each table's captured `schema_sql` is applied there first.
+   (a split target), each table's captured `schema_sql` is applied there first — a table
+   whose `schema_sql` is NULL (PR review round 11: only `/admin/create-table`-verified tables
+   are guaranteed to have one — see §7) can't be auto-provisioned this way and must already
+   exist on the target some other way, or be applied manually by an operator.
 2. **cutover** (formal 5-step ordering):
    1. Catalog sets `migration_status='cutover'` and synchronously writes a fence row to
       the source (`/fence-vbucket`). From this instant the source rejects any data write
