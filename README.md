@@ -188,8 +188,8 @@ Only tables whose `partitionKeyColumn` is verified UNIQUE can use this route.
 `/admin/create-table`, `/admin/set-partition-key-column`, and
 `/admin/register-table` each automatically check (a client-supplied
 uniqueness claim is never trusted) whether the column is backed by a real
-`UNIQUE` constraint, `PRIMARY KEY`, or a non-partial unique index — a column
-that's merely part of a composite unique key, or "unique" only via a
+`UNIQUE` constraint, the table's sole `PRIMARY KEY` column, or a non-partial unique index — a
+column that's only one part of a composite primary/unique key, or "unique" only via a
 partial/`WHERE`-conditioned index, does not count — and cache the result in
 `table_rules.partition_key_unique`, failing closed (unverified) on any
 introspection error. Call `/v1/table-scan` against a table where that flag
