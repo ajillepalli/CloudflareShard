@@ -238,6 +238,21 @@ took `partitionKeyColumn` unconditionally, silently repointing the column throug
 round 6's guard didn't cover — the same stale-`__cf_row_owners`-provenance / cross-tenant leak
 described below, just reachable through a second endpoint.
 
+**Rejects changing `schema_sql` once `partition_key_unique` is verified (PR review round 8).**
+`table_rules.schema_sql` is exactly what a future split/migration backfill executes verbatim to
+provision this table on a freshly-created target shard (see `/admin/create-table` below), while
+`partition_key_unique` (§5) is verified against the CURRENTLY LIVE shard schema, not against
+`schema_sql` text. If a table already has `partition_key_unique = 1` cached and the request
+supplies a `schemaSql` that differs from what's currently stored, the call is rejected with 409
+`SCHEMA_SQL_ALREADY_VERIFIED` and `table_rules` is left untouched — otherwise a caller could
+submit a schema that drops the partition key's UNIQUE/PRIMARY KEY constraint for an
+already-verified table, and a future split target provisioned from that drifted `schema_sql`
+would come up without the constraint while `partition_key_unique` still reads 1, reopening the
+exact cross-tenant `POST /v1/table-scan` leak that flag exists to prevent. Re-registering with
+the *identical* `schemaSql` remains allowed (idempotent re-registration), and a table whose
+`partition_key_unique` is still 0 (unverified) can have its `schemaSql` changed freely — the
+restriction only applies once uniqueness has actually been certified.
+
 POST /admin/create-table
 Request:
 - table string

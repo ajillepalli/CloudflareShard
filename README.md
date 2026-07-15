@@ -209,6 +209,19 @@ unique partition key, `/tenant-scan-page`'s join against `__cf_row_owners`
 another tenant who happens to share that value, so the route refuses to run
 rather than risk a cross-tenant read.
 
+Once `partition_key_unique` is cached as verified, `/admin/register-table`
+also **freezes that table's `schema_sql`** (PR review round 8):
+`table_rules.schema_sql` is exactly what a future split/migration backfill
+executes verbatim to provision the table on a freshly-created target shard,
+while `partition_key_unique` was only verified against the currently-live
+shard schema — not against `schema_sql` text. Submitting a different
+`schemaSql` for an already-verified table is rejected with 409
+`SCHEMA_SQL_ALREADY_VERIFIED` (re-submitting the identical `schemaSql` is
+still fine, and a table whose `partition_key_unique` is still 0 can have its
+`schemaSql` changed freely), so a drifted schema can never silently
+provision a future shard without the certified UNIQUE/PRIMARY KEY
+constraint.
+
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/table-scan \
   -H "content-type: application/json" \

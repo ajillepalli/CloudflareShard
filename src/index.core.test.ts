@@ -964,6 +964,125 @@ describe("Worker /admin/register-table rejects repointing an already-configured 
   });
 });
 
+/** Reads table_rules.schema_sql straight off catalog-0's own storage, keyed by
+ * table_name — used to verify a rejected schema_sql change left table_rules
+ * genuinely unchanged, not just that the HTTP response was a 409. */
+async function readTableRulesSchemaSql(table: string): Promise<string | null | undefined> {
+  const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    const rows = Array.from(
+      state.storage.sql.exec("SELECT schema_sql FROM table_rules WHERE table_name = ?", table),
+    ) as Array<{ schema_sql: string | null }>;
+    return rows[0]?.schema_sql;
+  });
+}
+
+// PR review round 8 (P1): table_rules.schema_sql is exactly what a future
+// split/migration backfill executes verbatim to provision a table on a
+// freshly-created target shard. partition_key_unique, once cached as 1, was
+// verified against the CURRENTLY LIVE shard schema — not against schema_sql
+// text — so an already-verified table's schema_sql being silently
+// overwritable with a DIFFERENT CREATE TABLE statement (e.g. one dropping the
+// partition key's UNIQUE/PK constraint) could let a future split target come
+// up without the constraint while partition_key_unique still reads 1,
+// reopening the cross-tenant /v1/table-scan leak that flag exists to
+// prevent. handleRegisterTable now freezes schema_sql once
+// partition_key_unique = 1, the same monotonic-once-verified pattern as the
+// partition_key_column guard above.
+describe("Worker /admin/register-table rejects changing schema_sql after partition_key_unique verification (PR review round 8 fix)", () => {
+  it("rejects re-registering a verified-unique table with a DIFFERENT schema_sql, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_diff_schemasql_evt";
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: originalSchema, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+
+    // A schema that drops the PRIMARY KEY/UNIQUE constraint on "id" entirely
+    // — if this were accepted, a future split target provisioned from it
+    // could come up without the certified constraint.
+    const driftedSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: driftedSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(409);
+    const body = (await registerRes.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("SCHEMA_SQL_ALREADY_VERIFIED");
+
+    // Nothing changed: schema_sql AND partition_key_unique both stay exactly
+    // as they were before this rejected call.
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+  });
+
+  it("allows re-registering a verified-unique table with the IDENTICAL schema_sql (idempotent re-registration, no regression)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_same_schemasql_evt";
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: originalSchema, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: originalSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+  });
+
+  it("allows changing schema_sql for a table whose partition_key_unique is still 0 (unverified — no over-rejection)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_unverified_schemasql_evt";
+
+    const firstSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: firstSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    expect(await readTableRulesSchemaSql(table)).toBe(firstSchema);
+
+    const secondSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT, extra TEXT)`;
+    const secondRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: secondSchema },
+      AUTH(),
+    );
+    expect(secondRes.status).toBe(200);
+    expect(await readTableRulesSchemaSql(table)).toBe(secondSchema);
+  });
+
+  it("allows registering a brand-new table with schema_sql set (first-ever registration, no prior row to conflict with)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_brandnew_schemasql_evt";
+    const schema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: schema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesSchemaSql(table)).toBe(schema);
+  });
+});
+
 // Pre-landing review fix: /admin/register-table never validated payload.table
 // or payload.partitionKeyColumn against IDENTIFIER_RE, unlike every sibling
 // route (e.g. /admin/set-partition-key-column). An unvalidated table string
