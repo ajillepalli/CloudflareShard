@@ -251,7 +251,9 @@ Response:
 - table
 - partitionKeyColumn
 
-Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409. Also recomputes `table_rules.partition_key_unique` (§5) for the newly-set column — a stale "unique" flag left over from the table's *previous* `partitionKeyColumn` (or from before this column was ever set) must never carry forward to the new one.
+Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409. Also recomputes `table_rules.partition_key_unique` (§5) for the newly-set column.
+
+**One-time upgrade only (PR review round 6).** This route is strictly a one-time `'__unset__'` → real-column upgrade, never a general "repoint an already-configured table's partition key column" operation. If `table_rules.partition_key_column` is already a real (non-`'__unset__'`) value for `table`, the call is rejected outright with 409 `PARTITION_KEY_ALREADY_SET` and `table_rules` is left untouched — it does not matter whether the requested `partitionKeyColumn` matches the current one or names something different. There is no legitimate use case for repointing an already-working column: any existing `__cf_row_owners` entries for the table were written keyed by the OLD column's values, and `POST /v1/table-scan` enumerates those entries but looks up base rows via `WHERE "<column>" = ?` against whatever column is *currently* configured — repointing to a different column would let a stale, now-mismatched `partition_key` value resolve to an unrelated row under the new column, a cross-tenant data leak. Rather than attempting to safely migrate or clear provenance for a repoint, the endpoint refuses the operation entirely.
 
 POST /admin/create-index (ADMIN_TOKEN) — Milestone 2, Chunk 1
 Request:
