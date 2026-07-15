@@ -1334,6 +1334,42 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
         const pkCol = table.partition_key_column;
         const safeTable = `"${table.table_name}"`;
         const safePk = `"${pkCol}"`;
+
+        // PR review round 8 (P2): distinguish "table not physically present
+        // on this shard" (a registered-but-never-created table_rules entry
+        // — e.g. /admin/register-table registers metadata only, with no
+        // physical DDL; see index.test.ts's column_mismatch_evt regression
+        // test) from a GENUINE scan-query failure (a malformed query, a
+        // missing/renamed partition-key column, etc). The old code inferred
+        // "absent" from the scan query itself failing (`!pageRes.ok`), which
+        // treated a real error identically to the legitimate skip case: the
+        // table stayed in scannedTableNames with nothing recorded in
+        // orphaned/ambiguous, so it could still get certified
+        // provenance_complete even though this shard's rows for it were
+        // never actually checked — hiding a false "provenance.complete:
+        // true" behind /v1/table-scan. Same fix pattern as f585f9b's
+        // /tenant-scan-page fix in shard.ts: probe existence via PRAGMA
+        // table_info first (never throws for a missing table, just returns
+        // zero rows), then run the real query uncaught below — so a genuine
+        // failure now fails the WHOLE /admin/backfill-provenance request
+        // instead of being silently treated as "table absent" and certified
+        // complete.
+        const probeRes = await routeToShard(env, shardId, "/execute", {
+          sql: `PRAGMA table_info(${safeTable})`,
+          requestId: `backfill-provenance-probe-${catalogShardId}-${shardId}-${table.table_name}-${crypto.randomUUID()}`,
+          isMutation: false,
+        });
+        if (!probeRes.ok) {
+          return new Response(probeRes.body, { status: probeRes.status, headers: probeRes.headers });
+        }
+        const probeBody = (await probeRes.json()) as { rows?: unknown[] };
+        if ((probeBody.rows ?? []).length === 0) {
+          // Legitimate skip: table_rules entry with no physical table on
+          // this shard yet.
+          log("worker.provenance_scan_skipped", { catalogShardId, shardId, table: table.table_name });
+          continue;
+        }
+
         let afterPk = "";
         for (;;) {
           const pageRes = await routeToShard(env, shardId, "/execute", {
@@ -1349,13 +1385,13 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
             isMutation: false,
           });
           if (!pageRes.ok) {
-            // A table_rules entry doesn't guarantee a physical table exists
-            // on every shard (e.g. /admin/register-table registers metadata
-            // only, with no physical DDL — see index.test.ts's
-            // column_mismatch_evt regression test) — skip rather than fail
-            // the whole multi-shard/multi-table run over one such entry.
-            log("worker.provenance_scan_skipped", { catalogShardId, shardId, table: table.table_name });
-            break;
+            // The table is confirmed to exist on this shard (probed above)
+            // — a failure here is a GENUINE SQL execution error (e.g. the
+            // partition key column was renamed/dropped out from under
+            // table_rules), not the "table absent" case. Fail the whole
+            // request rather than silently certifying possibly-unchecked
+            // data as provenance_complete.
+            return new Response(pageRes.body, { status: pageRes.status, headers: pageRes.headers });
           }
           const pageBody = (await pageRes.json()) as { rows?: Array<{ pk: unknown }> };
           const pks = pageBody.rows ?? [];

@@ -603,8 +603,8 @@ export class CatalogDO extends DurableObject {
     // again for it (e.g. a manual metadata-only re-registration). Preserve
     // "already complete" across a re-register; only handleAdminCreateTable's
     // fan-out (via provenanceComplete: true, a brand-new table) sets it fresh.
-    const existing = this.one<{ provenance_complete: number; partition_key_column: string }>(
-      "SELECT provenance_complete, partition_key_column FROM table_rules WHERE table_name = ?",
+    const existing = this.one<{ provenance_complete: number; partition_key_column: string; schema_sql: string | null; partition_key_unique: number }>(
+      "SELECT provenance_complete, partition_key_column, schema_sql, partition_key_unique FROM table_rules WHERE table_name = ?",
       body.table,
     );
     const provenanceComplete = existing?.provenance_complete === 1 || body.provenanceComplete === true ? 1 : 0;
@@ -630,6 +630,45 @@ export class CatalogDO extends DurableObject {
             code: "PARTITION_KEY_ALREADY_SET",
             message: `Table ${body.table} already has a configured partition key column (${existing.partition_key_column}).`,
             fix: "Registering again with the same partitionKeyColumn is fine, but repointing to a different column is not supported: it would leave existing row-ownership provenance keyed under the old column's values.",
+          },
+        },
+        409,
+      );
+    }
+    // PR review round 8: table_rules.schema_sql is exactly what a future
+    // split/migration backfill executes verbatim to provision this table on
+    // a freshly-created target shard (see ensureSchema's comment above the
+    // schema_sql column). partition_key_unique, once cached as 1, was
+    // verified against the CURRENTLY LIVE shard schema — not against
+    // schema_sql text. If an already-verified table's schema_sql could still
+    // be silently overwritten with a DIFFERENT CREATE TABLE statement (e.g.
+    // one that drops the partition key's UNIQUE/PK constraint), a future
+    // split target provisioned from that new schema_sql could come up
+    // without the constraint while partition_key_unique still reads 1 —
+    // reopening the exact cross-tenant /v1/table-scan leak that flag exists
+    // to prevent. Same "monotonic, once-verified, frozen" pattern as the
+    // partition_key_column guard directly above: identical resubmission
+    // (idempotent re-registration) stays allowed, but a genuinely different
+    // schema_sql is rejected outright once uniqueness has been certified. A
+    // table whose partition_key_unique is still 0 (never verified, or not
+    // yet) has no such invariant to protect, so its schema_sql remains
+    // freely updatable. Compared against what's currently STORED, not the
+    // freshly-computed body.partitionKeyUnique — the Worker layer
+    // (handleAdminRegisterTable) recomputes partitionKeyUnique fresh against
+    // the CURRENT partitionKeyColumn on every call, so it reflects a NEW
+    // verification, not necessarily the OLD cached one this guard protects.
+    if (
+      existing &&
+      existing.partition_key_unique === 1 &&
+      typeof body.schemaSql === "string" &&
+      body.schemaSql !== existing.schema_sql
+    ) {
+      return json(
+        {
+          error: {
+            code: "SCHEMA_SQL_ALREADY_VERIFIED",
+            message: `Table ${body.table} already has a verified unique partition key; schema_sql cannot be changed.`,
+            fix: "Registering again with the identical schema_sql is fine, but changing it after partition_key_unique verification is not supported: a future split/migration target provisioned from a different schema_sql could silently lack the certified constraint.",
           },
         },
         409,
