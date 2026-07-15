@@ -603,11 +603,38 @@ export class CatalogDO extends DurableObject {
     // again for it (e.g. a manual metadata-only re-registration). Preserve
     // "already complete" across a re-register; only handleAdminCreateTable's
     // fan-out (via provenanceComplete: true, a brand-new table) sets it fresh.
-    const existing = this.one<{ provenance_complete: number }>(
-      "SELECT provenance_complete FROM table_rules WHERE table_name = ?",
+    const existing = this.one<{ provenance_complete: number; partition_key_column: string }>(
+      "SELECT provenance_complete, partition_key_column FROM table_rules WHERE table_name = ?",
       body.table,
     );
     const provenanceComplete = existing?.provenance_complete === 1 || body.provenanceComplete === true ? 1 : 0;
+    // PR review round 7: INSERT OR REPLACE below would otherwise let this
+    // endpoint silently repoint an already-configured table's
+    // partition_key_column to a different value — the SAME vulnerability
+    // round 6 closed for /admin/set-partition-key-column (see that handler's
+    // comment for the full stale-__cf_row_owners-provenance/cross-tenant
+    // rationale). Allow the call through when there's no existing row yet
+    // (first-ever registration), when the existing value is still the
+    // '__unset__' sentinel (the legitimate upgrade path), or when the new
+    // value is IDENTICAL to what's already set (idempotent re-registration,
+    // e.g. metadata-only re-sync). Only reject when a real, differing value
+    // would overwrite an existing real value.
+    if (
+      existing &&
+      existing.partition_key_column !== UNSET_PARTITION_KEY_COLUMN &&
+      existing.partition_key_column !== body.partitionKeyColumn
+    ) {
+      return json(
+        {
+          error: {
+            code: "PARTITION_KEY_ALREADY_SET",
+            message: `Table ${body.table} already has a configured partition key column (${existing.partition_key_column}).`,
+            fix: "Registering again with the same partitionKeyColumn is fine, but repointing to a different column is not supported: it would leave existing row-ownership provenance keyed under the old column's values.",
+          },
+        },
+        409,
+      );
+    }
     // partition_key_unique is NOT preserved like provenance_complete above —
     // it's a property of the CURRENT partitionKeyColumn, which can itself
     // change (via /set-partition-key-column), so a re-register must take

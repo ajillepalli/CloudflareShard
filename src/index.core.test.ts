@@ -693,6 +693,38 @@ async function readTableRulesColumn(
   });
 }
 
+/** Reads table_rules.partition_key_column straight off catalog-0's own
+ * storage, keyed by table_name — used to verify a rejected repoint left
+ * table_rules genuinely unchanged, not just that the HTTP response was a
+ * 409. */
+async function readTableRulesPartitionKeyColumn(table: string): Promise<string | undefined> {
+  const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    const rows = Array.from(
+      state.storage.sql.exec("SELECT partition_key_column FROM table_rules WHERE table_name = ?", table),
+    ) as Array<{ partition_key_column: string }>;
+    return rows[0]?.partition_key_column;
+  });
+}
+
+/** Resets `table_rules.partition_key_column` back to the '__unset__' sentinel
+ * across every catalog shard for `table` — used by tests that intentionally
+ * re-register a table under a DIFFERENT partitionKeyColumn to exercise some
+ * OTHER behavior entirely (e.g. the partitionKeyUnique trust-bypass fix
+ * below), where PR review round 7's /admin/register-table repoint guard
+ * would otherwise reject the second call with 409 PARTITION_KEY_ALREADY_SET
+ * before the test ever reaches what it's actually checking. Mirrors the
+ * inline reset already used by the /admin/set-partition-key-column upgrade
+ * test above. */
+async function resetPartitionKeyColumnToSentinel(table: string, numCatalogShards: number): Promise<void> {
+  for (let i = 0; i < numCatalogShards; i += 1) {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = ?", table);
+    });
+  }
+}
+
 // Codex-found P1 (re-review of the P1 fix): /admin/register-table used to
 // forward body.partitionKeyUnique straight into table_rules.partition_key_unique
 // with zero verification, letting a caller bypass checkPartitionKeyUnique
@@ -717,6 +749,12 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
       AUTH(),
     );
     expect(createRes.status).toBe(200);
+
+    // This test's actual target is partitionKeyUnique trust, not the repoint
+    // guard — reset to the sentinel first so re-registering under a
+    // DIFFERENT partitionKeyColumn ("user_id" instead of "id") isn't itself
+    // rejected 409 PARTITION_KEY_ALREADY_SET by PR review round 7's guard.
+    await resetPartitionKeyColumnToSentinel(table, 4);
 
     // Re-register the same physical table, this time declaring partitionKeyColumn
     // as the NON-unique "user_id" column, and smuggling partitionKeyUnique: true
@@ -751,6 +789,12 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
       AUTH(),
     );
     expect(createRes.status).toBe(200);
+
+    // This test's actual target is partitionKeyUnique computation, not the
+    // repoint guard — reset to the sentinel first so re-registering under a
+    // DIFFERENT partitionKeyColumn ("user_id" instead of "id") isn't itself
+    // rejected 409 PARTITION_KEY_ALREADY_SET by PR review round 7's guard.
+    await resetPartitionKeyColumnToSentinel(table, 4);
 
     // Re-register declaring partitionKeyColumn as the genuinely-UNIQUE
     // "user_id" column — no partitionKeyUnique field supplied at all.
@@ -839,6 +883,84 @@ describe("Worker /admin/register-table preserves provenance_complete across re-r
     const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
     expect(registerRes.status).toBe(200);
     expect(await readProvenanceComplete(table)).toBe(0);
+  });
+});
+
+// PR review round 7: /admin/register-table's INSERT OR REPLACE used to take
+// body.partitionKeyColumn unconditionally, silently repointing an
+// already-configured table's partition_key_column to a different value —
+// the SAME __cf_row_owners stale-provenance / cross-tenant leak round 6
+// closed for /admin/set-partition-key-column (see that handler's comment),
+// but reachable through this OTHER route since round 6's guard only lived in
+// handleSetPartitionKeyColumn. handleRegisterTable now rejects a repoint the
+// same way, while still allowing brand-new registrations, the sentinel
+// upgrade path, and idempotent re-registration with the SAME value.
+describe("Worker /admin/register-table rejects repointing an already-configured partition key column (PR review round 7 fix)", () => {
+  it("allows re-registering a table with the SAME partitionKeyColumn it already has (idempotent re-registration)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_same_pkcol_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    expect(await readTableRulesPartitionKeyColumn(table)).toBe("id");
+  });
+
+  it("rejects re-registering a table with a DIFFERENT partitionKeyColumn than what's already set, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_diff_pkcol_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, email TEXT, v TEXT)`,
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "email" }, AUTH());
+    expect(registerRes.status).toBe(409);
+    const body = (await registerRes.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("PARTITION_KEY_ALREADY_SET");
+
+    const partitionKeyColumn = await readTableRulesPartitionKeyColumn(table);
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  it("allows registering a brand-new table with no prior table_rules row", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_brand_new_evt";
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    const partitionKeyColumn = await readTableRulesPartitionKeyColumn(table);
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  it("allows upgrading a table still carrying the '__unset__' sentinel to a real partitionKeyColumn", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_sentinel_upgrade_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    await resetPartitionKeyColumnToSentinel(table, 4);
+    expect(await readTableRulesPartitionKeyColumn(table)).toBe("__unset__");
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesPartitionKeyColumn(table)).toBe("id");
   });
 });
 

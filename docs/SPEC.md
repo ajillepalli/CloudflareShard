@@ -226,6 +226,18 @@ nothing can be verified. Any `partitionKeyUnique` present in the request body is
 ignored (Codex P1 fix: accepting a client-supplied value would let a caller lie about
 uniqueness and bypass the check `POST /v1/table-scan` relies on).
 
+**Rejects repointing an already-configured partition key column (PR review round 7).** The
+same rule `/admin/set-partition-key-column` enforces (see below) applies here too: if `table`
+already has a real (non-`'__unset__'`) `partition_key_column` in `table_rules` and the
+request's `partitionKeyColumn` names a *different* column, the call is rejected with 409
+`PARTITION_KEY_ALREADY_SET` and `table_rules` is left untouched. Re-registering with the
+*same* `partitionKeyColumn` value remains allowed (idempotent re-registration, e.g. a
+metadata-only re-sync), as does registering a brand-new table or upgrading one still carrying
+the `'__unset__'` sentinel. Before this fix, `/admin/register-table`'s `INSERT OR REPLACE`
+took `partitionKeyColumn` unconditionally, silently repointing the column through a route
+round 6's guard didn't cover — the same stale-`__cf_row_owners`-provenance / cross-tenant leak
+described below, just reachable through a second endpoint.
+
 POST /admin/create-table
 Request:
 - table string
