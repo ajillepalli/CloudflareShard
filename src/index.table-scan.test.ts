@@ -1,4 +1,4 @@
-import { env, reset, runInDurableObject } from "cloudflare:test";
+﻿import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { hashKey } from "./hash";
 import type { CatalogDO } from "./catalog";
@@ -400,7 +400,7 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
       "/admin/create-table",
       {
         table: "scan_collide_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_collide_evt (id TEXT PRIMARY KEY, __cf_scan_pk TEXT, v TEXT)",
+        schema: "CREATE TABLE scan_collide_evt (id TEXT PRIMARY KEY, __cf_scan_pk TEXT, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -458,7 +458,7 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     const table = "scan_coerce_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (pk INTEGER PRIMARY KEY, v TEXT)`, partitionKeyColumn: "pk" },
+      { table, schema: `CREATE TABLE ${table} (pk INTEGER PRIMARY KEY, v TEXT)`, partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -905,7 +905,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      { table: "scan_pku_pk_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_pk_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "scan_pku_pk_evt", schema: "CREATE TABLE scan_pku_pk_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -921,7 +921,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_uniq_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)",
+        schema: "CREATE TABLE scan_pku_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)",
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -948,7 +948,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_collate_pk_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_pk_evt (id TEXT PRIMARY KEY COLLATE NOCASE, v TEXT)",
+        schema: "CREATE TABLE scan_pku_collate_pk_evt (id TEXT PRIMARY KEY COLLATE NOCASE, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -977,7 +977,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_collate_uniq_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE NOCASE, v TEXT)",
+        schema: "CREATE TABLE scan_pku_collate_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE NOCASE, v TEXT)",
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -1009,7 +1009,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_collate_pk_dq_evt",
-        schema: 'CREATE TABLE IF NOT EXISTS scan_pku_collate_pk_dq_evt (id TEXT PRIMARY KEY COLLATE "NOCASE", v TEXT)',
+        schema: 'CREATE TABLE scan_pku_collate_pk_dq_evt (id TEXT PRIMARY KEY COLLATE "NOCASE", v TEXT)',
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1037,7 +1037,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       {
         table: "scan_pku_collate_uniq_dq_evt",
         schema:
-          'CREATE TABLE IF NOT EXISTS scan_pku_collate_uniq_dq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE "NOCASE", v TEXT)',
+          'CREATE TABLE scan_pku_collate_uniq_dq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE "NOCASE", v TEXT)',
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -1062,7 +1062,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_collate_pk_bt_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_pk_bt_evt (id TEXT PRIMARY KEY COLLATE `NOCASE`, v TEXT)",
+        schema: "CREATE TABLE scan_pku_collate_pk_bt_evt (id TEXT PRIMARY KEY COLLATE `NOCASE`, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1099,7 +1099,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_collate_tablepk_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_tablepk_evt (id TEXT, v TEXT, PRIMARY KEY(id COLLATE NOCASE))",
+        schema: "CREATE TABLE scan_pku_collate_tablepk_evt (id TEXT, v TEXT, PRIMARY KEY(id COLLATE NOCASE))",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1127,7 +1127,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       {
         table: "scan_pku_collate_tableuniq_evt",
         schema:
-          "CREATE TABLE IF NOT EXISTS scan_pku_collate_tableuniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT, UNIQUE(user_id COLLATE NOCASE))",
+          "CREATE TABLE scan_pku_collate_tableuniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT, UNIQUE(user_id COLLATE NOCASE))",
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -1156,7 +1156,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_probe_clean_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_probe_clean_evt (id TEXT PRIMARY KEY, v TEXT)",
+        schema: "CREATE TABLE scan_pku_probe_clean_evt (id TEXT PRIMARY KEY, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1212,7 +1212,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       {
         table: "scan_pku_probe_unsatisfiable_evt",
         schema:
-          "CREATE TABLE IF NOT EXISTS scan_pku_probe_unsatisfiable_evt (id TEXT PRIMARY KEY, other TEXT NOT NULL, CHECK (length(other) <= 3))",
+          "CREATE TABLE scan_pku_probe_unsatisfiable_evt (id TEXT PRIMARY KEY, other TEXT NOT NULL, CHECK (length(other) <= 3))",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1259,7 +1259,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       "/admin/create-table",
       {
         table: "scan_pku_collate_rtrim_pk_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_rtrim_pk_evt (id TEXT PRIMARY KEY COLLATE RTRIM, v TEXT)",
+        schema: "CREATE TABLE scan_pku_collate_rtrim_pk_evt (id TEXT PRIMARY KEY COLLATE RTRIM, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1281,7 +1281,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       {
         table: "scan_pku_collate_rtrim_uniq_evt",
         schema:
-          "CREATE TABLE IF NOT EXISTS scan_pku_collate_rtrim_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE RTRIM, v TEXT)",
+          "CREATE TABLE scan_pku_collate_rtrim_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE RTRIM, v TEXT)",
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -1323,7 +1323,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
       "/admin/create-table",
       {
         table,
-        schema: `CREATE TABLE IF NOT EXISTS ${table} (pk TEXT COLLATE NOCASE, v TEXT)`,
+        schema: `CREATE TABLE ${table} (pk TEXT COLLATE NOCASE, v TEXT)`,
         partitionKeyColumn: "pk",
       },
       AUTH(),
@@ -1367,7 +1367,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      { table: "scan_pku_int_affinity_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_int_affinity_evt (pk INTEGER PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
+      { table: "scan_pku_int_affinity_evt", schema: "CREATE TABLE scan_pku_int_affinity_evt (pk INTEGER PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -1385,7 +1385,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
 
     const binaryRes = await post(
       "/admin/create-table",
-      { table: "scan_pku_desc_binary_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_binary_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)", partitionKeyColumn: "pk" },
+      { table: "scan_pku_desc_binary_evt", schema: "CREATE TABLE scan_pku_desc_binary_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)", partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(binaryRes.status).toBe(200);
@@ -1394,7 +1394,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
       "/admin/create-table",
       {
         table: "scan_pku_desc_nocase_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_nocase_evt (pk INTEGER PRIMARY KEY DESC COLLATE NOCASE, v TEXT)",
+        schema: "CREATE TABLE scan_pku_desc_nocase_evt (pk INTEGER PRIMARY KEY DESC COLLATE NOCASE, v TEXT)",
         partitionKeyColumn: "pk",
       },
       AUTH(),
@@ -1419,7 +1419,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
       "/admin/create-table",
       {
         table: "scan_pku_numeric_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_numeric_evt (pk DECIMAL PRIMARY KEY, v TEXT)",
+        schema: "CREATE TABLE scan_pku_numeric_evt (pk DECIMAL PRIMARY KEY, v TEXT)",
         partitionKeyColumn: "pk",
       },
       AUTH(),
@@ -1428,7 +1428,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
 
     const realRes = await post(
       "/admin/create-table",
-      { table: "scan_pku_real_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_real_evt (pk REAL PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
+      { table: "scan_pku_real_evt", schema: "CREATE TABLE scan_pku_real_evt (pk REAL PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(realRes.status).toBe(200);
@@ -1453,7 +1453,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      { table: "scan_pku_blob_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_blob_evt (pk BLOB PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
+      { table: "scan_pku_blob_evt", schema: "CREATE TABLE scan_pku_blob_evt (pk BLOB PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -1474,7 +1474,7 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
     const table = "scan_pku_int_no_probe_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (pk INTEGER PRIMARY KEY, v TEXT)`, partitionKeyColumn: "pk" },
+      { table, schema: `CREATE TABLE ${table} (pk INTEGER PRIMARY KEY, v TEXT)`, partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -1572,7 +1572,7 @@ describe("/v1/table-scan collation probe: randomized non-TEXT placeholder values
       "/admin/create-table",
       {
         table,
-        schema: `CREATE TABLE IF NOT EXISTS ${table} (pk TEXT PRIMARY KEY, other_id INTEGER NOT NULL UNIQUE, v TEXT)`,
+        schema: `CREATE TABLE ${table} (pk TEXT PRIMARY KEY, other_id INTEGER NOT NULL UNIQUE, v TEXT)`,
         partitionKeyColumn: "pk",
       },
       AUTH(),
@@ -1643,7 +1643,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
       "/admin/create-table",
       {
         table: "scan_pku_partial_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_partial_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, active INTEGER, v TEXT)",
+        schema: "CREATE TABLE scan_pku_partial_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, active INTEGER, v TEXT)",
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -1657,14 +1657,22 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
     const beforeAnyIndex = await post("/v1/table-scan", { tenantId, table: "scan_pku_partial_evt" }, token);
     expect(beforeAnyIndex.status).toBe(409);
 
-    // Add a PARTIAL unique index directly on the shard's own SQLite storage —
-    // this can't be expressed via /admin/create-table's single-CREATE-TABLE
+    // Add a PARTIAL unique index directly on each shard's own SQLite storage
+    // — this can't be expressed via /admin/create-table's single-CREATE-TABLE
     // schema field, so we reach into the ShardDO directly (established
-    // pattern elsewhere in this file/catalog.test.ts).
-    const shardStub = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
-    await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
-      state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_partial ON scan_pku_partial_evt(user_id) WHERE active = 1");
-    });
+    // pattern elsewhere in this file/catalog.test.ts). PR review round 12:
+    // /admin/set-partition-key-column now requires EVERY physical shard to
+    // independently confirm uniqueness (checkPartitionKeyUniqueAcrossShards)
+    // — with numShards:1 there are still 4 physical shards, one per catalog
+    // shard (catalog-0-shard-0 .. catalog-3-shard-0, see ALL_TEST_SHARD_IDS's
+    // doc comment), and /admin/create-table's DDL push already created this
+    // table on all of them, so the index must be added to all of them too.
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+      await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
+        state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_partial ON scan_pku_partial_evt(user_id) WHERE active = 1");
+      });
+    }
 
     // Re-trigger verification for the same column via /admin/set-partition-key-column
     // — must STILL be gated 409: a partial unique index does not guarantee
@@ -1684,11 +1692,14 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
     expect(partialBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
 
     // Replace it with a genuine FULL (non-partial) unique index on the same
-    // column — must now be accepted.
-    await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
-      state.storage.sql.exec("DROP INDEX ux_scan_pku_partial");
-      state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_full ON scan_pku_partial_evt(user_id)");
-    });
+    // column, on every shard — must now be accepted.
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(shardId));
+      await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
+        state.storage.sql.exec("DROP INDEX ux_scan_pku_partial");
+        state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_full ON scan_pku_partial_evt(user_id)");
+      });
+    }
     await resetPartitionKeyToSentinel("scan_pku_partial_evt");
     const setWithFull = await post(
       "/admin/set-partition-key-column",
@@ -1706,7 +1717,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
       "/admin/create-table",
       {
         table: "scan_pku_notuniq_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_notuniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)",
+        schema: "CREATE TABLE scan_pku_notuniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)",
         partitionKeyColumn: "user_id",
       },
       AUTH(),
@@ -1729,7 +1740,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
       "/admin/create-table",
       {
         table: "scan_spkc_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_spkc_evt (id TEXT PRIMARY KEY, user_id TEXT, v TEXT)",
+        schema: "CREATE TABLE scan_spkc_evt (id TEXT PRIMARY KEY, user_id TEXT, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),

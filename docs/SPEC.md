@@ -107,12 +107,23 @@ Table: table_rules
   partial/`WHERE`-conditioned index, does not qualify. Computed automatically, never
   client-supplied, at /admin/create-table, /admin/set-partition-key-column, and
   /admin/register-table time via live `PRAGMA table_info`/`index_list`/`index_info`/
-  `sqlite_master` introspection against a representative shard (`checkPartitionKeyUnique` in
-  index.ts); fails closed to 0 on any introspection error or ambiguity. Gates
-  POST /v1/table-scan: a table where this isn't 1 is rejected 409 `PARTITION_KEY_NOT_UNIQUE`,
-  since `/tenant-scan-page`'s join keys purely by partition-key value against
-  `__cf_row_owners` — a non-unique column would let two tenants' rows share a value and the
-  join attribute both to whichever tenant currently owns that key, a cross-tenant read leak.)
+  `sqlite_master` introspection (`checkPartitionKeyUnique` in index.ts); fails closed to 0 on
+  any introspection error or ambiguity. **PR review round 12:** checked against a single
+  representative shard only for `/admin/create-table` — safe there because that route just
+  pushed the identical DDL to every shard in the same request, so uniformity is guaranteed by
+  construction. `/admin/set-partition-key-column` and `/admin/register-table` can both reach a
+  table that arrived some other way (a legacy table, or one created outside this system's own
+  DDL-push path, with genuine per-shard schema drift), so they instead run
+  `checkPartitionKeyUniqueAcrossShards` — every active shard independently re-runs
+  `checkPartitionKeyUnique`, and the result is 1 only if ALL of them agree; if any shard
+  disagrees or is unreachable, the whole result fails closed to 0. Gates POST /v1/table-scan: a
+  table where this isn't 1 is rejected 409 `PARTITION_KEY_NOT_UNIQUE`, since
+  `/tenant-scan-page`'s join keys purely by partition-key value against `__cf_row_owners` — a
+  non-unique column would let two tenants' rows share a value and the join attribute both to
+  whichever tenant currently owns that key, a cross-tenant read leak. Before round 12, checking
+  only one representative shard for these two routes meant a drifted OTHER shard (same table
+  name, no real uniqueness enforcement) could be silently missed, letting `/v1/table-scan`
+  query it and return duplicate-partition-key rows under the wrong tenant.)
 
 Table: index_rules (Milestone 2, extended in Milestone 3)
 - index_name TEXT PRIMARY KEY
@@ -228,12 +239,19 @@ Response:
 - metadataVersion
 
 This route is metadata-only (it doesn't create anything on any shard), but it still computes
-and caches `table_rules.partition_key_unique` against one active shard's existing schema for
-`table`, exactly as `/admin/create-table` does (see §5) — falling back to unverified (0) if no
-shards exist yet or listing them fails, since registration itself must succeed even when
+and caches `table_rules.partition_key_unique` for `table` — falling back to unverified (0) if
+no shards exist yet or listing them fails, since registration itself must succeed even when
 nothing can be verified. Any `partitionKeyUnique` present in the request body is always
 ignored (Codex P1 fix: accepting a client-supplied value would let a caller lie about
 uniqueness and bypass the check `POST /v1/table-scan` relies on).
+
+**Verified across EVERY active shard, not one representative (PR review round 12 fix).**
+Unlike `/admin/create-table`, this route has no guarantee the table's schema is uniform across
+shards (see §5's `partition_key_unique` entry) — it can be reached for a table that arrived
+some other way, with genuine per-shard drift. It therefore runs
+`checkPartitionKeyUniqueAcrossShards` (§5): every active shard must independently confirm
+uniqueness before `partition_key_unique` is set to 1; any shard that disagrees, or is
+unreachable, fails the whole check closed to 0.
 
 **Rejects repointing an already-configured partition key column (PR review round 7).** The
 same rule `/admin/set-partition-key-column` enforces (see below) applies here too: if `table`
@@ -255,10 +273,20 @@ executes verbatim to provision this table on a freshly-created target shard (see
 = 1` when the two were established TOGETHER, atomically, by `/admin/create-table`'s own
 push-then-verify flow — it pushes this exact DDL to every shard, THEN verifies uniqueness
 against a shard that just received it, so the two are structurally guaranteed to correspond.
-`/admin/register-table`'s own live probe (`checkPartitionKeyUnique`, run against whatever
-ALREADY physically exists on a representative shard right now) is structurally disconnected
-from whatever `schemaSql` text this or an earlier call submitted for storage, so it can never
-make the same guarantee. Earlier rounds tried to patch this gap with reject/preserve guards
+**PR review round 12 fix:** that correspondence guarantee only actually holds if the DDL push
+genuinely applied everywhere — a `body.schema` using `CREATE TABLE IF NOT EXISTS` could
+silently no-op on a shard where `table` already physically existed (e.g. a naming collision
+with a legacy table), leaving the verification step check whatever was ALREADY live there
+instead of what was just submitted, while `schema_sql` still got stored as the submitted
+(never-actually-applied) text. `/admin/create-table` now rejects any `body.schema` containing
+`IF NOT EXISTS` outright with 400 `SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED` (see below) — a genuinely
+new table still creates normally via a plain `CREATE TABLE`; a colliding one now fails loudly
+with SQLite's own "table already exists" error instead of silently no-oping, restoring the
+atomic push-then-verify guarantee this paragraph relies on.
+`/admin/register-table`'s own live probe (`checkPartitionKeyUniqueAcrossShards`, run against
+whatever ALREADY physically exists on every active shard right now — round 12, see §5) is
+structurally disconnected from whatever `schemaSql` text this or an earlier call submitted for
+storage, so it can never make the same guarantee. Earlier rounds tried to patch this gap with reject/preserve guards
 compared against the previously-stored value (round 8's `SCHEMA_SQL_ALREADY_VERIFIED`
 rejection, round 9's preserve-on-omission fallback, round 10's skip-the-probe-when-schemaSql-
 present rule) — each closed one call sequence while leaving another reachable (a second,
@@ -286,7 +314,16 @@ must already exist there some other way, or an operator applies the schema manua
 POST /admin/create-table
 Request:
 - table string
-- schema string (must be a `CREATE TABLE` statement whose table name matches `table`)
+- schema string (must be a `CREATE TABLE` statement whose table name matches `table`. **PR
+  review round 12 fix:** rejected 400 `SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED` if it contains `IF NOT
+  EXISTS` (case-insensitive) — this route's DDL push must genuinely apply everywhere for its
+  atomic push-then-verify guarantee to hold (see the `schema_sql` invariant above); `IF NOT
+  EXISTS` would let the push silently no-op on a shard where `table` already physically
+  existed, e.g. a naming collision with a legacy table, while verification and `schema_sql`
+  storage both went ahead as if it had applied. A genuinely new table still creates normally
+  via a plain `CREATE TABLE`; a colliding one now fails loudly with SQLite's own "table already
+  exists" error — use `/admin/register-table` for an existing table, or resolve the naming
+  conflict first)
 - partitionKeyColumn string (required — validated via `PRAGMA table_info` against the created schema; the table is dropped from every shard and the call fails 400 if the column doesn't exist. The rollback also clears the create-table idempotency-cache entry on each shard via `/invalidate-request`, so a retry with a corrected `partitionKeyColumn` genuinely re-creates the table rather than replaying a stale cached "success" for a table that no longer exists. The rollback's own `DROP TABLE` requestId is unique per attempt, not a stable per-table key — otherwise a second failed retry for the same table would replay the *first* rollback's cached success and leave the just-recreated table behind despite returning 400)
 
 Response:
@@ -302,15 +339,19 @@ round-11 invariant above.
 
 **No longer auto-certifies `provenance_complete` (PR review round 11, P2 fix).** Previously
 set `provenanceComplete: true` unconditionally when registering the table it just created —
-wrong when `table` already physically existed (its DDL is `CREATE TABLE IF NOT EXISTS`, which
-silently no-ops against a pre-existing table with legacy rows predating row-provenance
-tracking), since it would certify `provenance_complete = 1` regardless, hiding those legacy
-rows' absence from `__cf_row_owners` behind a false `provenance.complete: true` on
-`POST /v1/table-scan`. A newly created table now starts at `provenance_complete = 0` like any
-other table (see §5); a genuinely brand-new (empty) table's first `POST /admin/backfill-
-provenance` run trivially finds zero orphaned/ambiguous rows and certifies it complete through
-the normal mechanism — same end state as before for the legitimate case, one extra (cheap,
-near-no-op) admin call, with no false-positive risk for a colliding table name.
+wrong when `table` already physically existed, since `body.schema` could use
+`CREATE TABLE IF NOT EXISTS`, which silently no-ops against a pre-existing table with legacy
+rows predating row-provenance tracking, and it would certify `provenance_complete = 1`
+regardless, hiding those legacy rows' absence from `__cf_row_owners` behind a false
+`provenance.complete: true` on `POST /v1/table-scan`. A newly created table now starts at
+`provenance_complete = 0` like any other table (see §5); a genuinely brand-new (empty) table's
+first `POST /admin/backfill-provenance` run trivially finds zero orphaned/ambiguous rows and
+certifies it complete through the normal mechanism — same end state as before for the
+legitimate case, one extra (cheap, near-no-op) admin call, with no false-positive risk for a
+colliding table name. (PR review round 12 closes the underlying `IF NOT EXISTS` no-op path
+entirely — see above — but this route still doesn't auto-certify; a brand-new table earning
+its certification through the normal mechanism is simpler than special-casing "this table is
+new, so certification is safe to assume.")
 
 POST /admin/set-partition-key-column (ADMIN_TOKEN)
 Request:
@@ -326,6 +367,12 @@ Also nulls out any previously-stored `schema_sql` in the same `UPDATE` whenever 
 probe verifies `partition_key_unique = 1` (PR review round 11) — this route's live-state check
 can't guarantee whatever `schema_sql` happens to already be on file corresponds to the column it
 just verified, so it must not be left in place. Left untouched when unverified (0).
+
+**Verified across EVERY active shard, not one representative (PR review round 12 fix).** Same
+reasoning as `/admin/register-table` above: this route has no guarantee of uniform per-shard
+schema, so its probe runs `checkPartitionKeyUniqueAcrossShards` (§5) rather than checking a
+single shard — every active shard must independently confirm uniqueness, or the result fails
+closed to 0.
 
 Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409. Also recomputes `table_rules.partition_key_unique` (§5) for the newly-set column.
 
@@ -854,7 +901,7 @@ Emit structured logs and counters for:
 - Verify tenantId belongs to principal before route — implemented: the caller's bearer token is hashed and compared against the claimed `tenantId`'s stored hash; missing/wrong/revoked tokens are all rejected with 401.
 - This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary — see README.md's "Tenant authorization" section for the operator/tenant distinction this milestone's distribution model assumes.
 - **Raw `/v1/sql` is ADMIN-ONLY (Milestone 3), reads AND writes.** The trust-based tenant SQL path was removed rather than continue an unwinnable guard. Two things forced it: (1) the per-tenant write guard (denylist → allowlist against a passthrough SQL string) leaked six times — mixed case, inter-token comments, `schema.` qualifiers, a spaced+quoted internal name, double-quoted internal identifiers; and (2) there is **no safe tenant `SELECT` over arbitrary SQL**, because base rows carry no physical `tenant_id` column — the shard cannot add a `WHERE tenant_id = ?` predicate to an arbitrary query, so a partition-scoped raw read could return another tenant's rows that hash into the same vbucket. `/v1/sql` now requires `ADMIN_TOKEN` (operator/debugging); tenants write via `/v1/mutate` + `/v1/tx` (which force the partition-key predicate structurally) and read via `/v1/index-query` (exact-tuple lookups) and `/v1/table-scan` (Milestone 4 — lists a tenant's own rows, mechanically constructed and filtered by `tenant_id` via the `__cf_row_owners` join rather than a physical `tenant_id` column on the base row; see §7 and §6). This closes the general-read gap without needing the physical-`tenant_id` schema change originally assumed necessary — `TODOS.md`'s Completed section records why the join approach was chosen over adding that column. Even for the operator, a `/v1/sql` mutation whose write TARGET is an internal bookkeeping table is rejected 403 (internal reads and cross-table access are allowed — admin is trusted).
-- **`/v1/table-scan`'s isolation depends on `__cf_row_owners.tenant_id`, not a physical column on the base row.** Every query `/tenant-scan-page` runs filters `WHERE ro.tenant_id = ?` before joining to the base table — but that filter alone is not sufficient when two tenants' rows share a literal partition-key value on the same shard (§14's pre-existing collision: `__cf_row_owners`'s primary key is `(table_name, partition_key)`, no tenant in the key, so the last writer's attribution wins): the join would then attribute both rows to whichever tenant currently owns that key. The actual mechanism that closes this is `table_rules.partition_key_unique`, computed by `checkPartitionKeyUnique` (`index.ts`) at `/admin/create-table`, `/admin/set-partition-key-column`, and `/admin/register-table` time and failing closed to 0 on any ambiguity — `/v1/table-scan` rejects 409 `PARTITION_KEY_NOT_UNIQUE` for any table where the flag isn't 1, so a tenant's scan against a table with a verified-unique partition key can never join into another tenant's row for a colliding value in the first place. This is the same class of leak that motivated removing raw `/v1/sql`, closed by rejecting the unsafe case rather than by another guard.
+- **`/v1/table-scan`'s isolation depends on `__cf_row_owners.tenant_id`, not a physical column on the base row.** Every query `/tenant-scan-page` runs filters `WHERE ro.tenant_id = ?` before joining to the base table — but that filter alone is not sufficient when two tenants' rows share a literal partition-key value on the same shard (§14's pre-existing collision: `__cf_row_owners`'s primary key is `(table_name, partition_key)`, no tenant in the key, so the last writer's attribution wins): the join would then attribute both rows to whichever tenant currently owns that key. The actual mechanism that closes this is `table_rules.partition_key_unique`, computed by `checkPartitionKeyUnique` (`index.ts`) at `/admin/create-table`, `/admin/set-partition-key-column`, and `/admin/register-table` time and failing closed to 0 on any ambiguity — `/v1/table-scan` rejects 409 `PARTITION_KEY_NOT_UNIQUE` for any table where the flag isn't 1, so a tenant's scan against a table with a verified-unique partition key can never join into another tenant's row for a colliding value in the first place. (PR review round 12: `/admin/set-partition-key-column` and `/admin/register-table` verify this across EVERY active shard via `checkPartitionKeyUniqueAcrossShards`, not just one representative shard as `/admin/create-table` does — see §5 — since only `/admin/create-table`'s own just-completed DDL push actually guarantees per-shard schema uniformity.) This is the same class of leak that motivated removing raw `/v1/sql`, closed by rejecting the unsafe case rather than by another guard.
 - Enforce SQL policy allowlist in production (MVP currently permissive).
 
 ## 15) Migration Path to Production
