@@ -339,6 +339,24 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.error.shardId).toBe(shardId);
   });
 
+  // Codex P2 fix (defense in depth): a fractional/non-integer limit used to
+  // be able to reach a shard and trip a genuine SQLite error there, which the
+  // shard route then silently swallowed as {rows: []} instead of failing the
+  // request -- see shard.test.ts's "/tenant-scan-page error handling" tests
+  // for the shard-level half of this fix. Rejecting it at the Worker layer
+  // means it never even reaches a shard in the first place.
+  it("rejects a fractional/non-integer limit with 400 LIMIT_EXCEEDED before it ever reaches a shard", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("scan_fraclimit_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_fraclimit_evt", limit: 2.5 }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("LIMIT_EXCEEDED");
+  });
+
   it("rejects a malformed cursor with 400 INVALID_CURSOR rather than 500ing or silently restarting", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("scan_badcursor_evt");
