@@ -121,6 +121,16 @@ curl -X POST http://127.0.0.1:8787/admin/set-partition-key-column \
 Raw `/v1/sql` against an unupgraded table is unaffected — this gate only
 blocks the new structured paths.
 
+This is a strictly **one-time** upgrade: it only works on a table that's
+still carrying the `'__unset__'` sentinel. Calling it again on a table whose
+`partitionKeyColumn` has already been set (whether via `/admin/create-table`
+or a prior call to this endpoint) is rejected with 409
+`PARTITION_KEY_ALREADY_SET`, and `table_rules` is left unchanged. There's no
+supported way to repoint an already-configured table to a different
+partition key column — doing so would leave `__cf_row_owners`' existing
+provenance entries keyed by the old column's values while `/v1/table-scan`
+looks up rows by the new column, a cross-tenant data leak.
+
 ### 4) Register a tenant
 
 `/v1/mutate`, `/v1/tx`, `/v1/index-query`, and `/v1/table-scan` are the tenant
