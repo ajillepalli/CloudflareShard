@@ -1966,17 +1966,51 @@ export class ShardDO extends DurableObject {
     const markerWsBase = `__cf_collation_probe_${uuidSuffix}__ws`;
     const markerWsPadded = `${markerWsBase} `;
 
+    // Round-10 fix (P3): the INTEGER/REAL/BLOB/NUMERIC-fallback placeholders
+    // used to be FIXED, deterministic values (-987654321 - rowIndex, etc.) --
+    // if a real row in the table already happened to hold one of those exact
+    // values in an unrelated NOT NULL UNIQUE column, this probe's insert
+    // could spuriously collide, false-reporting an otherwise perfectly safe
+    // table as unsafe. Derived from the SAME per-invocation uuidSuffix
+    // randomness the TEXT branch already uses above, so these are just as
+    // astronomically unlikely to collide with real tenant data -- and, since
+    // uuidSuffix is fixed per invocation while rowIndex still varies the
+    // derived value, every probe row's placeholder in this same invocation
+    // stays mutually distinct too (matching the TEXT branch's guarantee).
+    const uuidHex = uuidSuffix.replace(/-/g, "");
+    // First 8 hex digits -> a 0..2^32-1 base, negated so it stays far outside
+    // any ordinary auto-increment/positive-id range real data would use.
+    const intPlaceholderBase = Number.parseInt(uuidHex.slice(0, 8), 16);
+    const intPlaceholderFor = (rowIndex: number): number => -1 * (intPlaceholderBase + rowIndex) - 1;
+    // Next 8 hex digits -> a fractional component appended to the same
+    // integer base, so REAL placeholders are derived the same way but never
+    // collide with the INTEGER branch's own values.
+    const realFracBase = Number.parseInt(uuidHex.slice(8, 16), 16) / 2 ** 32;
+    const realPlaceholderFor = (rowIndex: number): number => -1 * (intPlaceholderBase + rowIndex) - realFracBase - 1;
+    // All 16 bytes of the UUID (32 hex digits) plus a rowIndex-derived byte,
+    // so BLOB placeholders are actual random bytes instead of a fixed
+    // single-byte array, while still staying distinct per probe row.
+    const uuidBytes = new Uint8Array(uuidHex.length / 2 + 1);
+    for (let i = 0; i < uuidHex.length; i += 2) {
+      uuidBytes[i / 2] = Number.parseInt(uuidHex.slice(i, i + 2), 16);
+    }
+    const blobPlaceholderFor = (rowIndex: number): Uint8Array => {
+      const bytes = uuidBytes.slice();
+      bytes[bytes.length - 1] = rowIndex;
+      return bytes;
+    };
+
     const placeholderFor = (col: { type: string }, rowIndex: number): unknown => {
       const type = (col.type || "").toUpperCase();
-      if (type.includes("INT")) return -987654321 - rowIndex;
+      if (type.includes("INT")) return intPlaceholderFor(rowIndex);
       if (type.includes("CHAR") || type.includes("CLOB") || type.includes("TEXT")) {
         return `__cf_collation_probe_placeholder_${rowIndex}_${uuidSuffix}`;
       }
-      if (type.includes("BLOB") || type === "") return new Uint8Array([rowIndex]);
+      if (type.includes("BLOB") || type === "") return blobPlaceholderFor(rowIndex);
       if (type.includes("REAL") || type.includes("FLOA") || type.includes("DOUB")) {
-        return -987654321.5 - rowIndex;
+        return realPlaceholderFor(rowIndex);
       }
-      return -987654321 - rowIndex; // NUMERIC affinity fallback
+      return intPlaceholderFor(rowIndex); // NUMERIC affinity fallback
     };
 
     // rowIndex distinguishes every probe row's OTHER-column placeholders from

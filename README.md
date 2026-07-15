@@ -222,6 +222,21 @@ still fine, and a table whose `partition_key_unique` is still 0 can have its
 provision a future shard without the certified UNIQUE/PRIMARY KEY
 constraint.
 
+Registering a table with `schemaSql` **never** produces a verified
+(`table-scan`-eligible) partition key on that same call (PR review round
+10): the live-shard uniqueness probe and the `schemaSql` text stored for
+future provisioning are independent, unchecked-against-each-other sources,
+and this gap is otherwise invisible on a table's FIRST registration (rounds
+8-9's freeze above only protects an *already*-verified row, which doesn't
+exist yet the first time). Whenever `schemaSql` is present in the request,
+`/admin/register-table` skips the live probe entirely and stores
+`partition_key_unique = 0`, even if the column would otherwise verify as
+unique against whatever currently exists live on a shard. An operator who
+needs that table verified must follow up with a separate
+`/admin/set-partition-key-column` call once the table is truly in the state
+`schemaSql` describes — that route re-verifies fresh against the live shard
+and has no `schemaSql` field of its own to go stale against.
+
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/table-scan \
   -H "content-type: application/json" \

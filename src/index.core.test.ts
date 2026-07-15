@@ -4,7 +4,7 @@ import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { AUTH, initCluster, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
+import { ALL_TEST_SHARD_IDS, AUTH, initCluster, post, registerTenant, shardExecute, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -1022,7 +1022,22 @@ describe("Worker /admin/register-table rejects changing schema_sql after partiti
     expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
   });
 
-  it("allows re-registering a verified-unique table with the IDENTICAL schema_sql (idempotent re-registration, no regression)", async () => {
+  // PR review round 10 updates this test's expectation: re-registering with
+  // schemaSql present — even the IDENTICAL text already stored — no longer
+  // preserves partition_key_unique = 1. Round 10 forces
+  // /admin/register-table to skip the live-shard probe (and so store
+  // partition_key_unique = 0) unconditionally whenever schemaSql is present
+  // in the request, precisely because a caller-submitted schemaSql and a
+  // live-shard probe are two disconnected sources this route can no longer
+  // assume correspond — even when the text matches what's already stored,
+  // this route has no way to tell "identical to what's certified" apart from
+  // "identical to some other stale/incorrect value that happens to match
+  // now" without re-litigating the DDL-text-comparison approach rounds 1-3
+  // already abandoned. This call still succeeds (round 8's
+  // SCHEMA_SQL_ALREADY_VERIFIED guard only rejects a DIFFERING schema_sql),
+  // it just no longer stays verified — an operator needing it re-verified
+  // must follow up with /admin/set-partition-key-column.
+  it("re-registering a verified-unique table with the IDENTICAL schema_sql succeeds but demotes partition_key_unique to 0 (PR review round 10)", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const table = "reregister_same_schemasql_evt";
     const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
@@ -1041,7 +1056,7 @@ describe("Worker /admin/register-table rejects changing schema_sql after partiti
     );
     expect(registerRes.status).toBe(200);
     expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
-    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
   });
 
   it("allows changing schema_sql for a table whose partition_key_unique is still 0 (unverified — no over-rejection)", async () => {
@@ -1124,6 +1139,121 @@ describe("Worker /admin/register-table preserves schema_sql when omitted on a ve
     // response: schema_sql must still be the ORIGINAL value, not null.
     expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
     expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+  });
+});
+
+// PR review round 10 (P1): rounds 8-9's guards above prevent an ALREADY-
+// verified table's schema_sql from drifting away from the live-verified
+// schema, but only fire when there's a prior table_rules row with
+// partition_key_unique = 1 to compare against. They don't cover the FIRST
+// registration event: handleAdminRegisterTable computes partitionKeyUnique
+// by probing whatever ALREADY physically exists on a representative live
+// shard right now — completely independent of whatever schemaSql the SAME
+// request ALSO submits for storage (used later to provision split/migration
+// targets). If a table physically exists somewhere with a genuinely unique
+// constraint, but has never been registered before, an admin could register
+// it for the first time with a schemaSql that's weaker than (and doesn't
+// preserve) that live constraint: partition_key_unique would get computed
+// as 1 (correctly reflecting the real live shard), while the STORED
+// schema_sql doesn't actually carry the constraint a future split target
+// needs. Fixed by never letting /admin/register-table produce a verified
+// result when schemaSql is ALSO present in that same call — the live probe
+// is skipped entirely and partition_key_unique always stores its false
+// default in that case.
+describe("Worker /admin/register-table with schemaSql never verifies partition_key_unique on that same call (PR review round 10 fix)", () => {
+  it("stores partition_key_unique = 0 on first registration with schemaSql, even though the table physically exists elsewhere with a real unique constraint", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_schemasql_liveuniq_gap_evt";
+
+    // Physically create the table directly on every shard (bypassing both
+    // /admin/create-table and /admin/register-table entirely) with a
+    // GENUINE unique constraint on "id" — simulating a table that already
+    // exists live, but has never been registered in table_rules before.
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    // Register it for the FIRST time, submitting a schemaSql that's WEAKER
+    // than the live schema — it omits the PRIMARY KEY/UNIQUE constraint on
+    // "id" entirely. Before this fix, the live-shard probe would still
+    // compute partitionKeyUnique = 1 (correctly reflecting the real,
+    // already-unique live schema), while this weaker text got stored as
+    // schema_sql for a future split target to provision from.
+    const weakerSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: weakerSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    // The fix: partition_key_unique must be 0, not 1 — schemaSql being
+    // present forces the route to skip the live probe entirely.
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    expect(await readTableRulesSchemaSql(table)).toBe(weakerSchema);
+
+    // /v1/table-scan must therefore still refuse this table.
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(409);
+    const scanBody = (await scanRes.json()) as { error: { code: string } };
+    expect(scanBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  it("still computes partitionKeyUnique via the live-shard probe when schemaSql is OMITTED (no regression to the metadata-only path)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_noschemasql_liveuniq_evt";
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    // No schemaSql field at all — this is the pre-existing metadata-only
+    // registration path, which must be unaffected by this fix.
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+  });
+
+  it("allows a later /admin/set-partition-key-column call to verify a table registered with schemaSql (unverified=0), if the live schema is genuinely unique", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_schemasql_followup_verify_evt";
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    const weakerSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: weakerSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+
+    // /admin/set-partition-key-column is a one-time '__unset__'-sentinel
+    // upgrade path only (PR review round 6) — reset back to the sentinel
+    // first so this follow-up call isn't itself rejected 409
+    // PARTITION_KEY_ALREADY_SET before ever reaching the re-verification
+    // this test is actually about (same established pattern as the other
+    // register-table tests above that exercise a second call for a
+    // DIFFERENT reason than the repoint guard).
+    await resetPartitionKeyColumnToSentinel(table, 4);
+
+    // Follow-up call has no schemaSql field at all — it re-verifies fresh
+    // against the live shard, independent of whatever schema_sql text is
+    // stored, and is unaffected by this fix (it never had a probe-skip path
+    // to begin with).
+    const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(setRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
   });
 });
 

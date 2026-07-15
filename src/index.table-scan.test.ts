@@ -1537,6 +1537,70 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
   });
 });
 
+// PR review round 10 (P3): handleProbePartitionKeyCollation's placeholderFor
+// already used per-invocation randomness (uuidSuffix) for the TEXT-affinity
+// branch, so its marker values can't collide with real tenant data on an
+// unrelated NOT NULL UNIQUE column — but the INTEGER/REAL/BLOB/NUMERIC-
+// fallback branches used FIXED, deterministic values
+// (-987654321 - rowIndex, -987654321.5 - rowIndex, a one-byte
+// Uint8Array([rowIndex])). If a real row already held one of those exact
+// values in an unrelated NOT NULL UNIQUE column, the probe's own insert
+// could spuriously collide against that real row — false-reporting an
+// otherwise perfectly safe TEXT partitionKeyColumn as unsafe (over-
+// rejection, availability/correctness only, not a security issue). Fixed by
+// deriving the INTEGER/REAL/BLOB placeholders from the SAME per-invocation
+// uuidSuffix randomness the TEXT branch already used, so they're just as
+// astronomically unlikely to collide with real data.
+describe("/v1/table-scan collation probe: randomized non-TEXT placeholder values (PR review round 10 fix)", () => {
+  it("does not false-reject a genuinely unique TEXT partitionKeyColumn merely because an unrelated NOT NULL UNIQUE INTEGER column already holds the value the OLD fixed placeholder formula would have used", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_probe_placeholder_collision_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE IF NOT EXISTS ${table} (pk TEXT PRIMARY KEY, other_id INTEGER NOT NULL UNIQUE, v TEXT)`,
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // A real row whose unrelated other_id happens to equal EXACTLY the value
+    // the OLD fixed placeholder formula (-987654321 - rowIndex) would have
+    // assigned to the probe's very first inserted row (rowIndex 1):
+    // -987654321 - 1 = -987654322. Under the old code, this collision alone
+    // would make the probe's first insert throw a UNIQUE-constraint error,
+    // which propagates out of the (uncaught-by-design) transactionSync
+    // callback and is treated as an unexpected failure -> fail closed ->
+    // the whole column reported unsafe, even though "pk" itself has no
+    // actual collation problem whatsoever.
+    await shardExecute(
+      "catalog-0-shard-0",
+      `INSERT INTO ${table} (pk, other_id, v) VALUES (?, ?, ?)`,
+      ["real-row", -987654322, "x"],
+    );
+
+    // Re-trigger verification now that the table holds that real row —
+    // /admin/set-partition-key-column is a one-time unset->set upgrade (PR
+    // review round 6), so reset to the pre-upgrade sentinel first (same
+    // established pattern used throughout this file for a re-verify).
+    await resetPartitionKeyToSentinel(table);
+    const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "pk" }, AUTH());
+    expect(setRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
+
+    // The probe rolls back every insert it makes unconditionally (success or
+    // failure) — only the one genuine real row should remain afterward.
+    const { rows } = await shardExecute("catalog-0-shard-0", `SELECT COUNT(*) AS n FROM ${table}`);
+    expect(rows[0]?.n).toBe(1);
+  });
+});
+
 describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), continued: partial-index gate + related uniqueness edge cases", () => {
   // Round-5 note: round-4 tests used to live here asserting that
   // `INTEGER PRIMARY KEY DESC` (a rowid-alias CANDIDATE that SQLite does NOT

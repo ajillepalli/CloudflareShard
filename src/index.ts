@@ -242,6 +242,12 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
   // fan-out, and CatalogDO.migratableTables/advanceMigration's backfill pass).
   // Without this check an admin could seed DDL here that /admin/create-table
   // itself would reject, and have it silently executed later.
+  // PR review round 10 fix: whether schemaSql is present at all is also
+  // needed below (once we've fallen through this validation block, the
+  // `typeof payload.schemaSql === "string"` narrowing that guards it doesn't
+  // survive past the closing brace) — computed once here as a plain boolean
+  // so it can be reused without re-deriving the same check.
+  const hasSchemaSql = typeof payload.schemaSql === "string" && payload.schemaSql.length > 0;
   if (typeof payload.schemaSql === "string" && payload.schemaSql.length > 0) {
     if (!/^\s*create\s+table\b/i.test(payload.schemaSql)) {
       return json({ error: "schemaSql must be a CREATE TABLE statement." }, 400);
@@ -289,7 +295,33 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
   // true — it can still stay true if it already was.
   delete (payload as Record<string, unknown>).provenanceComplete;
   let partitionKeyUnique = false;
-  if (typeof payload.partitionKeyColumn === "string" && payload.partitionKeyColumn.length > 0 && typeof payload.table === "string") {
+  // PR review round 10 fix: schemaSql (caller-submitted text, later executed
+  // verbatim to provision split/migration targets) and partitionKeyUnique
+  // (probed against whatever ALREADY physically exists on a live shard right
+  // now) come from two structurally disconnected sources that are only ever
+  // assumed to correspond — never actually checked against each other. If a
+  // table happens to already exist somewhere with a genuinely unique
+  // constraint, but is being registered here for the FIRST time (so rounds
+  // 8-9's already-verified guards have no prior row to compare against) with
+  // a schemaSql that's weaker (e.g. omits the unique constraint), the live
+  // probe below would still compute partitionKeyUnique = true — verifying
+  // the ACTUAL current shard, not the DDL being stored — while schema_sql
+  // itself stores the weaker text a future split target would provision
+  // from. Comparing the DDL text against the live schema directly would
+  // reopen the exact whack-a-mole rounds 1-3 already abandoned text-parsing
+  // over. Instead: whenever schemaSql is present in this same call, this
+  // route can never produce a verified result — skip the probe entirely
+  // (wasted work otherwise) and leave partitionKeyUnique at its false
+  // default. Verification for such a table can only come from a LATER,
+  // separate /admin/set-partition-key-column call (no schemaSql field to go
+  // stale against) or from /admin/create-table's own atomic push-then-verify
+  // flow (a different code path entirely, unaffected by this route).
+  if (
+    !hasSchemaSql &&
+    typeof payload.partitionKeyColumn === "string" &&
+    payload.partitionKeyColumn.length > 0 &&
+    typeof payload.table === "string"
+  ) {
     const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
     const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
     if (!listFailed) {
