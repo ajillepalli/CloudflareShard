@@ -163,6 +163,13 @@ function escapeIdent(name: string): string {
  * purpose" from a genuine SQL execution error. */
 class PrepareValidationRollback extends Error {}
 
+/** Deliberate sentinel thrown inside handleProbePartitionKeyCollation's probe
+ * transactionSync to force a rollback unconditionally — same pattern as
+ * PrepareValidationRollback above, applied to a read-only-in-spirit
+ * introspection probe instead of a 2PC prepare. See that function's doc
+ * comment for the full rationale. */
+class CollationProbeRollback extends Error {}
+
 export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly shardEnv: Cloudflare.Env;
@@ -208,6 +215,7 @@ export class ShardDO extends DurableObject {
       "/purge-mirror-jobs": this.handlePurgeMirrorJobs.bind(this),
       "/index-entries-export": this.handleIndexEntriesExport.bind(this),
       "/index-entries-import": this.handleIndexEntriesImport.bind(this),
+      "/probe-partition-key-collation": this.handleProbePartitionKeyCollation.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -1737,6 +1745,207 @@ export class ShardDO extends DurableObject {
       log("shard.execution_failed", { requestId: payload.requestId, isMutation: mutating, message });
       return json({ error: "SQL execution failed." }, 400);
     }
+  }
+
+  /** Empirical replacement for DDL-text-parsing collation detection (Codex PR
+   * review round 3 on POST /v1/table-scan's checkPartitionKeyUnique gate, in
+   * index.ts).
+   *
+   * History: checkPartitionKeyUnique needs to know whether
+   * partitionKeyColumn's uniqueness is enforced under SQLite's BINARY
+   * collation (safe) or some other collation like NOCASE (unsafe — two
+   * case-variant keys, e.g. "a" and "A", would each satisfy a NOCASE unique
+   * constraint independently once sharded onto different shards by hashKey,
+   * which is case-sensitive, silently reopening the exact cross-tenant leak
+   * this gate exists to close). No PRAGMA exposes a column's or index's
+   * collation, so the original fix parsed the column's CREATE TABLE text for
+   * a `COLLATE <name>` clause. Three consecutive Codex review rounds each
+   * found a NEW SQL syntax variant that slipped past that text parser: round 1
+   * missed quoted collation names (`COLLATE "NOCASE"`), round 2 fixed quoting
+   * but still only looked at column-level COLLATE clauses, and round 3 found
+   * TABLE-LEVEL constraint syntax (`PRIMARY KEY(id COLLATE NOCASE)`,
+   * `UNIQUE(v COLLATE NOCASE)`) that the column-definition-only parser never
+   * even looked at. This matches a pattern already lived through elsewhere in
+   * this exact codebase: the original per-tenant /v1/sql write guard needed 6
+   * rounds of review to fail to fully close a similar text-parsing bypass
+   * class, and was ultimately abandoned for a safe-by-construction approach
+   * instead of continued patching. Text-parsing SQL is fundamentally
+   * open-ended — SQLite's grammar has more ways to spell a clause than any
+   * regex enumerates, and each fix only closes the ONE variant that was
+   * found, not the class.
+   *
+   * This function instead tests SQLite's actual, live-enforced behavior
+   * directly against the REAL target table, so no grammar variant (known or
+   * future) can be missed: it inserts a probe row with partitionKeyColumn set
+   * to a marker value, then inserts a second probe row with the SAME marker
+   * but its case flipped. If the column's real collation is case-insensitive
+   * (NOCASE or similar), the second insert collides with whatever
+   * UNIQUE/PRIMARY KEY constraint actually backs the column and fails; if the
+   * collation is BINARY (SQLite's safe default), the second insert succeeds
+   * because the two case-variant strings are genuinely distinct values. Both
+   * inserts run inside a single transactionSync whose callback ALWAYS throws
+   * a dedicated sentinel (CollationProbeRollback) at the end — mirroring
+   * handlePrepare's PrepareValidationRollback pattern above — so the
+   * transaction unconditionally rolls back and the probe leaves zero residual
+   * rows or side effects in the real table, regardless of outcome.
+   *
+   * Scope: this only tests the BINARY-vs-case-insensitive dimension, which is
+   * the one that's actually been found and is actually exploitable here. It
+   * does not probe for other exotic non-BINARY collations (e.g. RTRIM, which
+   * ignores trailing whitespace) — no such collation has ever surfaced in
+   * this codebase's review history, and folding in more probe pairs for
+   * collations that have never actually appeared here would grow this
+   * function's surface for a hypothetical risk rather than a demonstrated
+   * one. If a new non-BINARY collation variant is ever found in review, add
+   * another probe pair here (same transactionSync, same rollback) rather than
+   * reaching back for text-parsing.
+   *
+   * Every column that's NOT partitionKeyColumn but is NOT NULL with no
+   * default (and isn't a hidden/generated column — PRAGMA table_xinfo's
+   * `hidden` field is used instead of table_info specifically to detect and
+   * skip those, since SQLite forbids explicitly inserting into a generated
+   * column) gets a placeholder value matching its declared type affinity, so
+   * the probe insert doesn't spuriously fail against an unrelated NOT
+   * NULL/CHECK/FK constraint. Those placeholders are DELIBERATELY DIFFERENT
+   * between the two probe rows (a per-invocation random suffix distinguishes
+   * them) — reusing the SAME placeholder in both rows would make the second
+   * insert collide with the first on any unrelated secondary UNIQUE column,
+   * misreporting a BINARY-safe table as unsafe purely due to a placeholder
+   * collision that has nothing to do with partitionKeyColumn's own collation.
+   * Fails closed (false) if partitionKeyColumn isn't found among the table's
+   * columns, or if the FIRST probe insert fails for any reason (a genuine
+   * "cannot determine" case — this deliberately does NOT try to parse WHY the
+   * first insert failed, matching this function's fail-closed philosophy for
+   * every other ambiguous case, same as checkPartitionKeyUnique itself in
+   * index.ts). */
+  private async handleProbePartitionKeyCollation(request: Request): Promise<Response> {
+    const payload = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+    if (!payload.table || !payload.partitionKeyColumn) {
+      return json({ error: "Missing table or partitionKeyColumn" }, 400);
+    }
+    const table = payload.table;
+    const partitionKeyColumn = payload.partitionKeyColumn;
+    const safeTable = escapeIdent(table);
+
+    const columns = this.many<{ name: string; type: string; notnull: number; dflt_value: string | null; pk: number; hidden: number }>(
+      `PRAGMA table_xinfo("${safeTable}")`,
+    );
+    const pkColumn = columns.find((c) => c.name === partitionKeyColumn);
+    if (!pkColumn) {
+      return json({ ok: true, binaryCollation: false });
+    }
+
+    // Empirically verified (node:sqlite, same SQLite engine family): a column
+    // that is (a) the table's SOLE PRIMARY KEY column, (b) declared with the
+    // EXACT type name "INTEGER" (not "INT", "BIGINT", etc. -- SQLite is
+    // literal about this), and (c) belongs to a genuine rowid table (not
+    // WITHOUT ROWID) becomes an ALIAS for the rowid itself. SQLite then
+    // strictly enforces that this column can only ever hold real 64-bit
+    // integers -- inserting our TEXT marker into it raises "datatype
+    // mismatch" outright, rather than the normal manifest-typing behavior of
+    // storing unconvertible text as TEXT (which every other column, even
+    // other INTEGER-affinity ones, does). Without this carve-out the probe
+    // below would misfire on this specific, common schema shape (e.g. a
+    // plain `pk INTEGER PRIMARY KEY`) and misreport a legitimately safe table
+    // as unsafe. But it also doesn't need the probe at all: since this
+    // column can NEVER hold a non-integer value, two case-variant TEXT keys
+    // (the entire class of leak this probe exists to catch) can never both
+    // land in it in the first place -- the vulnerability is structurally
+    // impossible here, so it's safe by construction. Condition (c) is
+    // checked empirically (attempt to select the rowid pseudo-column) rather
+    // than by parsing "WITHOUT ROWID" out of stored DDL text, consistent
+    // with this function's whole reason for existing.
+    const pkColumns = columns.filter((c) => c.pk !== 0);
+    const looksLikeRowidAliasCandidate =
+      pkColumns.length === 1 && pkColumn.pk !== 0 && (pkColumn.type ?? "").trim().toUpperCase() === "INTEGER";
+    if (looksLikeRowidAliasCandidate) {
+      try {
+        this.sql.exec(`SELECT rowid FROM "${safeTable}" LIMIT 0`);
+        return json({ ok: true, binaryCollation: true }); // genuine rowid alias -- safe by construction
+      } catch {
+        // WITHOUT ROWID table -- not actually a rowid alias, so it follows
+        // normal affinity rules (a TEXT marker CAN be stored here). Fall
+        // through to the regular probe below.
+      }
+    }
+
+    // Random per-invocation suffix: makes the marker's own case-flip pair
+    // (checked below) astronomically unlikely to collide with real tenant
+    // data, AND (combined with the "a"/"b" row tag) makes every OTHER
+    // placeholder column's value distinct between the two probe rows, so an
+    // unrelated secondary UNIQUE column can never be the reason a probe
+    // insert fails.
+    const uuidSuffix = crypto.randomUUID();
+    const markerLower = `__cf_collation_probe_${uuidSuffix}__lower`;
+    const markerUpper = markerLower.toUpperCase();
+
+    const placeholderFor = (col: { type: string }, rowTag: "a" | "b"): unknown => {
+      const type = (col.type || "").toUpperCase();
+      if (type.includes("INT")) return rowTag === "a" ? -987654321 : -987654322;
+      if (type.includes("CHAR") || type.includes("CLOB") || type.includes("TEXT")) {
+        return `__cf_collation_probe_placeholder_${rowTag}_${uuidSuffix}`;
+      }
+      if (type.includes("BLOB") || type === "") return new Uint8Array([rowTag === "a" ? 0 : 1]);
+      if (type.includes("REAL") || type.includes("FLOA") || type.includes("DOUB")) {
+        return rowTag === "a" ? -987654321.5 : -987654322.5;
+      }
+      return rowTag === "a" ? -987654321 : -987654322; // NUMERIC affinity fallback
+    };
+
+    const buildInsert = (rowTag: "a" | "b", markerValue: string): { sql: string; values: unknown[] } => {
+      const names: string[] = [];
+      const values: unknown[] = [];
+      for (const col of columns) {
+        if (col.hidden !== 0) continue; // generated/virtual/hidden — never explicitly assignable
+        if (col.name === partitionKeyColumn) {
+          names.push(`"${escapeIdent(col.name)}"`);
+          values.push(markerValue);
+          continue;
+        }
+        if (col.notnull === 1 && col.dflt_value === null) {
+          names.push(`"${escapeIdent(col.name)}"`);
+          values.push(placeholderFor(col, rowTag));
+        }
+        // else: nullable or has its own default — leave unset entirely.
+      }
+      const placeholders = names.map(() => "?").join(", ");
+      return { sql: `INSERT INTO "${safeTable}" (${names.join(", ")}) VALUES (${placeholders})`, values };
+    };
+
+    const insertA = buildInsert("a", markerLower);
+    const insertB = buildInsert("b", markerUpper);
+
+    let binaryCollation = false;
+    try {
+      this.ctx.storage.transactionSync(() => {
+        // If this throws, it propagates past this try block entirely (no
+        // local catch) — "cannot even construct a valid probe row" is a
+        // genuine cannot-determine case, not a collation signal, and must
+        // fail closed rather than be reported as a collation finding.
+        this.sql.exec(insertA.sql, ...insertA.values);
+        try {
+          this.sql.exec(insertB.sql, ...insertB.values);
+          // Case-variant marker inserted alongside the first without
+          // colliding -> the column's real constraint didn't treat them as
+          // equal -> BINARY (or at least not case-insensitive) -> safe.
+          binaryCollation = true;
+        } catch {
+          // Second insert collided with the first under whatever
+          // UNIQUE/PRIMARY KEY constraint backs this column -> case-
+          // insensitive collation -> unsafe.
+          binaryCollation = false;
+        }
+        // ALWAYS roll back — both inserts, success or failure — so the probe
+        // never leaves residual rows in the real table.
+        throw new CollationProbeRollback();
+      });
+    } catch (error) {
+      if (!(error instanceof CollationProbeRollback)) {
+        binaryCollation = false; // first insert (or something unexpected) failed -- fail closed
+      }
+    }
+
+    return json({ ok: true, binaryCollation });
   }
 
   /** Shared 409 VBUCKET_FENCED response (review Tier 3 DRY) — the identical
