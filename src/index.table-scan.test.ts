@@ -213,6 +213,55 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.rows[0].v).toBe("x");
   });
 
+  // Codex-found P2 regression (from the /tenant-scan-page P3 fix above): that
+  // fix started reading the partition key directly off the base row's own
+  // value (row[partitionKeyColumn]) instead of __cf_row_owners' copy. That's
+  // wrong whenever partitionKeyColumn has SQLite type affinity that coerces
+  // values -- an INTEGER PRIMARY KEY column stores tenant keys "9"/"10" as the
+  // integers 9/10, while __cf_row_owners.partition_key keeps the original TEXT
+  // form. A cursor built from the coerced value would then be compared,
+  // lexicographically, against __cf_row_owners' text form on the NEXT call --
+  // string "10" sorts before "9" even though numeric 9 < 10 -- silently
+  // skipping rows. Keys below are chosen so the two orderings genuinely
+  // diverge ("10" < "2" < "9" lexicographically vs. 2 < 9 < 10 numerically).
+  it("regression (Codex-found P2, coercion divergence): paginates an INTEGER PRIMARY KEY partitionKeyColumn with no skips, in __cf_row_owners' canonical string order, even though its numeric sort order differs", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_coerce_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (pk INTEGER PRIMARY KEY, v TEXT)`, partitionKeyColumn: "pk" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const keys = ["01", "02", "10"];
+    for (const k of keys) {
+      const res = await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: k, values: { v: k } }, token);
+      expect(res.status).toBe(200);
+    }
+
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    let calls = 0;
+    for (;;) {
+      calls += 1;
+      expect(calls).toBeLessThanOrEqual(10); // sanity bound -- must terminate
+      const res = await post("/v1/table-scan", { tenantId, table, limit: 1, cursor: cursor ?? null }, token);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ pk: number; v: string }>; nextCursor?: string };
+      collected.push(...body.rows.map((r) => r.v));
+      if (!body.nextCursor) break;
+      cursor = body.nextCursor;
+    }
+
+    // Every key returned exactly once, with no skips, in __cf_row_owners'
+    // canonical (string) ascending order -- "01" < "02" < "10" lexicographically.
+    expect(collected).toEqual(["01", "02", "10"]);
+  });
+
   it("paginates to exhaustion with no duplicates and no gaps, even when a page truncates a shard's contribution mid-list (criterion 3)", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
     await createIndexTestTable("scan_page_evt");
