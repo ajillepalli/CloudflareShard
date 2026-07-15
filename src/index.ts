@@ -2635,17 +2635,43 @@ export function decodeTableScanCursor(raw: string): TableScanCursor | null {
   }
 }
 
-type ShardScanPage = { shardId: string; rows: Array<{ partitionKey: string; row: Record<string, unknown> }> };
+type ShardScanPage = {
+  shardId: string;
+  rows: Array<{ partitionKey: string; row: Record<string, unknown> }>;
+  // Both optional, defaulting to `rows.length` / undefined below, purely so
+  // the many pre-existing unit tests below that construct pages by hand
+  // (modelling "no skips occurred this call") don't all need updating — every
+  // real caller (handleV1TableScan) always supplies both, straight off the
+  // shard's response.
+  ownerRowsScanned?: number;
+  lastOwnerKeyScanned?: string;
+};
 
 /** Merges every shard's page into one ascending-by-partition_key result
  * (ties broken by shardId ascending — see criterion 2/the merge spec),
  * truncates to `overallLimit`, and computes the next per-shard cursor map per
- * the data-loss-avoiding invariant: a shard's cursor advances only to the
- * partition_key of the LAST ROW FROM THAT SHARD actually kept in the
- * truncated response — never to a row that was fetched but then cut, so the
- * next call re-fetches (never skips) it. Exported (and kept side-effect-free)
- * for direct unit testing of the merge/truncate invariant — the largest risk
- * item per the spec. */
+ * TWO composed invariants (Codex round-4 fix: the second one below is new;
+ * the first already existed and must keep working unchanged):
+ *
+ *  (a) never advance a shard's cursor past the last OWNER key it actually
+ *      scanned (`lastOwnerKeyScanned`) — but only once that shard's owner
+ *      query fully consumed its LIMIT (`ownerRowsScanned === perShardLimit`);
+ *      short of that, the shard is genuinely exhausted and there's nothing
+ *      to bound.
+ *  (b) never advance a shard's cursor past the partition_key of the LAST ROW
+ *      FROM THAT SHARD actually kept in the truncated response — never to a
+ *      row that was fetched but then cut by the overall-limit truncation, so
+ *      the next call re-fetches (never skips) it.
+ *
+ * A shard's next cursor is the EARLIER (partition-key ascending) of the two
+ * — (a) alone would skip a row truncated away by the cross-shard merge; (b)
+ * alone is what let a skipped owner row (base row deleted between the
+ * shard's two queries — see /tenant-scan-page) silently look like shard
+ * exhaustion, because it only ever looked at rows the shard actually
+ * *delivered*, never how far it had *scanned*. Composing them handles both
+ * failure modes without either one masking the other. Exported (and kept
+ * side-effect-free) for direct unit testing of the merge/truncate/exhaustion
+ * invariants — the largest risk item per the spec. */
 export function mergeTableScanPages(
   pages: ShardScanPage[],
   overallLimit: number,
@@ -2674,9 +2700,32 @@ export function mergeTableScanPages(
   for (const page of pages) {
     if (!(page.shardId in nextShardCursors)) nextShardCursors[page.shardId] = "";
   }
+  // Invariant (b): never advance past the last row from a shard actually
+  // kept in the truncated response.
   for (const entry of truncated) {
     const current = nextShardCursors[entry.shardId] ?? "";
     if (entry.partitionKey > current) nextShardCursors[entry.shardId] = entry.partitionKey;
+  }
+  // Invariant (a), composed with (b) above by taking whichever position is
+  // EARLIER: a shard whose owner query fully consumed its LIMIT may hold
+  // more owner rows beyond this batch, and it's safe to resume scanning past
+  // everything it already scanned (lastOwnerKeyScanned) — provided that
+  // isn't LATER than invariant (b)'s bound, which already correctly pins the
+  // cursor earlier whenever some of this shard's fetched rows got truncated
+  // away by the cross-shard merge (lastOwnerKeyScanned can never be earlier
+  // than (b) in that case, since (b) is itself derived only from partition
+  // keys the shard fetched, which are always <= the last key it scanned —
+  // this loop only ever tightens (b)'s bound, never loosens it, e.g. when a
+  // skipped owner row — see /tenant-scan-page — put the shard's own LAST
+  // scanned key ahead of the last one it actually delivered).
+  for (const page of pages) {
+    const ownerRowsScanned = page.ownerRowsScanned ?? page.rows.length;
+    if (ownerRowsScanned < perShardLimit) continue; // genuinely exhausted; nothing to bound
+    if (page.lastOwnerKeyScanned === undefined) continue;
+    const current = nextShardCursors[page.shardId] ?? "";
+    if (page.lastOwnerKeyScanned < current) {
+      nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+    }
   }
 
   // nextCursor must be present whenever there's ANY reason to believe more
@@ -2690,11 +2739,15 @@ export function mergeTableScanPages(
   //    its own per-shard cap" misses this and silently drops the cut row —
   //    its cursor legitimately didn't advance past it, but with no
   //    nextCursor the client never calls again to pick it up), OR
-  //  - any single shard's fetch returned >= perShardLimit rows (that shard
-  //    may hold more beyond what it fetched this call, even if every one of
-  //    its returned rows made the cut).
+  //  - any single shard's owner-row query fully consumed its LIMIT
+  //    (`ownerRowsScanned === perShardLimit` — Codex round-4 fix: this used
+  //    to check `page.rows.length >= perShardLimit`, the count of rows
+  //    actually resolved/returned, which a single skipped owner row — its
+  //    base row deleted between /tenant-scan-page's two queries — could pull
+  //    below perShardLimit even though the owner query's LIMIT was fully
+  //    consumed and __cf_row_owners may hold more keys beyond this batch).
   const anyRowsTruncatedAway = all.length > truncated.length;
-  const anyShardMayHaveMore = anyRowsTruncatedAway || pages.some((page) => page.rows.length >= perShardLimit);
+  const anyShardMayHaveMore = anyRowsTruncatedAway || pages.some((page) => (page.ownerRowsScanned ?? page.rows.length) >= perShardLimit);
   return {
     rows: truncated.map((e) => e.row),
     nextShardCursors: anyShardMayHaveMore ? nextShardCursors : null,
@@ -2825,7 +2878,13 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   const startedAt = Date.now();
   const perShardLimit = Math.min(TENANT_SCAN_PAGE_SIZE, limit);
 
-  type ShardPageOutcome = { shardId: string; ok: boolean; rows: Array<{ partitionKey: string; row: Record<string, unknown> }> };
+  type ShardPageOutcome = {
+    shardId: string;
+    ok: boolean;
+    rows: Array<{ partitionKey: string; row: Record<string, unknown> }>;
+    ownerRowsScanned: number;
+    lastOwnerKeyScanned?: string;
+  };
   const pageResults = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId): Promise<ShardPageOutcome> => {
     const res = await routeToShard(env, shardId, "/tenant-scan-page", {
       table: body.table,
@@ -2834,9 +2893,28 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
       afterPartitionKey: priorShardCursors[shardId] ?? "",
       limit: perShardLimit,
     });
-    if (!res.ok) return { shardId, ok: false, rows: [] };
-    const resBody = (await res.json()) as { rows?: Array<{ partitionKey: string; row: Record<string, unknown> }> };
-    return { shardId, ok: true, rows: resBody.rows ?? [] };
+    if (!res.ok) return { shardId, ok: false, rows: [], ownerRowsScanned: 0 };
+    const resBody = (await res.json()) as {
+      rows?: Array<{ partitionKey: string; row: Record<string, unknown> }>;
+      ownerRowsScanned?: number;
+      lastOwnerKeyScanned?: string;
+    };
+    const rows = resBody.rows ?? [];
+    return {
+      shardId,
+      ok: true,
+      rows,
+      // Codex round-4 fix: ownerRowsScanned/lastOwnerKeyScanned are the
+      // shard's true __cf_row_owners scan position (see /tenant-scan-page),
+      // which mergeTableScanPages needs to detect shard exhaustion instead
+      // of inferring it from rows.length -- a single owner row skipped for a
+      // deleted base row must never look like exhaustion. The `?? rows.length`
+      // fallback only matters if an older/mismatched shard build omits the
+      // field; it reproduces the pre-fix (rows.length-based) inference rather
+      // than crashing.
+      ownerRowsScanned: resBody.ownerRowsScanned ?? rows.length,
+      lastOwnerKeyScanned: resBody.lastOwnerKeyScanned,
+    };
   });
 
   // Any shard failure fails the whole request — no silently-partial tenant
@@ -2857,7 +2935,7 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   }
 
   const { rows, nextShardCursors } = mergeTableScanPages(
-    pageResults.map((r) => ({ shardId: r.shardId, rows: r.rows })),
+    pageResults.map((r) => ({ shardId: r.shardId, rows: r.rows, ownerRowsScanned: r.ownerRowsScanned, lastOwnerKeyScanned: r.lastOwnerKeyScanned })),
     limit,
     perShardLimit,
     priorShardCursors,

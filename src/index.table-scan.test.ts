@@ -12,6 +12,7 @@ import {
   insertRowBypassingProvenance,
   post,
   registerTenant,
+  shardExecute,
   tenantForCatalogShard,
 } from "./index.test-helpers";
 
@@ -117,6 +118,56 @@ describe("table-scan cursor + merge helpers (unit)", () => {
     const { rows, nextShardCursors } = mergeTableScanPages(pages, 10, 5, { "shard-b": "b-prior" });
     expect(rows.map((r) => r.id)).toEqual(["a1"]);
     expect(nextShardCursors).toBeNull();
+  });
+
+  // Codex round-4 fix: a shard's own owner-row query (__cf_row_owners, see
+  // /tenant-scan-page) can fully consume its LIMIT while still resolving
+  // FEWER than `limit` actual rows, because one or more owner rows' base rows
+  // were deleted between the shard's two queries (an accepted race — see
+  // shard.ts) and got silently skipped. `rows.length < perShardLimit` alone
+  // can no longer distinguish "genuinely exhausted" from "hit LIMIT, but a
+  // skip pulled the delivered count down" — only `ownerRowsScanned` (the
+  // count from query 1, before any skips) can. This regression-tests the
+  // fix directly at the merge-helper level: rows.length(1) < perShardLimit(3)
+  // would have signalled exhaustion under the old rows.length-only check, but
+  // ownerRowsScanned(3) === perShardLimit(3) correctly signals "may have more".
+  it("still signals nextCursor for a shard whose owner-row query fully consumed its LIMIT, even though a skipped owner row pulled its delivered row count below that LIMIT", () => {
+    const pages = [{ shardId: "shard-a", rows: [{ partitionKey: "a1", row: { id: "a1" } }], ownerRowsScanned: 3, lastOwnerKeyScanned: "a3" }];
+    const { rows, nextShardCursors } = mergeTableScanPages(pages, 10, 3, {});
+    expect(rows.map((r) => r.id)).toEqual(["a1"]);
+    expect(nextShardCursors).not.toBeNull();
+  });
+
+  // Control for the fix above: when the owner-row query genuinely came back
+  // under its LIMIT (ownerRowsScanned < perShardLimit — no more owner rows
+  // exist at all, not even skipped ones), nextCursor must still correctly be
+  // omitted. Confirms the new ownerRowsScanned-based check doesn't
+  // over-signal "may have more" and break the true end-of-data case.
+  it("still omits nextCursor when a shard's owner-row query genuinely came back under its LIMIT (true end-of-data, no regression)", () => {
+    const pages = [{ shardId: "shard-a", rows: [{ partitionKey: "a1", row: { id: "a1" } }], ownerRowsScanned: 1, lastOwnerKeyScanned: "a1" }];
+    const { rows, nextShardCursors } = mergeTableScanPages(pages, 10, 3, {});
+    expect(rows.map((r) => r.id)).toEqual(["a1"]);
+    expect(nextShardCursors).toBeNull();
+  });
+
+  // Codex round-4 fix: the new owner-scan cursor signal (lastOwnerKeyScanned)
+  // must never override the pre-existing cross-shard-truncation invariant --
+  // composing them means taking whichever position is EARLIER, never letting
+  // the "how far scanned" signal push the cursor past a row that was fetched
+  // but then cut by the overall-limit truncation. Here shard-a's owner query
+  // scanned as far as "a9" (not exhausted, limit fully consumed), but the
+  // overall truncation to 1 row cuts shard-a's own fetched "a2" away —
+  // nextShardCursors must stay at "" (never fetched "a2"), not jump to "a9".
+  it("never advances a shard's cursor past a row it fetched but the cross-shard merge truncated away, even when that shard's owner-row scan went further", () => {
+    const pages = [
+      { shardId: "shard-a", rows: [{ partitionKey: "a2", row: { id: "a2" } }], ownerRowsScanned: 3, lastOwnerKeyScanned: "a9" },
+      { shardId: "shard-b", rows: [{ partitionKey: "a1", row: { id: "a1" } }], ownerRowsScanned: 1, lastOwnerKeyScanned: "a1" },
+    ];
+    // Merged+sorted: [a1 (shard-b), a2 (shard-a)]; overallLimit(1) keeps only
+    // a1, cutting shard-a's a2 away entirely.
+    const { rows, nextShardCursors } = mergeTableScanPages(pages, 1, 3, {});
+    expect(rows.map((r) => r.id)).toEqual(["a1"]);
+    expect(nextShardCursors).toEqual({ "shard-a": "", "shard-b": "a1" });
   });
 
   it("breaks a tied partition_key across shards by shardId ascending, and isInternalTableName correctly identifies internal tables at this new gate", () => {
@@ -754,5 +805,68 @@ describe("Worker /v1/table-scan E2E (Milestone 4)", () => {
     for (const row of collected) {
       expect(row.v).toBe(row.id);
     }
+  });
+
+  // Codex round-4 fix, reproduced end-to-end: /tenant-scan-page's owner-row
+  // query (query 1, __cf_row_owners) can fully consume its LIMIT while the
+  // per-key base-row lookup (query 2) skips one entry whose base row was
+  // deleted between the two queries (the accepted race documented in
+  // shard.ts). Before this fix, the Worker inferred shard exhaustion from
+  // `rows.length < perShardLimit` -- the skip alone made that true even
+  // though __cf_row_owners still held more real keys beyond this batch,
+  // so the scan silently stopped and permanently dropped them.
+  //
+  // Uses numShards:1 (one physical shard per catalog shard) so every row
+  // lands on one known shard ("catalog-0-shard-0"), and a small
+  // limit(3) so a handful of rows is enough to force a batch boundary right
+  // where the deleted row sits -- no need for TENANT_SCAN_PAGE_SIZE(100) rows.
+  it("regression (Codex round-4): a base row deleted out from under its __cf_row_owners entry (simulating the query-1/query-2 race) never truncates the scan early -- pagination continues and still returns every other real row", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_owner_race_evt";
+    await createIndexTestTable(table);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const shardId = "catalog-0-shard-0"; // numShards:1 -> exactly one physical shard for this catalog shard
+
+    // Zero-padded, same-length keys so string order == insertion order:
+    // row-1 < row-2 < row-3 < row-4 < row-5.
+    const keys = ["row-1", "row-2", "row-3", "row-4", "row-5"];
+    for (const k of keys) {
+      const res = await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: k, values: { v: k } }, token);
+      expect(res.status).toBe(200);
+    }
+
+    // Simulate the race directly at the storage layer: delete JUST row-3's
+    // physical base row via the same /execute-backed test helper used
+    // elsewhere in this codebase (shardExecute), leaving its
+    // __cf_row_owners entry in place untouched -- exactly the state
+    // /tenant-scan-page's comment says query 2 must tolerate.
+    const deleteResult = await shardExecute(shardId, `DELETE FROM "${table}" WHERE "id" = ?`, ["row-3"]);
+    expect(deleteResult.status).toBe(200);
+
+    // limit:3 -> perShardLimit = min(TENANT_SCAN_PAGE_SIZE, 3) = 3. The first
+    // page's owner-row query (LIMIT 3) scans [row-1, row-2, row-3]; row-3's
+    // base row is gone, so only [row-1, row-2] (2 rows) come back --
+    // fewer than perShardLimit(3), purely because of the skip, while
+    // row-4/row-5 genuinely still exist beyond this batch.
+    const collected: Array<{ id: string; v: string }> = [];
+    let cursor: string | undefined;
+    let calls = 0;
+    for (let call = 0; call < 10; call += 1) {
+      calls += 1;
+      const res = await post("/v1/table-scan", { tenantId, table, limit: 3, cursor: cursor ?? null }, token);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ id: string; v: string }>; nextCursor?: string };
+      collected.push(...body.rows);
+      if (!body.nextCursor) break;
+      cursor = body.nextCursor;
+    }
+
+    // The scan must NOT have terminated after the first (short, skip-caused)
+    // page -- row-4 and row-5 are real and must still surface via
+    // nextCursor-driven pagination.
+    expect(calls).toBeGreaterThan(1);
+    expect(collected.map((r) => r.id).sort()).toEqual(["row-1", "row-2", "row-4", "row-5"]);
+    expect(new Set(collected.map((r) => r.id)).size).toBe(4); // no duplicate delivery either
   });
 });
