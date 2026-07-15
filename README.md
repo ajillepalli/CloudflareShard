@@ -205,21 +205,27 @@ found via `__cf_row_owners` (filtered by `tenant_id` + `table_name`, no
 physical `tenant_id` column needed on the base row), fanned out to every shard
 in the tenant's catalog shard's pool.
 
-Only tables whose `partitionKeyColumn` is verified UNIQUE can use this route.
+Only tables whose `partitionKeyColumn` has TEXT or BLOB type affinity, is
+verified UNIQUE, and is verified to collate as BINARY can use this route.
 `/admin/create-table`, `/admin/set-partition-key-column`, and
 `/admin/register-table` each automatically check (a client-supplied
 uniqueness claim is never trusted) whether the column is backed by a real
 `UNIQUE` constraint, the table's sole `PRIMARY KEY` column, or a non-partial unique index — a
 column that's only one part of a composite primary/unique key, or "unique" only via a
-partial/`WHERE`-conditioned index, does not count — and cache the result in
-`table_rules.partition_key_unique`, failing closed (unverified) on any
+partial/`WHERE`-conditioned index, does not count. INTEGER/NUMERIC/REAL-affinity columns are
+rejected outright regardless of uniqueness, since SQLite's numeric-string coercion (`'01'`,
+`'1'`, and `'1.0'` all matching the same row) is an unbounded ambiguity space; and the column's
+real collation is verified with a live probe against the shard's actual SQLite engine, not by
+parsing DDL text, so a column that behaves as `NOCASE` or `RTRIM` is rejected too. All three
+checks cache into `table_rules.partition_key_unique`, failing closed (unverified) on any
 introspection error. Call `/v1/table-scan` against a table where that flag
-isn't set and you'll get 409 `PARTITION_KEY_NOT_UNIQUE`: without a verified-
-unique partition key, `/tenant-scan-page`'s join against `__cf_row_owners`
+isn't set and you'll get 409 `PARTITION_KEY_NOT_UNIQUE`: without a verified-unique,
+BINARY-collated, TEXT/BLOB partition key, `/tenant-scan-page`'s join against `__cf_row_owners`
 (keyed purely by partition-key value) could return one tenant's row to
 another tenant who happens to share that value, so the route refuses to run
 rather than risk a cross-tenant read. (`docs/SPEC.md` §5/§7 has the
-per-shard verification details for each of the three routes above.)
+per-shard verification details for each of the three routes above, including the affinity and
+collation checks.)
 
 **Trade-off:** a table verified via `/admin/register-table`'s or
 `/admin/set-partition-key-column`'s own probe (not `/admin/create-table`)
