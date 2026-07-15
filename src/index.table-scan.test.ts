@@ -308,6 +308,16 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     await post("/v1/mutate", { op: "insert", table: "scan_single_evt", tenantId, partitionKey: "row-2", values: { v: "b" } }, token);
     await post("/v1/mutate", { op: "insert", table: "scan_single_evt", tenantId, partitionKey: "row-3", values: { v: "c" } }, token);
 
+    // PR review round 11: /admin/create-table no longer auto-certifies
+    // provenance_complete=1 at creation — a brand-new table now requires the
+    // normal /admin/backfill-provenance certification step like any other
+    // table. This test's actual target is the scan mechanism, not
+    // certification, so certify it the normal way before scanning; every row
+    // above was written through /v1/mutate (properly attributed), so the
+    // full-cluster run trivially finds nothing orphaned/ambiguous.
+    const backfillRes = await post("/admin/backfill-provenance", {}, AUTH());
+    expect(backfillRes.status).toBe(200);
+
     const res = await post("/v1/table-scan", { tenantId, table: "scan_single_evt" }, token);
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -318,7 +328,7 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     };
     expect(body.rows.map((r) => r.id).sort()).toEqual(["row-1", "row-2", "row-3"]);
     expect(body.nextCursor).toBeUndefined();
-    expect(body.provenance.complete).toBe(true); // /admin/create-table sets this fresh
+    expect(body.provenance.complete).toBe(true); // certified via /admin/backfill-provenance above
     expect(body.scan.shardCount).toBe(1); // numShards: 1 -> one physical shard in this tenant's pool
     expect(body.scan.successCount).toBe(1);
     expect(typeof body.scan.scanMs).toBe("number");
@@ -798,10 +808,13 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     await post("/v1/mutate", { op: "insert", table: "scan_prov_evt", tenantId, partitionKey: "attributed-row", values: { v: "x" } }, token);
     await insertRowBypassingProvenance("catalog-0-shard-0", "scan_prov_evt", "orphan-row", "y");
 
-    // /admin/create-table already set provenance_complete = 1 at creation —
-    // reset it directly to simulate a table that predates completeness
-    // tracking and genuinely has a legacy unattributed row (this test's
-    // premise), on every catalog shard (table_rules is fanned to all of them).
+    // PR review round 11: /admin/create-table no longer auto-certifies
+    // provenance_complete=1 at creation, so this is now a redundant no-op —
+    // left in place (harmless) since it still correctly simulates this
+    // test's premise (a table that predates completeness tracking and
+    // genuinely has a legacy unattributed row) on every catalog shard
+    // (table_rules is fanned to all of them), regardless of create-table's
+    // own starting value.
     for (let i = 0; i < 4; i += 1) {
       const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
       await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {

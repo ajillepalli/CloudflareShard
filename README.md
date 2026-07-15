@@ -209,33 +209,32 @@ unique partition key, `/tenant-scan-page`'s join against `__cf_row_owners`
 another tenant who happens to share that value, so the route refuses to run
 rather than risk a cross-tenant read.
 
-Once `partition_key_unique` is cached as verified, `/admin/register-table`
-also **freezes that table's `schema_sql`** (PR review round 8):
 `table_rules.schema_sql` is exactly what a future split/migration backfill
-executes verbatim to provision the table on a freshly-created target shard,
-while `partition_key_unique` was only verified against the currently-live
-shard schema — not against `schema_sql` text. Submitting a different
-`schemaSql` for an already-verified table is rejected with 409
-`SCHEMA_SQL_ALREADY_VERIFIED` (re-submitting the identical `schemaSql` is
-still fine, and a table whose `partition_key_unique` is still 0 can have its
-`schemaSql` changed freely), so a drifted schema can never silently
-provision a future shard without the certified UNIQUE/PRIMARY KEY
-constraint.
+executes verbatim to provision the table on a freshly-created target shard.
+It can only ever be trustworthy alongside a verified `partition_key_unique
+= 1` when the two were established *together*, atomically, by
+`/admin/create-table`'s own push-then-verify flow (it pushes the exact DDL
+to every shard, then verifies uniqueness against a shard that just received
+it — the only path where the two are structurally guaranteed to
+correspond). `/admin/register-table`'s and `/admin/set-partition-key-
+column`'s own live-shard uniqueness probes are independent of whatever
+`schemaSql` text is (or was previously) on file, so **whenever either of
+those two routes verifies uniqueness through its own probe, it nulls out
+`schema_sql` in the same write, unconditionally** (PR review round 11,
+replacing three earlier patch rounds that tried to protect a stale pairing
+with reject/preserve guards instead of removing the pairing's possibility
+outright). Submitting a real `schemaSql` on `/admin/register-table` always
+stores it as submitted and always demotes `partition_key_unique` to 0 in
+that same call — there's no rejection for changing `schema_sql` on an
+already-verified table, because the demotion itself means there's nothing
+unsafe left to protect against.
 
-Registering a table with `schemaSql` **never** produces a verified
-(`table-scan`-eligible) partition key on that same call (PR review round
-10): the live-shard uniqueness probe and the `schemaSql` text stored for
-future provisioning are independent, unchecked-against-each-other sources,
-and this gap is otherwise invisible on a table's FIRST registration (rounds
-8-9's freeze above only protects an *already*-verified row, which doesn't
-exist yet the first time). Whenever `schemaSql` is present in the request,
-`/admin/register-table` skips the live probe entirely and stores
-`partition_key_unique = 0`, even if the column would otherwise verify as
-unique against whatever currently exists live on a shard. An operator who
-needs that table verified must follow up with a separate
-`/admin/set-partition-key-column` call once the table is truly in the state
-`schemaSql` describes — that route re-verifies fresh against the live shard
-and has no `schemaSql` field of its own to go stale against.
+**Trade-off:** a table verified via `/admin/register-table`'s or
+`/admin/set-partition-key-column`'s own probe (not `/admin/create-table`)
+is `table-scan`-eligible but ends up with `schema_sql = NULL` — a future
+split/migration backfill can't auto-provision that table on a new target
+shard from stored DDL; the table must already exist there some other way,
+or an operator applies the schema manually.
 
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/table-scan \
@@ -271,8 +270,14 @@ cluster with no recorded owner (from before row-provenance tracking existed)
 definitionally unknown), and `provenance.fix` names the remediation
 (`/admin/backfill-provenance`) until a full-cluster run reports zero
 remaining gaps for the table, at which point it flips `true` permanently. A
-brand-new table (`/admin/create-table`) starts `true` — it has no legacy rows
-to backfill.
+brand-new table (`/admin/create-table`) starts `false` (PR review round 11)
+— its `CREATE TABLE IF NOT EXISTS` DDL silently no-ops if the table name
+already physically existed with legacy rows predating provenance tracking,
+so auto-certifying complete regardless would hide that collision behind a
+false `provenance.complete: true`. A genuinely brand-new (empty) table's
+first `/admin/backfill-provenance` run trivially finds nothing orphaned and
+certifies it complete through the normal mechanism — same end state, one
+extra (cheap) admin call.
 
 Any shard in the pool failing to respond fails the whole request 502
 `SHARD_UNREACHABLE` (naming the shard) rather than return a silently-partial
