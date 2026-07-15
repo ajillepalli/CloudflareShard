@@ -285,6 +285,19 @@ export class CatalogDO extends DurableObject {
     // is already provenance-tracked). /admin/create-table sets it to 1 at
     // creation (a brand-new table has no legacy rows to backfill).
     this.ensureColumn("table_rules", "provenance_complete", "INTEGER NOT NULL DEFAULT 0");
+    // Codex P1 fix (cross-tenant table-scan leak): cached "is partitionKeyColumn
+    // actually UNIQUE or the table's sole PRIMARY KEY" flag. __cf_row_owners
+    // stores one owner per (table, partition_key VALUE); /tenant-scan-page's
+    // JOIN matches on that value alone, so if two physical rows (any tenants)
+    // ever share a partition-key value, the join — and thus /v1/table-scan —
+    // would return both under whichever tenant currently owns that key. Set by
+    // /admin/create-table and /admin/set-partition-key-column (the only two
+    // places a table's partitionKeyColumn is established), each of which
+    // verifies via PRAGMA introspection before setting this to 1.
+    // Defaults to 0 (fail closed) — a table registered before this flag
+    // existed is unverified and /v1/table-scan on it is rejected until
+    // re-verified (no automatic backfill; out of scope for this fix).
+    this.ensureColumn("table_rules", "partition_key_unique", "INTEGER NOT NULL DEFAULT 0");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -559,6 +572,7 @@ export class CatalogDO extends DurableObject {
       partitionKeyColumn?: string;
       schemaSql?: string;
       provenanceComplete?: boolean;
+      partitionKeyUnique?: boolean;
     };
 
     if (!body.table) {
@@ -594,11 +608,18 @@ export class CatalogDO extends DurableObject {
       body.table,
     );
     const provenanceComplete = existing?.provenance_complete === 1 || body.provenanceComplete === true ? 1 : 0;
+    // partition_key_unique is NOT preserved like provenance_complete above —
+    // it's a property of the CURRENT partitionKeyColumn, which can itself
+    // change (via /set-partition-key-column), so a re-register must take
+    // whatever verification result the caller just computed for the
+    // partitionKeyColumn it's registering, defaulting to 0 (unverified) if
+    // the caller didn't verify (e.g. /admin/register-table's raw passthrough).
+    const partitionKeyUnique = body.partitionKeyUnique === true ? 1 : 0;
 
     this.sql.exec(
       `
-      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql, provenance_complete)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql, provenance_complete, partition_key_unique)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
       body.table,
       body.partitioning ?? "hash",
@@ -606,6 +627,7 @@ export class CatalogDO extends DurableObject {
       new Date().toISOString(),
       body.schemaSql ?? null,
       provenanceComplete,
+      partitionKeyUnique,
     );
 
     const version = this.bumpMetadataVersion();
@@ -613,7 +635,7 @@ export class CatalogDO extends DurableObject {
   }
 
   private async handleSetPartitionKeyColumn(request: Request): Promise<Response> {
-    const body = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+    const body = (await request.json()) as { table?: string; partitionKeyColumn?: string; partitionKeyUnique?: boolean };
     if (!body.table || !body.partitionKeyColumn) {
       return json(
         {
@@ -639,9 +661,15 @@ export class CatalogDO extends DurableObject {
     }
 
     this.audit("/set-partition-key-column", { table: body.table, partitionKeyColumn: body.partitionKeyColumn });
+    // Changing the partitionKeyColumn invalidates any previously-cached
+    // uniqueness verification (it was for the OLD column) — always take the
+    // caller's freshly-computed value for the NEW column, defaulting to 0
+    // (unverified) if it didn't verify.
+    const partitionKeyUnique = body.partitionKeyUnique === true ? 1 : 0;
     this.sql.exec(
-      "UPDATE table_rules SET partition_key_column = ? WHERE table_name = ?",
+      "UPDATE table_rules SET partition_key_column = ?, partition_key_unique = ? WHERE table_name = ?",
       body.partitionKeyColumn,
+      partitionKeyUnique,
       body.table,
     );
 
@@ -1008,8 +1036,8 @@ export class CatalogDO extends DurableObject {
     const authError = await this.checkTenantAuth(body.tenantId, request);
     if (authError) return authError;
 
-    const table = this.one<{ partition_key_column: string; provenance_complete: number }>(
-      "SELECT partition_key_column, provenance_complete FROM table_rules WHERE table_name = ?",
+    const table = this.one<{ partition_key_column: string; provenance_complete: number; partition_key_unique: number }>(
+      "SELECT partition_key_column, provenance_complete, partition_key_unique FROM table_rules WHERE table_name = ?",
       body.table,
     );
     if (!table) {
@@ -1031,6 +1059,25 @@ export class CatalogDO extends DurableObject {
             code: "PARTITION_KEY_COLUMN_UNSET",
             message: `Table ${body.table} has not been upgraded with a partition key column.`,
             fix: "Call /admin/set-partition-key-column first.",
+          },
+        },
+        409,
+      );
+    }
+    // Codex P1 fix: __cf_row_owners keys a row's owner by (table, partition
+    // key VALUE) alone. If partitionKeyColumn isn't verified UNIQUE/PRIMARY
+    // KEY, two different tenants' rows could share a value and the
+    // /tenant-scan-page JOIN would attribute both to whichever tenant
+    // currently owns that key — a cross-tenant read leak. Reject the scan
+    // rather than risk that; this check is separate from (and after) the
+    // UNSET check above since an unset column is the more fundamental issue.
+    if (table.partition_key_unique !== 1) {
+      return json(
+        {
+          error: {
+            code: "PARTITION_KEY_NOT_UNIQUE",
+            message: `Table ${body.table}'s partitionKeyColumn (${table.partition_key_column}) is not verified UNIQUE or PRIMARY KEY.`,
+            fix: "The table's partitionKeyColumn must be UNIQUE or PRIMARY KEY to support tenant-scoped scanning; recreate the table with that constraint, or contact an operator.",
           },
         },
         409,

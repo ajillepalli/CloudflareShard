@@ -245,6 +245,58 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
   return json({ ok: true, catalogShardCount: results.length });
 }
 
+/** Codex P1 fix (cross-tenant table-scan leak): verifies that `partitionKeyColumn`
+ * on `table` (already created/present on `shardId`) is backed by a UNIQUE
+ * constraint or is the table's SOLE primary-key column. /v1/table-scan's
+ * per-shard JOIN against __cf_row_owners matches purely on partition-key
+ * VALUE (see the /tenant-scan-page comment in shard.ts) — if the column isn't
+ * guaranteed unique, two different tenants' rows can share a value and the
+ * join would attribute both rows to whichever tenant currently owns that key
+ * in __cf_row_owners, leaking one tenant's row to another. A composite
+ * PRIMARY KEY where partitionKeyColumn is only one part is NOT sufficient —
+ * the value alone must be guaranteed unique on its own. Checked against a
+ * single representative shard: schema is uniform across shards for a table by
+ * construction, so one check suffices. Fails closed (false) on any
+ * introspection error — callers must treat "unable to verify" as "not safe to
+ * scan", matching table_rules.partition_key_unique's fail-closed default. */
+async function checkPartitionKeyUnique(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
+  const tableInfoRes = await routeToShard(env, shardId, "/execute", {
+    sql: `PRAGMA table_info("${table}")`,
+    requestId: `partition-key-unique-tableinfo-${table}-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (!tableInfoRes.ok) return false;
+  const tableInfoBody = (await tableInfoRes.json()) as { rows?: Array<{ name: string; pk: number }> };
+  const columns = tableInfoBody.rows ?? [];
+  const pkColumns = columns.filter((c) => c.pk !== 0);
+  if (pkColumns.length === 1 && pkColumns[0].name === partitionKeyColumn) {
+    return true;
+  }
+
+  const indexListRes = await routeToShard(env, shardId, "/execute", {
+    sql: `PRAGMA index_list("${table}")`,
+    requestId: `partition-key-unique-indexlist-${table}-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (!indexListRes.ok) return false;
+  const indexListBody = (await indexListRes.json()) as { rows?: Array<{ name: string; unique: number }> };
+  const uniqueIndexes = (indexListBody.rows ?? []).filter((i) => i.unique === 1);
+  for (const idx of uniqueIndexes) {
+    const indexInfoRes = await routeToShard(env, shardId, "/execute", {
+      sql: `PRAGMA index_info("${idx.name}")`,
+      requestId: `partition-key-unique-indexinfo-${table}-${idx.name}-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    if (!indexInfoRes.ok) continue;
+    const indexInfoBody = (await indexInfoRes.json()) as { rows?: Array<{ name: string }> };
+    const idxColumns = indexInfoBody.rows ?? [];
+    if (idxColumns.length === 1 && idxColumns[0].name === partitionKeyColumn) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as {
     table?: string;
@@ -370,6 +422,12 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     }
   }
 
+  // Codex P1 fix: verify partitionKeyColumn is UNIQUE/PRIMARY KEY on the
+  // table just created, so /v1/table-scan can later be safely allowed for it
+  // (see checkPartitionKeyUnique's doc comment). Checked against the same
+  // representative shard as the column-exists check above.
+  const partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], body.table, body.partitionKeyColumn);
+
   const registerResults = await fanOutToAllCatalogs(
     env,
     "/register-table",
@@ -385,6 +443,7 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
       partitionKeyColumn: body.partitionKeyColumn,
       schemaSql: body.schema,
       provenanceComplete: true,
+      partitionKeyUnique,
     }),
     request.headers.get("authorization") ?? undefined,
   );
@@ -440,10 +499,17 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
     );
   }
 
+  // Codex P1 fix: this is the OTHER place a table's partitionKeyColumn is
+  // established (for tables carrying the __unset__ sentinel from before this
+  // validation existed) — same verification as /admin/create-table, since a
+  // stale "unique" flag for a PREVIOUS partitionKeyColumn must never carry
+  // forward to a newly-set one.
+  const partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], body.table, body.partitionKeyColumn);
+
   const results = await fanOutToAllCatalogs(
     env,
     "/set-partition-key-column",
-    () => body,
+    () => ({ ...body, partitionKeyUnique }),
     request.headers.get("authorization") ?? undefined,
   );
   const failed = firstCatalogFanOutFailure(results, "Failed to update partitionKeyColumn on one or more catalog shards.");
