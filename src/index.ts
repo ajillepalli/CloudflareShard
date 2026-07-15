@@ -2653,13 +2653,22 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   if (!body.tenantId || !body.table) {
     return json({ error: { code: "MISSING_FIELDS", message: "Missing tenantId or table.", fix: "Provide both tenantId and table." } }, 400);
   }
-  if (body.limit !== undefined && (typeof body.limit !== "number" || !Number.isFinite(body.limit) || body.limit > MAX_TABLE_SCAN_LIMIT)) {
+  // Codex P2 fix: reject non-integer/fractional/non-positive limits here too
+  // (previously only the upper bound was enforced) -- defense in depth so a
+  // malformed limit (e.g. 2.5) never even reaches a shard, where it used to
+  // trip SQLite's LIMIT binding and, before this fix's shard.ts change, get
+  // silently swallowed into a fake-empty {rows: []} instead of surfacing as
+  // a real error.
+  if (
+    body.limit !== undefined &&
+    (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > MAX_TABLE_SCAN_LIMIT)
+  ) {
     return json(
       {
         error: {
           code: "LIMIT_EXCEEDED",
-          message: `limit exceeds the maximum of ${MAX_TABLE_SCAN_LIMIT}.`,
-          fix: `Omit limit (default ${DEFAULT_TABLE_SCAN_LIMIT}) or pass a value <= ${MAX_TABLE_SCAN_LIMIT}.`,
+          message: `limit must be a positive integer no greater than ${MAX_TABLE_SCAN_LIMIT}.`,
+          fix: `Omit limit (default ${DEFAULT_TABLE_SCAN_LIMIT}) or pass an integer in [1, ${MAX_TABLE_SCAN_LIMIT}].`,
         },
       },
       400,
