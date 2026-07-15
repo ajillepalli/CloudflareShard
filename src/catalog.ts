@@ -682,6 +682,16 @@ export class CatalogDO extends DurableObject {
     // the caller didn't verify (e.g. /admin/register-table's raw passthrough).
     const partitionKeyUnique = body.partitionKeyUnique === true ? 1 : 0;
 
+    // PR review round 9: an OMITTED body.schemaSql (undefined, e.g. a
+    // metadata-only re-registration that doesn't bother resending it) is not
+    // a "differing string" so the round-8 guard above doesn't reject it —
+    // but body.schemaSql ?? null would still have silently nulled out an
+    // already-verified table's stored schema_sql here, defeating that same
+    // guard's whole purpose. Fall back to the existing row's schema_sql
+    // first; only fall through to null when there was never a stored value
+    // (a genuine first-ever registration with no schemaSql provided). When
+    // body.schemaSql IS a string, it passes through untouched either way —
+    // this fallback only ever takes effect when it's undefined.
     this.sql.exec(
       `
       INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql, provenance_complete, partition_key_unique)
@@ -691,7 +701,7 @@ export class CatalogDO extends DurableObject {
       body.partitioning ?? "hash",
       body.partitionKeyColumn,
       new Date().toISOString(),
-      body.schemaSql ?? null,
+      body.schemaSql ?? existing?.schema_sql ?? null,
       provenanceComplete,
       partitionKeyUnique,
     );
