@@ -87,6 +87,11 @@ Table: table_rules
 - schema_sql TEXT (the CREATE TABLE statement captured at /admin/create-table — Milestone 3
   migration backfill applies it to a target shard created after the original fan-out,
   e.g. a split target; NULL for tables registered before this column existed)
+- provenance_complete INTEGER NOT NULL DEFAULT 0 (Milestone 4: 1 once a full-cluster
+  /admin/backfill-provenance run has reported zero orphaned/ambiguous rows for this table;
+  never reset to 0 automatically. /admin/create-table sets it to 1 at creation — a
+  brand-new table has no legacy rows to backfill. Read by POST /v1/table-scan's
+  `provenance.complete` response field.)
 
 Table: index_rules (Milestone 2, extended in Milestone 3)
 - index_name TEXT PRIMARY KEY
@@ -125,6 +130,19 @@ tenants use the same partition key on the same shard (§14). Rows written before
 existed are re-attributed by `/admin/backfill-provenance` (mechanical: candidate tenants ×
 hash → exactly one match writes provenance; multiple → reported `ambiguous` for
 `/admin/set-row-owner`; zero → reported `orphaned`).
+
+Indexed (Milestone 4) `(tenant_id, table_name, partition_key)` — `idx_cf_row_owners_tenant_scan`
+— so `POST /tenant-scan-page` (below) is a range scan, not a full table scan, of this table.
+
+`POST /tenant-scan-page` (Milestone 4, internal — ShardDO route driven by the Worker's
+`POST /v1/table-scan`): `{table, partitionKeyColumn, tenantId, afterPartitionKey, limit}` ->
+`{rows: [{partitionKey, row}]}`. Joins the base table against `__cf_row_owners` filtered by
+`tenant_id` + `table_name`, paged by `partition_key > afterPartitionKey` (mirrors
+`/migrate-export`'s join pattern, filtered by tenant instead of vbucket). `limit` is clamped
+to `min(requested, 100)` — the per-shard page cap, independent of `/v1/table-scan`'s overall
+response limit (up to 500), which is enforced by merging across shards. A table not
+physically present on this shard returns `{rows: []}` (same established
+`/migrate-export` precedent).
 
 Table: __cf_mirror_pending (Milestone 3, Chunk 3 — dual-write retry queue, on the SOURCE shard)
 - job_id          INTEGER PRIMARY KEY AUTOINCREMENT
@@ -291,6 +309,10 @@ POST /admin/migrate-vbucket-abort  {catalogShardId, vbucket}
 
 POST /admin/backfill-provenance    {catalogShardId?}            (omitted = all catalog shards)
   -> 200 {attributed:N, ambiguous:[{catalogShardId,shardId,table,partitionKey,candidateTenants}], orphaned:[...]}
+  (Milestone 4: only a full-cluster run — catalogShardId omitted — can flip a table's
+  `table_rules.provenance_complete` to 1, and only for tables it scanned with zero
+  orphaned/ambiguous rows across every catalog shard processed. A scoped single-catalog-shard
+  run never flips it, since it only ever sees that one catalog shard's own shard pool.)
 
 POST /admin/set-row-owner          {catalogShardId, shardId, table, partitionKey, tenantId}
   -> 200 {ok}  / 409 ROW_OWNER_SHARD_MISMATCH if the claimed tenant does not hash to a
@@ -415,6 +437,76 @@ Response:
 The first tenant-facing, non-partition-key query path this platform has — resolves in three hops (`CatalogDO` validates the tenant token and the index's columns, the computed index shard resolves matching `(partitionKey, sourceShardId)` pairs, each match's base row is read from its own shard), never `/v1/scatter`'s admin-only full-cluster fan-out. Because `/v1/mutate`'s index maintenance (Chunk 2) is async, a matched entry can be stale by the time it's read; the base row is re-verified against the queried tuple before being returned, so a stale delete/update is silently excluded — never surfaced as a wrong result. Rejects 425 `INDEX_BUILDING` if the index hasn't finished its initial backfill yet (see the `building`/`ready` status note in the `/admin/create-index` section above). `/v1/scatter` remains the admin-only fallback for querying by a column that has no registered index; the two coexist rather than one deprecating the other.
 
 **Paging past stale entries (eng-review fix).** `limit` no longer bounds the raw `__cf_indexes` scan directly — it used to apply `LIMIT` before the staleness re-check ran, so a run of stale entries sorted first could starve out live matches that exist further down the index, silently under-filling or emptying a result even though enough live rows exist. Raw entries are now paged (ordered by `partition_key` for a stable cursor) and re-verified batch by batch until `limit` verified rows are collected or the index is exhausted, bounded by a `limit * 5` raw-scan cap so a pathologically stale index (e.g. after a delete burst whose async cleanup hasn't caught up) can't make one query scan unboundedly. Within each batch, every match's hydrate read is dispatched concurrently (`Promise.all`) rather than one round trip at a time — each match is an independent read (different partition keys, potentially different shards), and `Promise.all` preserves the batch's `partition_key` order so the result stays deterministic across repeated calls.
+
+POST /v1/table-scan (tenant bearer token) — Milestone 4
+Request:
+- tenantId string
+- table string
+- limit number (optional, default 100, hard max 500)
+- cursor string (optional, opaque — from a prior response's `nextCursor`)
+
+Response (200):
+- rows: array of the tenant's own matching base rows (full row data)
+- nextCursor string (present iff any shard in the pool may have more rows; omitted when exhausted)
+- provenance: `{complete: boolean, fix?: string}` (`fix` present only when `complete` is `false`)
+- scan: `{catalogShardId, shardCount, successCount, scanMs}`
+
+Errors: 400 `MISSING_FIELDS` / `LIMIT_EXCEEDED` (limit > 500); 401 (tenant token doesn't match
+`tenantId`, identical to `/v1/index-query`'s check); 400 `TABLE_NOT_REGISTERED`; 409
+`PARTITION_KEY_COLUMN_UNSET`; 403 `INTERNAL_TABLE_ACCESS_FORBIDDEN` (defense-in-depth —
+`table_rules` should never contain a `__cf_*`/`sqlite_*` name); 400 `INVALID_CURSOR` (cursor
+fails to base64/JSON-decode, or names a shard no longer in the catalog shard's current active
+set — e.g. topology changed between calls; a client that gets this restarts with no cursor);
+502 `SHARD_UNREACHABLE` (naming the shard — any shard failure fails the whole request, no
+silently-partial result in this MVP).
+
+Lists a tenant's own rows in a registered table, with no arbitrary filters — the query is
+mechanically constructed (`table` + `tenantId` + `cursor` + `limit` only), the same
+safe-by-construction pattern `compileMutation` established for writes, rather than the
+raw-SQL pattern that failed for the removed tenant read path (see §14 and `TODOS.md`'s
+Completed section). Auth reuses `CatalogDO.checkTenantAuth` exactly as `/v1/index-query`
+does (via a new combined `/lookup-table-scan` route playing the same role `/lookup-index`
+does: auth check + `table_rules` gate in one round trip). Resolves the tenant's catalog
+shard (`catalogShardIdForTenant`) and its *active* shard pool (`/list-shards`), then fans out
+to every shard's internal `POST /tenant-scan-page` (§6) at `SHARD_FANOUT_CONCURRENCY`
+concurrency (the same constant/`batchedMap` helper reused throughout this codebase).
+
+**Cursor and the "advance only on emit" invariant (the largest correctness risk in this
+feature).** The opaque `cursor` is a base64-JSON `{shardCursors: {[shardId]: afterPartitionKey}}`
+— one position per shard in the pool at issuance time; a shard absent from the map starts at
+`""` (scan from the beginning). Results from every shard are merged ascending by
+`partition_key` (ties broken by `shardId` ascending — a same-`partition_key` tie across two
+different shards for the same tenant/table cannot happen in steady state, since a given key
+hashes to exactly one shard; it can happen transiently during the documented migration-
+duplicate window, where the tie-break only decides which copy sorts first) and truncated to
+the requested `limit`. Each shard's cursor then advances only to the `partition_key` of the
+last row **from that shard actually included** in the truncated response — a shard whose
+rows were fetched internally but then cut by the overall-limit truncation keeps its OLD
+cursor position, so the next call re-fetches (never skips) them. `nextCursor` is omitted only
+when there is no reason to believe more rows exist: every shard's own fetch returned fewer
+rows than its per-shard cap (`min(requested, 100)`), *and* nothing fetched this call was
+truncated away by the overall limit. (A real bug surfaced during implementation: checking
+only "did any shard hit its own per-shard cap" is insufficient — two shards can each return
+fewer rows than their own cap while the overall-limit truncation still cuts one of those
+already-fetched rows; the fix also checks whether the merge itself truncated anything.)
+
+**Provenance visibility (§14, Milestone 3 Chunk 0/1).** A row lacking a `__cf_row_owners`
+entry (pre-Chunk-0, never backfilled) is invisible to `/tenant-scan-page`'s join by
+construction — its owner is definitionally unknown, so it cannot be attributed to any
+tenant. `provenance.complete` (from `table_rules.provenance_complete`, a cheap column read)
+reports whether this table has zero such gaps anywhere in the cluster; `provenance.fix`
+names `/admin/backfill-provenance` as the remediation until a full-cluster run clears them,
+at which point it flips `true` permanently (see §5).
+
+**Non-goals (explicit, matching the design decision).** No arbitrary column filtering (only
+`table` + `tenantId` + pagination — a future milestone can add a structured equality-filter
+map if real usage demands it). No fix to §14's partition-key collision limitation (two
+tenants sharing a partition key on the same shard — `__cf_row_owners` reflects only the last
+writer either way; this milestone inherits, not worsens, that limitation). Migration-window
+duplicates are inherited, not solved fresh, exactly like `/v1/scatter`'s existing documented
+limitation. No per-tenant rate limiting on this fan-out-shaped route yet (the
+catalog-shard-scoped pool is the v1 blast-radius control). No partial-result mode (`SHARD_UNREACHABLE`
+fails the whole request rather than returning `{partial: true, errors: [...]}`).
 
 POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
@@ -624,7 +716,8 @@ Emit structured logs and counters for:
 - Require authenticated principal at Gateway — implemented via `tenant_auth` bearer tokens (`/admin/register-tenant`), checked in `CatalogDO.handleRoute` before any routing info is returned. `ADMIN_TOKEN` is accepted there as a universal bypass (the operator may route as any tenant), used by the admin-only `/v1/sql`.
 - Verify tenantId belongs to principal before route — implemented: the caller's bearer token is hashed and compared against the claimed `tenantId`'s stored hash; missing/wrong/revoked tokens are all rejected with 401.
 - This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary — see README.md's "Tenant authorization" section for the operator/tenant distinction this milestone's distribution model assumes.
-- **Raw `/v1/sql` is ADMIN-ONLY (Milestone 3), reads AND writes.** The trust-based tenant SQL path was removed rather than continue an unwinnable guard. Two things forced it: (1) the per-tenant write guard (denylist → allowlist against a passthrough SQL string) leaked six times — mixed case, inter-token comments, `schema.` qualifiers, a spaced+quoted internal name, double-quoted internal identifiers; and (2) there is **no safe tenant `SELECT`**, because base rows carry no physical `tenant_id` column — the shard cannot add a `WHERE tenant_id = ?` predicate, so a partition-scoped raw read could return another tenant's rows that hash into the same vbucket. `/v1/sql` now requires `ADMIN_TOKEN` (operator/debugging); tenants write via `/v1/mutate` + `/v1/tx` (which force the partition-key predicate structurally) and read via `/v1/index-query`. Even for the operator, a `/v1/sql` mutation whose write TARGET is an internal bookkeeping table is rejected 403 (internal reads and cross-table access are allowed — admin is trusted). A structured, isolation-enforced tenant read API (partition-scoped `SELECT` with an enforced `tenant_id` predicate) is future work and depends on giving base rows a physical `tenant_id` — see TODOS.md.
+- **Raw `/v1/sql` is ADMIN-ONLY (Milestone 3), reads AND writes.** The trust-based tenant SQL path was removed rather than continue an unwinnable guard. Two things forced it: (1) the per-tenant write guard (denylist → allowlist against a passthrough SQL string) leaked six times — mixed case, inter-token comments, `schema.` qualifiers, a spaced+quoted internal name, double-quoted internal identifiers; and (2) there is **no safe tenant `SELECT` over arbitrary SQL**, because base rows carry no physical `tenant_id` column — the shard cannot add a `WHERE tenant_id = ?` predicate to an arbitrary query, so a partition-scoped raw read could return another tenant's rows that hash into the same vbucket. `/v1/sql` now requires `ADMIN_TOKEN` (operator/debugging); tenants write via `/v1/mutate` + `/v1/tx` (which force the partition-key predicate structurally) and read via `/v1/index-query` (exact-tuple lookups) and `/v1/table-scan` (Milestone 4 — lists a tenant's own rows, mechanically constructed and filtered by `tenant_id` via the `__cf_row_owners` join rather than a physical `tenant_id` column on the base row; see §7 and §6). This closes the general-read gap without needing the physical-`tenant_id` schema change originally assumed necessary — `TODOS.md`'s Completed section records why the join approach was chosen over adding that column. Even for the operator, a `/v1/sql` mutation whose write TARGET is an internal bookkeeping table is rejected 403 (internal reads and cross-table access are allowed — admin is trusted).
+- **`/v1/table-scan`'s isolation depends on `__cf_row_owners.tenant_id`, not a physical column on the base row.** Every query `/tenant-scan-page` runs filters `WHERE ro.tenant_id = ?` before joining to the base table — even when two tenants' rows share a literal partition-key value on the same shard (§14's pre-existing collision: `__cf_row_owners`'s primary key is `(table_name, partition_key)`, no tenant in the key, so the last writer's attribution wins), a tenant's scan only ever joins to row-owner entries carrying their OWN `tenant_id` — it can return zero rows for a collided key, never another tenant's data for it. This is the same class of leak that motivated removing raw `/v1/sql`, closed structurally rather than by another guard.
 - Enforce SQL policy allowlist in production (MVP currently permissive).
 
 ## 15) Migration Path to Production
