@@ -722,29 +722,41 @@ export class ShardDO extends DurableObject {
     const safeTable = escapeIdent(body.table);
     const safePk = escapeIdent(body.partitionKeyColumn);
 
-    let raw: Array<Record<string, unknown>> = [];
-    try {
-      raw = this.many<Record<string, unknown>>(
-        `
-        SELECT b.*, ro.partition_key AS __cf_scan_pk
-        FROM __cf_row_owners ro
-        JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
-        WHERE ro.tenant_id = ? AND ro.table_name = ? AND ro.partition_key > ?
-        ORDER BY ro.partition_key ASC
-        LIMIT ?
-        `,
-        body.tenantId,
-        body.table,
-        body.afterPartitionKey ?? "",
-        limit,
-      );
-    } catch (error) {
-      // The table isn't physically present on this shard (registered in
-      // table_rules but never created here) — nothing to scan for it. Same
-      // accepted precedent as handleMigrateExport's try/catch above.
-      log("shard.tenant_scan_page_table_missing", { table: body.table, message: error instanceof Error ? error.message : String(error) });
+    // Codex P2 fix: distinguish "table not physically present on this shard"
+    // (registered in table_rules but never created here — nothing to scan,
+    // a legitimate empty page) from any OTHER SQL execution failure (e.g. a
+    // fractional `limit` reaching this route, or a missing/renamed column).
+    // The old code caught ALL errors from the query below and returned the
+    // same {rows: []} for either case — silently turning a genuine shard
+    // failure into a fake-empty success, which violates acceptance criterion
+    // 7 (any shard failure must fail the WHOLE /v1/table-scan request via
+    // 502 SHARD_UNREACHABLE, never a silently-partial/empty result). A
+    // PRAGMA table_info probe never throws for a missing table — it simply
+    // returns zero rows — so it's a safe, explicit, non-error-message-
+    // sniffing way to detect that one case up front; the real query below
+    // then runs uncaught, so a genuine SQL error propagates to fetch()'s
+    // catch-all (500), which the Worker's fan-out correctly treats as a
+    // shard failure.
+    const tableExists = this.many<{ name: string }>(`PRAGMA table_info("${safeTable}")`).length > 0;
+    if (!tableExists) {
+      log("shard.tenant_scan_page_table_missing", { table: body.table });
       return json({ rows: [] });
     }
+
+    const raw = this.many<Record<string, unknown>>(
+      `
+      SELECT b.*, ro.partition_key AS __cf_scan_pk
+      FROM __cf_row_owners ro
+      JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
+      WHERE ro.tenant_id = ? AND ro.table_name = ? AND ro.partition_key > ?
+      ORDER BY ro.partition_key ASC
+      LIMIT ?
+      `,
+      body.tenantId,
+      body.table,
+      body.afterPartitionKey ?? "",
+      limit,
+    );
 
     const rows = raw.map((r) => {
       const { __cf_scan_pk, ...rest } = r;
