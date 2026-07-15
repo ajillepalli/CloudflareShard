@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.1.0.2] - 2026-07-15 — README screenshots
+
+No functional changes. Deployed the Worker to Cloudflare for the first time (`cloudflare-shard-mvp.ananth-jillepalli.workers.dev`) and ran the API quickstart end to end against the live deployment. Added two screenshots to README.md's quickstart, built from that real run (not fabricated example output): cluster init through tenant registration, and `/v1/table-scan`'s `provenance.complete` transitioning from `false` to `true` across a `/admin/backfill-provenance` call.
+
 ## [2.1.0.1] - 2026-07-15 — Docs cleanup
 
 No functional changes. README.md and docs/SPEC.md's `/v1/table-scan` sections had accumulated "(PR review round N)" changelog-style citations and a blow-by-blow revision history from the 12-round review cycle that shipped Milestone 4 — stripped in favor of describing current behavior only (this file already carries the full history). Also closed a real documentation gap found in the process: the partition-key-eligibility gate's TEXT/BLOB-affinity and BINARY-collation requirements were never documented in README/SPEC at all (only the UNIQUE-constraint requirement was) — both files now describe all three requirements.
