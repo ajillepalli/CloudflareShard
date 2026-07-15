@@ -307,158 +307,92 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
   return json({ ok: true, catalogShardCount: results.length });
 }
 
-/** Codex P1 fix (cross-tenant table-scan leak): verifies that `partitionKeyColumn`
- * on `table` (already created/present on `shardId`) is backed by a UNIQUE
- * constraint or is the table's SOLE primary-key column. /v1/table-scan's
- * per-shard JOIN against __cf_row_owners matches purely on partition-key
- * VALUE (see the /tenant-scan-page comment in shard.ts) — if the column isn't
- * guaranteed unique, two different tenants' rows can share a value and the
- * join would attribute both rows to whichever tenant currently owns that key
- * in __cf_row_owners, leaking one tenant's row to another. A composite
- * PRIMARY KEY where partitionKeyColumn is only one part is NOT sufficient —
- * the value alone must be guaranteed unique on its own. Checked against a
- * single representative shard: schema is uniform across shards for a table by
- * construction, so one check suffices. Fails closed (false) on any
- * introspection error — callers must treat "unable to verify" as "not safe to
- * scan", matching table_rules.partition_key_unique's fail-closed default. */
-/** Depth-tracked split of a comma-separated list, only splitting on commas at
- * nesting depth 0 -- so a type's own parens (e.g. `DECIMAL(10,2)`) or a
- * table-level constraint's parenthesized column list (e.g.
- * `PRIMARY KEY (a, b)`) don't get split apart. Shared by
- * extractColumnCollation below to isolate a CREATE TABLE statement's
- * individual column/constraint definitions. */
-function splitTopLevel(text: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === "(") depth++;
-    else if (c === ")") depth--;
-    else if (c === "," && depth === 0) {
-      parts.push(text.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(text.slice(start));
-  return parts;
-}
-
-/** Matches a `COLLATE <name>` clause's collation name in any of SQLite's four
- * identifier-quoting forms (`"..."`, `` `...` ``, `[...]`, bare) PLUS the
- * single-quoted `'...'` form -- SQLite's lenient historical misfeature of
- * accepting a single-quoted string as an identifier when no string literal
- * makes contextual sense, which collation names hit in practice (verified
- * empirically: `COLLATE 'NOCASE'` is accepted and genuinely enforced, same as
- * the other four forms). Deliberately broader than extractColumnCollation's
- * own identRe below (used for COLUMN names, which don't hit the single-quote
- * misfeature the same way in this codebase's identifier positions).
- * Codex P1 fix (round 2): the previous `/\bcollate\s+(\w+)/i` only matched
- * the bare form -- any quoted COLLATE clause silently fell through to `null`
- * ("no explicit COLLATE" / safe BINARY default) even though SQLite was
- * enforcing a real non-BINARY collation underneath the quotes, reopening the
- * exact cross-tenant leak the collation gate exists to close. */
-const COLLATE_NAME_RE = /\bcollate\s+(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))/i;
-
-/** Extracts and upper-cases the collation name from a `COLLATE <name>` clause
- * found anywhere in `text`, unwrapping whichever of SQLite's identifier
- * quoting forms was used (see COLLATE_NAME_RE's doc comment). Returns null if
- * no COLLATE clause is present. Shared by extractColumnCollation (column-level
- * COLLATE, parsed from a CREATE TABLE's stored text) and checkPartitionKeyUnique's
- * unique-index path (index-level COLLATE, parsed from a CREATE INDEX's stored
- * text) so both call sites recognize identical quoting forms. */
-function extractCollationName(text: string): string | null {
-  const m = COLLATE_NAME_RE.exec(text);
-  if (!m) return null;
-  return (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? "").toUpperCase();
-}
-
-/** Parses `columnName`'s explicit `COLLATE <name>` clause out of a CREATE
- * TABLE statement's stored text (sqlite_master.sql) -- see
- * partitionKeyColumnIsBinaryCollation's doc comment for why this text-parsing
- * approach is necessary (no PRAGMA exposes a column's collation). Isolates
- * the top-level column/constraint definitions inside the statement's outer
- * parens (depth-tracked, so it survives typed columns and nested table-level
- * constraint column lists), skips table-level constraints (PRIMARY KEY,
- * UNIQUE, FOREIGN KEY, CHECK, CONSTRAINT) by their leading keyword, and
- * matches the remaining column definitions by their own leading identifier
- * (quoted `"..."`/`` `...` ``/`[...]` or bare, case-insensitive -- SQLite
- * identifiers are case-insensitive). Returns the collation name
- * (upper-cased, via extractCollationName -- handling all of SQLite's
- * identifier-quoting forms for the COLLATE name itself, not just the column
- * name) if an explicit COLLATE clause is present on that column's own
- * definition; null if the column definition was confidently isolated and has
- * NO explicit COLLATE (SQLite's safe BINARY default applies); undefined if
- * the column definition couldn't be confidently isolated at all (caller must
- * fail closed / treat as unsafe), mirroring extractCreateTableName's
- * regex-parsing convention in sql-safety.ts for a different sub-problem. */
-function extractColumnCollation(createTableSql: string, columnName: string): string | null | undefined {
-  const openIdx = createTableSql.indexOf("(");
-  if (openIdx === -1) return undefined;
-  let depth = 0;
-  let closeIdx = -1;
-  for (let i = openIdx; i < createTableSql.length; i++) {
-    if (createTableSql[i] === "(") depth++;
-    else if (createTableSql[i] === ")") {
-      depth--;
-      if (depth === 0) {
-        closeIdx = i;
-        break;
-      }
-    }
-  }
-  if (closeIdx === -1) return undefined;
-  const body = createTableSql.slice(openIdx + 1, closeIdx);
-  const tableConstraintKeywords = /^(primary\s+key|unique|foreign\s+key|check|constraint)\b/i;
-  const identRe = /^("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))/;
-  for (const rawPart of splitTopLevel(body)) {
-    const part = rawPart.trim();
-    if (tableConstraintKeywords.test(part)) continue; // table-level constraint, not a column def
-    const identMatch = identRe.exec(part);
-    if (!identMatch) continue;
-    const ident = (identMatch[2] ?? identMatch[3] ?? identMatch[4] ?? identMatch[5] ?? "").toLowerCase();
-    if (ident !== columnName.toLowerCase()) continue;
-    return extractCollationName(part);
-  }
-  return undefined; // no matching column definition found -- fail closed
-}
-
-/** Codex P1 fix (COLLATE-based cross-tenant leak, same class as the
- * partial-index bypass this function already guards against below):
- * PRAGMA table_info/index_list/index_info never expose a column's or index's
- * COLLATION -- a column declared with a non-BINARY collation (e.g.
- * `id TEXT PRIMARY KEY COLLATE NOCASE`) passes checkPartitionKeyUnique's
- * other checks (it genuinely IS unique under NOCASE comparison), but
- * __cf_row_owners is keyed by the LITERAL partition-key string, and hashKey
- * (which decides a row's shard) is case-sensitive too. Two case-variant keys
- * ("a", "A") hash to different shards, each independently satisfies ITS OWN
- * shard's NOCASE uniqueness constraint (no local collision -- sharding
- * physically separates the two rows), yet a NOCASE-aware read would treat
- * them as the same logical key -- reopening the exact cross-tenant leak this
- * function exists to close, just via collation instead of
- * composite-key/partial-index aliasing. SQLite's default TEXT collation (no
- * explicit COLLATE clause) is already BINARY, which is exactly what
- * /tenant-scan-page's unqualified `ORDER BY partition_key` /
- * `partition_key > ?` / `"pk" = ?` comparisons rely on -- only an EXPLICIT
- * non-BINARY COLLATE clause on the column is unsafe. Fails closed (false) on
- * anything ambiguous, matching this function's fail-closed philosophy
+/** Codex PR review round 3 fix: asks the shard itself (via
+ * /probe-partition-key-collation, see handleProbePartitionKeyCollation in
+ * shard.ts for the full design rationale) whether partitionKeyColumn's real,
+ * live-enforced collation is BINARY (safe) rather than parsing the table's
+ * DDL text for a `COLLATE` clause. Text-parsing was abandoned after three
+ * straight review rounds each found a new SQL syntax variant it missed
+ * (unquoted, then quoted, then table-level constraint COLLATE syntax) — the
+ * same failure mode this codebase already lived through once with the
+ * original per-tenant /v1/sql write guard (6 rounds, eventually abandoned for
+ * a safe-by-construction approach). An empirical probe against the shard's
+ * actual SQLite engine can't be fooled by a grammar variant it doesn't
+ * recognize, because it never looks at grammar at all. Fails closed (false)
+ * on any transport/parse error, matching this file's fail-closed philosophy
  * everywhere else. */
-async function partitionKeyColumnIsBinaryCollation(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
-  const tableSqlRes = await routeToShard(env, shardId, "/execute", {
-    sql: `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
-    params: [table],
-    requestId: `partition-key-unique-tablesql-${table}-${crypto.randomUUID()}`,
+async function partitionKeyColumnHasBinaryCollation(
+  env: Env,
+  shardId: string,
+  table: string,
+  partitionKeyColumn: string,
+): Promise<boolean> {
+  const res = await routeToShard(env, shardId, "/probe-partition-key-collation", { table, partitionKeyColumn });
+  if (!res.ok) return false;
+  const body = (await res.json()) as { binaryCollation?: boolean };
+  return body.binaryCollation === true;
+}
+
+/** Codex P1 fix (partial-unique-index bypass, kept from before the round-3
+ * rewrite below — this check is unrelated to collation and is still solid):
+ * PRAGMA index_list reports unique=1 for a PARTIAL unique index too (e.g.
+ * `CREATE UNIQUE INDEX ux ON t(col) WHERE active = 1`), and PRAGMA index_info
+ * never exposes the predicate — so without this check a partial unique index
+ * would be accepted as full-table uniqueness when it isn't (duplicate values
+ * ARE allowed for rows outside the predicate), reopening the exact
+ * cross-tenant leak this function exists to close. SQLite doesn't expose "is
+ * this index partial" via any PRAGMA boolean; the reliable signal is the
+ * index's own stored CREATE INDEX text in sqlite_master (same regex-text-
+ * parsing pattern as extractCreateTableName in sql-safety.ts — this one
+ * doesn't have the same open-ended-grammar problem the collation check did,
+ * since it's only checking for the LITERAL presence of a `WHERE` keyword
+ * anywhere in the index's own text, not trying to parse out a specific
+ * clause's value across multiple quoting forms). A NULL sql (an auto-created
+ * index backing a UNIQUE column constraint, or an implicit PRIMARY KEY index)
+ * is never partial, so that case is safe to accept. */
+async function uniqueIndexIsPartial(env: Env, shardId: string, indexName: string): Promise<boolean> {
+  const indexSqlRes = await routeToShard(env, shardId, "/execute", {
+    sql: `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
+    params: [indexName],
+    requestId: `partition-key-unique-indexsql-${indexName}-${crypto.randomUUID()}`,
     isMutation: false,
   });
-  if (!tableSqlRes.ok) return false;
-  const tableSqlBody = (await tableSqlRes.json()) as { rows?: Array<{ sql: string | null }> };
-  const tableSql = tableSqlBody.rows?.[0]?.sql ?? null;
-  if (tableSql === null) return false;
-  const collation = extractColumnCollation(tableSql, partitionKeyColumn);
-  if (collation === undefined) return false;
-  return collation === null || collation === "BINARY";
+  if (!indexSqlRes.ok) return true; // fail closed -- treat as partial (insufficient) on error
+  const indexSqlBody = (await indexSqlRes.json()) as { rows?: Array<{ sql: string | null }> };
+  const indexSql = indexSqlBody.rows?.[0]?.sql ?? null;
+  return indexSql !== null && /\bwhere\b/i.test(indexSql);
 }
 
+/** Codex P1 fix (cross-tenant table-scan leak): verifies that
+ * `partitionKeyColumn` on `table` (already created/present on `shardId`) is
+ * backed by a UNIQUE constraint or is the table's SOLE primary-key column.
+ * /v1/table-scan's per-shard JOIN against __cf_row_owners matches purely on
+ * partition-key VALUE (see the /tenant-scan-page comment in shard.ts) — if
+ * the column isn't guaranteed unique, two different tenants' rows can share a
+ * value and the join would attribute both rows to whichever tenant currently
+ * owns that key in __cf_row_owners, leaking one tenant's row to another. A
+ * composite PRIMARY KEY where partitionKeyColumn is only one part is NOT
+ * sufficient — the value alone must be guaranteed unique on its own. Checked
+ * against a single representative shard: schema is uniform across shards for
+ * a table by construction, so one check suffices. Fails closed (false) on
+ * any introspection error — callers must treat "unable to verify" as "not
+ * safe to scan", matching table_rules.partition_key_unique's fail-closed
+ * default.
+ *
+ * Round 3 addition: plain uniqueness alone is still not sufficient — see
+ * partitionKeyColumnHasBinaryCollation's doc comment (in this file) /
+ * handleProbePartitionKeyCollation's doc comment (in shard.ts) for why the
+ * column's real collation must ALSO be BINARY, and why that's now checked via
+ * an empirical probe instead of DDL-text-parsing.
+ *
+ * Structure (round 3): the collation probe tests the column's actual runtime
+ * behavior directly against the real table, independent of which specific
+ * unique-enforcing mechanism (sole PK vs. unique index) the column happens to
+ * have — so there's no need to run it once per candidate index the way the
+ * old per-path DDL-text lookups did. This function first determines, via the
+ * existing PRAGMA-based checks, whether SOME qualifying uniqueness mechanism
+ * exists at all (sole PK, or a single-column non-partial unique index), and
+ * only if one does, runs the collation probe ONCE as a final gate. */
 async function checkPartitionKeyUnique(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
   const tableInfoRes = await routeToShard(env, shardId, "/execute", {
     sql: `PRAGMA table_info("${table}")`,
@@ -469,89 +403,47 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
   const tableInfoBody = (await tableInfoRes.json()) as { rows?: Array<{ name: string; pk: number }> };
   const columns = tableInfoBody.rows ?? [];
   const pkColumns = columns.filter((c) => c.pk !== 0);
-  if (pkColumns.length === 1 && pkColumns[0].name === partitionKeyColumn) {
-    // Codex P1 fix (collation gate): the PK constraint alone is not enough --
-    // see partitionKeyColumnIsBinaryCollation's doc comment. An explicit
-    // non-BINARY COLLATE on this column fails the whole check; there's no
-    // "keep checking other candidates" fallback for the sole-PK case the way
-    // there is for unique indexes below.
-    return await partitionKeyColumnIsBinaryCollation(env, shardId, table, partitionKeyColumn);
-  }
 
-  const indexListRes = await routeToShard(env, shardId, "/execute", {
-    sql: `PRAGMA index_list("${table}")`,
-    requestId: `partition-key-unique-indexlist-${table}-${crypto.randomUUID()}`,
-    isMutation: false,
-  });
-  if (!indexListRes.ok) return false;
-  const indexListBody = (await indexListRes.json()) as { rows?: Array<{ name: string; unique: number }> };
-  const uniqueIndexes = (indexListBody.rows ?? []).filter((i) => i.unique === 1);
-  for (const idx of uniqueIndexes) {
-    const indexInfoRes = await routeToShard(env, shardId, "/execute", {
-      sql: `PRAGMA index_info("${idx.name}")`,
-      requestId: `partition-key-unique-indexinfo-${table}-${idx.name}-${crypto.randomUUID()}`,
+  let uniquenessConfirmed = pkColumns.length === 1 && pkColumns[0].name === partitionKeyColumn;
+
+  if (!uniquenessConfirmed) {
+    const indexListRes = await routeToShard(env, shardId, "/execute", {
+      sql: `PRAGMA index_list("${table}")`,
+      requestId: `partition-key-unique-indexlist-${table}-${crypto.randomUUID()}`,
       isMutation: false,
     });
-    if (!indexInfoRes.ok) continue;
-    const indexInfoBody = (await indexInfoRes.json()) as { rows?: Array<{ name: string }> };
-    const idxColumns = indexInfoBody.rows ?? [];
-    if (idxColumns.length !== 1 || idxColumns[0].name !== partitionKeyColumn) {
-      continue;
+    if (!indexListRes.ok) return false;
+    const indexListBody = (await indexListRes.json()) as { rows?: Array<{ name: string; unique: number }> };
+    const uniqueIndexes = (indexListBody.rows ?? []).filter((i) => i.unique === 1);
+    for (const idx of uniqueIndexes) {
+      const indexInfoRes = await routeToShard(env, shardId, "/execute", {
+        sql: `PRAGMA index_info("${idx.name}")`,
+        requestId: `partition-key-unique-indexinfo-${table}-${idx.name}-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!indexInfoRes.ok) continue;
+      const indexInfoBody = (await indexInfoRes.json()) as { rows?: Array<{ name: string }> };
+      const idxColumns = indexInfoBody.rows ?? [];
+      if (idxColumns.length !== 1 || idxColumns[0].name !== partitionKeyColumn) {
+        continue;
+      }
+      if (await uniqueIndexIsPartial(env, shardId, idx.name)) {
+        // Partial index — not sufficient on its own. Keep checking other
+        // unique indexes rather than giving up immediately, in case a later
+        // (non-partial) unique index on this same column also exists.
+        continue;
+      }
+      uniquenessConfirmed = true;
+      break;
     }
-
-    // Codex P1 fix (partial-unique-index bypass): PRAGMA index_list reports
-    // unique=1 for a PARTIAL unique index too (e.g. `CREATE UNIQUE INDEX ux ON
-    // t(col) WHERE active = 1`), and PRAGMA index_info never exposes the
-    // predicate — so without this check a partial unique index would be
-    // accepted as full-table uniqueness when it isn't (duplicate values ARE
-    // allowed for rows outside the predicate), reopening the exact
-    // cross-tenant leak this function exists to close. SQLite doesn't expose
-    // "is this index partial" via any PRAGMA boolean; the reliable signal is
-    // the index's own stored CREATE INDEX text in sqlite_master (same
-    // regex-text-parsing pattern as extractCreateTableName in sql-safety.ts).
-    // A NULL sql (an auto-created index backing a UNIQUE column constraint,
-    // or an implicit PRIMARY KEY index) is never partial, so that case is
-    // safe to accept.
-    const indexSqlRes = await routeToShard(env, shardId, "/execute", {
-      sql: `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
-      params: [idx.name],
-      requestId: `partition-key-unique-indexsql-${table}-${idx.name}-${crypto.randomUUID()}`,
-      isMutation: false,
-    });
-    if (!indexSqlRes.ok) continue;
-    const indexSqlBody = (await indexSqlRes.json()) as { rows?: Array<{ sql: string | null }> };
-    const indexSql = indexSqlBody.rows?.[0]?.sql ?? null;
-    if (indexSql !== null && /\bwhere\b/i.test(indexSql)) {
-      // Partial index — not sufficient on its own. Keep checking other
-      // unique indexes rather than returning false immediately, in case a
-      // later (non-partial) unique index on this same column also exists.
-      continue;
-    }
-
-    // Codex P1 fix (collation gate): mirrors the partial-index check just
-    // above -- same "keep checking other candidates" pattern, applied to
-    // collation instead of a WHERE predicate. idxColumns.length === 1 was
-    // already confirmed above, so any COLLATE clause found anywhere in this
-    // index's own stored SQL necessarily applies to partitionKeyColumn (the
-    // only column it indexes) -- an explicit override there takes precedence
-    // over the column's own declaration. When the index's SQL has no
-    // COLLATE of its own (including a NULL sql -- e.g. the auto-index
-    // backing an inline `col TEXT UNIQUE COLLATE NOCASE` column constraint,
-    // which carries no collation info of its own at all), it inherits
-    // partitionKeyColumn's own declared collation, so that's checked
-    // instead. See partitionKeyColumnIsBinaryCollation's doc comment for why
-    // a non-BINARY collation here is unsafe. extractCollationName (shared
-    // with extractColumnCollation above) handles all of SQLite's
-    // identifier-quoting forms for the COLLATE name, not just the bare form.
-    const indexCollation = indexSql !== null ? extractCollationName(indexSql) : null;
-    if (indexCollation !== null) {
-      if (indexCollation !== "BINARY") continue;
-    } else if (!(await partitionKeyColumnIsBinaryCollation(env, shardId, table, partitionKeyColumn))) {
-      continue;
-    }
-    return true;
   }
-  return false;
+
+  if (!uniquenessConfirmed) return false;
+
+  // Single collation gate, run once regardless of which mechanism above
+  // confirmed uniqueness — see this function's doc comment for why one probe
+  // suffices now that it tests the column's actual behavior directly.
+  return await partitionKeyColumnHasBinaryCollation(env, shardId, table, partitionKeyColumn);
 }
 
 async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
