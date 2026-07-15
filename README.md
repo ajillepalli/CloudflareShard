@@ -142,6 +142,12 @@ partition key column — doing so would leave `__cf_row_owners`' existing
 provenance entries keyed by the old column's values while `/v1/table-scan`
 looks up rows by the new column, a cross-tenant data leak.
 
+![Terminal output showing steps 1-3 of the quickstart — cluster init, table registration, and schema creation — each returning HTTP 200 with real JSON responses](docs/images/quickstart-cluster-init.png)
+
+Steps 1-3 run end to end against the actual live deployment
+(`https://cloudflare-shard-mvp.<account>.workers.dev`) — this is real `curl`
+output, not fabricated example data.
+
 ### 4) Register a tenant
 
 `/v1/mutate`, `/v1/tx`, `/v1/index-query`, and `/v1/table-scan` are the tenant
@@ -277,6 +283,12 @@ Any shard in the pool failing to respond fails the whole request 502
 `SHARD_UNREACHABLE` (naming the shard) rather than return a silently-partial
 result — a deliberate MVP simplification (a `partial: true` mode with
 per-shard errors is a documented future option, not a blocker today).
+
+![Terminal output from a live run: table-scan on a brand-new table returns provenance.complete: false, then a backfill-provenance call reports 0 orphaned/ambiguous rows, then the same table-scan call returns provenance.complete: true](docs/images/tenant-table-scan-live.png)
+
+`provenance.complete: false` right after inserting data is expected, not a
+bug: a brand-new table always starts unverified until an explicit
+`/admin/backfill-provenance` run certifies it clean, as shown above.
 
 ### 8) Structured mutation (row-owned, single-shard)
 
