@@ -212,7 +212,11 @@ async function handleAdminInit(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleAdminRegisterTable(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as Record<string, unknown> & { table?: string; schemaSql?: string };
+  const payload = (await request.json()) as Record<string, unknown> & {
+    table?: string;
+    schemaSql?: string;
+    partitionKeyColumn?: string;
+  };
   // Review Tier 3: /admin/register-table stores schemaSql (if present) for
   // later use — a split target's backfill executes it verbatim to provision
   // the table (see handleAdminCreateTable's comment above /register-table's
@@ -238,8 +242,36 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
       );
     }
   }
+
+  // Codex P1 fix (register-table trust bypass): the raw request body's
+  // partitionKeyUnique must NEVER be forwarded — a caller could otherwise set
+  // {partitionKeyColumn, partitionKeyUnique: true} with no actual unique
+  // constraint on that column and completely bypass checkPartitionKeyUnique,
+  // reopening the exact cross-tenant /v1/table-scan leak that check exists to
+  // close. Always compute it ourselves, the same way /admin/create-table and
+  // /admin/set-partition-key-column do. Unlike those two, this route is
+  // metadata-only and doesn't know which shard(s) the table lives on, so pick
+  // any one active shard (schema is uniform across shards for a table by
+  // construction — see checkPartitionKeyUnique's doc comment). If no shards
+  // exist yet, or listing them fails, fail closed (unverified = false):
+  // registration itself must not hard-fail here (a table can legitimately be
+  // registered before /admin/init has ever run), but nothing can be verified
+  // as unique either.
+  delete (payload as Record<string, unknown>).partitionKeyUnique;
+  let partitionKeyUnique = false;
+  if (typeof payload.partitionKeyColumn === "string" && payload.partitionKeyColumn.length > 0 && typeof payload.table === "string") {
+    const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+    const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
+    if (!listFailed) {
+      const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+      if (shardIds.length > 0) {
+        partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], payload.table, payload.partitionKeyColumn);
+      }
+    }
+  }
+
   const authorization = request.headers.get("authorization") ?? undefined;
-  const results = await fanOutToAllCatalogs(env, "/register-table", () => payload, authorization);
+  const results = await fanOutToAllCatalogs(env, "/register-table", () => ({ ...payload, partitionKeyUnique }), authorization);
   const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to register the table.");
   if (failed) return failed;
   return json({ ok: true, catalogShardCount: results.length });
