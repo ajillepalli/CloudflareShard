@@ -33,6 +33,7 @@ const ADMIN_GATED_ROUTES = new Set([
   "/migrate-vbucket-status",
   "/migrate-vbucket-abort",
   "/drain-shard-status",
+  "/mark-table-provenance-complete",
 ]);
 
 // Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
@@ -113,6 +114,8 @@ export class CatalogDO extends DurableObject {
       "/create-index": this.handleCreateIndex.bind(this),
       "/list-indexes": this.handleListIndexes.bind(this),
       "/lookup-index": this.handleLookupIndex.bind(this),
+      "/lookup-table-scan": this.handleLookupTableScan.bind(this),
+      "/mark-table-provenance-complete": this.handleMarkTableProvenanceComplete.bind(this),
       "/drop-index": this.handleDropIndex.bind(this),
       "/mark-index-ready": this.handleMarkIndexReady.bind(this),
       "/list-tenants": this.handleListTenants.bind(this),
@@ -272,6 +275,16 @@ export class CatalogDO extends DurableObject {
     // table registered before this column existed simply can't be
     // auto-provisioned on new shards (operator applies schema manually).
     this.ensureColumn("table_rules", "schema_sql", "TEXT");
+    // Tenant-scoped table scan (POST /v1/table-scan): cached provenance-
+    // completeness flag, mirroring index_rules.status's building/ready cache.
+    // 1 once a full-cluster (catalogShardId omitted) /admin/backfill-
+    // provenance run has reported zero orphaned and zero ambiguous rows for
+    // this table across every catalog shard and shard it touched; never reset
+    // to 0 automatically (a completed table stays complete — only pre-
+    // existing legacy rows can be unattributed, and every write since Chunk 0
+    // is already provenance-tracked). /admin/create-table sets it to 1 at
+    // creation (a brand-new table has no legacy rows to backfill).
+    this.ensureColumn("table_rules", "provenance_complete", "INTEGER NOT NULL DEFAULT 0");
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -545,6 +558,7 @@ export class CatalogDO extends DurableObject {
       partitioning?: string;
       partitionKeyColumn?: string;
       schemaSql?: string;
+      provenanceComplete?: boolean;
     };
 
     if (!body.table) {
@@ -569,16 +583,29 @@ export class CatalogDO extends DurableObject {
       partitionKeyColumn: body.partitionKeyColumn,
     });
 
+    // provenance_complete is monotonic (see ensureSchema's comment above) —
+    // INSERT OR REPLACE below would otherwise silently reset an
+    // already-completed table back to 0 if /register-table is ever called
+    // again for it (e.g. a manual metadata-only re-registration). Preserve
+    // "already complete" across a re-register; only handleAdminCreateTable's
+    // fan-out (via provenanceComplete: true, a brand-new table) sets it fresh.
+    const existing = this.one<{ provenance_complete: number }>(
+      "SELECT provenance_complete FROM table_rules WHERE table_name = ?",
+      body.table,
+    );
+    const provenanceComplete = existing?.provenance_complete === 1 || body.provenanceComplete === true ? 1 : 0;
+
     this.sql.exec(
       `
-      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO table_rules (table_name, partitioning, partition_key_column, created_at, schema_sql, provenance_complete)
+      VALUES (?, ?, ?, ?, ?, ?)
       `,
       body.table,
       body.partitioning ?? "hash",
       body.partitionKeyColumn,
       new Date().toISOString(),
       body.schemaSql ?? null,
+      provenanceComplete,
     );
 
     const version = this.bumpMetadataVersion();
@@ -964,6 +991,71 @@ export class CatalogDO extends DurableObject {
       // dual-looks-up these alongside the current ring shard.
       evacFromShards: JSON.parse(index.evac_from_shards_json ?? "[]") as string[],
     });
+  }
+
+  /** Tenant-scoped table scan (POST /v1/table-scan). Tenant-auth-gated (not
+   * admin-gated) the same way /lookup-index is — checks the caller's token
+   * exactly like /route/handleLookupIndex do, reusing checkTenantAuth rather
+   * than re-implementing it, per the spec's explicit instruction. No
+   * partitionKey is available yet (a scan has none), so this can't reuse
+   * /route itself; it plays the combined "auth + table_rules gate" role
+   * /lookup-index plays for /v1/index-query instead. */
+  private async handleLookupTableScan(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string; tenantId?: string };
+    if (!body.table || !body.tenantId) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing table or tenantId." } }, 400);
+    }
+    const authError = await this.checkTenantAuth(body.tenantId, request);
+    if (authError) return authError;
+
+    const table = this.one<{ partition_key_column: string; provenance_complete: number }>(
+      "SELECT partition_key_column, provenance_complete FROM table_rules WHERE table_name = ?",
+      body.table,
+    );
+    if (!table) {
+      return json(
+        {
+          error: {
+            code: "TABLE_NOT_REGISTERED",
+            message: `Table ${body.table} is not registered.`,
+            fix: "Call /admin/create-table first.",
+          },
+        },
+        400,
+      );
+    }
+    if (table.partition_key_column === UNSET_PARTITION_KEY_COLUMN) {
+      return json(
+        {
+          error: {
+            code: "PARTITION_KEY_COLUMN_UNSET",
+            message: `Table ${body.table} has not been upgraded with a partition key column.`,
+            fix: "Call /admin/set-partition-key-column first.",
+          },
+        },
+        409,
+      );
+    }
+    return json({
+      partitionKeyColumn: table.partition_key_column,
+      provenanceComplete: table.provenance_complete === 1,
+    });
+  }
+
+  /** /admin/backfill-provenance (internal, admin-gated at the Worker level and
+   * re-gated here — see ADMIN_GATED_ROUTES) flips a table's cached
+   * provenance_complete flag once a full-cluster run reports zero orphaned
+   * and zero ambiguous rows for it. Monotonic (see ensureSchema's comment):
+   * an UPDATE ... SET provenance_complete = 1 can only ever set it, never
+   * clear it, so calling this again for an already-complete table is a no-op,
+   * not a regression. */
+  private async handleMarkTableProvenanceComplete(request: Request): Promise<Response> {
+    const body = (await request.json()) as { table?: string };
+    if (!body.table) {
+      return json({ error: "Missing table" }, 400);
+    }
+    this.sql.exec("UPDATE table_rules SET provenance_complete = 1 WHERE table_name = ?", body.table);
+    return json({ ok: true, table: body.table });
   }
 
   /** Data-plane tenant auth check: does the caller's bearer token match the
