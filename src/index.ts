@@ -1,11 +1,11 @@
 import { CatalogDO } from "./catalog";
-import { ShardDO } from "./shard";
+import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
 import { CoordinatorDO } from "./coordinator";
 import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
-import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation, mutationTargetIsInternal } from "./sql-safety";
+import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableName, isMutation, mutationTargetIsInternal, normalizeTableName } from "./sql-safety";
 import {
   compileMutation,
   IDENTIFIER_RE,
@@ -212,13 +212,46 @@ async function handleAdminInit(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleAdminRegisterTable(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as Record<string, unknown> & { table?: string; schemaSql?: string };
+  const payload = (await request.json()) as Record<string, unknown> & {
+    table?: string;
+    // PR review round 11: widened to `string | null` — this route now sends
+    // an explicit `null` down to CatalogDO to signal "clear schema_sql",
+    // distinct from omitting the field ("preserve it"). See the comment
+    // below (just before the fan-out) for the full contract.
+    schemaSql?: string | null;
+    partitionKeyColumn?: string;
+  };
+  // Pre-landing review fix: every sibling route (handleAdminSetPartitionKeyColumn,
+  // handleAdminCreateIndex) validates its identifiers against IDENTIFIER_RE before
+  // using them; this route was missing that check even though payload.table flows
+  // unvalidated into checkPartitionKeyUnique below, which interpolates it directly
+  // into raw SQL text (PRAGMA table_info("${table}") etc.) sent to a shard's
+  // /execute route. partitionKeyColumn is optional on this route, so it's only
+  // validated when actually provided, matching the existing guard used below.
+  if (typeof payload.table !== "string" || !IDENTIFIER_RE.test(payload.table)) {
+    return json(
+      { error: { code: "UNSAFE_IDENTIFIER", message: "table or partitionKeyColumn is not a valid identifier.", fix: "Use only letters, digits, and underscores, starting with a letter or underscore." } },
+      400,
+    );
+  }
+  if (typeof payload.partitionKeyColumn === "string" && payload.partitionKeyColumn.length > 0 && !IDENTIFIER_RE.test(payload.partitionKeyColumn)) {
+    return json(
+      { error: { code: "UNSAFE_IDENTIFIER", message: "table or partitionKeyColumn is not a valid identifier.", fix: "Use only letters, digits, and underscores, starting with a letter or underscore." } },
+      400,
+    );
+  }
   // Review Tier 3: /admin/register-table stores schemaSql (if present) for
   // later use — a split target's backfill executes it verbatim to provision
   // the table (see handleAdminCreateTable's comment above /register-table's
   // fan-out, and CatalogDO.migratableTables/advanceMigration's backfill pass).
   // Without this check an admin could seed DDL here that /admin/create-table
   // itself would reject, and have it silently executed later.
+  // PR review round 10 fix: whether schemaSql is present at all is also
+  // needed below (once we've fallen through this validation block, the
+  // `typeof payload.schemaSql === "string"` narrowing that guards it doesn't
+  // survive past the closing brace) — computed once here as a plain boolean
+  // so it can be reused without re-deriving the same check.
+  const hasSchemaSql = typeof payload.schemaSql === "string" && payload.schemaSql.length > 0;
   if (typeof payload.schemaSql === "string" && payload.schemaSql.length > 0) {
     if (!/^\s*create\s+table\b/i.test(payload.schemaSql)) {
       return json({ error: "schemaSql must be a CREATE TABLE statement." }, 400);
@@ -238,11 +271,340 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
       );
     }
   }
+
+  // Codex P1 fix (register-table trust bypass): the raw request body's
+  // partitionKeyUnique must NEVER be forwarded — a caller could otherwise set
+  // {partitionKeyColumn, partitionKeyUnique: true} with no actual unique
+  // constraint on that column and completely bypass checkPartitionKeyUnique,
+  // reopening the exact cross-tenant /v1/table-scan leak that check exists to
+  // close. Always compute it ourselves, the same way /admin/create-table and
+  // /admin/set-partition-key-column do. Unlike those two, this route is
+  // metadata-only and doesn't know which shard(s) the table lives on, so pick
+  // any one active shard (schema is uniform across shards for a table by
+  // construction — see checkPartitionKeyUnique's doc comment). If no shards
+  // exist yet, or listing them fails, fail closed (unverified = false):
+  // registration itself must not hard-fail here (a table can legitimately be
+  // registered before /admin/init has ever run), but nothing can be verified
+  // as unique either.
+  delete (payload as Record<string, unknown>).partitionKeyUnique;
+  // Codex structured-review fix: same trust-bypass class as
+  // partitionKeyUnique above — a client-supplied provenanceComplete: true
+  // would let /admin/register-table force table_rules.provenance_complete to
+  // 1 with no actual backfill run behind it, making /v1/table-scan's
+  // provenance.complete field falsely claim no legacy unattributed rows are
+  // being hidden. CatalogDO.handleRegisterTable's own monotonic-preserve
+  // logic (`existing?.provenance_complete === 1`) already keeps a
+  // legitimately-true value across re-registration without trusting this
+  // field at all, so stripping it here only removes the ability to FORCE it
+  // true — it can still stay true if it already was.
+  delete (payload as Record<string, unknown>).provenanceComplete;
+  let partitionKeyUnique = false;
+  // PR review round 10: schemaSql (caller-submitted text, later executed
+  // verbatim to provision split/migration targets) and partitionKeyUnique
+  // (probed against whatever ALREADY physically exists on a live shard right
+  // now) come from two structurally disconnected sources that are only ever
+  // assumed to correspond — never actually checked against each other.
+  // Comparing the DDL text against the live schema directly would reopen the
+  // exact whack-a-mole rounds 1-3 already abandoned text-parsing over.
+  // Instead: whenever schemaSql is present in this same call, this route can
+  // never produce a verified result — skip the probe entirely (wasted work
+  // otherwise) and leave partitionKeyUnique at its false default.
+  // Verification for such a table can only come from a LATER, separate
+  // /admin/set-partition-key-column call (no schemaSql field to go stale
+  // against) or from /admin/create-table's own atomic push-then-verify flow
+  // (a different code path entirely, unaffected by this route).
+  if (
+    !hasSchemaSql &&
+    typeof payload.partitionKeyColumn === "string" &&
+    payload.partitionKeyColumn.length > 0 &&
+    typeof payload.table === "string"
+  ) {
+    const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
+    const listFailed = firstCatalogFanOutFailure(listResults, "Failed to list shards.");
+    if (!listFailed) {
+      const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
+      if (shardIds.length > 0) {
+        // PR review round 12 (P1 fix): this route's schema isn't guaranteed
+        // uniform across shards by construction (unlike /admin/create-table's
+        // call site below) — see checkPartitionKeyUniqueAcrossShards's doc
+        // comment. Every shard must independently confirm uniqueness.
+        partitionKeyUnique = await checkPartitionKeyUniqueAcrossShards(env, shardIds, payload.table, payload.partitionKeyColumn);
+      }
+    }
+  }
+
+  // PR review round 11 (fundamental fix, P1+P2): closes two residual gaps
+  // round 10 left open.
+  //   Finding 1 — a LATER call that OMITS schemaSql (hasSchemaSql=false) can
+  //   still compute partitionKeyUnique=true from the live probe above, while
+  //   whatever schema_sql an EARLIER call stored (possibly weak, possibly
+  //   stale) sat untouched — recreating the exact partition_key_unique=1 +
+  //   untrustworthy-schema_sql pairing round 10 was meant to prevent, just
+  //   via a second call. Fixed by having THIS call explicitly clear
+  //   schema_sql whenever ITS OWN probe just verified uniqueness — this
+  //   route's live-state check can never vouch for whatever text happens to
+  //   be on file, so it must not be left in place once partition_key_unique
+  //   flips to 1 through this path.
+  //   Finding 2 — hasSchemaSql already treats an empty string identically to
+  //   omitted (the `.length > 0` check above), so the probe correctly runs;
+  //   but the empty string itself used to still ride along in `...payload`
+  //   to CatalogDO and land in schema_sql as garbage (not a valid CREATE
+  //   TABLE statement, but not null either). Fixed by the same branches
+  //   below: an empty/omitted schemaSql never reaches CatalogDO as a stored
+  //   string in either case.
+  // CatalogDO's handleRegisterTable distinguishes three states by FIELD
+  // PRESENCE (a bare `??` can't tell "omitted" from "explicitly null" —
+  // both are nullish): omit "schemaSql" entirely to preserve whatever's
+  // stored; send "schemaSql": null to explicitly clear it; send a real
+  // string to store it. hasSchemaSql=true needs no action here — this
+  // call's own real schemaSql already sits in `payload.schemaSql` and is
+  // stored as submitted (partitionKeyUnique stays false, so there's no
+  // verified-flag/schema-text mismatch risk to guard against).
+  if (!hasSchemaSql) {
+    if (partitionKeyUnique) {
+      (payload as Record<string, unknown>).schemaSql = null;
+    } else {
+      delete (payload as Record<string, unknown>).schemaSql;
+    }
+  }
+
   const authorization = request.headers.get("authorization") ?? undefined;
-  const results = await fanOutToAllCatalogs(env, "/register-table", () => payload, authorization);
+  const results = await fanOutToAllCatalogs(env, "/register-table", () => ({ ...payload, partitionKeyUnique }), authorization);
   const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to register the table.");
   if (failed) return failed;
   return json({ ok: true, catalogShardCount: results.length });
+}
+
+/** Codex PR review round 3 fix: asks the shard itself (via
+ * /probe-partition-key-collation, see handleProbePartitionKeyCollation in
+ * shard.ts for the full design rationale) whether partitionKeyColumn's real,
+ * live-enforced collation is BINARY (safe) rather than parsing the table's
+ * DDL text for a `COLLATE` clause. Text-parsing was abandoned after three
+ * straight review rounds each found a new SQL syntax variant it missed
+ * (unquoted, then quoted, then table-level constraint COLLATE syntax) — the
+ * same failure mode this codebase already lived through once with the
+ * original per-tenant /v1/sql write guard (6 rounds, eventually abandoned for
+ * a safe-by-construction approach). An empirical probe against the shard's
+ * actual SQLite engine can't be fooled by a grammar variant it doesn't
+ * recognize, because it never looks at grammar at all. Fails closed (false)
+ * on any transport/parse error, matching this file's fail-closed philosophy
+ * everywhere else. */
+async function partitionKeyColumnHasBinaryCollation(
+  env: Env,
+  shardId: string,
+  table: string,
+  partitionKeyColumn: string,
+): Promise<boolean> {
+  const res = await routeToShard(env, shardId, "/probe-partition-key-collation", { table, partitionKeyColumn });
+  if (!res.ok) return false;
+  const body = (await res.json()) as { binaryCollation?: boolean };
+  return body.binaryCollation === true;
+}
+
+/** Codex P1 fix (partial-unique-index bypass, kept from before the round-3
+ * rewrite below — this check is unrelated to collation and is still solid):
+ * PRAGMA index_list reports unique=1 for a PARTIAL unique index too (e.g.
+ * `CREATE UNIQUE INDEX ux ON t(col) WHERE active = 1`), and PRAGMA index_info
+ * never exposes the predicate — so without this check a partial unique index
+ * would be accepted as full-table uniqueness when it isn't (duplicate values
+ * ARE allowed for rows outside the predicate), reopening the exact
+ * cross-tenant leak this function exists to close. SQLite doesn't expose "is
+ * this index partial" via any PRAGMA boolean; the reliable signal is the
+ * index's own stored CREATE INDEX text in sqlite_master (same regex-text-
+ * parsing pattern as extractCreateTableName in sql-safety.ts — this one
+ * doesn't have the same open-ended-grammar problem the collation check did,
+ * since it's only checking for the LITERAL presence of a `WHERE` keyword
+ * anywhere in the index's own text, not trying to parse out a specific
+ * clause's value across multiple quoting forms). A NULL sql (an auto-created
+ * index backing a UNIQUE column constraint, or an implicit PRIMARY KEY index)
+ * is never partial, so that case is safe to accept. */
+async function uniqueIndexIsPartial(env: Env, shardId: string, indexName: string): Promise<boolean> {
+  const indexSqlRes = await routeToShard(env, shardId, "/execute", {
+    sql: `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
+    params: [indexName],
+    requestId: `partition-key-unique-indexsql-${indexName}-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (!indexSqlRes.ok) return true; // fail closed -- treat as partial (insufficient) on error
+  const indexSqlBody = (await indexSqlRes.json()) as { rows?: Array<{ sql: string | null }> };
+  const indexSql = indexSqlBody.rows?.[0]?.sql ?? null;
+  return indexSql !== null && /\bwhere\b/i.test(indexSql);
+}
+
+/** SQLite's own documented type-affinity rules (https://www.sqlite.org/datatype3.html
+ * §3.1), applied to a column's declared type-name string. Used by
+ * checkPartitionKeyUnique's round-5 affinity gate below — see that function's
+ * doc comment for why this matters. Order matters: SQLite checks "INT"
+ * before "CHAR"/"CLOB"/"TEXT" etc., so this mirrors that precedence exactly
+ * (a hypothetical type name matching more than one rule, e.g. containing both
+ * "INT" and "CHAR", resolves the same way SQLite itself would). */
+type SqliteAffinity = "TEXT" | "NUMERIC" | "INTEGER" | "REAL" | "BLOB";
+
+function sqliteTypeAffinity(declaredType: string): SqliteAffinity {
+  const t = (declaredType ?? "").toUpperCase();
+  if (t.includes("INT")) return "INTEGER";
+  if (t.includes("CHAR") || t.includes("CLOB") || t.includes("TEXT")) return "TEXT";
+  if (t.includes("BLOB") || t === "") return "BLOB";
+  if (t.includes("REAL") || t.includes("FLOA") || t.includes("DOUB")) return "REAL";
+  return "NUMERIC";
+}
+
+/** Codex P1 fix (cross-tenant table-scan leak): verifies that
+ * `partitionKeyColumn` on `table` (already created/present on `shardId`) is
+ * backed by a UNIQUE constraint or is the table's SOLE primary-key column.
+ * /v1/table-scan's per-shard JOIN against __cf_row_owners matches purely on
+ * partition-key VALUE (see the /tenant-scan-page comment in shard.ts) — if
+ * the column isn't guaranteed unique, two different tenants' rows can share a
+ * value and the join would attribute both rows to whichever tenant currently
+ * owns that key in __cf_row_owners, leaking one tenant's row to another. A
+ * composite PRIMARY KEY where partitionKeyColumn is only one part is NOT
+ * sufficient — the value alone must be guaranteed unique on its own. Checked
+ * against a single representative shard: schema is uniform across shards for
+ * a table by construction, so one check suffices — but that "by construction"
+ * guarantee only actually holds for a caller that JUST pushed the identical
+ * DDL to every shard in this same request (currently, only
+ * /admin/create-table). A caller that reaches a table via a live probe
+ * against whatever ALREADY physically exists (/admin/register-table,
+ * /admin/set-partition-key-column) cannot assume uniformity — the table may
+ * have been created outside this system's own DDL-push path, with per-shard
+ * schema drift — and must use checkPartitionKeyUniqueAcrossShards below
+ * instead of calling this function directly against one shard. Fails closed
+ * (false) on any introspection error — callers must treat "unable to verify"
+ * as "not safe to scan", matching table_rules.partition_key_unique's
+ * fail-closed default.
+ *
+ * Round 3 addition: plain uniqueness alone is still not sufficient — see
+ * partitionKeyColumnHasBinaryCollation's doc comment (in this file) /
+ * handleProbePartitionKeyCollation's doc comment (in shard.ts) for why the
+ * column's real collation must ALSO be BINARY, and why that's now checked via
+ * an empirical probe instead of DDL-text-parsing.
+ *
+ * Structure (round 3): the collation probe tests the column's actual runtime
+ * behavior directly against the real table, independent of which specific
+ * unique-enforcing mechanism (sole PK vs. unique index) the column happens to
+ * have — so there's no need to run it once per candidate index the way the
+ * old per-path DDL-text lookups did. This function first determines, via the
+ * existing PRAGMA-based checks, whether SOME qualifying uniqueness mechanism
+ * exists at all (sole PK, or a single-column non-partial unique index), and
+ * only if one does, runs the collation probe ONCE as a final gate.
+ *
+ * Round 5 addition (SCOPE RESTRICTION, not a probe): even a BINARY-collated,
+ * genuinely unique INTEGER/NUMERIC/REAL-affinity column is still not safe to
+ * scan, because /tenant-scan-page's bare `WHERE pkCol = ?` predicate goes
+ * through SQLite's numeric type-affinity comparison rules, not a byte-for-byte
+ * text comparison. On a genuine `INTEGER PRIMARY KEY` (rowid alias) column,
+ * `WHERE id = '01'`, `WHERE id = '1'`, and `WHERE id = '1.0'` all match the
+ * SAME physical row — three different literal strings, each of which could
+ * get its OWN separate __cf_row_owners entry (possibly owned by different
+ * tenants), all coercing to one physical row. Unlike collation (three known,
+ * enumerable built-in values), the representation-ambiguity space for numeric
+ * strings is unbounded (leading zeros, leading '+', decimal points,
+ * exponents, "0x..", etc.) — the same shape of problem that made DDL-text
+ * parsing for collation detection unwinnable in rounds 1-3. Rather than try
+ * to probe around an open-ended space, table-scan eligibility is restricted
+ * outright to TEXT-affinity (and BLOB-affinity, since BLOB is always compared
+ * byte-for-byte with no numeric coercion — `__cf_row_owners.partition_key`
+ * itself is TEXT and the canonical key is always bound as a string, so a BLOB
+ * partition-key column round-trips exactly the same way a TEXT one does)
+ * partition-key columns. This check runs BEFORE the uniqueness/collation
+ * checks below — it's a fast, purely-declarative read of the `table_info`
+ * PRAGMA already fetched above, so there's no reason to pay for the
+ * shard-round-trip collation probe on a column that's disqualified
+ * regardless. */
+async function checkPartitionKeyUnique(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
+  const tableInfoRes = await routeToShard(env, shardId, "/execute", {
+    sql: `PRAGMA table_info("${table}")`,
+    requestId: `partition-key-unique-tableinfo-${table}-${crypto.randomUUID()}`,
+    isMutation: false,
+  });
+  if (!tableInfoRes.ok) return false;
+  const tableInfoBody = (await tableInfoRes.json()) as { rows?: Array<{ name: string; type: string; pk: number }> };
+  const columns = tableInfoBody.rows ?? [];
+
+  const pkColumn = columns.find((c) => c.name === partitionKeyColumn);
+  if (!pkColumn) return false; // column doesn't exist on this shard's table — can't verify anything about it.
+
+  const affinity = sqliteTypeAffinity(pkColumn.type);
+  if (affinity !== "TEXT" && affinity !== "BLOB") return false;
+
+  const pkColumns = columns.filter((c) => c.pk !== 0);
+
+  let uniquenessConfirmed = pkColumns.length === 1 && pkColumns[0].name === partitionKeyColumn;
+
+  if (!uniquenessConfirmed) {
+    const indexListRes = await routeToShard(env, shardId, "/execute", {
+      sql: `PRAGMA index_list("${table}")`,
+      requestId: `partition-key-unique-indexlist-${table}-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    if (!indexListRes.ok) return false;
+    const indexListBody = (await indexListRes.json()) as { rows?: Array<{ name: string; unique: number }> };
+    const uniqueIndexes = (indexListBody.rows ?? []).filter((i) => i.unique === 1);
+    for (const idx of uniqueIndexes) {
+      const indexInfoRes = await routeToShard(env, shardId, "/execute", {
+        sql: `PRAGMA index_info("${idx.name}")`,
+        requestId: `partition-key-unique-indexinfo-${table}-${idx.name}-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!indexInfoRes.ok) continue;
+      const indexInfoBody = (await indexInfoRes.json()) as { rows?: Array<{ name: string }> };
+      const idxColumns = indexInfoBody.rows ?? [];
+      if (idxColumns.length !== 1 || idxColumns[0].name !== partitionKeyColumn) {
+        continue;
+      }
+      if (await uniqueIndexIsPartial(env, shardId, idx.name)) {
+        // Partial index — not sufficient on its own. Keep checking other
+        // unique indexes rather than giving up immediately, in case a later
+        // (non-partial) unique index on this same column also exists.
+        continue;
+      }
+      uniquenessConfirmed = true;
+      break;
+    }
+  }
+
+  if (!uniquenessConfirmed) return false;
+
+  // Single collation gate, run once regardless of which mechanism above
+  // confirmed uniqueness — see this function's doc comment for why one probe
+  // suffices now that it tests the column's actual behavior directly.
+  return await partitionKeyColumnHasBinaryCollation(env, shardId, table, partitionKeyColumn);
+}
+
+/** PR review round 12 (P1 fix): checkPartitionKeyUnique's "schema is uniform
+ * across shards by construction, so one representative shard suffices"
+ * assumption only actually holds for /admin/create-table, which just pushed
+ * the identical DDL to every shard in this same request. /admin/register-table
+ * (via its own live probe) and /admin/set-partition-key-column can both run
+ * against a table that reached this system some other way — a legacy table,
+ * or one created by an external/manual process — with no guarantee every
+ * shard's copy of the table agrees. If shard A genuinely has the unique
+ * constraint but shard B (same table name) doesn't, checking only shard A and
+ * setting partition_key_unique=1 globally would let /v1/table-scan query
+ * shard B — which has no real uniqueness enforcement — and return
+ * duplicate-partition-key rows under the wrong tenant.
+ *
+ * Runs checkPartitionKeyUnique against EVERY shard in `shardIds` in parallel
+ * (bounded via batchedMap, matching this file's existing shard-fan-out
+ * convention) and returns true only if ALL of them independently confirm
+ * uniqueness + BINARY collation. If any shard disagrees, or is unreachable,
+ * the overall result is false — fail-closed, consistent with
+ * checkPartitionKeyUnique's own philosophy. Callers that CAN guarantee
+ * uniformity by construction (currently, only /admin/create-table) should
+ * keep calling checkPartitionKeyUnique directly against their own
+ * just-created representative shard instead of this wrapper, to avoid paying
+ * for redundant checks against shards whose schema is already known to
+ * match. */
+async function checkPartitionKeyUniqueAcrossShards(
+  env: Env,
+  shardIds: string[],
+  table: string,
+  partitionKeyColumn: string,
+): Promise<boolean> {
+  const results = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, (shardId) =>
+    checkPartitionKeyUnique(env, shardId, table, partitionKeyColumn),
+  );
+  return results.every((result) => result === true);
 }
 
 async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
@@ -278,6 +640,31 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
   }
   if (isDangerousSchema(body.schema)) {
     return json({ error: "schema statement not permitted." }, 403);
+  }
+  // PR review round 12 (P1 fix): round 11's whole "schema_sql can only be
+  // trustworthy via create-table's atomic push-then-verify flow" fix assumed
+  // this route's OWN schema push and its subsequent uniqueness verification
+  // always correspond. IF NOT EXISTS breaks that: if body.table already
+  // physically existed (with some OTHER, possibly different schema) on one
+  // or more shards, the DDL push below silently no-ops there, and the
+  // verification that runs afterward reflects whatever was ALREADY live —
+  // unrelated to body.schema's content — while table_rules.schema_sql still
+  // gets stored as the submitted (possibly never-actually-applied) text.
+  // Rejecting IF NOT EXISTS outright converts that silent divergence into a
+  // loud, obvious failure: a genuinely new table still gets created normally
+  // via a plain CREATE TABLE; a colliding one now fails loudly with SQLite's
+  // own "table already exists" error instead of silently no-opping.
+  if (/if\s+not\s+exists/i.test(body.schema)) {
+    return json(
+      {
+        error: {
+          code: "SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED",
+          message: "schema must not use IF NOT EXISTS.",
+          fix: "/admin/create-table requires the table not already exist; use /admin/register-table for an existing table, or resolve the naming conflict first.",
+        },
+      },
+      400,
+    );
   }
 
   const schemaTableName = extractCreateTableName(body.schema);
@@ -370,13 +757,39 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     }
   }
 
+  // Codex P1 fix: verify partitionKeyColumn is UNIQUE/PRIMARY KEY on the
+  // table just created, so /v1/table-scan can later be safely allowed for it
+  // (see checkPartitionKeyUnique's doc comment). Checked against the same
+  // representative shard as the column-exists check above.
+  const partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], body.table, body.partitionKeyColumn);
+
   const registerResults = await fanOutToAllCatalogs(
     env,
     "/register-table",
     // schemaSql: Milestone 3, Chunk 5 — captured so migration backfill can
     // provision this table on a shard created after this fan-out ran (e.g.
     // a split target).
-    () => ({ table: body.table, partitioning: body.partitioning, partitionKeyColumn: body.partitionKeyColumn, schemaSql: body.schema }),
+    //
+    // PR review round 11 (P2 fix): no longer sends provenanceComplete: true.
+    // The DDL above is CREATE TABLE IF NOT EXISTS — if `body.table` already
+    // physically existed (e.g. this call is re-creating a table name that
+    // collides with pre-existing legacy data), the DDL silently no-ops, but
+    // this fan-out used to certify provenance_complete=1 unconditionally
+    // regardless, hiding any of that legacy table's rows never covered by
+    // __cf_row_owners behind a false `provenance.complete: true` on
+    // /v1/table-scan. A genuinely brand-new (empty) table now starts at 0
+    // like any other table; its first /admin/backfill-provenance run
+    // trivially finds zero orphaned/ambiguous rows (nothing to scan) and
+    // certifies it complete through the normal mechanism — same end state
+    // for the legitimate case, one extra (cheap, near-no-op) admin call, no
+    // false-positive risk for a colliding table name.
+    () => ({
+      table: body.table,
+      partitioning: body.partitioning,
+      partitionKeyColumn: body.partitionKeyColumn,
+      schemaSql: body.schema,
+      partitionKeyUnique,
+    }),
     request.headers.get("authorization") ?? undefined,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register table.");
@@ -431,10 +844,21 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
     );
   }
 
+  // Codex P1 fix: this is the OTHER place a table's partitionKeyColumn is
+  // established (for tables carrying the __unset__ sentinel from before this
+  // validation existed) — same verification as /admin/create-table, since a
+  // stale "unique" flag for a PREVIOUS partitionKeyColumn must never carry
+  // forward to a newly-set one.
+  // PR review round 12 (P1 fix): unlike /admin/create-table, this route's
+  // table isn't guaranteed uniform across shards by construction — see
+  // checkPartitionKeyUniqueAcrossShards's doc comment. Every shard must
+  // independently confirm uniqueness.
+  const partitionKeyUnique = await checkPartitionKeyUniqueAcrossShards(env, shardIds, body.table, body.partitionKeyColumn);
+
   const results = await fanOutToAllCatalogs(
     env,
     "/set-partition-key-column",
-    () => body,
+    () => ({ ...body, partitionKeyUnique }),
     request.headers.get("authorization") ?? undefined,
   );
   const failed = firstCatalogFanOutFailure(results, "Failed to update partitionKeyColumn on one or more catalog shards.");
@@ -1020,6 +1444,13 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
   let attributed = 0;
   const ambiguous: AmbiguousRow[] = [];
   const orphaned: OrphanedRow[] = [];
+  // Tenant-scoped table scan: every table_name this run actually scanned
+  // (across every catalog shard processed), used below to flip
+  // table_rules.provenance_complete for the ones that came out clean. Only
+  // meaningful when catalogShardId was omitted (a genuinely full-cluster
+  // run) — a scoped single-catalog-shard run doesn't see every shard pool a
+  // table's rows could live in, so it can't certify completeness.
+  const scannedTableNames = new Set<string>();
 
   for (const catalogShardId of catalogShardIds) {
     const [tablesRes, tenantsRes, vbMapRes, shardsRes] = await Promise.all([
@@ -1042,6 +1473,7 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
     const tables = ((await tablesRes.json()) as { tables: Array<{ table_name: string; partition_key_column: string }> }).tables.filter(
       (t) => t.partition_key_column !== UNSET_PARTITION_KEY_COLUMN,
     );
+    for (const t of tables) scannedTableNames.add(t.table_name);
     const tenantIds = ((await tenantsRes.json()) as { tenantIds: string[] }).tenantIds;
     const vbMapBody = (await vbMapRes.json()) as { totalVBuckets: number; map: Array<{ vbucket: number; shardId: string }> };
     const totalVBuckets = vbMapBody.totalVBuckets;
@@ -1053,6 +1485,42 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
         const pkCol = table.partition_key_column;
         const safeTable = `"${table.table_name}"`;
         const safePk = `"${pkCol}"`;
+
+        // PR review round 8 (P2): distinguish "table not physically present
+        // on this shard" (a registered-but-never-created table_rules entry
+        // — e.g. /admin/register-table registers metadata only, with no
+        // physical DDL; see index.test.ts's column_mismatch_evt regression
+        // test) from a GENUINE scan-query failure (a malformed query, a
+        // missing/renamed partition-key column, etc). The old code inferred
+        // "absent" from the scan query itself failing (`!pageRes.ok`), which
+        // treated a real error identically to the legitimate skip case: the
+        // table stayed in scannedTableNames with nothing recorded in
+        // orphaned/ambiguous, so it could still get certified
+        // provenance_complete even though this shard's rows for it were
+        // never actually checked — hiding a false "provenance.complete:
+        // true" behind /v1/table-scan. Same fix pattern as f585f9b's
+        // /tenant-scan-page fix in shard.ts: probe existence via PRAGMA
+        // table_info first (never throws for a missing table, just returns
+        // zero rows), then run the real query uncaught below — so a genuine
+        // failure now fails the WHOLE /admin/backfill-provenance request
+        // instead of being silently treated as "table absent" and certified
+        // complete.
+        const probeRes = await routeToShard(env, shardId, "/execute", {
+          sql: `PRAGMA table_info(${safeTable})`,
+          requestId: `backfill-provenance-probe-${catalogShardId}-${shardId}-${table.table_name}-${crypto.randomUUID()}`,
+          isMutation: false,
+        });
+        if (!probeRes.ok) {
+          return new Response(probeRes.body, { status: probeRes.status, headers: probeRes.headers });
+        }
+        const probeBody = (await probeRes.json()) as { rows?: unknown[] };
+        if ((probeBody.rows ?? []).length === 0) {
+          // Legitimate skip: table_rules entry with no physical table on
+          // this shard yet.
+          log("worker.provenance_scan_skipped", { catalogShardId, shardId, table: table.table_name });
+          continue;
+        }
+
         let afterPk = "";
         for (;;) {
           const pageRes = await routeToShard(env, shardId, "/execute", {
@@ -1068,13 +1536,13 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
             isMutation: false,
           });
           if (!pageRes.ok) {
-            // A table_rules entry doesn't guarantee a physical table exists
-            // on every shard (e.g. /admin/register-table registers metadata
-            // only, with no physical DDL — see index.test.ts's
-            // column_mismatch_evt regression test) — skip rather than fail
-            // the whole multi-shard/multi-table run over one such entry.
-            log("worker.provenance_scan_skipped", { catalogShardId, shardId, table: table.table_name });
-            break;
+            // The table is confirmed to exist on this shard (probed above)
+            // — a failure here is a GENUINE SQL execution error (e.g. the
+            // partition key column was renamed/dropped out from under
+            // table_rules), not the "table absent" case. Fail the whole
+            // request rather than silently certifying possibly-unchecked
+            // data as provenance_complete.
+            return new Response(pageRes.body, { status: pageRes.status, headers: pageRes.headers });
           }
           const pageBody = (await pageRes.json()) as { rows?: Array<{ pk: unknown }> };
           const pks = pageBody.rows ?? [];
@@ -1103,6 +1571,31 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
         }
       }
     }
+  }
+
+  // Tenant-scoped table scan: only a genuinely full-cluster run (catalogShardId
+  // omitted) can certify a table's provenance complete — a scoped run only
+  // ever sees one catalog shard's own shard pool, which may leave other
+  // catalog shards' pools (and therefore other rows of the same table) unseen.
+  if (!body.catalogShardId) {
+    const orphanedTables = new Set(orphaned.map((o) => o.table));
+    const ambiguousTables = new Set(ambiguous.map((a) => a.table));
+    const completeTables = Array.from(scannedTableNames).filter(
+      (t) => !orphanedTables.has(t) && !ambiguousTables.has(t),
+    );
+    const markOutcomes = await Promise.all(
+      completeTables.map(async (tableName) => {
+        const markResults = await fanOutToAllCatalogs(
+          env,
+          "/mark-table-provenance-complete",
+          () => ({ table: tableName }),
+          authorization,
+        );
+        return firstCatalogFanOutFailure(markResults, `Failed to mark ${tableName} provenance complete.`);
+      }),
+    );
+    const firstMarkFailed = markOutcomes.find((failed) => failed !== null);
+    if (firstMarkFailed) return firstMarkFailed;
   }
 
   return json({ attributed, ambiguous, orphaned });
@@ -2418,6 +2911,488 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   return json({ rows });
 }
 
+const DEFAULT_TABLE_SCAN_LIMIT = 100;
+const MAX_TABLE_SCAN_LIMIT = 500;
+
+/** Opaque cursor shape for POST /v1/table-scan: one afterPartitionKey per
+ * shard in the tenant's catalog shard's pool at the time this cursor was
+ * issued. A shard with no entry (either because the cursor predates it, or
+ * because a fresh scan hasn't touched it yet) starts at "" — scan from the
+ * beginning. `table` binds the cursor to the table it was issued against
+ * (Codex-found P2 fix: without it, a cursor from scanning table A could be
+ * silently accepted as valid resume positions against table B for the same
+ * tenant, skipping/reordering table B's own rows) — handleV1TableScan rejects
+ * a cursor whose `table` doesn't match the current request's `table` with 400
+ * INVALID_CURSOR. Exported for direct unit testing of the encode/decode
+ * round-trip and the merge invariant, independent of the HTTP route. */
+export type TableScanCursor = { table: string; shardCursors: Record<string, string> };
+
+/** Base64-JSON encode, UTF-8-safe (partition keys are arbitrary strings, so a
+ * plain btoa() over the raw JSON string would throw on non-Latin1 input). */
+export function encodeTableScanCursor(cursor: TableScanCursor): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(cursor));
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+/** Decodes a client-supplied cursor. Returns null for anything that fails to
+ * base64/JSON-decode or doesn't have the expected shape — the caller turns
+ * that into 400 INVALID_CURSOR rather than guessing at a partial cursor
+ * (client-supplied input the Worker never itself produced this way is
+ * otherwise unvalidated). `table` is required (Codex-found P2 fix — see
+ * TableScanCursor's doc comment); a cursor encoded before this field existed
+ * has no back-compat path and is rejected the same as any other malformed
+ * cursor, since this branch hasn't shipped yet. Does NOT check the shard-id
+ * keys against the current active shard set, or `table` against the current
+ * request's table — those require values only the caller has (the live shard
+ * list, and the request body), checked separately once it has them. */
+export function decodeTableScanCursor(raw: string): TableScanCursor | null {
+  try {
+    const binary = atob(raw);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      "table" in parsed &&
+      typeof (parsed as { table: unknown }).table === "string" &&
+      "shardCursors" in parsed &&
+      (parsed as { shardCursors: unknown }).shardCursors !== null &&
+      typeof (parsed as { shardCursors: unknown }).shardCursors === "object" &&
+      !Array.isArray((parsed as { shardCursors: unknown }).shardCursors) &&
+      Object.values((parsed as { shardCursors: Record<string, unknown> }).shardCursors).every((v) => typeof v === "string")
+    ) {
+      return { table: (parsed as TableScanCursor).table, shardCursors: (parsed as TableScanCursor).shardCursors };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compares two strings the way SQLite's default BINARY collation does: a
+ * byte-by-byte comparison of their UTF-8 encoding. JS's native `<`/`>`
+ * compares UTF-16 code units instead, which diverges from UTF-8 byte order
+ * for non-BMP Unicode (surrogate-pair) characters relative to certain BMP
+ * characters — e.g. U+E000 sorts before U+10000 in UTF-8 bytes but AFTER it
+ * under naive UTF-16 code-unit comparison. Table-scan pagination depends on
+ * matching SQLite's actual `ORDER BY partition_key` order exactly (see
+ * /tenant-scan-page's `ORDER BY partition_key ASC` / `partition_key > ?` in
+ * shard.ts, which run under SQLite's default BINARY collation), since a
+ * mismatch can silently skip a row the cursor advances past. Returns <0, 0,
+ * or >0, matching the memcmp/strcmp convention Array.prototype.sort expects. */
+export function compareBinaryCollation(a: string, b: string): number {
+  const encoder = new TextEncoder();
+  const bytesA = encoder.encode(a);
+  const bytesB = encoder.encode(b);
+  const len = Math.min(bytesA.length, bytesB.length);
+  for (let i = 0; i < len; i++) {
+    if (bytesA[i] !== bytesB[i]) return bytesA[i] - bytesB[i];
+  }
+  return bytesA.length - bytesB.length;
+}
+
+type ShardScanPage = {
+  shardId: string;
+  rows: Array<{ partitionKey: string; row: Record<string, unknown> }>;
+  // Both optional, defaulting to `rows.length` / undefined below, purely so
+  // the many pre-existing unit tests below that construct pages by hand
+  // (modelling "no skips occurred this call") don't all need updating — every
+  // real caller (handleV1TableScan) always supplies both, straight off the
+  // shard's response.
+  ownerRowsScanned?: number;
+  lastOwnerKeyScanned?: string;
+};
+
+/** Merges every shard's page into one ascending-by-partition_key result
+ * (ties broken by shardId ascending — see criterion 2/the merge spec),
+ * truncates to `overallLimit`, and computes the next per-shard cursor map per
+ * TWO composed invariants (Codex round-4 fix: the second one below is new;
+ * the first already existed and must keep working unchanged):
+ *
+ *  (a) never advance a shard's cursor past the last OWNER key it actually
+ *      scanned (`lastOwnerKeyScanned`) — but only once that shard's owner
+ *      query fully consumed its LIMIT (`ownerRowsScanned === perShardLimit`);
+ *      short of that, the shard is genuinely exhausted and there's nothing
+ *      to bound.
+ *  (b) never advance a shard's cursor past the partition_key of the LAST ROW
+ *      FROM THAT SHARD actually kept in the truncated response — never to a
+ *      row that was fetched but then cut by the overall-limit truncation, so
+ *      the next call re-fetches (never skips) it.
+ *
+ * These are NOT simply composed by taking whichever position is earlier
+ * (round-5 fix: that was the original, INCORRECT composition — see the inline
+ * comment above invariant (a)'s loop for why). Instead, per shard: if it
+ * fetched zero rows this batch, or every row it fetched survived truncation,
+ * (a) is free to advance the cursor past (b)'s position, all the way to
+ * `lastOwnerKeyScanned`; if cross-shard truncation cut some (but not all) of
+ * what it fetched, (a) must leave (b)'s bound untouched. (b) alone is what let
+ * a skipped owner row (base row deleted between the shard's two queries — see
+ * /tenant-scan-page) silently look like shard exhaustion, because it only
+ * ever looked at rows the shard actually *delivered*, never how far it had
+ * *scanned* — and naively letting (a) always win whenever it's later would
+ * skip a row truncated away by the cross-shard merge. Composing them
+ * correctly handles both failure modes without either one masking the other.
+ * Exported (and kept side-effect-free) for direct unit testing of the
+ * merge/truncate/exhaustion invariants — the largest risk item per the
+ * spec. */
+export function mergeTableScanPages(
+  pages: ShardScanPage[],
+  overallLimit: number,
+  perShardLimit: number,
+  priorShardCursors: Record<string, string>,
+): { rows: Array<Record<string, unknown>>; nextShardCursors: Record<string, string> | null } {
+  type Entry = { shardId: string; partitionKey: string; row: Record<string, unknown> };
+  const all: Entry[] = [];
+  for (const page of pages) {
+    for (const r of page.rows) all.push({ shardId: page.shardId, partitionKey: r.partitionKey, row: r.row });
+  }
+  all.sort((a, b) => {
+    const pkCmp = compareBinaryCollation(a.partitionKey, b.partitionKey);
+    if (pkCmp !== 0) return pkCmp;
+    return a.shardId < b.shardId ? -1 : a.shardId > b.shardId ? 1 : 0;
+  });
+  const truncated = all.slice(0, overallLimit);
+
+  // Every shard this call touched keeps a cursor entry — either the prior
+  // value (untouched, or every one of its rows got truncated away) or an
+  // advanced one (some of its rows made the cut). A shard silently dropped
+  // from the map would restart from "" next time, re-scanning from the
+  // beginning instead of resuming — that's wasteful, not lossy, but still
+  // wrong, so every fanned-out shard gets an explicit entry.
+  const nextShardCursors: Record<string, string> = { ...priorShardCursors };
+  for (const page of pages) {
+    if (!(page.shardId in nextShardCursors)) nextShardCursors[page.shardId] = "";
+  }
+  // Invariant (b): never advance past the last row from a shard actually
+  // kept in the truncated response.
+  for (const entry of truncated) {
+    const current = nextShardCursors[entry.shardId] ?? "";
+    if (compareBinaryCollation(entry.partitionKey, current) > 0) nextShardCursors[entry.shardId] = entry.partitionKey;
+  }
+  // Invariant (a): a shard whose owner query fully consumed its LIMIT may
+  // hold more owner rows beyond this batch, and it's safe to resume scanning
+  // past everything it already scanned (lastOwnerKeyScanned) — but ONLY once
+  // we know invariant (b) isn't holding the cursor back on purpose. There are
+  // two genuinely different reasons a shard can end up with zero of its rows
+  // in `truncated` this round, and they demand opposite treatment (round-5
+  // fix: the composition below used to always take whichever of (a)/(b) was
+  // EARLIER, which silently assumed every such case was the first one):
+  //
+  //  (A) cross-shard truncation cut rows this shard DID fetch, because other
+  //      shards' rows sorted earlier — invariant (b) is already correctly
+  //      pinning the cursor at the last row this shard actually got to keep
+  //      (or its untouched prior cursor, if none survived), so those cut
+  //      rows get re-fetched, not skipped, next call. (a) must not loosen
+  //      that bound.
+  //  (B) every owner key in this shard's OWN batch resolved to zero rows —
+  //      e.g. every one of their base rows was deleted between
+  //      /tenant-scan-page's two queries (see shard.ts). There is nothing
+  //      fetched to hold back for, and since lastOwnerKeyScanned is always
+  //      >= the prior cursor (the owner query is `partition_key > prior`),
+  //      "the earlier of (a)/(b)" always picks the untouched prior cursor in
+  //      this case — the cursor never advances, the next call re-issues the
+  //      identical query, and the scan stalls forever instead of finishing.
+  //
+  // page.rows.length (what THIS shard itself fetched, before the cross-shard
+  // merge/truncate step) vs. how many of that shard's rows survived into
+  // `truncated` is what tells the two cases apart.
+  const deliveredCountByShard: Record<string, number> = {};
+  for (const entry of truncated) {
+    deliveredCountByShard[entry.shardId] = (deliveredCountByShard[entry.shardId] ?? 0) + 1;
+  }
+  for (const page of pages) {
+    const ownerRowsScanned = page.ownerRowsScanned ?? page.rows.length;
+    if (ownerRowsScanned < perShardLimit) continue; // genuinely exhausted; nothing to bound
+    if (page.lastOwnerKeyScanned === undefined) continue;
+    const current = nextShardCursors[page.shardId] ?? "";
+    if (page.rows.length === 0) {
+      // Case (B): this shard fetched nothing at all, so invariant (b) never
+      // touched it (there's no entry of its in `truncated` either way).
+      // Nothing to hold back for — always safe, and necessary, to advance
+      // past everything scanned.
+      if (compareBinaryCollation(page.lastOwnerKeyScanned, current) > 0) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+      continue;
+    }
+    const deliveredCount = deliveredCountByShard[page.shardId] ?? 0;
+    if (deliveredCount < page.rows.length) {
+      // Case (A): some of what this shard fetched was cut by cross-shard
+      // truncation. Leave invariant (b)'s bound exactly as computed.
+      continue;
+    }
+    // Everything this shard fetched made it into the response — safe to
+    // advance past a trailing skipped-owner-row gap beyond the last
+    // delivered row too.
+    if (compareBinaryCollation(page.lastOwnerKeyScanned, current) > 0) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+  }
+
+  // nextCursor must be present whenever there's ANY reason to believe more
+  // rows exist beyond what was just returned:
+  //  - the OVERALL merge truncated away some fetched-but-unreturned rows
+  //    (a real bug found during implementation: a shard can return fewer
+  //    than its OWN perShardLimit — correctly signalling that shard has
+  //    nothing further beyond what it fetched — while still having had one
+  //    of ITS OWN fetched rows cut by the overall-limit truncation, because
+  //    another shard's rows sorted earlier. Checking only "did any shard hit
+  //    its own per-shard cap" misses this and silently drops the cut row —
+  //    its cursor legitimately didn't advance past it, but with no
+  //    nextCursor the client never calls again to pick it up), OR
+  //  - any single shard's owner-row query fully consumed its LIMIT
+  //    (`ownerRowsScanned === perShardLimit` — Codex round-4 fix: this used
+  //    to check `page.rows.length >= perShardLimit`, the count of rows
+  //    actually resolved/returned, which a single skipped owner row — its
+  //    base row deleted between /tenant-scan-page's two queries — could pull
+  //    below perShardLimit even though the owner query's LIMIT was fully
+  //    consumed and __cf_row_owners may hold more keys beyond this batch).
+  const anyRowsTruncatedAway = all.length > truncated.length;
+  const anyShardMayHaveMore = anyRowsTruncatedAway || pages.some((page) => (page.ownerRowsScanned ?? page.rows.length) >= perShardLimit);
+  return {
+    rows: truncated.map((e) => e.row),
+    nextShardCursors: anyShardMayHaveMore ? nextShardCursors : null,
+  };
+}
+
+/** Milestone 4 (tenant-scoped table scan). Lists a tenant's own rows in a
+ * registered table, cursor-paginated, with no arbitrary filters — the query
+ * is mechanically constructed (table + tenantId + cursor + limit only),
+ * matching the safe-by-construction pattern /v1/mutate's compileMutation
+ * already established for writes, rather than the raw-SQL pattern that
+ * failed for the old (pre-Milestone-3) tenant read path. This is the direct
+ * replacement for that removed capability: /v1/index-query only supports
+ * exact-tuple lookups, and there was otherwise no way for a tenant to
+ * enumerate its own rows without already knowing an indexed value. */
+async function handleV1TableScan(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { tenantId?: string; table?: string; limit?: number; cursor?: string | null };
+  // Codex-found P2 fix: truthiness alone let a type-confused table (e.g.
+  // `{}`, which is truthy) slip past this gate and reach normalizeTableName's
+  // .trim() call below, crashing with an unhandled TypeError before
+  // authentication even runs (auth happens later, via /lookup-table-scan).
+  // Validating the type here, not just presence, closes that unauthenticated
+  // crash.
+  if (typeof body.tenantId !== "string" || !body.tenantId || typeof body.table !== "string" || !body.table) {
+    return json({ error: { code: "MISSING_FIELDS", message: "Missing tenantId or table.", fix: "Provide both tenantId and table." } }, 400);
+  }
+  // Codex P2 fix: reject non-integer/fractional/non-positive limits here too
+  // (previously only the upper bound was enforced) -- defense in depth so a
+  // malformed limit (e.g. 2.5) never even reaches a shard, where it used to
+  // trip SQLite's LIMIT binding and, before this fix's shard.ts change, get
+  // silently swallowed into a fake-empty {rows: []} instead of surfacing as
+  // a real error.
+  if (
+    body.limit !== undefined &&
+    (typeof body.limit !== "number" || !Number.isInteger(body.limit) || body.limit < 1 || body.limit > MAX_TABLE_SCAN_LIMIT)
+  ) {
+    return json(
+      {
+        error: {
+          code: "LIMIT_EXCEEDED",
+          message: `limit must be a positive integer no greater than ${MAX_TABLE_SCAN_LIMIT}.`,
+          fix: `Omit limit (default ${DEFAULT_TABLE_SCAN_LIMIT}) or pass an integer in [1, ${MAX_TABLE_SCAN_LIMIT}].`,
+        },
+      },
+      400,
+    );
+  }
+  const limit = Math.max(1, Math.min(MAX_TABLE_SCAN_LIMIT, body.limit ?? DEFAULT_TABLE_SCAN_LIMIT));
+
+  // Defense-in-depth (structurally unreachable in practice — table_rules
+  // should never contain a __cf_*/sqlite_* name — checked explicitly anyway,
+  // per the spec). Cheap and needs no network round trip, so it runs first.
+  // Codex P2 fix: isInternalTableName expects a NORMALIZED (unquoted,
+  // lowercased) name — passing the raw request value let a case variant
+  // (e.g. "SQLite_master", "__CF_row_owners") slip past this guard, the same
+  // bug class (case-sensitivity bypass of an internal-table guard) that took
+  // several review rounds to fully close on /v1/sql earlier in this
+  // project's history. normalizeTableName is the same normalization
+  // mutationTargetIsInternal already applies before its own
+  // isInternalTableName check, for consistency.
+  if (isInternalTableName(normalizeTableName(body.table))) {
+    return json(
+      {
+        error: {
+          code: "INTERNAL_TABLE_ACCESS_FORBIDDEN",
+          message: `Table ${body.table} is an internal system table and cannot be scanned.`,
+          fix: "Table scans are only available for tenant-registered tables.",
+        },
+      },
+      403,
+    );
+  }
+
+  // Syntactic cursor validation only — the semantic "shard-id keys are a
+  // subset of the CURRENT active shard set" check needs the live shard list,
+  // fetched below (topology can change between two calls).
+  let requestedCursor: TableScanCursor | null = null;
+  if (body.cursor) {
+    requestedCursor = decodeTableScanCursor(body.cursor);
+    if (!requestedCursor) {
+      return json(
+        {
+          error: {
+            code: "INVALID_CURSOR",
+            message: "cursor failed to decode.",
+            fix: "Omit cursor to restart the scan from the beginning.",
+          },
+        },
+        400,
+      );
+    }
+    // Codex-found P2 fix: a cursor carries resume positions for the table it
+    // was issued against — accepting it for a different table would let a
+    // tenant's cursor from scanning table A silently resume (and potentially
+    // skip/reorder) that tenant's own rows in table B.
+    if (requestedCursor.table !== body.table) {
+      return json(
+        {
+          error: {
+            code: "INVALID_CURSOR",
+            message: `cursor was issued for table "${requestedCursor.table}", not "${body.table}".`,
+            fix: "Omit cursor to restart the scan from the beginning, or resume it against the same table it was issued for.",
+          },
+        },
+        400,
+      );
+    }
+  }
+
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+
+  // Auth: identical tenant-token verification to /v1/index-query — reuses
+  // CatalogDO.checkTenantAuth via /lookup-table-scan (the same combined
+  // "auth + registry gate" role /lookup-index plays for /v1/index-query),
+  // rather than re-implementing the check here.
+  const lookupRes = await routeToCatalog(env, catalogShardId, "/lookup-table-scan", { table: body.table, tenantId: body.tenantId }, authorization);
+  if (!lookupRes.ok) {
+    return new Response(lookupRes.body, { status: lookupRes.status, headers: lookupRes.headers });
+  }
+  const lookupBody = (await lookupRes.json()) as { partitionKeyColumn: string; provenanceComplete: boolean };
+
+  // Fix (drain-completeness gap, found by 3 independent reviewers): a
+  // draining shard still physically holds its base rows until its vbuckets
+  // finish migrating (see CatalogDO.handleListShards's doc comment) -- a
+  // table-scan must SEE every existing row, exactly like
+  // handleAdminBackfillProvenance and the create-index backfill path already
+  // do, or it silently drops a draining shard's rows with no error at all.
+  // This can now surface the same row from both the draining shard and its
+  // migration target mid-flight -- an accepted, already-documented limitation
+  // (SPEC's Non-goals section: "Migration-window duplicates are inherited,
+  // not solved fresh"), not something this route dedupes.
+  const listRes = await routeToCatalog(env, catalogShardId, "/list-shards", { includeDraining: true }, authorization);
+  if (!listRes.ok) {
+    return new Response(listRes.body, { status: listRes.status, headers: listRes.headers });
+  }
+  const shardIds = ((await listRes.json()) as { shardIds: string[] }).shardIds;
+  if (shardIds.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet.", fix: "Call /admin/init first." } }, 400);
+  }
+
+  if (requestedCursor) {
+    const activeShardIdSet = new Set(shardIds);
+    const staleShardId = Object.keys(requestedCursor.shardCursors).find((id) => !activeShardIdSet.has(id));
+    if (staleShardId !== undefined) {
+      return json(
+        {
+          error: {
+            code: "INVALID_CURSOR",
+            message: `cursor names shard ${staleShardId}, which is no longer in this tenant's active shard set.`,
+            fix: "Omit cursor to restart the scan from the beginning.",
+          },
+        },
+        400,
+      );
+    }
+  }
+  const priorShardCursors = requestedCursor?.shardCursors ?? {};
+
+  const startedAt = Date.now();
+  const perShardLimit = Math.min(TENANT_SCAN_PAGE_SIZE, limit);
+
+  type ShardPageOutcome = {
+    shardId: string;
+    ok: boolean;
+    rows: Array<{ partitionKey: string; row: Record<string, unknown> }>;
+    ownerRowsScanned: number;
+    lastOwnerKeyScanned?: string;
+  };
+  const pageResults = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId): Promise<ShardPageOutcome> => {
+    const res = await routeToShard(env, shardId, "/tenant-scan-page", {
+      table: body.table,
+      partitionKeyColumn: lookupBody.partitionKeyColumn,
+      tenantId: body.tenantId,
+      afterPartitionKey: priorShardCursors[shardId] ?? "",
+      limit: perShardLimit,
+    });
+    if (!res.ok) return { shardId, ok: false, rows: [], ownerRowsScanned: 0 };
+    const resBody = (await res.json()) as {
+      rows?: Array<{ partitionKey: string; row: Record<string, unknown> }>;
+      ownerRowsScanned?: number;
+      lastOwnerKeyScanned?: string;
+    };
+    const rows = resBody.rows ?? [];
+    return {
+      shardId,
+      ok: true,
+      rows,
+      // Codex round-4 fix: ownerRowsScanned/lastOwnerKeyScanned are the
+      // shard's true __cf_row_owners scan position (see /tenant-scan-page),
+      // which mergeTableScanPages needs to detect shard exhaustion instead
+      // of inferring it from rows.length -- a single owner row skipped for a
+      // deleted base row must never look like exhaustion. The `?? rows.length`
+      // fallback only matters if an older/mismatched shard build omits the
+      // field; it reproduces the pre-fix (rows.length-based) inference rather
+      // than crashing.
+      ownerRowsScanned: resBody.ownerRowsScanned ?? rows.length,
+      lastOwnerKeyScanned: resBody.lastOwnerKeyScanned,
+    };
+  });
+
+  // Any shard failure fails the whole request — no silently-partial tenant
+  // data in this MVP (see the spec's "Non-goals: Partial-result mode").
+  const failed = pageResults.find((r) => !r.ok);
+  if (failed) {
+    return json(
+      {
+        error: {
+          code: "SHARD_UNREACHABLE",
+          shardId: failed.shardId,
+          message: `Shard ${failed.shardId} did not respond.`,
+          fix: "Retry — one or more shards did not respond.",
+        },
+      },
+      502,
+    );
+  }
+
+  const { rows, nextShardCursors } = mergeTableScanPages(
+    pageResults.map((r) => ({ shardId: r.shardId, rows: r.rows, ownerRowsScanned: r.ownerRowsScanned, lastOwnerKeyScanned: r.lastOwnerKeyScanned })),
+    limit,
+    perShardLimit,
+    priorShardCursors,
+  );
+
+  return json({
+    rows,
+    ...(nextShardCursors ? { nextCursor: encodeTableScanCursor({ table: body.table, shardCursors: nextShardCursors }) } : {}),
+    provenance: {
+      complete: lookupBody.provenanceComplete,
+      ...(lookupBody.provenanceComplete
+        ? {}
+        : {
+            fix: "Run POST /admin/backfill-provenance, then retry — some rows in this table have no owner recorded and are hidden from all scans until backfilled.",
+          }),
+    },
+    scan: {
+      catalogShardId,
+      shardCount: shardIds.length,
+      successCount: pageResults.length,
+      scanMs: Date.now() - startedAt,
+    },
+  });
+}
+
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
@@ -2528,6 +3503,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
   "/v1/index-query": handleV1IndexQuery,
+  "/v1/table-scan": handleV1TableScan,
   "/v1/scatter": handleV1Scatter,
 };
 

@@ -1,10 +1,10 @@
-import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+﻿import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { AUTH, initCluster, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
+import { ALL_TEST_SHARD_IDS, AUTH, initCluster, post, registerTenant, shardExecute, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -101,7 +101,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "events", schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY)" },
+      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY)" },
       AUTH(),
     );
     expect(res.status).toBe(400);
@@ -113,7 +113,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post("/admin/create-table", {
       table: "events",
-      schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY)",
+      schema: "CREATE TABLE events (id TEXT PRIMARY KEY)",
     });
     expect(res.status).toBe(401);
   });
@@ -138,6 +138,78 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(403);
   });
 
+  // PR review round 12 (P1 fix): round 11's whole "schema_sql can only be
+  // trustworthy via create-table's atomic push-then-verify flow" fix assumed
+  // this route's own schema push and its subsequent uniqueness verification
+  // always correspond — but IF NOT EXISTS breaks that assumption: if
+  // body.table already physically existed (with some OTHER schema) on one or
+  // more shards, the DDL silently no-ops there while table_rules.schema_sql
+  // still gets stored as the submitted (never-actually-applied) text.
+  // Rejecting IF NOT EXISTS outright converts that silent divergence into a
+  // loud, obvious 400.
+  it("rejects a schema containing IF NOT EXISTS (case-insensitive), instead of silently risking a no-op DDL push (PR review round 12 fix)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "ifnotexists_evt", schema: "CREATE TABLE IF NOT EXISTS ifnotexists_evt (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED");
+  });
+
+  it("rejects IF NOT EXISTS regardless of casing", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "ifnotexists_mixedcase_evt", schema: "create table if NOT exists ifnotexists_mixedcase_evt (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED");
+  });
+
+  it("still accepts a plain CREATE TABLE (no IF NOT EXISTS) — no regression", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "plain_create_evt", schema: "CREATE TABLE plain_create_evt (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  // Note: a LITERAL repeat of the exact same /admin/create-table call (same
+  // table, same shardId) is NOT the right way to exercise "table already
+  // exists" — that route's own per-shard requestId
+  // (`create-table-${table}-${shardId}`) is deliberately STABLE, so a
+  // verbatim retry replays its cached success by design (the same
+  // established idempotent-retry contract the rollback path's comment above
+  // describes), and rightly so — this fix doesn't touch that. The scenario
+  // round 12 actually closes is a table that already exists via some path
+  // OTHER than this exact call (a legacy table, or a genuine out-of-band
+  // creation) when /admin/create-table is invoked for it for the first time.
+  it("genuinely fails (SQLite's real 'table already exists' error) when the table already exists on a shard from something other than this exact /admin/create-table call, instead of a plain CREATE TABLE silently no-oping", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "create_table_collide_evt";
+
+    // Simulate the table already physically existing on one shard from some
+    // OTHER process (bypassing /admin/create-table entirely) — the same
+    // "legacy table" / "external process" scenario round 12's fix targets.
+    await shardExecute("catalog-0-shard-0", `CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
+
+    const res = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("Failed to create table");
+  });
+
   it("/admin/init requires an admin token at the Worker level (structural /admin/* gate)", async () => {
     const res = await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true });
     expect(res.status).toBe(401);
@@ -160,7 +232,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "quoted_regression_evt", schema: 'CREATE TABLE IF NOT EXISTS "quoted_regression_evt" (id TEXT PRIMARY KEY)', partitionKeyColumn: "id" },
+      { table: "quoted_regression_evt", schema: 'CREATE TABLE "quoted_regression_evt" (id TEXT PRIMARY KEY)', partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(200);
@@ -378,7 +450,7 @@ describe("Worker tenant authorization", () => {
     await initCluster();
     await post(
       "/admin/create-table",
-      { table: "other_tbl", schema: "CREATE TABLE IF NOT EXISTS other_tbl (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "other_tbl", schema: "CREATE TABLE other_tbl (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
 
@@ -534,22 +606,29 @@ describe("Worker /admin/set-partition-key-column", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      { table: "upgrade_me", schema: "CREATE TABLE IF NOT EXISTS upgrade_me (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "upgrade_me", schema: "CREATE TABLE upgrade_me (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
 
-    // Force catalog-0 back to the sentinel to simulate a pre-Chunk-1 table —
-    // the test tenant must route to catalog-0 specifically, since this seed
-    // is per-catalog-shard, not cluster-wide.
+    // Force EVERY catalog shard back to the sentinel to simulate a
+    // pre-Chunk-1 table. A real pre-migration table would carry the sentinel
+    // on all catalog shards alike (table_rules is fanned out identically to
+    // each of them at /admin/create-table time) — resetting only catalog-0
+    // would leave catalog-1/2/3 still holding the real "id" value from
+    // create-table above, and since PR review round 6 made
+    // /admin/set-partition-key-column a one-time unset->set upgrade, the
+    // fan-out below would then get rejected 409 PARTITION_KEY_ALREADY_SET on
+    // those three shards.
     const tenantId = tenantForCatalogShard(0, 4);
-    const id = env.CATALOG.idFromName("catalog-0");
-    const stub = env.CATALOG.get(id);
-    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
-      state.storage.sql.exec(
-        "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'upgrade_me'",
-      );
-    });
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'upgrade_me'",
+        );
+      });
+    }
 
     const token = await registerTenant(tenantId);
     const blockedRes = await post(
@@ -574,6 +653,936 @@ describe("Worker /admin/set-partition-key-column", () => {
       token,
     );
     expect(unblockedRes.status).toBe(200);
+  });
+
+  // PR review round 6: re-invoking this endpoint on a table that already has
+  // a real (non-sentinel) partition_key_column used to silently repoint
+  // table_rules, leaving __cf_row_owners' existing entries keyed under the
+  // OLD column's values — a stale-provenance cross-tenant leak surfaced via
+  // /tenant-scan-page. The endpoint is now a strictly one-time unset->set
+  // upgrade: a second call must be rejected 409 PARTITION_KEY_ALREADY_SET and
+  // must leave table_rules untouched.
+  it("rejects a second call against a table whose partition key column was already set via /admin/create-table, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "already_set_via_create",
+        schema: "CREATE TABLE already_set_via_create (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const res = await post(
+      "/admin/set-partition-key-column",
+      { table: "already_set_via_create", partitionKeyColumn: "email" },
+      AUTH(),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("PARTITION_KEY_ALREADY_SET");
+
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const partitionKeyColumn = await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key_column FROM table_rules WHERE table_name = ?", "already_set_via_create"),
+      ) as Array<{ partition_key_column: string }>;
+      return rows[0]?.partition_key_column;
+    });
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  it("rejects a second call against a table whose partition key column was already set via a prior /admin/set-partition-key-column upgrade, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "already_set_via_upgrade",
+        schema: "CREATE TABLE already_set_via_upgrade (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Simulate a legacy sentinel-tagged table (on every catalog shard — a
+    // real one would carry the sentinel on all of them alike) and legitimately
+    // upgrade it once via /admin/set-partition-key-column.
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'already_set_via_upgrade'",
+        );
+      });
+    }
+    const upgradeRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "already_set_via_upgrade", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(upgradeRes.status).toBe(200);
+
+    // A SECOND call — even to a different column — must now be rejected.
+    const res = await post(
+      "/admin/set-partition-key-column",
+      { table: "already_set_via_upgrade", partitionKeyColumn: "email" },
+      AUTH(),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("PARTITION_KEY_ALREADY_SET");
+
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const partitionKeyColumn = await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key_column FROM table_rules WHERE table_name = ?", "already_set_via_upgrade"),
+      ) as Array<{ partition_key_column: string }>;
+      return rows[0]?.partition_key_column;
+    });
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  // PR review round 11 (P1+P2 fundamental fix), test #5: this route's own
+  // live-shard probe is the OTHER place (besides /admin/register-table's) a
+  // table's partition_key_unique can flip to 1 independently of whatever
+  // schema_sql happens to be on file — it must null schema_sql in the SAME
+  // operation whenever it verifies uniqueness, since it can't guarantee the
+  // stored text corresponds to what it just checked live.
+  it("nulls out a previously-stored schema_sql when this call's own probe verifies partition_key_unique=1", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "setpkcol_nulls_schemasql_evt";
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: originalSchema, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+
+    // Overwrite schema_sql via /admin/register-table (hasSchemaSql=true —
+    // demotes partition_key_unique to 0, per round 10's unaffected behavior)
+    // so this test can prove the FOLLOW-UP set-partition-key-column call
+    // nulls it out rather than merely leaving it at its original value.
+    const overwrittenSchema = `CREATE TABLE ${table} (id TEXT, v TEXT, extra TEXT)`;
+    const overwriteRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: overwrittenSchema },
+      AUTH(),
+    );
+    expect(overwriteRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    expect(await readTableRulesSchemaSql(table)).toBe(overwrittenSchema);
+
+    // /admin/set-partition-key-column is a one-time '__unset__'-sentinel
+    // upgrade path only — reset to the sentinel so this call isn't rejected
+    // 409 PARTITION_KEY_ALREADY_SET before reaching the verification below.
+    await resetPartitionKeyColumnToSentinel(table, 4);
+
+    // The live shard's REAL schema (from /admin/create-table above) still has
+    // a genuine unique constraint on "id" — the probe verifies true.
+    const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(setRes.status).toBe(200);
+
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    // The fix: schema_sql is NULL now, not the stale overwrittenSchema this
+    // call's own probe has no way to vouch for.
+    expect(await readTableRulesSchemaSql(table)).toBeNull();
+  });
+});
+
+/** Reads a single table_rules boolean-flag column straight off catalog-0's own
+ * storage, keyed by table_name — used by tests below where the route's own
+ * response body doesn't echo the computed flag, so this is the only way to
+ * assert what actually landed. Column is restricted to the known flag columns
+ * (never client/test-supplied free text) since column names can't be
+ * parameterized in SQL. */
+async function readTableRulesColumn(
+  table: string,
+  column: "partition_key_unique" | "provenance_complete",
+): Promise<number | undefined> {
+  const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    const rows = Array.from(
+      state.storage.sql.exec(`SELECT ${column} FROM table_rules WHERE table_name = ?`, table),
+    ) as Array<Record<string, number>>;
+    return rows[0]?.[column];
+  });
+}
+
+/** Reads table_rules.partition_key_column straight off catalog-0's own
+ * storage, keyed by table_name — used to verify a rejected repoint left
+ * table_rules genuinely unchanged, not just that the HTTP response was a
+ * 409. */
+async function readTableRulesPartitionKeyColumn(table: string): Promise<string | undefined> {
+  const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    const rows = Array.from(
+      state.storage.sql.exec("SELECT partition_key_column FROM table_rules WHERE table_name = ?", table),
+    ) as Array<{ partition_key_column: string }>;
+    return rows[0]?.partition_key_column;
+  });
+}
+
+/** Resets `table_rules.partition_key_column` back to the '__unset__' sentinel
+ * across every catalog shard for `table` — used by tests that intentionally
+ * re-register a table under a DIFFERENT partitionKeyColumn to exercise some
+ * OTHER behavior entirely (e.g. the partitionKeyUnique trust-bypass fix
+ * below), where PR review round 7's /admin/register-table repoint guard
+ * would otherwise reject the second call with 409 PARTITION_KEY_ALREADY_SET
+ * before the test ever reaches what it's actually checking. Mirrors the
+ * inline reset already used by the /admin/set-partition-key-column upgrade
+ * test above. */
+async function resetPartitionKeyColumnToSentinel(table: string, numCatalogShards: number): Promise<void> {
+  for (let i = 0; i < numCatalogShards; i += 1) {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = ?", table);
+    });
+  }
+}
+
+// Codex-found P1 (re-review of the P1 fix): /admin/register-table used to
+// forward body.partitionKeyUnique straight into table_rules.partition_key_unique
+// with zero verification, letting a caller bypass checkPartitionKeyUnique
+// entirely by just asserting the flag. The Worker's handleAdminRegisterTable
+// must never read that field off the raw request — it computes it itself,
+// the same way /admin/create-table and /admin/set-partition-key-column do.
+describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1 fix)", () => {
+  async function readPartitionKeyUnique(table: string): Promise<number | undefined> {
+    return readTableRulesColumn(table, "partition_key_unique");
+  }
+
+  it("ignores a smuggled partitionKeyUnique: true when the column has no real unique constraint — computes 0 and still 409s /v1/table-scan", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_bypass_notuniq_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)`,
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // This test's actual target is partitionKeyUnique trust, not the repoint
+    // guard — reset to the sentinel first so re-registering under a
+    // DIFFERENT partitionKeyColumn ("user_id" instead of "id") isn't itself
+    // rejected 409 PARTITION_KEY_ALREADY_SET by PR review round 7's guard.
+    await resetPartitionKeyColumnToSentinel(table, 4);
+
+    // Re-register the same physical table, this time declaring partitionKeyColumn
+    // as the NON-unique "user_id" column, and smuggling partitionKeyUnique: true
+    // in the request body — this must be silently ignored, not trusted.
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "user_id", partitionKeyUnique: true },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    expect(await readPartitionKeyUnique(table)).toBe(0);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(409);
+    const scanBody = (await scanRes.json()) as { error: { code: string } };
+    expect(scanBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  it("computes partitionKeyUnique: 1 for a genuinely unique column with no client-supplied field at all", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_bypass_uniq_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`,
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // This test's actual target is partitionKeyUnique computation, not the
+    // repoint guard — reset to the sentinel first so re-registering under a
+    // DIFFERENT partitionKeyColumn ("user_id" instead of "id") isn't itself
+    // rejected 409 PARTITION_KEY_ALREADY_SET by PR review round 7's guard.
+    await resetPartitionKeyColumnToSentinel(table, 4);
+
+    // Re-register declaring partitionKeyColumn as the genuinely-UNIQUE
+    // "user_id" column — no partitionKeyUnique field supplied at all.
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "user_id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    expect(await readPartitionKeyUnique(table)).toBe(1);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
+  });
+
+  // Fix (P2, provenance trust gap found by Codex structured review):
+  // /admin/register-table already strips a client-supplied
+  // partitionKeyUnique (tested above) but used to forward provenanceComplete
+  // as-is -- a caller could claim {"provenanceComplete": true} for a table
+  // that never actually had a backfill run, making /v1/table-scan's
+  // provenance.complete field falsely report no legacy unattributed rows are
+  // hidden.
+  it("ignores a smuggled provenanceComplete: true for a table that was never actually backfilled — computes 0, not 1", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_bypass_provenance_evt";
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", provenanceComplete: true },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    expect(await readTableRulesColumn(table, "provenance_complete")).toBe(0);
+  });
+});
+
+// Coverage gap: catalog.ts's handleRegisterTable computes
+// `existing?.provenance_complete === 1 || body.provenanceComplete === true`
+// specifically so that re-registering an already-complete table (e.g. a
+// manual /admin/register-table call, which never sends provenanceComplete
+// itself) doesn't silently reset provenance_complete back to 0 via the
+// INSERT OR REPLACE below it. That monotonic-preserve behavior had zero test
+// coverage anywhere in the suite.
+describe("Worker /admin/register-table preserves provenance_complete across re-registration (catalog.ts monotonic fix)", () => {
+  async function readProvenanceComplete(table: string): Promise<number | undefined> {
+    return readTableRulesColumn(table, "provenance_complete");
+  }
+
+  it("keeps provenance_complete=1 after /admin/register-table is called again for an already-complete table, instead of resetting it to 0", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_provdone_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // PR review round 11 (P2 fix): /admin/create-table no longer
+    // auto-certifies provenance_complete=1 at creation (see this file's
+    // "Worker /admin/create-table no longer auto-certifies provenance_complete"
+    // describe block below) — a brand-new table now requires the normal
+    // /admin/backfill-provenance certification step like any other table.
+    // This test's actual target is the MONOTONIC PRESERVE behavior on
+    // re-registration, not create-table's own certification, so simulate an
+    // already-completed table the same way a real /admin/backfill-provenance
+    // run would leave it, directly via DO storage.
+    expect(await readProvenanceComplete(table)).toBe(0);
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE table_rules SET provenance_complete = 1 WHERE table_name = ?", table);
+    });
+    expect(await readProvenanceComplete(table)).toBe(1);
+
+    // A manual re-registration via /admin/register-table never sends
+    // provenanceComplete at all -- only the monotonic "preserve if already
+    // complete" logic in catalog.ts can be responsible for it staying 1.
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readProvenanceComplete(table)).toBe(1);
+  });
+
+  it("leaves provenance_complete=0 after re-registering a table that was never marked complete (no false positive from the preserve logic)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_provpending_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Simulate a legacy table that predates completeness tracking.
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE table_rules SET provenance_complete = 0 WHERE table_name = ?", table);
+    });
+    expect(await readProvenanceComplete(table)).toBe(0);
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readProvenanceComplete(table)).toBe(0);
+  });
+});
+
+// PR review round 11 (P2 fix): /admin/create-table used to set
+// provenanceComplete: true unconditionally when registering the table it
+// just created via CREATE TABLE IF NOT EXISTS — wrong when the table name
+// already physically existed (legacy rows predating row-provenance
+// tracking): the DDL silently no-ops, but the table got certified
+// provenance-complete anyway, hiding those legacy rows' absence from
+// __cf_row_owners behind a false `provenance.complete: true` on
+// /v1/table-scan. Fixed: create-table no longer auto-sets it — a newly
+// created table starts at 0 like any other table and earns certification
+// through the normal /admin/backfill-provenance mechanism (trivially, for a
+// genuinely brand-new/empty table, since there's nothing to find).
+describe("Worker /admin/create-table no longer auto-certifies provenance_complete (PR review round 11 fix)", () => {
+  it("a genuinely brand-new table's provenance_complete is 0 immediately after /admin/create-table, not auto-certified 1", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "create_table_no_autocert_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "provenance_complete")).toBe(0);
+  });
+
+  it("a brand-new (empty) table's first full-cluster /admin/backfill-provenance run certifies it complete — same end state as the old auto-certify, one extra (cheap, no-op-ish) admin call", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "create_table_backfill_certifies_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "provenance_complete")).toBe(0);
+
+    // Full-cluster run (catalogShardId omitted): the table is empty, so
+    // there's nothing orphaned/ambiguous to find, and it's certified complete
+    // through the normal mechanism, same as any other table.
+    const backfillRes = await post("/admin/backfill-provenance", {}, AUTH());
+    expect(backfillRes.status).toBe(200);
+    const backfillBody = (await backfillRes.json()) as { orphaned: unknown[]; ambiguous: unknown[] };
+    expect(backfillBody.orphaned).toHaveLength(0);
+    expect(backfillBody.ambiguous).toHaveLength(0);
+
+    expect(await readTableRulesColumn(table, "provenance_complete")).toBe(1);
+  });
+});
+
+// PR review round 7: /admin/register-table's INSERT OR REPLACE used to take
+// body.partitionKeyColumn unconditionally, silently repointing an
+// already-configured table's partition_key_column to a different value —
+// the SAME __cf_row_owners stale-provenance / cross-tenant leak round 6
+// closed for /admin/set-partition-key-column (see that handler's comment),
+// but reachable through this OTHER route since round 6's guard only lived in
+// handleSetPartitionKeyColumn. handleRegisterTable now rejects a repoint the
+// same way, while still allowing brand-new registrations, the sentinel
+// upgrade path, and idempotent re-registration with the SAME value.
+describe("Worker /admin/register-table rejects repointing an already-configured partition key column (PR review round 7 fix)", () => {
+  it("allows re-registering a table with the SAME partitionKeyColumn it already has (idempotent re-registration)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_same_pkcol_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    expect(await readTableRulesPartitionKeyColumn(table)).toBe("id");
+  });
+
+  it("rejects re-registering a table with a DIFFERENT partitionKeyColumn than what's already set, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_diff_pkcol_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, email TEXT, v TEXT)`,
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "email" }, AUTH());
+    expect(registerRes.status).toBe(409);
+    const body = (await registerRes.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("PARTITION_KEY_ALREADY_SET");
+
+    const partitionKeyColumn = await readTableRulesPartitionKeyColumn(table);
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  it("allows registering a brand-new table with no prior table_rules row", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_brand_new_evt";
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    const partitionKeyColumn = await readTableRulesPartitionKeyColumn(table);
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  it("allows upgrading a table still carrying the '__unset__' sentinel to a real partitionKeyColumn", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_sentinel_upgrade_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    await resetPartitionKeyColumnToSentinel(table, 4);
+    expect(await readTableRulesPartitionKeyColumn(table)).toBe("__unset__");
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesPartitionKeyColumn(table)).toBe("id");
+  });
+});
+
+/** Reads table_rules.schema_sql straight off catalog-0's own storage, keyed by
+ * table_name — used to verify what actually landed (including NULL), not
+ * just that the HTTP response was a 200/409. */
+async function readTableRulesSchemaSql(table: string): Promise<string | null | undefined> {
+  const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    const rows = Array.from(
+      state.storage.sql.exec("SELECT schema_sql FROM table_rules WHERE table_name = ?", table),
+    ) as Array<{ schema_sql: string | null }>;
+    return rows[0]?.schema_sql;
+  });
+}
+
+// PR review round 11 (fundamental fix, replacing rounds 8/9's reject/preserve
+// guard pair): table_rules.schema_sql is exactly what a future split/
+// migration backfill executes verbatim to provision a table on a
+// freshly-created target shard. It can only ever be trustworthy alongside a
+// probe-verified partition_key_unique=1 when the two were established
+// TOGETHER, atomically, by /admin/create-table's own push-then-verify flow —
+// so /admin/register-table (whose own probe, when it runs at all, verifies
+// against whatever ALREADY physically exists, completely disconnected from
+// whatever schema_sql text this call ALSO submits) no longer tries to
+// protect a stale pairing by rejecting a differing schema_sql once
+// previously verified. Rounds 8/9's SCHEMA_SQL_ALREADY_VERIFIED rejection
+// and omission-preserve fallback are gone: submitting a real schemaSql in
+// this call ALWAYS demotes partition_key_unique to 0 (round 10's existing,
+// unaffected behavior) and stores the submitted text as-is — there is no
+// longer a stale-pairing risk to guard against, because the demotion itself
+// closes it on every such call.
+describe("Worker /admin/register-table: a real schemaSql always demotes partition_key_unique to 0 and stores as submitted, even overwriting an already-verified table (PR review round 11 fix)", () => {
+  it("succeeds (200, not 409) overwriting a create-table-verified table's schema_sql with a DIFFERENT one, and demotes partition_key_unique to 0", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_diff_schemasql_evt";
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: originalSchema, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+
+    // A schema that drops the PRIMARY KEY/UNIQUE constraint on "id" entirely.
+    // Under rounds 8/9 this used to be rejected 409 SCHEMA_SQL_ALREADY_VERIFIED
+    // to protect the (then-preserved) create-table-verified pairing. Under the
+    // round-11 design there's nothing to protect: this call's own probe never
+    // runs (schemaSql is present), so partition_key_unique demotes to 0 in the
+    // SAME write that stores the new, differing text — never leaving a "1"
+    // paired with unverified schema text.
+    const driftedSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: driftedSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    expect(await readTableRulesSchemaSql(table)).toBe(driftedSchema);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+  });
+
+  it("re-registering a verified-unique table with the IDENTICAL schema_sql succeeds but demotes partition_key_unique to 0 (PR review round 10, unaffected)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_same_schemasql_evt";
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: originalSchema, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: originalSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+  });
+
+  it("allows changing schema_sql for a table whose partition_key_unique is still 0 (unverified — no over-rejection)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_unverified_schemasql_evt";
+
+    const firstSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: firstSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    expect(await readTableRulesSchemaSql(table)).toBe(firstSchema);
+
+    const secondSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT, extra TEXT)`;
+    const secondRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: secondSchema },
+      AUTH(),
+    );
+    expect(secondRes.status).toBe(200);
+    expect(await readTableRulesSchemaSql(table)).toBe(secondSchema);
+  });
+
+  it("allows registering a brand-new table with schema_sql set (first-ever registration, no prior row to conflict with)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_brandnew_schemasql_evt";
+    const schema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: schema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesSchemaSql(table)).toBe(schema);
+  });
+});
+
+// PR review round 11 finding 1 (closed): rounds 8/9's guards prevented an
+// already-verified table's schema_sql from drifting away from the
+// live-verified schema — but ONLY by comparing against a prior table_rules
+// row's partition_key_unique. A LATER /admin/register-table call that OMITS
+// schemaSql could still independently compute partitionKeyUnique=true from
+// its OWN live probe, while schema_sql sat there untouched (round 9's
+// preserve-on-omission fallback), holding whatever an EARLIER call had
+// stored — recreating the exact partition_key_unique=1 +
+// possibly-untrustworthy-schema_sql pairing round 10 closed for a SINGLE
+// call, just via two calls instead of one. Fixed: whenever THIS call's own
+// probe verifies partitionKeyUnique=true, schema_sql is explicitly nulled
+// regardless of what's currently stored — this route's live-state check can
+// never vouch for arbitrary stored text, so it must not be left in place.
+describe("Worker /admin/register-table nulls a previously-stored schema_sql when a LATER call's own live probe verifies uniqueness (closes PR review round 11 finding 1)", () => {
+  it("a first call stores a weak schema_sql (unverified); a later call OMITTING schemaSql verifies true via the live probe and nulls schema_sql instead of preserving the weak value", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "regreg_finding1_evt";
+
+    // Physically create the table with a GENUINE unique constraint on "id"
+    // (bypassing /admin/create-table and /admin/register-table entirely) —
+    // simulating a table that already exists live with a real constraint.
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    // First call: register with a WEAK schemaSql present (doesn't preserve
+    // the real constraint) — hasSchemaSql=true skips the probe entirely, so
+    // this stores schema_sql=weakerSchema with partition_key_unique=0,
+    // exactly round 10's existing (unaffected) behavior.
+    const weakerSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const firstRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: weakerSchema },
+      AUTH(),
+    );
+    expect(firstRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    expect(await readTableRulesSchemaSql(table)).toBe(weakerSchema);
+
+    // Second call: OMITS schemaSql entirely (e.g. a metadata-only
+    // re-registration). This route's own live probe now runs against the
+    // REAL, genuinely-unique live schema and verifies true.
+    const secondRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(secondRes.status).toBe(200);
+
+    // The fix: partition_key_unique becomes 1 (the probe is trustworthy and
+    // allowed to run) BUT schema_sql is now NULL — not the previously-stored
+    // weak value, which this call's own probe has no way to vouch for.
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    expect(await readTableRulesSchemaSql(table)).toBeNull();
+
+    // And /v1/table-scan is now genuinely eligible.
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
+  });
+});
+
+// PR review round 12 (P1 fix): checkPartitionKeyUnique's "schema is uniform
+// across shards for a table by construction, so one representative shard
+// suffices" assumption only actually holds for /admin/create-table, which
+// just pushed the identical DDL to every shard in this same request.
+// /admin/register-table's own live probe (this describe block) can run
+// against a table that reached this system some other way — a legacy table,
+// or one created by an external/manual process — with genuine per-shard
+// schema drift. Before this fix, checkPartitionKeyUnique was only ever
+// checked against shardIds[0] (whichever shard /list-shards happened to
+// return first), so a drifted OTHER shard's lack of a real unique constraint
+// was silently ignored, letting /v1/table-scan later query that shard and
+// return duplicate-partition-key rows under the wrong tenant. Fixed:
+// checkPartitionKeyUniqueAcrossShards requires EVERY shard to independently
+// agree; if any one disagrees, the whole result fails closed to 0/false.
+describe("Worker /admin/register-table verifies partitionKeyUnique across EVERY shard, not just one representative (PR review round 12 fix)", () => {
+  it("computes partitionKeyUnique: 0 when one shard genuinely has a UNIQUE constraint but another (same table name) doesn't — not just whichever shard happens to be checked first", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_drift_evt";
+
+    // Bypass /admin/create-table's uniform DDL push entirely — create the
+    // physical table independently, per shard, simulating a table that
+    // reached this system with genuine per-shard schema drift.
+    // catalog-0-shard-0 is the FIRST shard /list-shards returns (the old
+    // shardIds[0] this fix replaces): give IT a genuine UNIQUE constraint on
+    // user_id, while catalog-1-shard-0 gets no constraint at all — the
+    // regression this test guards against is the check trusting shardIds[0]
+    // alone and missing that catalog-1-shard-0 disagrees.
+    await shardExecute(
+      "catalog-0-shard-0",
+      `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`,
+    );
+    await shardExecute(
+      "catalog-1-shard-0",
+      `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)`,
+    );
+    for (const shardId of ["catalog-2-shard-0", "catalog-3-shard-0"]) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`);
+    }
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "user_id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    // Before this fix, checking only shardIds[0] (catalog-0-shard-0, which
+    // DOES have the unique constraint) would have incorrectly set this to 1.
+    // Correct behavior: 0, because not EVERY shard agrees.
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(409);
+    const scanBody = (await scanRes.json()) as { error: { code: string } };
+    expect(scanBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+});
+
+// PR review round 11 finding 2 (closed): hasSchemaSql already treated an
+// empty string identically to omitted for deciding whether the live probe
+// runs (the `.length > 0` check) — but the empty string itself used to still
+// ride along in the fanned-out payload and land in schema_sql as a garbage,
+// non-null value (not a valid CREATE TABLE statement, but not null either).
+// Fixed by scrubbing payload.schemaSql (delete or explicit null, matching
+// finding 1's branches) whenever hasSchemaSql is false, whether that's
+// because the field was omitted OR because it was an empty string.
+describe('Worker /admin/register-table treats schemaSql: "" identically to omitted (closes PR review round 11 finding 2)', () => {
+  it('registering with schemaSql: "" runs the live probe (not skipped) and, once it verifies true, ends up with schema_sql = NULL, not the empty string', async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "regreg_finding2_evt";
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: "" },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    // The probe ran (schemaSql: "" is treated as absent) and verified true
+    // against the genuinely-unique live schema.
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    // The fix: schema_sql is NULL, never the empty string itself.
+    expect(await readTableRulesSchemaSql(table)).toBeNull();
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
+  });
+
+  it('registering with schemaSql: "" on a table whose live probe verifies FALSE simply omits schema_sql from the write (stays whatever was stored, no garbage "" value)', async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "regreg_finding2_notunique_evt";
+
+    // No unique constraint on "id" this time — the probe will verify false.
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT, v TEXT)`);
+    }
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: "" },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    // No prior row existed, so "preserve whatever's stored" is still null —
+    // critically, NOT the empty string that was submitted.
+    expect(await readTableRulesSchemaSql(table)).toBeNull();
+  });
+});
+
+// PR review round 10 (P1): rounds 8-9's guards above prevent an ALREADY-
+// verified table's schema_sql from drifting away from the live-verified
+// schema, but only fire when there's a prior table_rules row with
+// partition_key_unique = 1 to compare against. They don't cover the FIRST
+// registration event: handleAdminRegisterTable computes partitionKeyUnique
+// by probing whatever ALREADY physically exists on a representative live
+// shard right now — completely independent of whatever schemaSql the SAME
+// request ALSO submits for storage (used later to provision split/migration
+// targets). If a table physically exists somewhere with a genuinely unique
+// constraint, but has never been registered before, an admin could register
+// it for the first time with a schemaSql that's weaker than (and doesn't
+// preserve) that live constraint: partition_key_unique would get computed
+// as 1 (correctly reflecting the real live shard), while the STORED
+// schema_sql doesn't actually carry the constraint a future split target
+// needs. Fixed by never letting /admin/register-table produce a verified
+// result when schemaSql is ALSO present in that same call — the live probe
+// is skipped entirely and partition_key_unique always stores its false
+// default in that case.
+describe("Worker /admin/register-table with schemaSql never verifies partition_key_unique on that same call (PR review round 10 fix)", () => {
+  it("stores partition_key_unique = 0 on first registration with schemaSql, even though the table physically exists elsewhere with a real unique constraint", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_schemasql_liveuniq_gap_evt";
+
+    // Physically create the table directly on every shard (bypassing both
+    // /admin/create-table and /admin/register-table entirely) with a
+    // GENUINE unique constraint on "id" — simulating a table that already
+    // exists live, but has never been registered in table_rules before.
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    // Register it for the FIRST time, submitting a schemaSql that's WEAKER
+    // than the live schema — it omits the PRIMARY KEY/UNIQUE constraint on
+    // "id" entirely. Before this fix, the live-shard probe would still
+    // compute partitionKeyUnique = 1 (correctly reflecting the real,
+    // already-unique live schema), while this weaker text got stored as
+    // schema_sql for a future split target to provision from.
+    const weakerSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: weakerSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    // The fix: partition_key_unique must be 0, not 1 — schemaSql being
+    // present forces the route to skip the live probe entirely.
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+    expect(await readTableRulesSchemaSql(table)).toBe(weakerSchema);
+
+    // /v1/table-scan must therefore still refuse this table.
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(409);
+    const scanBody = (await scanRes.json()) as { error: { code: string } };
+    expect(scanBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  it("still computes partitionKeyUnique via the live-shard probe when schemaSql is OMITTED (no regression to the metadata-only path)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_noschemasql_liveuniq_evt";
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    // No schemaSql field at all — this is the pre-existing metadata-only
+    // registration path, which must be unaffected by this fix.
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+  });
+
+  it("allows a later /admin/set-partition-key-column call to verify a table registered with schemaSql (unverified=0), if the live schema is genuinely unique", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_schemasql_followup_verify_evt";
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`);
+    }
+
+    const weakerSchema = `CREATE TABLE ${table} (id TEXT, v TEXT)`;
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", schemaSql: weakerSchema },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+
+    // /admin/set-partition-key-column is a one-time '__unset__'-sentinel
+    // upgrade path only (PR review round 6) — reset back to the sentinel
+    // first so this follow-up call isn't itself rejected 409
+    // PARTITION_KEY_ALREADY_SET before ever reaching the re-verification
+    // this test is actually about (same established pattern as the other
+    // register-table tests above that exercise a second call for a
+    // DIFFERENT reason than the repoint guard).
+    await resetPartitionKeyColumnToSentinel(table, 4);
+
+    // Follow-up call has no schemaSql field at all — it re-verifies fresh
+    // against the live shard, independent of whatever schema_sql text is
+    // stored, and is unaffected by this fix (it never had a probe-skip path
+    // to begin with).
+    const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(setRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
+  });
+});
+
+// Pre-landing review fix: /admin/register-table never validated payload.table
+// or payload.partitionKeyColumn against IDENTIFIER_RE, unlike every sibling
+// route (e.g. /admin/set-partition-key-column). An unvalidated table string
+// reaches checkPartitionKeyUnique, which interpolates it directly into raw SQL
+// text sent to a shard's /execute route — a real identifier-injection gap.
+describe("Worker /admin/register-table validates identifiers (pre-landing review fix)", () => {
+  it("rejects a table name that fails IDENTIFIER_RE with 400 UNSAFE_IDENTIFIER", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post("/admin/register-table", { table: `evil"; DROP TABLE x; --` }, AUTH());
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNSAFE_IDENTIFIER");
+  });
+
+  it("rejects a partitionKeyColumn that fails IDENTIFIER_RE with 400 UNSAFE_IDENTIFIER", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/register-table",
+      { table: "register_bad_pkcol_evt", partitionKeyColumn: `id"); DROP TABLE x; --` },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNSAFE_IDENTIFIER");
   });
 });
 

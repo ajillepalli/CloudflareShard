@@ -219,4 +219,84 @@ describe("Worker /admin/backfill-provenance and /admin/set-row-owner (Milestone 
     expect(owners).toHaveLength(1);
     expect(owners[0].tenant_id).toBe(tenantId);
   });
+
+  // PR review round 8 (P2): the scan loop used to infer "table not
+  // physically present on this shard" from the scan query ITSELF failing
+  // (!pageRes.ok), which silently treated ANY other genuine SQL error (a
+  // malformed query, a missing/renamed partition-key column, etc.)
+  // identically to that one legitimate case — the table stayed eligible for
+  // provenance_complete certification even though this shard's rows for it
+  // were never actually checked. The fix probes existence via PRAGMA
+  // table_info first (mirroring f585f9b's /tenant-scan-page fix in
+  // shard.ts), so a genuine failure against a table that DOES physically
+  // exist now fails the whole /admin/backfill-provenance request instead.
+  it("fails the whole /admin/backfill-provenance request on a genuine shard-side SQL error, instead of silently certifying the table provenance-complete", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("bp_genuineerr_evt");
+
+    // Simulate a legacy table that predates completeness tracking (same
+    // premise as index.table-scan.test.ts's criterion-4 test), then corrupt
+    // table_rules' partition_key_column to point at a column that doesn't
+    // exist on the PHYSICALLY-PRESENT table (e.g. renamed/dropped out from
+    // under it) — replicated to every catalog shard, same as table_rules
+    // itself is normally fanned out.
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "UPDATE table_rules SET provenance_complete = 0, partition_key_column = ? WHERE table_name = ?",
+          "ghost_col",
+          "bp_genuineerr_evt",
+        );
+      });
+    }
+
+    const res = await post("/admin/backfill-provenance", {}, AUTH());
+    // A genuine SQL error (no such column "ghost_col" on a table that
+    // definitely exists) must fail the whole request — never silently
+    // skipped as "table absent" the way the legitimate case below is.
+    expect(res.status).not.toBe(200);
+
+    // Critically: the table must NOT have been silently certified
+    // provenance-complete off the back of an unscanned/errored shard.
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const provenanceComplete = await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT provenance_complete FROM table_rules WHERE table_name = ?", "bp_genuineerr_evt"),
+      ) as Array<{ provenance_complete: number }>;
+      return rows[0]?.provenance_complete;
+    });
+    expect(provenanceComplete).toBe(0);
+  });
+
+  // Preserves the ORIGINAL legitimate case the old (too-broad) `!pageRes.ok`
+  // check existed for: a table_rules entry with no physical table ever
+  // created on this shard (e.g. /admin/register-table registers metadata
+  // only — mirrors index.core.test.ts's column_mismatch_evt regression
+  // scenario). This must still be silently skipped, not treated as a
+  // failure, and — since nothing else is wrong with it — the table still
+  // gets certified provenance_complete exactly as before this fix.
+  it("still silently skips a registered-but-never-physically-created table (existing legitimate case, no regression)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 64, force: true }, AUTH());
+    const table = "bp_neverphysical_evt";
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    const res = await post("/admin/backfill-provenance", {}, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { orphaned: Array<{ table: string }>; ambiguous: Array<{ table: string }> };
+    expect(body.orphaned.some((o) => o.table === table)).toBe(false);
+    expect(body.ambiguous.some((a) => a.table === table)).toBe(false);
+
+    // A genuinely full-cluster run with nothing wrong recorded for this
+    // table still certifies it complete, exactly as before this fix.
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const provenanceComplete = await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT provenance_complete FROM table_rules WHERE table_name = ?", table),
+      ) as Array<{ provenance_complete: number }>;
+      return rows[0]?.provenance_complete;
+    });
+    expect(provenanceComplete).toBe(1);
+  });
 });
