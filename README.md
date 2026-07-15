@@ -123,8 +123,8 @@ blocks the new structured paths.
 
 ### 4) Register a tenant
 
-`/v1/mutate`, `/v1/tx`, and `/v1/index-query` are the tenant data-plane routes
-and require a tenant bearer token, not `ADMIN_TOKEN` — this isolates
+`/v1/mutate`, `/v1/tx`, `/v1/index-query`, and `/v1/table-scan` are the tenant
+data-plane routes and require a tenant bearer token, not `ADMIN_TOKEN` — this isolates
 apps/environments within one deployment (see "Tenant authorization" below).
 (`/v1/sql` is **admin-only** — see the note under step 5.) `/register-tenant`
 returns the plaintext token exactly once; store it.
@@ -174,15 +174,69 @@ curl -X POST http://127.0.0.1:8787/v1/mutate \
 
 ### 6) Query a partition
 
-There is currently **no general partition-scoped tenant `SELECT`** — the raw
-`/v1/sql` read path was removed for tenants (see the note above). Tenants read
-through the secondary-index path, `/v1/index-query` (step 4 of the index
-walkthrough / the "Secondary indexes" section). A structured, isolation-enforced
-tenant read API (partition-scoped `SELECT` with an enforced `tenant_id`
-predicate) is a planned future milestone; it depends on giving base rows a
-physical `tenant_id` column (see SPEC §14 and TODOS.md).
+There is still no general partition-scoped tenant `SELECT` — the raw `/v1/sql`
+read path was removed for tenants (see the note above) — but tenants now have
+two structured read paths: exact-tuple lookups via `/v1/index-query` (step 4 of
+the index walkthrough / the "Secondary indexes" section), and listing a
+tenant's own rows in a table via `POST /v1/table-scan` (cursor-paginated, no
+arbitrary filters). See "Tenant-scoped table scan" below.
 
-### 7) Structured mutation (row-owned, single-shard)
+### 7) Tenant-scoped table scan
+
+`POST /v1/table-scan` lists a tenant's own rows in a registered table,
+cursor-paginated, with the query mechanically constructed from
+`table + tenantId + cursor + limit` only — no arbitrary filtering, the same
+safe-by-construction pattern `/v1/mutate` already uses for writes. It replaces
+the general tenant read path removed when `/v1/sql` became admin-only (see
+"Known limitations" below and `TODOS.md`'s Completed section): a tenant's rows
+are found via `__cf_row_owners` (filtered by `tenant_id` + `table_name`, no
+physical `tenant_id` column needed on the base row), fanned out to every shard
+in the tenant's catalog shard's pool.
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/table-scan \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $TENANT_TOKEN" \
+  -d '{"tenantId":"t1","table":"events","limit":100}'
+```
+
+Response:
+
+```json
+{
+  "rows": [{"id":"e1","user_id":"user-1","body":"hello"}],
+  "nextCursor": "eyJzaGFyZEN1cnNvcnMiOnsi...",
+  "provenance": {"complete": true},
+  "scan": {"catalogShardId":"catalog-0","shardCount":4,"successCount":4,"scanMs":12}
+}
+```
+
+`nextCursor` is present iff any shard in the pool may have more rows; pass it
+back on the next call to continue, and omit it (or pass `null`) to restart from
+the beginning. It's an opaque, per-shard cursor map — each shard's position
+advances only to the last row from that shard actually returned in a given
+response, never to a row that was fetched internally but cut by the overall
+`limit`, so pagination can't silently drop a row even when a page truncates
+mid-shard. A cursor that fails to decode, or names a shard no longer in the
+catalog shard's active set (topology changed between calls), is rejected 400
+`INVALID_CURSOR` — omit `cursor` to restart the scan.
+
+`provenance.complete` reports whether this table has any rows anywhere in the
+cluster with no recorded owner (pre-`/admin/backfill-provenance`, from before
+Milestone 3's row-provenance tracking existed) — such rows are always hidden
+from every tenant's scan (their owner is definitionally unknown), and
+`provenance.fix` names the remediation (`/admin/backfill-provenance`) until a
+full-cluster run reports zero remaining gaps for the table, at which point it
+flips `true` permanently. A brand-new table (`/admin/create-table`) starts
+`true` — it has no legacy rows to backfill.
+
+Any shard in the pool failing to respond fails the whole request 502
+`SHARD_UNREACHABLE` (naming the shard) rather than return a silently-partial
+result — a deliberate MVP simplification (a `partial: true` mode with
+per-shard errors is a documented future option, not a blocker for this
+milestone).
+
+### 8) Structured mutation (row-owned, single-shard)
 
 `/v1/mutate` is an alternative to raw SQL for writes: instead of a SQL string,
 you describe the operation (`insert`/`update`/`delete`/`upsert`) and its
@@ -207,7 +261,7 @@ curl -X POST http://127.0.0.1:8787/v1/mutate \
 
 Response: `{"ok":true,"rowsAffected":1}`.
 
-### 8) Cross-shard atomic transaction
+### 9) Cross-shard atomic transaction
 
 `/v1/tx` atomically commits a batch of structured mutations that may span
 multiple shards, via two-phase commit (`CoordinatorDO`). Every mutation must
@@ -245,7 +299,7 @@ curl -X POST http://127.0.0.1:8787/admin/tx-force-abort \
   -d '{"txId":"..."}'
 ```
 
-### 9) Fan-out query (all shards)
+### 10) Fan-out query (all shards)
 
 `/v1/scatter` reads across every tenant indiscriminately, so it's an admin
 operation — it requires `ADMIN_TOKEN`, not a tenant token.
@@ -261,7 +315,7 @@ curl -X POST http://127.0.0.1:8787/v1/scatter \
   }'
 ```
 
-### 10) Move one vBucket to a new shard (real online migration since Milestone 3)
+### 11) Move one vBucket to a new shard (real online migration since Milestone 3)
 
 The cluster is partitioned across a fixed set of catalog shards (see
 "Catalog sharding" below); `vbucket` numbering is local to one catalog shard,
@@ -357,8 +411,8 @@ with 409 `RING_EVACUATION_NO_CANDIDATE` (add a shard via a split first).
 
 ## Tenant authorization
 
-The tenant data-plane routes — `/v1/mutate`, `/v1/tx`, and `/v1/index-query` —
-require a tenant bearer token (`POST /admin/register-tenant {"tenantId":
+The tenant data-plane routes — `/v1/mutate`, `/v1/tx`, `/v1/index-query`, and
+`/v1/table-scan` — require a tenant bearer token (`POST /admin/register-tenant {"tenantId":
 "..."}`, `ADMIN_TOKEN`-gated), separate from `ADMIN_TOKEN` itself. (`/v1/sql`
 and `/v1/scatter` are admin-only, `ADMIN_TOKEN`-gated operator routes — not
 tenant paths.) This isolates apps/environments *within* one
@@ -387,7 +441,15 @@ callers with zero overlap window; a known limitation, not yet addressed).
   cutover completes).
 - Row provenance (`__cf_row_owners`) inherits — does not widen — the documented §14
   trust-model limitation: two tenants sharing a partition key on the same shard collide
-  in the base table's own physical layout already.
+  in the base table's own physical layout already. `/v1/table-scan` inherits the same
+  limitation unaffected: it doesn't fix or worsen it (see §14).
+- `/v1/table-scan` supports only `table + tenantId + cursor + limit` — no arbitrary
+  column filtering (a future milestone can add a structured equality-filter map if real
+  usage demands it), and no per-tenant rate limiting on the fan-out yet (the
+  catalog-shard-scoped pool is the v1 blast-radius control).
+- `/v1/table-scan` may return the same row twice during an active migration window, for
+  the same reason `/v1/scatter` can: a migrating vbucket's rows exist on both source and
+  target until cutover completes. It never *loses* a row for this reason.
 - When to split (hot-shard detection) is still a manual operator decision — Milestone 3
   built the migration mechanism, not the heuristics (see `TODOS.md`).
 

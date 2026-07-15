@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.1.0.0] - 2026-07-14 — Milestone 4: Tenant-Scoped Table Scan
+
+`POST /v1/table-scan` (issue #9): the general tenant read path Milestone 3 removed when raw `/v1/sql` became admin-only, restored safely. Lists a tenant's own rows in a registered table, cursor-paginated, with no arbitrary filtering — closes the gap left by `/v1/index-query`'s exact-tuple-only reach.
+
+### Added
+- `POST /v1/table-scan` (tenant bearer token): `{tenantId, table, limit?, cursor?}` -> `{rows, nextCursor?, provenance:{complete,fix?}, scan:{catalogShardId,shardCount,successCount,scanMs}}`. The query is mechanically constructed (`table` + `tenantId` + `cursor` + `limit` only), matching the safe-by-construction pattern `compileMutation` established for writes rather than the raw-SQL pattern that failed for the removed tenant read path. Auth reuses `CatalogDO.checkTenantAuth` exactly as `/v1/index-query` does, via a new combined `/lookup-table-scan` route (auth + `table_rules` gate in one round trip, mirroring `/lookup-index`'s role). Fans out to every active shard in the tenant's catalog-shard pool at `SHARD_FANOUT_CONCURRENCY`; any shard failure fails the whole request 502 `SHARD_UNREACHABLE` naming the shard (deliberate MVP fail-closed simplification, not a partial-result mode).
+- New internal `ShardDO` route `POST /tenant-scan-page`: joins the base table against `__cf_row_owners` filtered by `(tenant_id, table_name)`, paged by `partition_key` — mirrors `/migrate-export`'s existing join pattern, filtered by tenant instead of vbucket. Backed by a new composite index, `idx_cf_row_owners_tenant_scan (tenant_id, table_name, partition_key)`.
+- Opaque per-shard cursor (`{shardCursors: {[shardId]: afterPartitionKey}}`, base64-JSON): merges every shard's page ascending by `partition_key` (ties broken by `shardId` ascending), truncates to the requested `limit`, and advances each shard's cursor only to the last row **from that shard actually included** in the truncated response — a row fetched internally but cut by the overall-limit truncation keeps its shard's old cursor position, so the next call re-fetches (never skips) it. A malformed cursor, or one naming a shard no longer in the catalog shard's current active set (topology changed between calls), is rejected 400 `INVALID_CURSOR`.
+- `table_rules.provenance_complete` (additive column, mirrors `index_rules.status`'s building/ready cache): 1 once a full-cluster (`catalogShardId` omitted) `/admin/backfill-provenance` run reports zero orphaned/ambiguous rows for a table across every catalog shard and shard it touched; never reset to 0 automatically. `/admin/create-table` sets it to 1 at creation (a brand-new table has no legacy rows to backfill). Read by `/v1/table-scan`'s `provenance.complete` response field — a row lacking a `__cf_row_owners` entry is invisible to every tenant's scan by construction (its owner is unknown), surfaced this way rather than silently.
+- README quickstart step, SPEC §5/§6/§7/§14 updates, and `TODOS.md`'s "Structured tenant read API + physical `tenant_id`" item moved to Completed — superseding its original physical-`tenant_id`-column premise with the `__cf_row_owners` join approach this milestone actually shipped (see that entry for why: the join reuses infrastructure Milestone 3 already added for migration, rather than requiring a schema/write-path change to every application table).
+
+### Fixed (found during implementation, before merge)
+- The cursor's "advance only on emit" no-data-loss invariant had a real gap: two shards could each return fewer rows than their own per-shard cap (correctly signalling "nothing further behind what I fetched"), while the overall-limit truncation still cut one of those already-fetched rows — checking only "did any shard hit its own cap" missed this and would have silently dropped the truncated row forever (no shard's cursor would ever pass it, and `nextCursor` would be omitted, so the client would never call again to retrieve it). Fixed by also checking whether the merge itself truncated anything fetched. Caught by an integration test before merge, then locked in with a dedicated unit-test regression case.
+
+### Non-goals (explicit, matching the design decision)
+- No arbitrary column filtering — only `table` + `tenantId` + pagination.
+- §14's partition-key collision limitation (two tenants sharing a partition key on the same shard) is inherited, not fixed or worsened — isolation still holds structurally, since `/tenant-scan-page`'s query filters by `tenant_id` before ever joining to the base table.
+- Migration-window duplicates are inherited, not solved fresh, exactly like the existing documented `/v1/scatter` limitation.
+- No per-tenant rate limiting on this fan-out-shaped route yet (the catalog-shard-scoped pool is the v1 blast-radius control).
+
 ## [2.0.0.0] - 2026-07-14 — Milestone 3: Topology Service
 
 vBucket migration with dual-write backfill, drain-shard evacuation, and index-topology v2 (issue #7). Unfreezes both topology operations that Milestone 2 blocked, and delivers the oldest unfulfilled README promise: an automated split with backfill and dual-write cutover.
