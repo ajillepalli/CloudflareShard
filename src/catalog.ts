@@ -1023,7 +1023,7 @@ export class CatalogDO extends DurableObject {
 
   /** Tenant-scoped table scan (POST /v1/table-scan). Tenant-auth-gated (not
    * admin-gated) the same way /lookup-index is — checks the caller's token
-   * exactly like /route/handleLookupIndex do, reusing checkTenantAuth rather
+   * exactly like handleLookupIndex does, reusing checkTenantAuth rather
    * than re-implementing it, per the spec's explicit instruction. No
    * partitionKey is available yet (a scan has none), so this can't reuse
    * /route itself; it plays the combined "auth + table_rules gate" role
@@ -1049,7 +1049,7 @@ export class CatalogDO extends DurableObject {
             fix: "Call /admin/create-table first.",
           },
         },
-        400,
+        404,
       );
     }
     if (table.partition_key_column === UNSET_PARTITION_KEY_COLUMN) {
