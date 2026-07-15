@@ -577,6 +577,88 @@ describe("Worker /admin/set-partition-key-column", () => {
   });
 });
 
+// Codex-found P1 (re-review of the P1 fix): /admin/register-table used to
+// forward body.partitionKeyUnique straight into table_rules.partition_key_unique
+// with zero verification, letting a caller bypass checkPartitionKeyUnique
+// entirely by just asserting the flag. The Worker's handleAdminRegisterTable
+// must never read that field off the raw request — it computes it itself,
+// the same way /admin/create-table and /admin/set-partition-key-column do.
+describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1 fix)", () => {
+  /** Reads table_rules.partition_key_unique straight off catalog-0's own
+   * storage — /admin/register-table's response body doesn't echo the computed
+   * flag, so this is the only way to assert what actually landed. */
+  async function readPartitionKeyUnique(table: string): Promise<number | undefined> {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key_unique FROM table_rules WHERE table_name = ?", table),
+      ) as Array<{ partition_key_unique: number }>;
+      return rows[0]?.partition_key_unique;
+    });
+  }
+
+  it("ignores a smuggled partitionKeyUnique: true when the column has no real unique constraint — computes 0 and still 409s /v1/table-scan", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_bypass_notuniq_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE IF NOT EXISTS ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)`,
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Re-register the same physical table, this time declaring partitionKeyColumn
+    // as the NON-unique "user_id" column, and smuggling partitionKeyUnique: true
+    // in the request body — this must be silently ignored, not trusted.
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "user_id", partitionKeyUnique: true },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    expect(await readPartitionKeyUnique(table)).toBe(0);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(409);
+    const scanBody = (await scanRes.json()) as { error: { code: string } };
+    expect(scanBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  it("computes partitionKeyUnique: 1 for a genuinely unique column with no client-supplied field at all", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_bypass_uniq_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE IF NOT EXISTS ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`,
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Re-register declaring partitionKeyColumn as the genuinely-UNIQUE
+    // "user_id" column — no partitionKeyUnique field supplied at all.
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "user_id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    expect(await readPartitionKeyUnique(table)).toBe(1);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(200);
+  });
+});
+
 describe("Worker top-level routes", () => {
   it("GET /health returns ok", async () => {
     const res = await SELF.fetch("https://worker.internal/health");
