@@ -659,6 +659,67 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
   });
 });
 
+// Coverage gap: catalog.ts's handleRegisterTable computes
+// `existing?.provenance_complete === 1 || body.provenanceComplete === true`
+// specifically so that re-registering an already-complete table (e.g. a
+// manual /admin/register-table call, which never sends provenanceComplete
+// itself) doesn't silently reset provenance_complete back to 0 via the
+// INSERT OR REPLACE below it. That monotonic-preserve behavior had zero test
+// coverage anywhere in the suite.
+describe("Worker /admin/register-table preserves provenance_complete across re-registration (catalog.ts monotonic fix)", () => {
+  async function readProvenanceComplete(table: string): Promise<number | undefined> {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT provenance_complete FROM table_rules WHERE table_name = ?", table),
+      ) as Array<{ provenance_complete: number }>;
+      return rows[0]?.provenance_complete;
+    });
+  }
+
+  it("keeps provenance_complete=1 after /admin/register-table is called again for an already-complete table, instead of resetting it to 0", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_provdone_evt";
+    // /admin/create-table sets provenanceComplete: true fresh at creation.
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readProvenanceComplete(table)).toBe(1);
+
+    // A manual re-registration via /admin/register-table never sends
+    // provenanceComplete at all -- only the monotonic "preserve if already
+    // complete" logic in catalog.ts can be responsible for it staying 1.
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readProvenanceComplete(table)).toBe(1);
+  });
+
+  it("leaves provenance_complete=0 after re-registering a table that was never marked complete (no false positive from the preserve logic)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_provpending_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Simulate a legacy table that predates completeness tracking.
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("UPDATE table_rules SET provenance_complete = 0 WHERE table_name = ?", table);
+    });
+    expect(await readProvenanceComplete(table)).toBe(0);
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+    expect(await readProvenanceComplete(table)).toBe(0);
+  });
+});
+
 describe("Worker top-level routes", () => {
   it("GET /health returns ok", async () => {
     const res = await SELF.fetch("https://worker.internal/health");
