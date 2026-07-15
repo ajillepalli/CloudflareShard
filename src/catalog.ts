@@ -649,14 +649,39 @@ export class CatalogDO extends DurableObject {
       );
     }
 
-    const existing = this.one<{ table_name: string }>(
-      "SELECT table_name FROM table_rules WHERE table_name = ?",
+    const existing = this.one<{ table_name: string; partition_key_column: string }>(
+      "SELECT table_name, partition_key_column FROM table_rules WHERE table_name = ?",
       body.table,
     );
     if (!existing) {
       return json(
         { error: { code: "TABLE_NOT_REGISTERED", message: `Table ${body.table} is not registered.`, fix: "Call /register-table first." } },
         404,
+      );
+    }
+    // PR review round 6: this endpoint is a ONE-TIME unset->set upgrade path
+    // only (for tables carrying the __unset__ sentinel from before
+    // partition-key-column validation existed), never a general "repoint an
+    // already-working table's partition key column" operation. Re-invoking it
+    // on a table that already has a real partition_key_column would silently
+    // repoint table_rules while leaving __cf_row_owners' existing entries
+    // keyed under the OLD column's values — /tenant-scan-page would then
+    // enumerate those stale partition_key values but look up base rows via
+    // `WHERE "<NEW_column>" = ?`, a cross-tenant data leak if an unrelated row
+    // happens to share that value under the new column. There is no
+    // legitimate use case for repointing an already-configured column, so
+    // reject outright rather than attempting to safely migrate/clear
+    // provenance.
+    if (existing.partition_key_column !== UNSET_PARTITION_KEY_COLUMN) {
+      return json(
+        {
+          error: {
+            code: "PARTITION_KEY_ALREADY_SET",
+            message: `Table ${body.table} already has a configured partition key column (${existing.partition_key_column}).`,
+            fix: "This endpoint only upgrades a table from the '__unset__' sentinel; it cannot repoint an already-configured partition key column.",
+          },
+        },
+        409,
       );
     }
 

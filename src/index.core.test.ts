@@ -539,17 +539,24 @@ describe("Worker /admin/set-partition-key-column", () => {
     );
     expect(createRes.status).toBe(200);
 
-    // Force catalog-0 back to the sentinel to simulate a pre-Chunk-1 table —
-    // the test tenant must route to catalog-0 specifically, since this seed
-    // is per-catalog-shard, not cluster-wide.
+    // Force EVERY catalog shard back to the sentinel to simulate a
+    // pre-Chunk-1 table. A real pre-migration table would carry the sentinel
+    // on all catalog shards alike (table_rules is fanned out identically to
+    // each of them at /admin/create-table time) — resetting only catalog-0
+    // would leave catalog-1/2/3 still holding the real "id" value from
+    // create-table above, and since PR review round 6 made
+    // /admin/set-partition-key-column a one-time unset->set upgrade, the
+    // fan-out below would then get rejected 409 PARTITION_KEY_ALREADY_SET on
+    // those three shards.
     const tenantId = tenantForCatalogShard(0, 4);
-    const id = env.CATALOG.idFromName("catalog-0");
-    const stub = env.CATALOG.get(id);
-    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
-      state.storage.sql.exec(
-        "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'upgrade_me'",
-      );
-    });
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'upgrade_me'",
+        );
+      });
+    }
 
     const token = await registerTenant(tenantId);
     const blockedRes = await post(
@@ -574,6 +581,96 @@ describe("Worker /admin/set-partition-key-column", () => {
       token,
     );
     expect(unblockedRes.status).toBe(200);
+  });
+
+  // PR review round 6: re-invoking this endpoint on a table that already has
+  // a real (non-sentinel) partition_key_column used to silently repoint
+  // table_rules, leaving __cf_row_owners' existing entries keyed under the
+  // OLD column's values — a stale-provenance cross-tenant leak surfaced via
+  // /tenant-scan-page. The endpoint is now a strictly one-time unset->set
+  // upgrade: a second call must be rejected 409 PARTITION_KEY_ALREADY_SET and
+  // must leave table_rules untouched.
+  it("rejects a second call against a table whose partition key column was already set via /admin/create-table, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "already_set_via_create",
+        schema: "CREATE TABLE IF NOT EXISTS already_set_via_create (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const res = await post(
+      "/admin/set-partition-key-column",
+      { table: "already_set_via_create", partitionKeyColumn: "email" },
+      AUTH(),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("PARTITION_KEY_ALREADY_SET");
+
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const partitionKeyColumn = await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key_column FROM table_rules WHERE table_name = ?", "already_set_via_create"),
+      ) as Array<{ partition_key_column: string }>;
+      return rows[0]?.partition_key_column;
+    });
+    expect(partitionKeyColumn).toBe("id");
+  });
+
+  it("rejects a second call against a table whose partition key column was already set via a prior /admin/set-partition-key-column upgrade, leaving table_rules unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "already_set_via_upgrade",
+        schema: "CREATE TABLE IF NOT EXISTS already_set_via_upgrade (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Simulate a legacy sentinel-tagged table (on every catalog shard — a
+    // real one would carry the sentinel on all of them alike) and legitimately
+    // upgrade it once via /admin/set-partition-key-column.
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "UPDATE table_rules SET partition_key_column = '__unset__' WHERE table_name = 'already_set_via_upgrade'",
+        );
+      });
+    }
+    const upgradeRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "already_set_via_upgrade", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(upgradeRes.status).toBe(200);
+
+    // A SECOND call — even to a different column — must now be rejected.
+    const res = await post(
+      "/admin/set-partition-key-column",
+      { table: "already_set_via_upgrade", partitionKeyColumn: "email" },
+      AUTH(),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { details: { error: { code: string } } };
+    expect(body.details.error.code).toBe("PARTITION_KEY_ALREADY_SET");
+
+    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const partitionKeyColumn = await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(
+        state.storage.sql.exec("SELECT partition_key_column FROM table_rules WHERE table_name = ?", "already_set_via_upgrade"),
+      ) as Array<{ partition_key_column: string }>;
+      return rows[0]?.partition_key_column;
+    });
+    expect(partitionKeyColumn).toBe("id");
   });
 });
 

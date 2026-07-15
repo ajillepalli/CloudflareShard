@@ -55,6 +55,26 @@ async function findKeysSpanningShards(tenantId: string, table: string, minTotal:
   return keys;
 }
 
+/** Resets table_rules.partition_key_column (and the uniqueness flag) back to
+ * the '__unset__' sentinel on EVERY catalog shard (table_rules is fanned out
+ * identically to all of them), simulating a pre-upgrade table. Needed because
+ * /admin/set-partition-key-column is now a one-time unset->set upgrade only
+ * (PR review round 6) — tests that re-invoke it against the SAME table to
+ * re-exercise checkPartitionKeyUnique's probe/affinity logic must first put
+ * the table back into the legitimate "not yet upgraded" state, or the
+ * endpoint now correctly rejects the call with 409 PARTITION_KEY_ALREADY_SET. */
+async function resetPartitionKeyToSentinel(table: string): Promise<void> {
+  for (let i = 0; i < 4; i += 1) {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE table_rules SET partition_key_column = '__unset__', partition_key_unique = 0 WHERE table_name = ?",
+        table,
+      );
+    });
+  }
+}
+
 describe("table-scan cursor + merge helpers (unit)", () => {
   it("round-trips a cursor through encode/decode, including non-ASCII partition keys", () => {
     const cursor = { table: "scan_roundtrip_evt", shardCursors: { "shard-a": "row-042", "shard-b": "row-日本語-9" } };
@@ -1133,7 +1153,10 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     // /admin/create-table already ran checkPartitionKeyUnique (and therefore
     // the probe) once at creation time. Re-run it via /admin/set-partition-key-column
     // for a second pass, then check every shard's real table for anything
-    // matching the probe's marker prefix.
+    // matching the probe's marker prefix. /admin/set-partition-key-column is
+    // now a one-time unset->set upgrade (PR review round 6), so put the table
+    // back into the legitimate pre-upgrade state first.
+    await resetPartitionKeyToSentinel("scan_pku_probe_clean_evt");
     const setRes = await post(
       "/admin/set-partition-key-column",
       { table: "scan_pku_probe_clean_evt", partitionKeyColumn: "id" },
@@ -1302,6 +1325,10 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
       state.storage.sql.exec(`CREATE UNIQUE INDEX ux_${table} ON ${table}(pk COLLATE BINARY)`);
     });
 
+    // /admin/set-partition-key-column is now a one-time unset->set upgrade
+    // (PR review round 6); reset to the pre-upgrade sentinel before
+    // re-invoking it to re-verify uniqueness against the newly-added index.
+    await resetPartitionKeyToSentinel(table);
     const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "pk" }, AUTH());
     expect(setRes.status).toBe(200);
 
@@ -1439,6 +1466,10 @@ describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-af
     );
     expect(createRes.status).toBe(200);
 
+    // /admin/set-partition-key-column is now a one-time unset->set upgrade
+    // (PR review round 6); reset to the pre-upgrade sentinel before
+    // re-invoking it to re-exercise the affinity gate.
+    await resetPartitionKeyToSentinel(table);
     const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "pk" }, AUTH());
     expect(setRes.status).toBe(200);
 
@@ -1560,7 +1591,10 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
 
     // Re-trigger verification for the same column via /admin/set-partition-key-column
     // — must STILL be gated 409: a partial unique index does not guarantee
-    // uniqueness for rows outside its predicate.
+    // uniqueness for rows outside its predicate. /admin/set-partition-key-column
+    // is now a one-time unset->set upgrade (PR review round 6), so reset to
+    // the pre-upgrade sentinel before each re-invocation below.
+    await resetPartitionKeyToSentinel("scan_pku_partial_evt");
     const setWithPartial = await post(
       "/admin/set-partition-key-column",
       { table: "scan_pku_partial_evt", partitionKeyColumn: "user_id" },
@@ -1578,6 +1612,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
       state.storage.sql.exec("DROP INDEX ux_scan_pku_partial");
       state.storage.sql.exec("CREATE UNIQUE INDEX ux_scan_pku_full ON scan_pku_partial_evt(user_id)");
     });
+    await resetPartitionKeyToSentinel("scan_pku_partial_evt");
     const setWithFull = await post(
       "/admin/set-partition-key-column",
       { table: "scan_pku_partial_evt", partitionKeyColumn: "user_id" },
@@ -1627,16 +1662,7 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
     // Simulate a table registered before this validation existed: reset to
     // the __unset__ sentinel and an unverified (0) uniqueness flag, on every
     // catalog shard (table_rules is fanned out to all of them).
-    for (let i = 0; i < 4; i += 1) {
-      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
-      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
-        state.storage.sql.exec(
-          "UPDATE table_rules SET partition_key_column = ?, partition_key_unique = 0 WHERE table_name = ?",
-          "__unset__",
-          "scan_spkc_evt",
-        );
-      });
-    }
+    await resetPartitionKeyToSentinel("scan_spkc_evt");
 
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
@@ -1656,7 +1682,14 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), cont
 
     // Upgrade to a genuinely unique (PRIMARY KEY) column: the flag must be
     // freshly re-verified for the NEW column (not stuck from the old one),
-    // and the scan must now be allowed.
+    // and the scan must now be allowed. /admin/set-partition-key-column is
+    // now a one-time unset->set upgrade (PR review round 6) — the table was
+    // just upgraded to "user_id" above, so put it back into the pre-upgrade
+    // sentinel state before this second, deliberately-repeated invocation
+    // (this test exists specifically to exercise re-verification against a
+    // DIFFERENT column, which is otherwise no longer reachable through this
+    // endpoint on a single table).
+    await resetPartitionKeyToSentinel("scan_spkc_evt");
     const setUniqueRes = await post(
       "/admin/set-partition-key-column",
       { table: "scan_spkc_evt", partitionKeyColumn: "id" },
