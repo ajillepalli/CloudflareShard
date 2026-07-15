@@ -214,7 +214,11 @@ async function handleAdminInit(request: Request, env: Env): Promise<Response> {
 async function handleAdminRegisterTable(request: Request, env: Env): Promise<Response> {
   const payload = (await request.json()) as Record<string, unknown> & {
     table?: string;
-    schemaSql?: string;
+    // PR review round 11: widened to `string | null` — this route now sends
+    // an explicit `null` down to CatalogDO to signal "clear schema_sql",
+    // distinct from omitting the field ("preserve it"). See the comment
+    // below (just before the fan-out) for the full contract.
+    schemaSql?: string | null;
     partitionKeyColumn?: string;
   };
   // Pre-landing review fix: every sibling route (handleAdminSetPartitionKeyColumn,
@@ -295,27 +299,20 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
   // true — it can still stay true if it already was.
   delete (payload as Record<string, unknown>).provenanceComplete;
   let partitionKeyUnique = false;
-  // PR review round 10 fix: schemaSql (caller-submitted text, later executed
+  // PR review round 10: schemaSql (caller-submitted text, later executed
   // verbatim to provision split/migration targets) and partitionKeyUnique
   // (probed against whatever ALREADY physically exists on a live shard right
   // now) come from two structurally disconnected sources that are only ever
-  // assumed to correspond — never actually checked against each other. If a
-  // table happens to already exist somewhere with a genuinely unique
-  // constraint, but is being registered here for the FIRST time (so rounds
-  // 8-9's already-verified guards have no prior row to compare against) with
-  // a schemaSql that's weaker (e.g. omits the unique constraint), the live
-  // probe below would still compute partitionKeyUnique = true — verifying
-  // the ACTUAL current shard, not the DDL being stored — while schema_sql
-  // itself stores the weaker text a future split target would provision
-  // from. Comparing the DDL text against the live schema directly would
-  // reopen the exact whack-a-mole rounds 1-3 already abandoned text-parsing
-  // over. Instead: whenever schemaSql is present in this same call, this
-  // route can never produce a verified result — skip the probe entirely
-  // (wasted work otherwise) and leave partitionKeyUnique at its false
-  // default. Verification for such a table can only come from a LATER,
-  // separate /admin/set-partition-key-column call (no schemaSql field to go
-  // stale against) or from /admin/create-table's own atomic push-then-verify
-  // flow (a different code path entirely, unaffected by this route).
+  // assumed to correspond — never actually checked against each other.
+  // Comparing the DDL text against the live schema directly would reopen the
+  // exact whack-a-mole rounds 1-3 already abandoned text-parsing over.
+  // Instead: whenever schemaSql is present in this same call, this route can
+  // never produce a verified result — skip the probe entirely (wasted work
+  // otherwise) and leave partitionKeyUnique at its false default.
+  // Verification for such a table can only come from a LATER, separate
+  // /admin/set-partition-key-column call (no schemaSql field to go stale
+  // against) or from /admin/create-table's own atomic push-then-verify flow
+  // (a different code path entirely, unaffected by this route).
   if (
     !hasSchemaSql &&
     typeof payload.partitionKeyColumn === "string" &&
@@ -329,6 +326,41 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
       if (shardIds.length > 0) {
         partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], payload.table, payload.partitionKeyColumn);
       }
+    }
+  }
+
+  // PR review round 11 (fundamental fix, P1+P2): closes two residual gaps
+  // round 10 left open.
+  //   Finding 1 — a LATER call that OMITS schemaSql (hasSchemaSql=false) can
+  //   still compute partitionKeyUnique=true from the live probe above, while
+  //   whatever schema_sql an EARLIER call stored (possibly weak, possibly
+  //   stale) sat untouched — recreating the exact partition_key_unique=1 +
+  //   untrustworthy-schema_sql pairing round 10 was meant to prevent, just
+  //   via a second call. Fixed by having THIS call explicitly clear
+  //   schema_sql whenever ITS OWN probe just verified uniqueness — this
+  //   route's live-state check can never vouch for whatever text happens to
+  //   be on file, so it must not be left in place once partition_key_unique
+  //   flips to 1 through this path.
+  //   Finding 2 — hasSchemaSql already treats an empty string identically to
+  //   omitted (the `.length > 0` check above), so the probe correctly runs;
+  //   but the empty string itself used to still ride along in `...payload`
+  //   to CatalogDO and land in schema_sql as garbage (not a valid CREATE
+  //   TABLE statement, but not null either). Fixed by the same branches
+  //   below: an empty/omitted schemaSql never reaches CatalogDO as a stored
+  //   string in either case.
+  // CatalogDO's handleRegisterTable distinguishes three states by FIELD
+  // PRESENCE (a bare `??` can't tell "omitted" from "explicitly null" —
+  // both are nullish): omit "schemaSql" entirely to preserve whatever's
+  // stored; send "schemaSql": null to explicitly clear it; send a real
+  // string to store it. hasSchemaSql=true needs no action here — this
+  // call's own real schemaSql already sits in `payload.schemaSql` and is
+  // stored as submitted (partitionKeyUnique stays false, so there's no
+  // verified-flag/schema-text mismatch risk to guard against).
+  if (!hasSchemaSql) {
+    if (partitionKeyUnique) {
+      (payload as Record<string, unknown>).schemaSql = null;
+    } else {
+      delete (payload as Record<string, unknown>).schemaSql;
     }
   }
 
@@ -663,16 +695,26 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     "/register-table",
     // schemaSql: Milestone 3, Chunk 5 — captured so migration backfill can
     // provision this table on a shard created after this fan-out ran (e.g.
-    // a split target). provenanceComplete: true — a table just created here
-    // has zero legacy rows (nothing predates its own existence), so it starts
-    // fully backfilled rather than 0 (see table_rules.provenance_complete's
-    // ensureSchema comment in catalog.ts).
+    // a split target).
+    //
+    // PR review round 11 (P2 fix): no longer sends provenanceComplete: true.
+    // The DDL above is CREATE TABLE IF NOT EXISTS — if `body.table` already
+    // physically existed (e.g. this call is re-creating a table name that
+    // collides with pre-existing legacy data), the DDL silently no-ops, but
+    // this fan-out used to certify provenance_complete=1 unconditionally
+    // regardless, hiding any of that legacy table's rows never covered by
+    // __cf_row_owners behind a false `provenance.complete: true` on
+    // /v1/table-scan. A genuinely brand-new (empty) table now starts at 0
+    // like any other table; its first /admin/backfill-provenance run
+    // trivially finds zero orphaned/ambiguous rows (nothing to scan) and
+    // certifies it complete through the normal mechanism — same end state
+    // for the legitimate case, one extra (cheap, near-no-op) admin call, no
+    // false-positive risk for a colliding table name.
     () => ({
       table: body.table,
       partitioning: body.partitioning,
       partitionKeyColumn: body.partitionKeyColumn,
       schemaSql: body.schema,
-      provenanceComplete: true,
       partitionKeyUnique,
     }),
     request.headers.get("authorization") ?? undefined,
