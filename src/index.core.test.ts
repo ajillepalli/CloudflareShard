@@ -667,6 +667,27 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
     const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
     expect(scanRes.status).toBe(200);
   });
+
+  // Fix (P2, provenance trust gap found by Codex structured review):
+  // /admin/register-table already strips a client-supplied
+  // partitionKeyUnique (tested above) but used to forward provenanceComplete
+  // as-is -- a caller could claim {"provenanceComplete": true} for a table
+  // that never actually had a backfill run, making /v1/table-scan's
+  // provenance.complete field falsely report no legacy unattributed rows are
+  // hidden.
+  it("ignores a smuggled provenanceComplete: true for a table that was never actually backfilled — computes 0, not 1", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_bypass_provenance_evt";
+
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id", provenanceComplete: true },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    expect(await readTableRulesColumn(table, "provenance_complete")).toBe(0);
+  });
 });
 
 // Coverage gap: catalog.ts's handleRegisterTable computes

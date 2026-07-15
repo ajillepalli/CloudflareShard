@@ -277,6 +277,17 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
   // registered before /admin/init has ever run), but nothing can be verified
   // as unique either.
   delete (payload as Record<string, unknown>).partitionKeyUnique;
+  // Codex structured-review fix: same trust-bypass class as
+  // partitionKeyUnique above — a client-supplied provenanceComplete: true
+  // would let /admin/register-table force table_rules.provenance_complete to
+  // 1 with no actual backfill run behind it, making /v1/table-scan's
+  // provenance.complete field falsely claim no legacy unattributed rows are
+  // being hidden. CatalogDO.handleRegisterTable's own monotonic-preserve
+  // logic (`existing?.provenance_complete === 1`) already keeps a
+  // legitimately-true value across re-registration without trusting this
+  // field at all, so stripping it here only removes the ability to FORCE it
+  // true — it can still stay true if it already was.
+  delete (payload as Record<string, unknown>).provenanceComplete;
   let partitionKeyUnique = false;
   if (typeof payload.partitionKeyColumn === "string" && payload.partitionKeyColumn.length > 0 && typeof payload.table === "string") {
     const listResults = await fanOutToAllCatalogs(env, "/list-shards", () => ({}));
@@ -2614,9 +2625,14 @@ const MAX_TABLE_SCAN_LIMIT = 500;
  * shard in the tenant's catalog shard's pool at the time this cursor was
  * issued. A shard with no entry (either because the cursor predates it, or
  * because a fresh scan hasn't touched it yet) starts at "" — scan from the
- * beginning. Exported for direct unit testing of the encode/decode round-trip
- * and the merge invariant, independent of the HTTP route. */
-export type TableScanCursor = { shardCursors: Record<string, string> };
+ * beginning. `table` binds the cursor to the table it was issued against
+ * (Codex-found P2 fix: without it, a cursor from scanning table A could be
+ * silently accepted as valid resume positions against table B for the same
+ * tenant, skipping/reordering table B's own rows) — handleV1TableScan rejects
+ * a cursor whose `table` doesn't match the current request's `table` with 400
+ * INVALID_CURSOR. Exported for direct unit testing of the encode/decode
+ * round-trip and the merge invariant, independent of the HTTP route. */
+export type TableScanCursor = { table: string; shardCursors: Record<string, string> };
 
 /** Base64-JSON encode, UTF-8-safe (partition keys are arbitrary strings, so a
  * plain btoa() over the raw JSON string would throw on non-Latin1 input). */
@@ -2631,9 +2647,13 @@ export function encodeTableScanCursor(cursor: TableScanCursor): string {
  * base64/JSON-decode or doesn't have the expected shape — the caller turns
  * that into 400 INVALID_CURSOR rather than guessing at a partial cursor
  * (client-supplied input the Worker never itself produced this way is
- * otherwise unvalidated). Does NOT check the shard-id keys against the
- * current active shard set — that requires the live shard list, checked
- * separately by the caller once it's fetched one. */
+ * otherwise unvalidated). `table` is required (Codex-found P2 fix — see
+ * TableScanCursor's doc comment); a cursor encoded before this field existed
+ * has no back-compat path and is rejected the same as any other malformed
+ * cursor, since this branch hasn't shipped yet. Does NOT check the shard-id
+ * keys against the current active shard set, or `table` against the current
+ * request's table — those require values only the caller has (the live shard
+ * list, and the request body), checked separately once it has them. */
 export function decodeTableScanCursor(raw: string): TableScanCursor | null {
   try {
     const binary = atob(raw);
@@ -2643,13 +2663,15 @@ export function decodeTableScanCursor(raw: string): TableScanCursor | null {
     if (
       parsed !== null &&
       typeof parsed === "object" &&
+      "table" in parsed &&
+      typeof (parsed as { table: unknown }).table === "string" &&
       "shardCursors" in parsed &&
       (parsed as { shardCursors: unknown }).shardCursors !== null &&
       typeof (parsed as { shardCursors: unknown }).shardCursors === "object" &&
       !Array.isArray((parsed as { shardCursors: unknown }).shardCursors) &&
       Object.values((parsed as { shardCursors: Record<string, unknown> }).shardCursors).every((v) => typeof v === "string")
     ) {
-      return { shardCursors: (parsed as TableScanCursor).shardCursors };
+      return { table: (parsed as TableScanCursor).table, shardCursors: (parsed as TableScanCursor).shardCursors };
     }
     return null;
   } catch {
@@ -2828,7 +2850,13 @@ export function mergeTableScanPages(
  * enumerate its own rows without already knowing an indexed value. */
 async function handleV1TableScan(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { tenantId?: string; table?: string; limit?: number; cursor?: string | null };
-  if (!body.tenantId || !body.table) {
+  // Codex-found P2 fix: truthiness alone let a type-confused table (e.g.
+  // `{}`, which is truthy) slip past this gate and reach normalizeTableName's
+  // .trim() call below, crashing with an unhandled TypeError before
+  // authentication even runs (auth happens later, via /lookup-table-scan).
+  // Validating the type here, not just presence, closes that unauthenticated
+  // crash.
+  if (typeof body.tenantId !== "string" || !body.tenantId || typeof body.table !== "string" || !body.table) {
     return json({ error: { code: "MISSING_FIELDS", message: "Missing tenantId or table.", fix: "Provide both tenantId and table." } }, 400);
   }
   // Codex P2 fix: reject non-integer/fractional/non-positive limits here too
@@ -2896,6 +2924,22 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
         400,
       );
     }
+    // Codex-found P2 fix: a cursor carries resume positions for the table it
+    // was issued against — accepting it for a different table would let a
+    // tenant's cursor from scanning table A silently resume (and potentially
+    // skip/reorder) that tenant's own rows in table B.
+    if (requestedCursor.table !== body.table) {
+      return json(
+        {
+          error: {
+            code: "INVALID_CURSOR",
+            message: `cursor was issued for table "${requestedCursor.table}", not "${body.table}".`,
+            fix: "Omit cursor to restart the scan from the beginning, or resume it against the same table it was issued for.",
+          },
+        },
+        400,
+      );
+    }
   }
 
   const authorization = request.headers.get("authorization") ?? undefined;
@@ -2911,7 +2955,17 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   }
   const lookupBody = (await lookupRes.json()) as { partitionKeyColumn: string; provenanceComplete: boolean };
 
-  const listRes = await routeToCatalog(env, catalogShardId, "/list-shards", {});
+  // Fix (drain-completeness gap, found by 3 independent reviewers): a
+  // draining shard still physically holds its base rows until its vbuckets
+  // finish migrating (see CatalogDO.handleListShards's doc comment) -- a
+  // table-scan must SEE every existing row, exactly like
+  // handleAdminBackfillProvenance and the create-index backfill path already
+  // do, or it silently drops a draining shard's rows with no error at all.
+  // This can now surface the same row from both the draining shard and its
+  // migration target mid-flight -- an accepted, already-documented limitation
+  // (SPEC's Non-goals section: "Migration-window duplicates are inherited,
+  // not solved fresh"), not something this route dedupes.
+  const listRes = await routeToCatalog(env, catalogShardId, "/list-shards", { includeDraining: true }, authorization);
   if (!listRes.ok) {
     return new Response(listRes.body, { status: listRes.status, headers: listRes.headers });
   }
@@ -3006,7 +3060,7 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
 
   return json({
     rows,
-    ...(nextShardCursors ? { nextCursor: encodeTableScanCursor({ shardCursors: nextShardCursors }) } : {}),
+    ...(nextShardCursors ? { nextCursor: encodeTableScanCursor({ table: body.table, shardCursors: nextShardCursors }) } : {}),
     provenance: {
       complete: lookupBody.provenanceComplete,
       ...(lookupBody.provenanceComplete

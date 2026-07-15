@@ -56,7 +56,7 @@ async function findKeysSpanningShards(tenantId: string, table: string, minTotal:
 
 describe("table-scan cursor + merge helpers (unit)", () => {
   it("round-trips a cursor through encode/decode, including non-ASCII partition keys", () => {
-    const cursor = { shardCursors: { "shard-a": "row-042", "shard-b": "row-日本語-9" } };
+    const cursor = { table: "scan_roundtrip_evt", shardCursors: { "shard-a": "row-042", "shard-b": "row-日本語-9" } };
     const encoded = encodeTableScanCursor(cursor);
     expect(typeof encoded).toBe("string");
     expect(decodeTableScanCursor(encoded)).toEqual(cursor);
@@ -66,8 +66,11 @@ describe("table-scan cursor + merge helpers (unit)", () => {
     expect(decodeTableScanCursor("not valid base64!!!")).toBeNull();
     expect(decodeTableScanCursor(btoa("not json"))).toBeNull();
     expect(decodeTableScanCursor(btoa(JSON.stringify({ notShardCursors: {} })))).toBeNull();
-    expect(decodeTableScanCursor(btoa(JSON.stringify({ shardCursors: { a: 1 } })))).toBeNull();
-    expect(decodeTableScanCursor(btoa(JSON.stringify({ shardCursors: ["a"] })))).toBeNull();
+    expect(decodeTableScanCursor(btoa(JSON.stringify({ table: "t", shardCursors: { a: 1 } })))).toBeNull();
+    expect(decodeTableScanCursor(btoa(JSON.stringify({ table: "t", shardCursors: ["a"] })))).toBeNull();
+    // Fix (cursor table-binding, P2): missing `table` is rejected too, same as
+    // any other malformed shape.
+    expect(decodeTableScanCursor(btoa(JSON.stringify({ shardCursors: { a: "b" } })))).toBeNull();
   });
 
   it("advances a shard's cursor only to the last row from that shard actually kept after truncation — never to a row that was fetched but cut (the data-loss-avoiding invariant)", () => {
@@ -257,6 +260,43 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.rows.map((r) => r.id).sort()).toEqual([keyA, keyB].sort());
     expect(body.nextCursor).toBeUndefined();
     expect(body.scan.shardCount).toBe(2);
+  });
+
+  // Fix (P1, drain-completeness gap found by 3 independent reviewers):
+  // /list-shards used to default to ACTIVE-only shards for /v1/table-scan, so
+  // a shard marked draining -- which still physically holds its base rows
+  // until its vbuckets finish migrating (see CatalogDO.handleListShards's doc
+  // comment) -- had its rows silently omitted from a scan, with no error at
+  // all: the request just returned 200 with a strictly smaller row set than
+  // actually exists. handleAdminBackfillProvenance and the create-index
+  // backfill path already pass `{ includeDraining: true }` for exactly this
+  // reason; /v1/table-scan was the one completeness-critical route that
+  // didn't.
+  it("still returns a row that lives on a DRAINING shard, not just active ones (drain-completeness fix)", async () => {
+    await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("scan_drain_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Two keys on different shards within this tenant's catalog-shard pool --
+    // draining exactly the one holding keyA leaves the pool's other shard
+    // active, so the request itself still succeeds (200, not 400 NO_SHARDS)
+    // and genuinely exercises "active-only enumeration silently drops a
+    // draining shard's row", not "no shards left at all".
+    const [keyA, keyB] = await findPartitionKeyPairOnDifferentShards(token, tenantId, "scan_drain_evt");
+    await post("/v1/mutate", { op: "insert", table: "scan_drain_evt", tenantId, partitionKey: keyA, values: { v: "a" } }, token);
+    await post("/v1/mutate", { op: "insert", table: "scan_drain_evt", tenantId, partitionKey: keyB, values: { v: "b" } }, token);
+
+    const drainedShardId = await probeShardForKey(tenantId, "scan_drain_evt", keyA);
+    const drainRes = await post("/admin/drain-shard", { shardId: drainedShardId, catalogShardId: "catalog-0" }, AUTH());
+    expect(drainRes.status).toBe(200);
+
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_drain_evt" }, token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ id: string }> };
+    // Both rows still present -- keyA's row, on the now-draining shard, is not
+    // silently dropped.
+    expect(body.rows.map((r) => r.id).sort()).toEqual([keyA, keyB].sort());
   });
 
   // Codex P3 fix: /tenant-scan-page used to SELECT b.*, ro.partition_key AS
@@ -561,6 +601,23 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(((await missingTenant.json()) as { error: { code: string } }).error.code).toBe("MISSING_FIELDS");
   });
 
+  // Codex adversarial fix: the check above only tested PRESENCE
+  // (`!body.tenantId || !body.table`), not TYPE. `{"tenantId":"x","table":{}}`
+  // passes a truthiness check (an empty object is truthy) and used to reach
+  // normalizeTableName's .trim() call further down, crashing with an
+  // unhandled TypeError -- before authentication even runs (auth happens
+  // later, via /lookup-table-scan). Validating typeof alongside presence
+  // closes that unauthenticated crash.
+  it("rejects a table-scan with a non-string tenantId or table with 400 MISSING_FIELDS rather than crashing (Codex type-confusion fix)", async () => {
+    const objectTable = await post("/v1/table-scan", { tenantId: "t1", table: {} });
+    expect(objectTable.status).toBe(400);
+    expect(((await objectTable.json()) as { error: { code: string } }).error.code).toBe("MISSING_FIELDS");
+
+    const objectTenant = await post("/v1/table-scan", { tenantId: {}, table: "scan_typeconfusion_evt" });
+    expect(objectTenant.status).toBe(400);
+    expect(((await objectTenant.json()) as { error: { code: string } }).error.code).toBe("MISSING_FIELDS");
+  });
+
   // Coverage gap: the fractional-limit test above only exercises the
   // `!Number.isInteger` disjunct of this route's compound limit validation.
   // The `< 1` and `> MAX_TABLE_SCAN_LIMIT` disjuncts had zero coverage of
@@ -595,11 +652,42 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
-    const staleCursor = encodeTableScanCursor({ shardCursors: { "catalog-0-shard-does-not-exist": "row-9" } });
+    const staleCursor = encodeTableScanCursor({ table: "scan_stalecursor_evt", shardCursors: { "catalog-0-shard-does-not-exist": "row-9" } });
     const res = await post("/v1/table-scan", { tenantId, table: "scan_stalecursor_evt", cursor: staleCursor }, token);
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("INVALID_CURSOR");
+  });
+
+  // Fix (P2, cursor table-binding gap found by Claude adversarial subagent):
+  // TableScanCursor used to carry only per-shard cursor positions, nothing
+  // identifying which table it was issued against. A cursor obtained while
+  // scanning table A would be silently accepted as valid resume positions for
+  // table B (same tenant) -- potentially skipping/reordering table B's own
+  // rows with no validation error at all.
+  it("rejects a cursor obtained from scanning a different table with 400 INVALID_CURSOR (cursor table-binding fix)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("scan_tablebind_a");
+    await createIndexTestTable("scan_tablebind_b");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    await post("/v1/mutate", { op: "insert", table: "scan_tablebind_a", tenantId, partitionKey: "row-1", values: { v: "a" } }, token);
+    await post("/v1/mutate", { op: "insert", table: "scan_tablebind_b", tenantId, partitionKey: "row-1", values: { v: "b" } }, token);
+
+    // limit: 1 forces a nextCursor even off a single row (the shard's owner
+    // query fully consumes its LIMIT, signalling "may have more" until a
+    // follow-up call proves otherwise) -- see the coercion-divergence test
+    // above for the same established pattern.
+    const scanARes = await post("/v1/table-scan", { tenantId, table: "scan_tablebind_a", limit: 1 }, token);
+    expect(scanARes.status).toBe(200);
+    const scanABody = (await scanARes.json()) as { nextCursor?: string };
+    expect(scanABody.nextCursor).toBeDefined();
+
+    const crossRes = await post("/v1/table-scan", { tenantId, table: "scan_tablebind_b", cursor: scanABody.nextCursor }, token);
+    expect(crossRes.status).toBe(400);
+    const crossBody = (await crossRes.json()) as { error: { code: string } };
+    expect(crossBody.error.code).toBe("INVALID_CURSOR");
   });
 
   it("hides an unattributed row from every tenant and reports provenance.complete=false until a full backfill run clears it, then flips true and the row becomes visible (criterion 4)", async () => {
