@@ -152,11 +152,12 @@ describe("table-scan cursor + merge helpers (unit)", () => {
 
   // Codex round-4 fix: the new owner-scan cursor signal (lastOwnerKeyScanned)
   // must never override the pre-existing cross-shard-truncation invariant --
-  // composing them means taking whichever position is EARLIER, never letting
-  // the "how far scanned" signal push the cursor past a row that was fetched
-  // but then cut by the overall-limit truncation. Here shard-a's owner query
-  // scanned as far as "a9" (not exhausted, limit fully consumed), but the
-  // overall truncation to 1 row cuts shard-a's own fetched "a2" away —
+  // when cross-shard truncation cuts SOME of a shard's own fetched rows away,
+  // the "how far scanned" signal must not push the cursor past a row that was
+  // fetched but then cut by the overall-limit truncation. Here shard-a's
+  // owner query scanned as far as "a9" (not exhausted, limit fully
+  // consumed), but the overall truncation to 1 row cuts shard-a's own
+  // fetched "a2" away entirely (0 of its 1 fetched rows survived) —
   // nextShardCursors must stay at "" (never fetched "a2"), not jump to "a9".
   it("never advances a shard's cursor past a row it fetched but the cross-shard merge truncated away, even when that shard's owner-row scan went further", () => {
     const pages = [
@@ -168,6 +169,36 @@ describe("table-scan cursor + merge helpers (unit)", () => {
     const { rows, nextShardCursors } = mergeTableScanPages(pages, 1, 3, {});
     expect(rows.map((r) => r.id)).toEqual(["a1"]);
     expect(nextShardCursors).toEqual({ "shard-a": "", "shard-b": "a1" });
+  });
+
+  // Codex round-5 fix: a shard whose ENTIRE batch of owner keys resolves to
+  // zero delivered rows (e.g. every one of their base rows was deleted
+  // between /tenant-scan-page's two queries -- shard.ts's accepted race) has
+  // no entry at all in `truncated`, so invariant (b) never touches it and its
+  // cursor is left at whatever it was BEFORE this call. Since
+  // lastOwnerKeyScanned is always >= that prior position (the owner query is
+  // `partition_key > prior`), the old "take whichever of (a)/(b) is EARLIER"
+  // composition always picked the untouched prior position here -- the
+  // cursor could never advance, so a client would re-issue the identical
+  // query forever. rows.length(0) must instead let (a) advance the cursor
+  // all the way to lastOwnerKeyScanned unconditionally.
+  it("advances a shard's cursor to lastOwnerKeyScanned when its entire batch resolved to zero delivered rows, rather than stalling at the untouched prior cursor forever", () => {
+    const pages = [{ shardId: "shard-a", rows: [], ownerRowsScanned: 3, lastOwnerKeyScanned: "a3" }];
+    const { rows, nextShardCursors } = mergeTableScanPages(pages, 10, 3, { "shard-a": "" });
+    expect(rows).toEqual([]);
+    expect(nextShardCursors).toEqual({ "shard-a": "a3" });
+  });
+
+  // Companion to the fix above: when every row a shard DID fetch survived
+  // into the truncated response (no cross-shard truncation touched it at
+  // all), (a) is also free to advance past a trailing skipped-owner-row gap
+  // beyond the last delivered row -- not just hold at invariant (b)'s bound.
+  it("advances a shard's cursor past a trailing skipped-owner-row gap when every row it fetched was delivered (no cross-shard truncation involved)", () => {
+    const pages = [{ shardId: "shard-a", rows: [{ partitionKey: "a1", row: { id: "a1" } }], ownerRowsScanned: 3, lastOwnerKeyScanned: "a3" }];
+    // overallLimit(10) keeps a1 -- nothing truncated away from shard-a.
+    const { rows, nextShardCursors } = mergeTableScanPages(pages, 10, 3, {});
+    expect(rows.map((r) => r.id)).toEqual(["a1"]);
+    expect(nextShardCursors).toEqual({ "shard-a": "a3" });
   });
 
   it("breaks a tied partition_key across shards by shardId ascending, and isInternalTableName correctly identifies internal tables at this new gate", () => {
@@ -868,5 +899,107 @@ describe("Worker /v1/table-scan E2E (Milestone 4)", () => {
     expect(calls).toBeGreaterThan(1);
     expect(collected.map((r) => r.id).sort()).toEqual(["row-1", "row-2", "row-4", "row-5"]);
     expect(new Set(collected.map((r) => r.id)).size).toBe(4); // no duplicate delivery either
+  });
+
+  // Codex round-5 fix, reproduced end-to-end: the round-4 fix above handles a
+  // shard's owner-row batch delivering SOME rows with one skip mixed in. It
+  // has a blind spot when a shard's ENTIRE batch resolves to zero delivered
+  // rows -- e.g. every owner key in the first LIMIT-sized batch has its base
+  // row deleted. Before this fix, mergeTableScanPages's invariant (a) never
+  // advances a shard's cursor in that case (lastOwnerKeyScanned is always >=
+  // the untouched prior cursor, so "take whichever of (a)/(b) is earlier"
+  // always picked the prior, unmoved position) -- the client would re-issue
+  // the identical /tenant-scan-page query forever.
+  //
+  // Uses numShards:1 so all rows land on one known shard, and limit:3 so the
+  // whole tenant's data (exactly 3 rows) is consumed by the FIRST batch, with
+  // nothing left beyond it -- a scan that stalls will never see a null
+  // nextCursor; a correctly-fixed scan advances past the fully-skipped batch
+  // on the very next call and terminates immediately.
+  it("regression (Codex round-5): a shard whose entire first batch resolves to zero delivered rows still terminates the scan, instead of re-issuing the identical empty query forever", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_owner_allskip_evt";
+    await createIndexTestTable(table);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const shardId = "catalog-0-shard-0";
+
+    const keys = ["row-1", "row-2", "row-3"];
+    for (const k of keys) {
+      const res = await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: k, values: { v: k } }, token);
+      expect(res.status).toBe(200);
+    }
+    // Delete every physical base row, leaving all three __cf_row_owners
+    // entries in place -- the whole first (and only) batch resolves to zero
+    // delivered rows.
+    for (const k of keys) {
+      const deleteResult = await shardExecute(shardId, `DELETE FROM "${table}" WHERE "id" = ?`, [k]);
+      expect(deleteResult.status).toBe(200);
+    }
+
+    const collected: Array<{ id: string; v: string }> = [];
+    let cursor: string | undefined;
+    let calls = 0;
+    // A stalled scan would never see a null nextCursor; cap well above the 2
+    // calls a correct fix needs (1: empty page + cursor advanced past
+    // row-3; 2: owner query past row-3 finds nothing, scan ends) so a
+    // regression fails loudly on the `calls` assertion below rather than
+    // hanging the test suite.
+    for (let call = 0; call < 5; call += 1) {
+      calls += 1;
+      const res = await post("/v1/table-scan", { tenantId, table, limit: 3, cursor: cursor ?? null }, token);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ id: string; v: string }>; nextCursor?: string };
+      collected.push(...body.rows);
+      if (!body.nextCursor) break;
+      cursor = body.nextCursor;
+    }
+
+    expect(calls).toBeLessThanOrEqual(2);
+    expect(collected).toEqual([]);
+  });
+
+  // Companion to the regression above: proves the fix doesn't just terminate
+  // the stalled scan, but actually makes PROGRESS past the fully-skipped
+  // batch -- real data seeded beyond it must still surface.
+  it("regression (Codex round-5): real rows beyond a shard's fully-skipped first batch are still returned, proving the cursor advanced past it (not just that the scan terminated)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_owner_allskip_progress_evt";
+    await createIndexTestTable(table);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const shardId = "catalog-0-shard-0";
+
+    // Zero-padded so string order == insertion order: row-1..row-3 form the
+    // fully-skipped first batch (limit:3); row-4/row-5 are real data sorting
+    // strictly after it.
+    const skippedKeys = ["row-1", "row-2", "row-3"];
+    const realKeys = ["row-4", "row-5"];
+    for (const k of [...skippedKeys, ...realKeys]) {
+      const res = await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: k, values: { v: k } }, token);
+      expect(res.status).toBe(200);
+    }
+    for (const k of skippedKeys) {
+      const deleteResult = await shardExecute(shardId, `DELETE FROM "${table}" WHERE "id" = ?`, [k]);
+      expect(deleteResult.status).toBe(200);
+    }
+
+    const collected: Array<{ id: string; v: string }> = [];
+    let cursor: string | undefined;
+    let calls = 0;
+    for (let call = 0; call < 5; call += 1) {
+      calls += 1;
+      const res = await post("/v1/table-scan", { tenantId, table, limit: 3, cursor: cursor ?? null }, token);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: Array<{ id: string; v: string }>; nextCursor?: string };
+      collected.push(...body.rows);
+      if (!body.nextCursor) break;
+      cursor = body.nextCursor;
+    }
+
+    expect(calls).toBeGreaterThan(1);
+    expect(calls).toBeLessThanOrEqual(5);
+    expect(collected.map((r) => r.id).sort()).toEqual(["row-4", "row-5"]);
+    expect(new Set(collected.map((r) => r.id)).size).toBe(2);
   });
 });
