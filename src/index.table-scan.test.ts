@@ -542,6 +542,40 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.error.code).toBe("LIMIT_EXCEEDED");
   });
 
+  // Coverage gap: neither tenantId nor table has any test at all -- both are
+  // required fields checked before anything else in handleV1TableScan (the
+  // sibling /v1/index-query route has an equivalent MISSING_FIELDS test in
+  // index.indexing.test.ts; /v1/table-scan's own copy of this check had none).
+  it("rejects a table-scan missing tenantId or table with 400 MISSING_FIELDS", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const missingTable = await post("/v1/table-scan", { tenantId }, token);
+    expect(missingTable.status).toBe(400);
+    expect(((await missingTable.json()) as { error: { code: string } }).error.code).toBe("MISSING_FIELDS");
+
+    const missingTenant = await post("/v1/table-scan", { table: "scan_missingfields_evt" }, token);
+    expect(missingTenant.status).toBe(400);
+    expect(((await missingTenant.json()) as { error: { code: string } }).error.code).toBe("MISSING_FIELDS");
+  });
+
+  // Coverage gap: the fractional-limit test above only exercises the
+  // `!Number.isInteger` disjunct of this route's compound limit validation.
+  // The `< 1` and `> MAX_TABLE_SCAN_LIMIT` disjuncts had zero coverage of
+  // their own -- each is a genuinely different reason the same 400 fires.
+  it.each([0, -1, 501])("rejects an out-of-range limit (%d) with 400 LIMIT_EXCEEDED", async (limit) => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("scan_limitrange_evt");
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_limitrange_evt", limit }, token);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("LIMIT_EXCEEDED");
+  });
+
   it("rejects a malformed cursor with 400 INVALID_CURSOR rather than 500ing or silently restarting", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("scan_badcursor_evt");
@@ -621,6 +655,56 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(afterBody.rows.map((r) => r.id).sort()).toEqual(["attributed-row", "orphan-row"]);
     expect(afterBody.provenance.complete).toBe(true);
     expect(afterBody.provenance.fix).toBeUndefined();
+  });
+
+  // Coverage gap: the criterion-4 test above only exercises the `if
+  // (!body.catalogShardId)` branch's TRUE path (a full-cluster run). The
+  // FALSE path -- a scoped run (catalogShardId given) must NEVER mark
+  // provenance_complete, even when ITS OWN scan reports zero orphaned/
+  // ambiguous rows -- had zero coverage. A scoped run only ever sees one
+  // catalog shard's own shard pool, so "clean" there doesn't mean clean
+  // cluster-wide; incorrectly marking complete here would permanently hide
+  // this table's provenance status from ever being re-checked honestly.
+  it("does NOT mark a table provenance-complete after a scoped (catalogShardId-given) backfill run, even when that run itself finds zero orphaned/ambiguous rows", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 64, force: true }, AUTH());
+    await createIndexTestTable("scan_scopedprov_evt");
+
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await stub.fetch(
+        new Request("https://catalog.internal/list-shards", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+      );
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec("DELETE FROM tenant_auth");
+      });
+    }
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    await post("/v1/mutate", { op: "insert", table: "scan_scopedprov_evt", tenantId, partitionKey: "row-1", values: { v: "x" } }, token);
+
+    // Simulate a table that predates completeness tracking, same as the
+    // criterion-4 test above.
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec("UPDATE table_rules SET provenance_complete = 0 WHERE table_name = ?", "scan_scopedprov_evt");
+      });
+    }
+
+    // Scoped run against just catalog-0: the single attributed row here is
+    // fully clean (zero orphaned, zero ambiguous) FOR THIS SHARD POOL, but
+    // that must not be enough to certify the table complete.
+    const scopedRes = await post("/admin/backfill-provenance", { catalogShardId: "catalog-0" }, AUTH());
+    expect(scopedRes.status).toBe(200);
+    const scopedBody = (await scopedRes.json()) as { orphaned: unknown[]; ambiguous: unknown[] };
+    expect(scopedBody.orphaned).toHaveLength(0);
+    expect(scopedBody.ambiguous).toHaveLength(0);
+
+    const afterScoped = await post("/v1/table-scan", { tenantId, table: "scan_scopedprov_evt" }, token);
+    expect(afterScoped.status).toBe(200);
+    const afterScopedBody = (await afterScoped.json()) as { provenance: { complete: boolean } };
+    expect(afterScopedBody.provenance.complete).toBe(false);
   });
 });
 
