@@ -384,6 +384,7 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     const tenantA = tenantForCatalogShard(0, 4);
     let tenantB = "";
     for (let i = 0; ; i += 1) {
+      if (i > 5000) throw new Error("could not find a colliding tenantId within 5000 probes");
       const candidate = `${tenantA}-collide-${i}`;
       if (candidate !== tenantA && hashKey(candidate) % 4 === 0) {
         tenantB = candidate;
@@ -419,12 +420,12 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(bodyB.rows[0].v).toBe("b-shared-value");
   });
 
-  it("rejects a table-scan against an unregistered table with 400 TABLE_NOT_REGISTERED", async () => {
+  it("rejects a table-scan against an unregistered table with 404 TABLE_NOT_REGISTERED", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
     const res = await post("/v1/table-scan", { tenantId, table: "scan_nonexistent_evt" }, token);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(404);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("TABLE_NOT_REGISTERED");
   });

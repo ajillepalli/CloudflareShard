@@ -217,6 +217,25 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
     schemaSql?: string;
     partitionKeyColumn?: string;
   };
+  // Pre-landing review fix: every sibling route (handleAdminSetPartitionKeyColumn,
+  // handleAdminCreateIndex) validates its identifiers against IDENTIFIER_RE before
+  // using them; this route was missing that check even though payload.table flows
+  // unvalidated into checkPartitionKeyUnique below, which interpolates it directly
+  // into raw SQL text (PRAGMA table_info("${table}") etc.) sent to a shard's
+  // /execute route. partitionKeyColumn is optional on this route, so it's only
+  // validated when actually provided, matching the existing guard used below.
+  if (typeof payload.table !== "string" || !IDENTIFIER_RE.test(payload.table)) {
+    return json(
+      { error: { code: "UNSAFE_IDENTIFIER", message: "table or partitionKeyColumn is not a valid identifier.", fix: "Use only letters, digits, and underscores, starting with a letter or underscore." } },
+      400,
+    );
+  }
+  if (typeof payload.partitionKeyColumn === "string" && payload.partitionKeyColumn.length > 0 && !IDENTIFIER_RE.test(payload.partitionKeyColumn)) {
+    return json(
+      { error: { code: "UNSAFE_IDENTIFIER", message: "table or partitionKeyColumn is not a valid identifier.", fix: "Use only letters, digits, and underscores, starting with a letter or underscore." } },
+      400,
+    );
+  }
   // Review Tier 3: /admin/register-table stores schemaSql (if present) for
   // later use — a split target's backfill executes it verbatim to provision
   // the table (see handleAdminCreateTable's comment above /register-table's
@@ -1260,16 +1279,19 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
     const completeTables = Array.from(scannedTableNames).filter(
       (t) => !orphanedTables.has(t) && !ambiguousTables.has(t),
     );
-    for (const tableName of completeTables) {
-      const markResults = await fanOutToAllCatalogs(
-        env,
-        "/mark-table-provenance-complete",
-        () => ({ table: tableName }),
-        authorization,
-      );
-      const markFailed = firstCatalogFanOutFailure(markResults, `Failed to mark ${tableName} provenance complete.`);
-      if (markFailed) return markFailed;
-    }
+    const markOutcomes = await Promise.all(
+      completeTables.map(async (tableName) => {
+        const markResults = await fanOutToAllCatalogs(
+          env,
+          "/mark-table-provenance-complete",
+          () => ({ table: tableName }),
+          authorization,
+        );
+        return firstCatalogFanOutFailure(markResults, `Failed to mark ${tableName} provenance complete.`);
+      }),
+    );
+    const firstMarkFailed = markOutcomes.find((failed) => failed !== null);
+    if (firstMarkFailed) return firstMarkFailed;
   }
 
   return json({ attributed, ambiguous, orphaned });

@@ -19,7 +19,7 @@ All notable changes to this project are documented in this file.
 
 ### Non-goals (explicit, matching the design decision)
 - No arbitrary column filtering — only `table` + `tenantId` + pagination.
-- §14's partition-key collision limitation (two tenants sharing a partition key on the same shard) is inherited, not fixed or worsened — isolation still holds structurally, since `/tenant-scan-page`'s query filters by `tenant_id` before ever joining to the base table.
+- §14's partition-key collision limitation (two tenants sharing a partition key on the same shard) is inherited, not fixed or worsened — for tables whose `partitionKeyColumn` isn't verified `UNIQUE`/`PRIMARY KEY`, isolation is achieved by REJECTING the scan (409 `PARTITION_KEY_NOT_UNIQUE`) rather than by the `tenant_id`-filtered join being inherently safe against value collisions on its own.
 - Migration-window duplicates are inherited, not solved fresh, exactly like the existing documented `/v1/scatter` limitation.
 - No per-tenant rate limiting on this fan-out-shaped route yet (the catalog-shard-scoped pool is the v1 blast-radius control).
 

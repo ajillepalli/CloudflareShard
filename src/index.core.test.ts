@@ -577,6 +577,25 @@ describe("Worker /admin/set-partition-key-column", () => {
   });
 });
 
+/** Reads a single table_rules boolean-flag column straight off catalog-0's own
+ * storage, keyed by table_name — used by tests below where the route's own
+ * response body doesn't echo the computed flag, so this is the only way to
+ * assert what actually landed. Column is restricted to the known flag columns
+ * (never client/test-supplied free text) since column names can't be
+ * parameterized in SQL. */
+async function readTableRulesColumn(
+  table: string,
+  column: "partition_key_unique" | "provenance_complete",
+): Promise<number | undefined> {
+  const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    const rows = Array.from(
+      state.storage.sql.exec(`SELECT ${column} FROM table_rules WHERE table_name = ?`, table),
+    ) as Array<Record<string, number>>;
+    return rows[0]?.[column];
+  });
+}
+
 // Codex-found P1 (re-review of the P1 fix): /admin/register-table used to
 // forward body.partitionKeyUnique straight into table_rules.partition_key_unique
 // with zero verification, letting a caller bypass checkPartitionKeyUnique
@@ -584,17 +603,8 @@ describe("Worker /admin/set-partition-key-column", () => {
 // must never read that field off the raw request — it computes it itself,
 // the same way /admin/create-table and /admin/set-partition-key-column do.
 describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1 fix)", () => {
-  /** Reads table_rules.partition_key_unique straight off catalog-0's own
-   * storage — /admin/register-table's response body doesn't echo the computed
-   * flag, so this is the only way to assert what actually landed. */
   async function readPartitionKeyUnique(table: string): Promise<number | undefined> {
-    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
-    return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
-      const rows = Array.from(
-        state.storage.sql.exec("SELECT partition_key_unique FROM table_rules WHERE table_name = ?", table),
-      ) as Array<{ partition_key_unique: number }>;
-      return rows[0]?.partition_key_unique;
-    });
+    return readTableRulesColumn(table, "partition_key_unique");
   }
 
   it("ignores a smuggled partitionKeyUnique: true when the column has no real unique constraint — computes 0 and still 409s /v1/table-scan", async () => {
@@ -668,13 +678,7 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
 // coverage anywhere in the suite.
 describe("Worker /admin/register-table preserves provenance_complete across re-registration (catalog.ts monotonic fix)", () => {
   async function readProvenanceComplete(table: string): Promise<number | undefined> {
-    const stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
-    return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
-      const rows = Array.from(
-        state.storage.sql.exec("SELECT provenance_complete FROM table_rules WHERE table_name = ?", table),
-      ) as Array<{ provenance_complete: number }>;
-      return rows[0]?.provenance_complete;
-    });
+    return readTableRulesColumn(table, "provenance_complete");
   }
 
   it("keeps provenance_complete=1 after /admin/register-table is called again for an already-complete table, instead of resetting it to 0", async () => {
@@ -717,6 +721,33 @@ describe("Worker /admin/register-table preserves provenance_complete across re-r
     const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "id" }, AUTH());
     expect(registerRes.status).toBe(200);
     expect(await readProvenanceComplete(table)).toBe(0);
+  });
+});
+
+// Pre-landing review fix: /admin/register-table never validated payload.table
+// or payload.partitionKeyColumn against IDENTIFIER_RE, unlike every sibling
+// route (e.g. /admin/set-partition-key-column). An unvalidated table string
+// reaches checkPartitionKeyUnique, which interpolates it directly into raw SQL
+// text sent to a shard's /execute route — a real identifier-injection gap.
+describe("Worker /admin/register-table validates identifiers (pre-landing review fix)", () => {
+  it("rejects a table name that fails IDENTIFIER_RE with 400 UNSAFE_IDENTIFIER", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post("/admin/register-table", { table: `evil"; DROP TABLE x; --` }, AUTH());
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNSAFE_IDENTIFIER");
+  });
+
+  it("rejects a partitionKeyColumn that fails IDENTIFIER_RE with 400 UNSAFE_IDENTIFIER", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/register-table",
+      { table: "register_bad_pkcol_evt", partitionKeyColumn: `id"); DROP TABLE x; --` },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNSAFE_IDENTIFIER");
   });
 });
 
