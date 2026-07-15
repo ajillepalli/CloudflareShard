@@ -141,6 +141,14 @@ const INTERNAL_TABLES = new Set<string>(INTERNAL_TABLE_NAMES);
 // loops use the identical constant (a clamp mismatch would silently drop rows).
 export const MIGRATE_PAGE_SIZE = 500;
 
+// Milestone 4 (tenant-scoped table scan): per-shard page cap for
+// /tenant-scan-page — independent of the overall /v1/table-scan response
+// limit (up to 500), which is capped by merging across shards. Re-exported so
+// src/index.ts's Worker handler requests the identical clamp it should expect
+// back, keeping the "did this shard possibly have more?" (nextCursor
+// presence) check meaningful on both sides.
+export const TENANT_SCAN_PAGE_SIZE = 100;
+
 /** Escapes a SQL identifier's inner double-quotes for interpolation inside a
  * quoted identifier (`"..."`). Callers still wrap the result in quotes. Shared
  * by every place that builds a dynamic table/column reference (review Tier 3
@@ -186,6 +194,7 @@ export class ShardDO extends DurableObject {
       "/mirror-pending-count": this.handleMirrorPendingCount.bind(this),
       "/drain-mirror-jobs": this.handleDrainMirrorJobs.bind(this),
       "/migrate-export": this.handleMigrateExport.bind(this),
+      "/tenant-scan-page": this.handleTenantScanPage.bind(this),
       "/migrate-import": this.handleMigrateImport.bind(this),
       "/migrate-checksum": this.handleMigrateChecksum.bind(this),
       "/migrate-checksums": this.handleMigrateChecksums.bind(this),
@@ -687,6 +696,63 @@ export class ShardDO extends DurableObject {
     return json({ rows });
   }
 
+  /** Tenant-scoped table scan (POST /v1/table-scan's per-shard fan-out
+   * target). One page of a tenant's own rows in `table`, selected via
+   * __cf_row_owners the same way handleMigrateExport selects a vbucket's rows
+   * — but filtered by (tenant_id, table_name) instead of vbucket, since a
+   * scan doesn't know or care which vbucket a row lives in. A row with no
+   * __cf_row_owners entry (pre-Chunk-0, not yet backfilled) is invisible to
+   * this join by construction: its owner is unknown, so it can't be attributed
+   * to this or any tenant (criterion 4). `limit` is independently capped at
+   * TENANT_SCAN_PAGE_SIZE regardless of what the Worker requests — the
+   * overall /v1/table-scan response limit (up to 500) is enforced by merging
+   * across shards, not by widening any single shard's page. */
+  private async handleTenantScanPage(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      table?: string;
+      partitionKeyColumn?: string;
+      tenantId?: string;
+      afterPartitionKey?: string;
+      limit?: number;
+    };
+    if (!body.table || !body.partitionKeyColumn || !body.tenantId) {
+      return json({ error: "Missing table, partitionKeyColumn, or tenantId" }, 400);
+    }
+    const limit = Math.min(TENANT_SCAN_PAGE_SIZE, Math.max(1, body.limit ?? TENANT_SCAN_PAGE_SIZE));
+    const safeTable = escapeIdent(body.table);
+    const safePk = escapeIdent(body.partitionKeyColumn);
+
+    let raw: Array<Record<string, unknown>> = [];
+    try {
+      raw = this.many<Record<string, unknown>>(
+        `
+        SELECT b.*, ro.partition_key AS __cf_scan_pk
+        FROM __cf_row_owners ro
+        JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
+        WHERE ro.tenant_id = ? AND ro.table_name = ? AND ro.partition_key > ?
+        ORDER BY ro.partition_key ASC
+        LIMIT ?
+        `,
+        body.tenantId,
+        body.table,
+        body.afterPartitionKey ?? "",
+        limit,
+      );
+    } catch (error) {
+      // The table isn't physically present on this shard (registered in
+      // table_rules but never created here) — nothing to scan for it. Same
+      // accepted precedent as handleMigrateExport's try/catch above.
+      log("shard.tenant_scan_page_table_missing", { table: body.table, message: error instanceof Error ? error.message : String(error) });
+      return json({ rows: [] });
+    }
+
+    const rows = raw.map((r) => {
+      const { __cf_scan_pk, ...rest } = r;
+      return { partitionKey: String(__cf_scan_pk), row: rest };
+    });
+    return json({ rows });
+  }
+
   /** Milestone 3, Chunk 4 (internal): applies one exported batch — base rows
    * via INSERT OR REPLACE (idempotent, so a re-pushed page is harmless) plus
    * each row's provenance, in one transaction. */
@@ -1178,6 +1244,14 @@ export class ShardDO extends DurableObject {
     // index otherwise.
     this.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_cf_row_owners_vb ON __cf_row_owners (vbucket, table_name, partition_key)",
+    );
+    // Tenant-scoped table scan (POST /v1/table-scan): /tenant-scan-page filters
+    // by (tenant_id, table_name) and pages by partition_key — the PK
+    // (table_name, partition_key) has no leading tenant_id, so without this
+    // index every scan page is a full table scan of __cf_row_owners instead of
+    // a range scan.
+    this.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_cf_row_owners_tenant_scan ON __cf_row_owners (tenant_id, table_name, partition_key)",
     );
 
     // Milestone 2 (Index Service). Lives on a shard chosen by hashing
