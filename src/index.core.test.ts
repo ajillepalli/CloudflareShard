@@ -1083,6 +1083,50 @@ describe("Worker /admin/register-table rejects changing schema_sql after partiti
   });
 });
 
+// PR review round 9 (P2): the round-8 guard above only fires when
+// body.schemaSql is a STRING that differs from what's stored — it doesn't
+// fire when body.schemaSql is OMITTED entirely (e.g. a metadata-only
+// re-registration call that assumes schema_sql is already set and doesn't
+// bother resending it). But the INSERT OR REPLACE at the bottom of
+// handleRegisterTable used to do `body.schemaSql ?? null`, so an omitted
+// schemaSql silently NULLED OUT the previously-stored, verified schema_sql
+// even for an already-partition_key_unique=1 table — defeating the very
+// guard round 8 added, since a future split/migration backfill depends on
+// schema_sql being present. handleRegisterTable now falls back to the
+// existing row's schema_sql first (`body.schemaSql ?? existing?.schema_sql
+// ?? null`), only falling through to null when there was never a stored
+// value at all.
+describe("Worker /admin/register-table preserves schema_sql when omitted on a verified table's re-registration (PR review round 9 fix)", () => {
+  it("re-registering a verified-unique table WITHOUT schemaSql succeeds and leaves schema_sql unchanged", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "reregister_omitted_schemasql_evt";
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const createRes = await post(
+      "/admin/create-table",
+      { table, schema: originalSchema, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+
+    // Metadata-only re-registration: schemaSql is OMITTED entirely (not an
+    // empty string, not repeated) — this is not a "differing string", so the
+    // round-8 guard must not reject it, and schema_sql must survive intact.
+    const registerRes = await post(
+      "/admin/register-table",
+      { table, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    // Verified directly off catalog-0's own DO storage, not just the HTTP
+    // response: schema_sql must still be the ORIGINAL value, not null.
+    expect(await readTableRulesSchemaSql(table)).toBe(originalSchema);
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(1);
+  });
+});
+
 // Pre-landing review fix: /admin/register-table never validated payload.table
 // or payload.partitionKeyColumn against IDENTIFIER_RE, unlike every sibling
 // route (e.g. /admin/set-partition-key-column). An unvalidated table string
