@@ -421,6 +421,124 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
   });
 });
 
+// Codex P1 fix: __cf_row_owners keys a row's owner by (table, partition key
+// VALUE) alone, so /tenant-scan-page's JOIN is only safe if partitionKeyColumn
+// is guaranteed unique. These tests exercise the new table_rules.
+// partition_key_unique verification/gate at both places a partitionKeyColumn
+// is established (/admin/create-table and /admin/set-partition-key-column).
+describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () => {
+  it("allows table-scan normally when partitionKeyColumn is the table's sole PRIMARY KEY (regression, existing behavior)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      { table: "scan_pku_pk_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_pk_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_pk_evt" }, token);
+    expect(res.status).toBe(200);
+  });
+
+  it("allows table-scan normally when partitionKeyColumn is backed by a UNIQUE constraint rather than being the PRIMARY KEY (exercises the PRAGMA index_list/index_info branch)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_uniq_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)",
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_uniq_evt" }, token);
+    expect(res.status).toBe(200);
+  });
+
+  it("lets /admin/create-table succeed for a schema whose partitionKeyColumn is NOT unique (schema creation isn't blocked), but rejects /v1/table-scan on it with 409 PARTITION_KEY_NOT_UNIQUE", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_notuniq_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_notuniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)",
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    // Schema creation itself is never blocked by the uniqueness check.
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_notuniq_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string; fix?: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+    expect(body.error.fix).toBeDefined();
+  });
+
+  it("re-verifies uniqueness at /admin/set-partition-key-column time too — switching to a non-unique column gates the scan 409, switching to a unique one clears it", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_spkc_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_spkc_evt (id TEXT PRIMARY KEY, user_id TEXT, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // Simulate a table registered before this validation existed: reset to
+    // the __unset__ sentinel and an unverified (0) uniqueness flag, on every
+    // catalog shard (table_rules is fanned out to all of them).
+    for (let i = 0; i < 4; i += 1) {
+      const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-${i}`));
+      await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "UPDATE table_rules SET partition_key_column = ?, partition_key_unique = 0 WHERE table_name = ?",
+          "__unset__",
+          "scan_spkc_evt",
+        );
+      });
+    }
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Upgrade to a NON-unique column: the endpoint itself succeeds (it only
+    // validates the column exists), but the scan must be gated 409.
+    const setNonUniqueRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "scan_spkc_evt", partitionKeyColumn: "user_id" },
+      AUTH(),
+    );
+    expect(setNonUniqueRes.status).toBe(200);
+    const scanAfterNonUnique = await post("/v1/table-scan", { tenantId, table: "scan_spkc_evt" }, token);
+    expect(scanAfterNonUnique.status).toBe(409);
+    const nonUniqueBody = (await scanAfterNonUnique.json()) as { error: { code: string } };
+    expect(nonUniqueBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+
+    // Upgrade to a genuinely unique (PRIMARY KEY) column: the flag must be
+    // freshly re-verified for the NEW column (not stuck from the old one),
+    // and the scan must now be allowed.
+    const setUniqueRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "scan_spkc_evt", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(setUniqueRes.status).toBe(200);
+    const scanAfterUnique = await post("/v1/table-scan", { tenantId, table: "scan_spkc_evt" }, token);
+    expect(scanAfterUnique.status).toBe(200);
+  });
+});
+
 describe("Worker /v1/table-scan E2E (Milestone 4)", () => {
   it("register table -> tenant writes rows across multiple shards via /v1/mutate -> /v1/table-scan paginates to completion, returning every row exactly once", async () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
