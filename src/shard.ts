@@ -141,6 +141,14 @@ const INTERNAL_TABLES = new Set<string>(INTERNAL_TABLE_NAMES);
 // loops use the identical constant (a clamp mismatch would silently drop rows).
 export const MIGRATE_PAGE_SIZE = 500;
 
+// Milestone 4 (tenant-scoped table scan): per-shard page cap for
+// /tenant-scan-page — independent of the overall /v1/table-scan response
+// limit (up to 500), which is capped by merging across shards. Re-exported so
+// src/index.ts's Worker handler requests the identical clamp it should expect
+// back, keeping the "did this shard possibly have more?" (nextCursor
+// presence) check meaningful on both sides.
+export const TENANT_SCAN_PAGE_SIZE = 100;
+
 /** Escapes a SQL identifier's inner double-quotes for interpolation inside a
  * quoted identifier (`"..."`). Callers still wrap the result in quotes. Shared
  * by every place that builds a dynamic table/column reference (review Tier 3
@@ -154,6 +162,13 @@ function escapeIdent(name: string): string {
  * to force a rollback — distinguishes "validation succeeded, roll back on
  * purpose" from a genuine SQL execution error. */
 class PrepareValidationRollback extends Error {}
+
+/** Deliberate sentinel thrown inside handleProbePartitionKeyCollation's probe
+ * transactionSync to force a rollback unconditionally — same pattern as
+ * PrepareValidationRollback above, applied to a read-only-in-spirit
+ * introspection probe instead of a 2PC prepare. See that function's doc
+ * comment for the full rationale. */
+class CollationProbeRollback extends Error {}
 
 export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
@@ -186,6 +201,7 @@ export class ShardDO extends DurableObject {
       "/mirror-pending-count": this.handleMirrorPendingCount.bind(this),
       "/drain-mirror-jobs": this.handleDrainMirrorJobs.bind(this),
       "/migrate-export": this.handleMigrateExport.bind(this),
+      "/tenant-scan-page": this.handleTenantScanPage.bind(this),
       "/migrate-import": this.handleMigrateImport.bind(this),
       "/migrate-checksum": this.handleMigrateChecksum.bind(this),
       "/migrate-checksums": this.handleMigrateChecksums.bind(this),
@@ -199,6 +215,7 @@ export class ShardDO extends DurableObject {
       "/purge-mirror-jobs": this.handlePurgeMirrorJobs.bind(this),
       "/index-entries-export": this.handleIndexEntriesExport.bind(this),
       "/index-entries-import": this.handleIndexEntriesImport.bind(this),
+      "/probe-partition-key-collation": this.handleProbePartitionKeyCollation.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -685,6 +702,132 @@ export class ShardDO extends DurableObject {
       return { partitionKey: String(__cf_export_pk), tenantId: String(__cf_export_tenant), row: rest };
     });
     return json({ rows });
+  }
+
+  /** Tenant-scoped table scan (POST /v1/table-scan's per-shard fan-out
+   * target). One page of a tenant's own rows in `table`, selected via
+   * __cf_row_owners the same way handleMigrateExport selects a vbucket's rows
+   * — but filtered by (tenant_id, table_name) instead of vbucket, since a
+   * scan doesn't know or care which vbucket a row lives in. A row with no
+   * __cf_row_owners entry (pre-Chunk-0, not yet backfilled) is invisible to
+   * this join by construction: its owner is unknown, so it can't be attributed
+   * to this or any tenant (criterion 4). `limit` is independently capped at
+   * TENANT_SCAN_PAGE_SIZE regardless of what the Worker requests — the
+   * overall /v1/table-scan response limit (up to 500) is enforced by merging
+   * across shards, not by widening any single shard's page. */
+  private async handleTenantScanPage(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      table?: string;
+      partitionKeyColumn?: string;
+      tenantId?: string;
+      afterPartitionKey?: string;
+      limit?: number;
+    };
+    if (!body.table || !body.partitionKeyColumn || !body.tenantId) {
+      return json({ error: "Missing table, partitionKeyColumn, or tenantId" }, 400);
+    }
+    const limit = Math.min(TENANT_SCAN_PAGE_SIZE, Math.max(1, body.limit ?? TENANT_SCAN_PAGE_SIZE));
+    const safeTable = escapeIdent(body.table);
+    const safePk = escapeIdent(body.partitionKeyColumn);
+
+    // Codex P2 fix: distinguish "table not physically present on this shard"
+    // (registered in table_rules but never created here — nothing to scan,
+    // a legitimate empty page) from any OTHER SQL execution failure (e.g. a
+    // fractional `limit` reaching this route, or a missing/renamed column).
+    // The old code caught ALL errors from the query below and returned the
+    // same {rows: []} for either case — silently turning a genuine shard
+    // failure into a fake-empty success, which violates acceptance criterion
+    // 7 (any shard failure must fail the WHOLE /v1/table-scan request via
+    // 502 SHARD_UNREACHABLE, never a silently-partial/empty result). A
+    // PRAGMA table_info probe never throws for a missing table — it simply
+    // returns zero rows — so it's a safe, explicit, non-error-message-
+    // sniffing way to detect that one case up front; the real query below
+    // then runs uncaught, so a genuine SQL error propagates to fetch()'s
+    // catch-all (500), which the Worker's fan-out correctly treats as a
+    // shard failure.
+    const tableExists = this.many<{ name: string }>(`PRAGMA table_info("${safeTable}")`).length > 0;
+    if (!tableExists) {
+      log("shard.tenant_scan_page_table_missing", { table: body.table });
+      return json({ rows: [] });
+    }
+
+    // Codex P2 fix (regression from the P3 fix above): the P3 fix replaced
+    // the synthetic `ro.partition_key AS __cf_scan_pk` alias with reading the
+    // partition key directly off the returned row via `row[partitionKeyColumn]`
+    // (b.*'s own value) — but that's wrong whenever partitionKeyColumn has
+    // SQLite type affinity that coerces values. E.g. an INTEGER PRIMARY KEY
+    // column storing tenant keys "9"/"10" returns b.*'s value as the integers
+    // 9/10, while __cf_row_owners.partition_key (used for the cursor's
+    // `WHERE ... > ?` predicate and its ORDER BY on the NEXT call) keeps the
+    // original TEXT form. A page cursor built from the coerced value would
+    // then be compared, lexicographically, against __cf_row_owners' text
+    // values on the next call — string "10" sorts before "9", silently
+    // skipping rows a numeric comparison wouldn't.
+    //
+    // Fixed by splitting into two queries instead of one JOIN, which also
+    // keeps the P3 fix's guarantee (no synthetic alias at all, so no
+    // SQL-level merge and thus no collision with a real column is even
+    // possible):
+    //   1. __cf_row_owners ALONE gives the canonical, never-coerced partition
+    //      keys for this page — this is what the cursor must be built from.
+    //   2. Each base row is then looked up by its own exact key value — b.*'s
+    //      own untouched data. This is deliberately N single-key lookups
+    //      rather than one batched `IN (...)` query zipped back up by value:
+    //      zipping-by-value means comparing the canonical TEXT key against
+    //      String(baseRow[partitionKeyColumn]) — but that reintroduces the
+    //      exact coercion problem this fix closes whenever the affinity
+    //      round-trip isn't lossless (e.g. an INTEGER PRIMARY KEY silently
+    //      drops a leading zero: "01" is stored as 1, and String(1) is "1",
+    //      which no longer equals the canonical "01" key it came from — a
+    //      value-based zip would then wrongly treat that row as missing and
+    //      drop it from the page). Looking each key up individually needs no
+    //      matching at all: the key used for the lookup IS the key returned,
+    //      by construction. TENANT_SCAN_PAGE_SIZE (100) caps how many such
+    //      lookups a single call can trigger, so this stays cheap.
+    const ownerRows = this.many<{ partition_key: string }>(
+      `
+      SELECT partition_key
+      FROM __cf_row_owners
+      WHERE tenant_id = ? AND table_name = ? AND partition_key > ?
+      ORDER BY partition_key ASC
+      LIMIT ?
+      `,
+      body.tenantId,
+      body.table,
+      body.afterPartitionKey ?? "",
+      limit,
+    );
+
+    const rows: Array<{ partitionKey: string; row: Record<string, unknown> }> = [];
+    for (const ownerRow of ownerRows) {
+      const partitionKey = ownerRow.partition_key;
+      // partitionKeyColumn is guaranteed unique (checkPartitionKeyUnique gates
+      // /v1/table-scan on this — see index.ts), so at most one base row can
+      // match. No match (e.g. a race: the row was deleted between the two
+      // queries) is simply omitted rather than erroring or returning a null row.
+      const baseRow = this.many<Record<string, unknown>>(`SELECT * FROM "${safeTable}" WHERE "${safePk}" = ?`, partitionKey)[0];
+      if (baseRow === undefined) continue;
+      rows.push({ partitionKey, row: baseRow });
+    }
+
+    // Codex P2 fix (round-4, regression from the round-3 fix above): the
+    // Worker used to infer "this shard is exhausted" from `rows.length <
+    // limit` — but a single skipped owner row (base row deleted between the
+    // two queries above) makes `rows.length` fall below `limit` even though
+    // query 1's LIMIT was fully consumed, meaning __cf_row_owners may hold
+    // MORE keys beyond this batch. Report the query-1 scan position
+    // explicitly instead of leaving it to be inferred from the final row
+    // count, which the skip can no longer silently corrupt:
+    //   - ownerRowsScanned: the COUNT from query 1 (before any base-row
+    //     lookups/skips) — the Worker's true "did LIMIT get fully consumed"
+    //     signal for this shard.
+    //   - lastOwnerKeyScanned: the LAST partition_key query 1 returned
+    //     (undefined if it returned zero rows) — the true scan position,
+    //     safe to resume past even where a row was skipped, since nothing
+    //     relevant to this tenant/table exists there anymore.
+    const ownerRowsScanned = ownerRows.length;
+    const lastOwnerKeyScanned = ownerRows.length > 0 ? ownerRows[ownerRows.length - 1].partition_key : undefined;
+    return json({ rows, ownerRowsScanned, lastOwnerKeyScanned });
   }
 
   /** Milestone 3, Chunk 4 (internal): applies one exported batch — base rows
@@ -1179,6 +1322,14 @@ export class ShardDO extends DurableObject {
     this.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_cf_row_owners_vb ON __cf_row_owners (vbucket, table_name, partition_key)",
     );
+    // Tenant-scoped table scan (POST /v1/table-scan): /tenant-scan-page filters
+    // by (tenant_id, table_name) and pages by partition_key — the PK
+    // (table_name, partition_key) has no leading tenant_id, so without this
+    // index every scan page is a full table scan of __cf_row_owners instead of
+    // a range scan.
+    this.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_cf_row_owners_tenant_scan ON __cf_row_owners (tenant_id, table_name, partition_key)",
+    );
 
     // Milestone 2 (Index Service). Lives on a shard chosen by hashing
     // (table, indexName, indexKeyJson) — independent of the base row's own
@@ -1594,6 +1745,358 @@ export class ShardDO extends DurableObject {
       log("shard.execution_failed", { requestId: payload.requestId, isMutation: mutating, message });
       return json({ error: "SQL execution failed." }, 400);
     }
+  }
+
+  /** Empirical replacement for DDL-text-parsing collation detection (Codex PR
+   * review round 3 on POST /v1/table-scan's checkPartitionKeyUnique gate, in
+   * index.ts).
+   *
+   * History: checkPartitionKeyUnique needs to know whether
+   * partitionKeyColumn's uniqueness is enforced under SQLite's BINARY
+   * collation (safe) or some other collation like NOCASE (unsafe — two
+   * case-variant keys, e.g. "a" and "A", would each satisfy a NOCASE unique
+   * constraint independently once sharded onto different shards by hashKey,
+   * which is case-sensitive, silently reopening the exact cross-tenant leak
+   * this gate exists to close). No PRAGMA exposes a column's or index's
+   * collation, so the original fix parsed the column's CREATE TABLE text for
+   * a `COLLATE <name>` clause. Three consecutive Codex review rounds each
+   * found a NEW SQL syntax variant that slipped past that text parser: round 1
+   * missed quoted collation names (`COLLATE "NOCASE"`), round 2 fixed quoting
+   * but still only looked at column-level COLLATE clauses, and round 3 found
+   * TABLE-LEVEL constraint syntax (`PRIMARY KEY(id COLLATE NOCASE)`,
+   * `UNIQUE(v COLLATE NOCASE)`) that the column-definition-only parser never
+   * even looked at. This matches a pattern already lived through elsewhere in
+   * this exact codebase: the original per-tenant /v1/sql write guard needed 6
+   * rounds of review to fail to fully close a similar text-parsing bypass
+   * class, and was ultimately abandoned for a safe-by-construction approach
+   * instead of continued patching. Text-parsing SQL is fundamentally
+   * open-ended — SQLite's grammar has more ways to spell a clause than any
+   * regex enumerates, and each fix only closes the ONE variant that was
+   * found, not the class.
+   *
+   * This function instead tests SQLite's actual, live-enforced behavior
+   * directly against the REAL target table, so no grammar variant (known or
+   * future) can be missed: it inserts a probe row with partitionKeyColumn set
+   * to a marker value, then inserts a second probe row with the SAME marker
+   * but its case flipped. If the column's real collation is case-insensitive
+   * (NOCASE or similar), the second insert collides with whatever
+   * UNIQUE/PRIMARY KEY constraint actually backs the column and fails; if the
+   * collation is BINARY (SQLite's safe default), the second insert succeeds
+   * because the two case-variant strings are genuinely distinct values. All
+   * probe inserts run inside a single transactionSync whose callback ALWAYS
+   * throws a dedicated sentinel (CollationProbeRollback) at the end —
+   * mirroring handlePrepare's PrepareValidationRollback pattern above — so the
+   * transaction unconditionally rolls back and the probe leaves zero residual
+   * rows or side effects in the real table, regardless of outcome.
+   *
+   * Scope (PR review round 4): SQLite has exactly 3 built-in collations —
+   * BINARY (case- and whitespace-sensitive), NOCASE (case-insensitive,
+   * whitespace-sensitive), and RTRIM (case-sensitive, but ignores TRAILING
+   * whitespace — "a" and "a " compare equal under it). Round 3 only ran the
+   * case-flip pair, which never exercises RTRIM (a case-flip never collides
+   * under RTRIM) — a column declared COLLATE RTRIM passed the gate as "safe"
+   * even though two literal strings differing only in trailing whitespace
+   * (which hashKey/__cf_row_owners treat as distinct keys) are actually the
+   * SAME row under the base table's own constraint, reopening the identical
+   * cross-tenant-leak class this gate exists to close, just via
+   * trailing-whitespace equivalence instead of case-equivalence. Fixed by
+   * adding a SECOND probe pair testing trailing-whitespace equivalence: a
+   * marker, then the SAME marker with a single trailing space appended (a
+   * single space is sufficient — verified empirically below, and confirmed
+   * against a real SQLite engine, see the round-4 fix commit). If EITHER pair
+   * collides (case-flip OR whitespace-append), the whole check reports unsafe
+   * — this doesn't try to name which exact collation is responsible, only
+   * whether ANY non-BINARY behavior is observable, which is what actually
+   * matters for the gate. Verified empirically (node:sqlite) against all 3
+   * built-in collations before implementing:
+   *   BINARY:  case-flip pair does NOT collide; whitespace pair does NOT collide.
+   *   NOCASE:  case-flip pair COLLIDES;         whitespace pair does NOT collide.
+   *   RTRIM:   case-flip pair does NOT collide; whitespace pair COLLIDES.
+   * Two independent pairs cleanly separate all 3 built-ins, and "any collision
+   * -> unsafe" needs no per-collation branching to get the right answer for
+   * every one of them.
+   *
+   * Every column that's NOT partitionKeyColumn but is NOT NULL with no
+   * default (and isn't a hidden/generated column — PRAGMA table_xinfo's
+   * `hidden` field is used instead of table_info specifically to detect and
+   * skip those, since SQLite forbids explicitly inserting into a generated
+   * column) gets a placeholder value matching its declared type affinity, so
+   * the probe insert doesn't spuriously fail against an unrelated NOT
+   * NULL/CHECK/FK constraint. Those placeholders are DELIBERATELY DIFFERENT
+   * across every probe row (keyed by a row index 0..4 plus a per-invocation
+   * random suffix) — reusing the SAME placeholder across rows would make a
+   * later insert collide with an earlier one on any unrelated secondary
+   * UNIQUE column, misreporting a BINARY-safe table as unsafe purely due to a
+   * placeholder collision that has nothing to do with partitionKeyColumn's
+   * own collation. Fails closed (false) if partitionKeyColumn isn't found
+   * among the table's columns, or if a pair's FIRST probe insert fails for
+   * any reason (a genuine "cannot determine" case — this deliberately does
+   * NOT try to parse WHY the first insert failed, matching this function's
+   * fail-closed philosophy for every other ambiguous case, same as
+   * checkPartitionKeyUnique itself in index.ts). */
+  /** Round-5 fixes (both approved Codex findings):
+   *
+   * (1) The round-3/4 probe inferred safety purely from whether a
+   * case-variant / whitespace-variant marker's INSERT collided against the
+   * qualifying UNIQUE/PRIMARY KEY constraint. But /tenant-scan-page's actual
+   * read query (see that handler above) is a BARE `WHERE "<pkCol>" = ?`
+   * predicate with no explicit COLLATE clause -- and SQLite resolves a bare
+   * predicate's collation from the COLUMN's own declared collation, which
+   * can DIFFER from a specific INDEX's own COLLATE override. Verified
+   * empirically:
+   *   CREATE TABLE t (pk TEXT COLLATE NOCASE, v TEXT);
+   *   CREATE UNIQUE INDEX ux ON t(pk COLLATE BINARY);
+   *   INSERT INTO t VALUES ('a', 'row-a');
+   *   INSERT INTO t VALUES ('A', 'row-A');  -- SUCCEEDS (index's own BINARY
+   *                                         -- override allows coexistence)
+   *   SELECT v FROM t WHERE pk = 'a';        -- returns BOTH rows -- the bare
+   *                                         -- predicate uses the column's
+   *                                         -- NOCASE collation, not the
+   *                                         -- index's BINARY override.
+   * A table shaped like this passed the old insert-collision-only probe as
+   * "safe" (the case-variant insert SUCCEEDS, so nothing collided at insert
+   * time) even though the real read query used by table-scan conflates the
+   * two rows -- a genuine cross-tenant leak. Fixed by no longer inferring
+   * safety from insert success/failure alone: each probe pair (case,
+   * whitespace) now also runs the SAME KIND of bare-predicate query
+   * /tenant-scan-page issues -- bound to one marker value from the pair --
+   * and checks whether it returns MORE than the one expected row. Two
+   * possible outcomes per pair:
+   *   - the second insert of the pair FAILS (a genuine UNIQUE/PK collision at
+   *     insert time -- the common case, e.g. a plain NOCASE column with no
+   *     index override): provably unsafe already, no need to run the SELECT
+   *     probe at all -- the constraint itself already proved the two values
+   *     are indistinguishable in this schema.
+   *   - the second insert SUCCEEDS (both rows coexist, e.g. the index-
+   *     override scenario above): run the bare-predicate SELECT bound to one
+   *     marker value and count matched rows. Exactly 1 (the literal's own
+   *     row) is safe; more than 1 means the bare predicate's own collation
+   *     conflated the pair, so it's unsafe.
+   *
+   * Verified empirically (node:sqlite) before implementing, against: (a) the
+   * index-COLLATE-override scenario above (now correctly reports unsafe --
+   * `SELECT COUNT(*) ... WHERE pk = 'markerlower'` returns cnt=2), (b) a
+   * genuinely BINARY-collated column with a plain matching index (still
+   * reports safe -- cnt=1, no over-rejection), (c) a genuinely
+   * NOCASE-collated column with a plain matching index (still reports
+   * unsafe via the insert-collision fast path -- no under-rejection
+   * regression).
+   *
+   * (2) The round-3/4 rowid-alias carve-out (a preliminary probe-insert of a
+   * large integer + a `WHERE pkCol = ? AND rowid = ?` check, to short-
+   * circuit a genuine `INTEGER PRIMARY KEY` column as safe-by-construction
+   * since a non-integer TEXT marker could never land there) is now
+   * UNREACHABLE and has been removed entirely: checkPartitionKeyUnique
+   * (index.ts) now rejects any INTEGER/NUMERIC/REAL-affinity
+   * partitionKeyColumn outright, before this probe ever runs -- see that
+   * function's doc comment for why (the representation-ambiguity space for
+   * numeric strings, e.g. "01" vs "1" vs "1.0" all matching the same rowid,
+   * is unbounded, not a narrow case to special-case around -- the same
+   * failure mode that sank DDL-text-parsing for collation detection in
+   * rounds 1-3). A rowid alias is by definition an INTEGER-affinity column,
+   * so it's now excluded upstream, and this probe only ever runs against
+   * TEXT/BLOB-affinity columns -- for which the TEXT marker values used
+   * below are always valid to insert, so no rowid-alias carve-out is needed
+   * at all. */
+  private async handleProbePartitionKeyCollation(request: Request): Promise<Response> {
+    const payload = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+    if (!payload.table || !payload.partitionKeyColumn) {
+      return json({ error: "Missing table or partitionKeyColumn" }, 400);
+    }
+    const table = payload.table;
+    const partitionKeyColumn = payload.partitionKeyColumn;
+    const safeTable = escapeIdent(table);
+    const safePk = escapeIdent(partitionKeyColumn);
+
+    const columns = this.many<{ name: string; type: string; notnull: number; dflt_value: string | null; pk: number; hidden: number }>(
+      `PRAGMA table_xinfo("${safeTable}")`,
+    );
+    const pkColumn = columns.find((c) => c.name === partitionKeyColumn);
+    if (!pkColumn) {
+      return json({ ok: true, binaryCollation: false });
+    }
+
+    // Round-5 fix (fail closed for generated/hidden partition-key columns):
+    // buildInsert's loop below skips any `col.hidden !== 0` column BEFORE
+    // checking whether it's partitionKeyColumn -- so if partitionKeyColumn
+    // ITSELF is generated/virtual (hidden !== 0 in PRAGMA table_xinfo), the
+    // marker value would never be assigned to it at all, silently making the
+    // whole probe meaningless (neither probe row's actual partition-key
+    // value gets set to anything informative -- the "does it collide" test
+    // would prove nothing). Checked here, before any of that machinery runs,
+    // so it can't be reached: this schema shape can't be safely probed, so
+    // it can't be verified safe.
+    //
+    // Reachability, verified empirically: this is unreachable via TWO
+    // independent layers, not just one. (1) The normal WRITE path --
+    // compileMutation forces the partition key into `values` on every
+    // insert/upsert, and SQLite outright rejects an explicit assignment to a
+    // generated column ("cannot INSERT into generated column"), so a table
+    // with a generated partition-key column could never receive tenant
+    // writes at all. (2) Even the ADMIN REGISTRATION path is foreclosed:
+    // /admin/create-table and /admin/set-partition-key-column (index.ts) both
+    // confirm partitionKeyColumn's existence via `PRAGMA table_info`, which
+    // (unlike `PRAGMA table_xinfo`, used here and by checkPartitionKeyUnique)
+    // silently OMITS generated columns from its result set entirely -- so
+    // naming a generated column as partitionKeyColumn is rejected 400
+    // COLUMN_NOT_IN_SCHEMA before ever reaching checkPartitionKeyUnique, let
+    // alone this probe. Despite being unreachable via every current call
+    // path, this check is cheap and this function's whole philosophy is
+    // "never report safe when unverified", so it stays regardless -- and is
+    // exercised directly (bypassing the admin handlers) in
+    // index.table-scan.test.ts.
+    if (pkColumn.hidden !== 0) {
+      return json({ ok: true, binaryCollation: false });
+    }
+
+    // Random per-invocation suffix: makes every marker/placeholder value
+    // astronomically unlikely to collide with real tenant data, AND (combined
+    // with each probe row's own index below) makes every placeholder column's
+    // value distinct across ALL probe rows in this invocation, so an
+    // unrelated secondary UNIQUE column can never be the reason a probe
+    // insert fails.
+    const uuidSuffix = crypto.randomUUID();
+    const markerLower = `__cf_collation_probe_${uuidSuffix}__lower`;
+    const markerUpper = markerLower.toUpperCase();
+    // Round-4 addition: a second, independent probe pair testing trailing-
+    // whitespace equivalence (RTRIM collation) -- see this function's doc
+    // comment above for the empirical verification across all 3 built-in
+    // SQLite collations. A single trailing space is sufficient to trigger
+    // RTRIM's equivalence.
+    const markerWsBase = `__cf_collation_probe_${uuidSuffix}__ws`;
+    const markerWsPadded = `${markerWsBase} `;
+
+    // Round-10 fix (P3): the INTEGER/REAL/BLOB/NUMERIC-fallback placeholders
+    // used to be FIXED, deterministic values (-987654321 - rowIndex, etc.) --
+    // if a real row in the table already happened to hold one of those exact
+    // values in an unrelated NOT NULL UNIQUE column, this probe's insert
+    // could spuriously collide, false-reporting an otherwise perfectly safe
+    // table as unsafe. Derived from the SAME per-invocation uuidSuffix
+    // randomness the TEXT branch already uses above, so these are just as
+    // astronomically unlikely to collide with real tenant data -- and, since
+    // uuidSuffix is fixed per invocation while rowIndex still varies the
+    // derived value, every probe row's placeholder in this same invocation
+    // stays mutually distinct too (matching the TEXT branch's guarantee).
+    const uuidHex = uuidSuffix.replace(/-/g, "");
+    // First 8 hex digits -> a 0..2^32-1 base, negated so it stays far outside
+    // any ordinary auto-increment/positive-id range real data would use.
+    const intPlaceholderBase = Number.parseInt(uuidHex.slice(0, 8), 16);
+    const intPlaceholderFor = (rowIndex: number): number => -1 * (intPlaceholderBase + rowIndex) - 1;
+    // Next 8 hex digits -> a fractional component appended to the same
+    // integer base, so REAL placeholders are derived the same way but never
+    // collide with the INTEGER branch's own values.
+    const realFracBase = Number.parseInt(uuidHex.slice(8, 16), 16) / 2 ** 32;
+    const realPlaceholderFor = (rowIndex: number): number => -1 * (intPlaceholderBase + rowIndex) - realFracBase - 1;
+    // All 16 bytes of the UUID (32 hex digits) plus a rowIndex-derived byte,
+    // so BLOB placeholders are actual random bytes instead of a fixed
+    // single-byte array, while still staying distinct per probe row.
+    const uuidBytes = new Uint8Array(uuidHex.length / 2 + 1);
+    for (let i = 0; i < uuidHex.length; i += 2) {
+      uuidBytes[i / 2] = Number.parseInt(uuidHex.slice(i, i + 2), 16);
+    }
+    const blobPlaceholderFor = (rowIndex: number): Uint8Array => {
+      const bytes = uuidBytes.slice();
+      bytes[bytes.length - 1] = rowIndex;
+      return bytes;
+    };
+
+    const placeholderFor = (col: { type: string }, rowIndex: number): unknown => {
+      const type = (col.type || "").toUpperCase();
+      if (type.includes("INT")) return intPlaceholderFor(rowIndex);
+      if (type.includes("CHAR") || type.includes("CLOB") || type.includes("TEXT")) {
+        return `__cf_collation_probe_placeholder_${rowIndex}_${uuidSuffix}`;
+      }
+      if (type.includes("BLOB") || type === "") return blobPlaceholderFor(rowIndex);
+      if (type.includes("REAL") || type.includes("FLOA") || type.includes("DOUB")) {
+        return realPlaceholderFor(rowIndex);
+      }
+      return intPlaceholderFor(rowIndex); // NUMERIC affinity fallback
+    };
+
+    // rowIndex distinguishes every probe row's OTHER-column placeholders from
+    // every other probe row in this same invocation (1/2 = case-flip pair,
+    // 3/4 = whitespace pair).
+    const buildInsert = (rowIndex: number, markerValue: unknown): { sql: string; values: unknown[] } => {
+      const names: string[] = [];
+      const values: unknown[] = [];
+      for (const col of columns) {
+        if (col.hidden !== 0) continue; // generated/virtual/hidden — never explicitly assignable
+        if (col.name === partitionKeyColumn) {
+          names.push(`"${escapeIdent(col.name)}"`);
+          values.push(markerValue);
+          continue;
+        }
+        if (col.notnull === 1 && col.dflt_value === null) {
+          names.push(`"${escapeIdent(col.name)}"`);
+          values.push(placeholderFor(col, rowIndex));
+        }
+        // else: nullable or has its own default — leave unset entirely.
+      }
+      const placeholders = names.map(() => "?").join(", ");
+      return { sql: `INSERT INTO "${safeTable}" (${names.join(", ")}) VALUES (${placeholders})`, values };
+    };
+
+    const insertCaseLower = buildInsert(1, markerLower);
+    const insertCaseUpper = buildInsert(2, markerUpper);
+    const insertWsBase = buildInsert(3, markerWsBase);
+    const insertWsPadded = buildInsert(4, markerWsPadded);
+
+    // Round-5 fix: tests whether /tenant-scan-page's ACTUAL bare-predicate
+    // read query (`WHERE "<pkCol>" = ?`, no explicit COLLATE) conflates a
+    // first/second marker pair -- NOT merely whether the second insert
+    // collided with the first. See this function's doc comment above for the
+    // full rationale and the index-COLLATE-override case this closes.
+    const pairIsSafe = (
+      first: { sql: string; values: unknown[] },
+      second: { sql: string; values: unknown[] },
+      firstMarkerValue: unknown,
+    ): boolean => {
+      this.sql.exec(first.sql, ...first.values);
+      try {
+        this.sql.exec(second.sql, ...second.values);
+        // Second insert coexists alongside the first -- fall through to the
+        // bare-predicate SELECT probe below; insert success alone is no
+        // longer sufficient to call this pair safe.
+      } catch {
+        // Second insert collided with the first under whatever UNIQUE/
+        // PRIMARY KEY constraint backs this column -> the constraint itself
+        // already proved these two values are indistinguishable here ->
+        // unsafe, no need to run the SELECT probe at all.
+        return false;
+      }
+      // Both rows coexist -- now run the EXACT kind of bare predicate
+      // /tenant-scan-page issues, bound to one marker value from this pair,
+      // and check whether it ALSO incidentally returns the other marker's
+      // row. A value always matches itself under any collation, so this
+      // always returns >= 1; > 1 proves the bare predicate's own collation
+      // conflated the pair (the index-COLLATE-override scenario).
+      const matched = this.one<{ cnt: number }>(`SELECT COUNT(*) AS cnt FROM "${safeTable}" WHERE "${safePk}" = ?`, firstMarkerValue);
+      return (matched?.cnt ?? 0) <= 1;
+    };
+
+    let binaryCollation = false;
+    try {
+      this.ctx.storage.transactionSync(() => {
+        const caseSafe = pairIsSafe(insertCaseLower, insertCaseUpper, markerLower);
+        const wsSafe = pairIsSafe(insertWsBase, insertWsPadded, markerWsBase);
+
+        // Either dimension being unsafe is sufficient to be unsafe overall --
+        // see this function's doc comment for why this closes the gate for
+        // every built-in SQLite collation without needing to name which one
+        // applies.
+        binaryCollation = caseSafe && wsSafe;
+
+        // ALWAYS roll back — every insert above, success or failure — so the
+        // probe never leaves residual rows in the real table.
+        throw new CollationProbeRollback();
+      });
+    } catch (error) {
+      if (!(error instanceof CollationProbeRollback)) {
+        binaryCollation = false; // an unexpected insert failed -- fail closed
+      }
+    }
+
+    return json({ ok: true, binaryCollation });
   }
 
   /** Shared 409 VBUCKET_FENCED response (review Tier 3 DRY) — the identical

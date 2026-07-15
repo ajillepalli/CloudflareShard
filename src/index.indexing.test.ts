@@ -1,4 +1,4 @@
-import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+﻿import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
@@ -176,7 +176,7 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      { table: "legacy_idx_evt", schema: "CREATE TABLE IF NOT EXISTS legacy_idx_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "legacy_idx_evt", schema: "CREATE TABLE legacy_idx_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -560,7 +560,7 @@ describe("Worker /v1/mutate async index maintenance (Milestone 2 Chunk 2)", () =
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c2_untouched_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c2_untouched_evt (id TEXT PRIMARY KEY, v TEXT, other TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c2_untouched_evt", schema: "CREATE TABLE idx_c2_untouched_evt (id TEXT PRIMARY KEY, v TEXT, other TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);
@@ -605,7 +605,7 @@ describe("Worker /v1/mutate async index maintenance (Milestone 2 Chunk 2)", () =
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c2_zerorow_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c2_zerorow_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c2_zerorow_evt", schema: "CREATE TABLE idx_c2_zerorow_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);
@@ -643,7 +643,7 @@ describe("Worker /v1/mutate async index maintenance (Milestone 2 Chunk 2)", () =
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c2_defaulted_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c2_defaulted_evt (id TEXT PRIMARY KEY, v TEXT DEFAULT 'fallback', other TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c2_defaulted_evt", schema: "CREATE TABLE idx_c2_defaulted_evt (id TEXT PRIMARY KEY, v TEXT DEFAULT 'fallback', other TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);
