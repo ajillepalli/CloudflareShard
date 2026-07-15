@@ -98,10 +98,20 @@ Table: table_rules
   through the normal `/admin/backfill-provenance` mechanism (trivially, for a genuinely
   brand-new/empty table — nothing to find). Read by POST /v1/table-scan's
   `provenance.complete` response field.)
-- partition_key_unique INTEGER NOT NULL DEFAULT 0 (Milestone 4: 1 iff `partition_key_column`
-  is verified backed by a real `UNIQUE` constraint, sole `PRIMARY KEY`, or a non-partial
-  UNIQUE index — merely being part of a composite unique key, or "unique" only via a
-  partial/`WHERE`-conditioned index, does not qualify. Computed automatically, never
+- partition_key_unique INTEGER NOT NULL DEFAULT 0 (Milestone 4: despite the name, this single
+  flag actually gates THREE requirements — 1 iff `partition_key_column` (a) has TEXT or BLOB
+  type affinity, (b) is verified backed by a real `UNIQUE` constraint, sole `PRIMARY KEY`, or a
+  non-partial UNIQUE index — merely being part of a composite unique key, or "unique" only via
+  a partial/`WHERE`-conditioned index, does not qualify — and (c) is verified to collate as
+  BINARY. The affinity check runs first and short-circuits the rest: INTEGER/NUMERIC/REAL-
+  affinity columns are rejected outright regardless of what uniqueness/collation would
+  otherwise find, because SQLite's numeric-string coercion on such a column (`'01'`, `'1'`, and
+  `'1.0'` all resolving to the same physical row) is an unbounded representation-ambiguity
+  space — the same shape of problem, one level down, that made DDL-text parsing for collation
+  unworkable (see below). `sqliteTypeAffinity` in index.ts mirrors SQLite's own declared-type-
+  name affinity rules; BLOB qualifies alongside TEXT because it's always compared byte-for-byte
+  with no numeric coercion, and `__cf_row_owners.partition_key` round-trips a BLOB partition key
+  the same way it does a TEXT one. Uniqueness and collation are computed automatically, never
   client-supplied, at /admin/create-table, /admin/set-partition-key-column, and
   /admin/register-table time via live `PRAGMA table_info`/`index_list`/`index_info`/
   `sqlite_master` introspection (`checkPartitionKeyUnique` in index.ts); fails closed to 0 on
@@ -113,11 +123,26 @@ Table: table_rules
   DDL-push path, with genuine per-shard schema drift), so they instead run
   `checkPartitionKeyUniqueAcrossShards` — every active shard independently re-runs
   `checkPartitionKeyUnique`, and the result is 1 only if ALL of them agree; if any shard
-  disagrees or is unreachable, the whole result fails closed to 0. Gates POST /v1/table-scan: a
+  disagrees or is unreachable, the whole result fails closed to 0. Once a qualifying uniqueness
+  mechanism is confirmed on a shard, a final collation gate runs (`partitionKeyColumnHasBinaryCollation`
+  in index.ts, calling `POST /probe-partition-key-collation` /
+  `handleProbePartitionKeyCollation` in shard.ts): an empirical probe against the shard's actual
+  running SQLite engine, not a parse of the column's stored DDL text for a `COLLATE` clause.
+  DDL-text parsing was tried and abandoned across three straight review rounds, each of which
+  found another syntactic position `COLLATE` can legally appear in (unquoted column-level,
+  quoted column-level, table-level constraint) that the previous round's parser missed — an
+  empirical probe against the live engine can't be fooled by a grammar variant it doesn't
+  recognize, because it never looks at grammar at all. The probe inserts case-variant and
+  trailing-whitespace-variant marker rows and checks whether they collide, and whether a bare
+  `WHERE col = ?` predicate (the same shape `/tenant-scan-page` issues) conflates them, the way
+  a genuinely BINARY-collated column would; a column that behaves as `NOCASE`
+  (case-insensitive) or `RTRIM` (ignores trailing whitespace) fails the gate even if otherwise
+  unique. Gates POST /v1/table-scan: a
   table where this isn't 1 is rejected 409 `PARTITION_KEY_NOT_UNIQUE`, since
   `/tenant-scan-page`'s join keys purely by partition-key value against `__cf_row_owners` — a
-  non-unique column would let two tenants' rows share a value and the join attribute both to
-  whichever tenant currently owns that key, a cross-tenant read leak.)
+  column that isn't unique, isn't BINARY-collated, or carries numeric affinity could let two
+  tenants' rows collide on that join and get attributed to whichever tenant currently owns that
+  key, a cross-tenant read leak.)
 
 Table: index_rules (Milestone 2, extended in Milestone 3)
 - index_name TEXT PRIMARY KEY
@@ -610,17 +635,21 @@ its vbuckets finish migrating, so excluding draining shards would silently omit 
 shard's internal `POST /tenant-scan-page` (§6) at `SHARD_FANOUT_CONCURRENCY` concurrency (the
 same constant/`batchedMap` helper reused throughout this codebase).
 
-**Partition-key-uniqueness precondition (structural, not incidental).** `/tenant-scan-page`
+**Partition-key-eligibility precondition (structural, not incidental).** `/tenant-scan-page`
 keys its `__cf_row_owners` join purely by partition-key VALUE, filtered by
-`(tenant_id, table_name)` — if `partitionKeyColumn` isn't actually guaranteed unique, two
-different tenants' rows could share the same value and the join would attribute both to
+`(tenant_id, table_name)` — if `partitionKeyColumn` isn't actually guaranteed unique, doesn't
+collate BINARY (a `NOCASE` or `RTRIM` column can conflate two distinct literal values), or
+carries INTEGER/NUMERIC/REAL type affinity (SQLite's own numeric-string coercion can conflate
+them instead), two different tenants' rows could collide on that join and get attributed to
 whichever tenant currently owns that key in `__cf_row_owners`, a cross-tenant read leak. This
-is why `table_rules.partition_key_unique` (§5) exists: it's computed automatically — never
-accepted from a client — at `/admin/create-table`, `/admin/set-partition-key-column`, and
-`/admin/register-table` time via live schema introspection (`checkPartitionKeyUnique` in
-index.ts: a real `UNIQUE` constraint, sole `PRIMARY KEY`, or non-partial UNIQUE index counts;
-composite-key membership and partial/`WHERE`-conditioned unique indexes do not), and fails
-closed to unverified (0) on any introspection error or ambiguity. `POST /v1/table-scan`
+is why `table_rules.partition_key_unique` (§5) exists: despite its name, the single flag gates
+all three requirements — TEXT/BLOB affinity, real uniqueness, and BINARY collation — computed
+automatically — never accepted from a client — at `/admin/create-table`,
+`/admin/set-partition-key-column`, and `/admin/register-table` time via live schema
+introspection plus an empirical collation probe (`checkPartitionKeyUnique` in index.ts; see §5
+for the full per-requirement breakdown, including why collation is verified live against the
+shard rather than parsed from DDL text), and fails closed to unverified (0) on any
+introspection error or ambiguity. `POST /v1/table-scan`
 checks this flag on every call (via `/lookup-table-scan`) and rejects 409
 `PARTITION_KEY_NOT_UNIQUE` for any table where it isn't 1 — a hard requirement for using this
 route safely, not a soft recommendation.
