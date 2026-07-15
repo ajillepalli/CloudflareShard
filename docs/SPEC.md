@@ -483,8 +483,10 @@ isn't 1 for this table — see §5 and the paragraph below); 403 `INTERNAL_TABLE
 (defense-in-depth — `table_rules` should never contain a `__cf_*`/`sqlite_*` name); 400
 `INVALID_CURSOR` (cursor fails to base64/JSON-decode, or names a shard no longer in the
 catalog shard's current active set — e.g. topology changed between calls; a client that gets
-this restarts with no cursor); 502 `SHARD_UNREACHABLE` (naming the shard — any shard failure
-fails the whole request, no silently-partial result in this MVP).
+this restarts with no cursor); 400 `NO_SHARDS` (the tenant's catalog shard has no shards at
+all yet — same pre-cluster-init condition every other shard-listing route rejects); 502
+`SHARD_UNREACHABLE` (naming the shard — any shard failure fails the whole request, no
+silently-partial result in this MVP).
 
 Lists a tenant's own rows in a registered table, with no arbitrary filters — the query is
 mechanically constructed (`table` + `tenantId` + `cursor` + `limit` only), the same
