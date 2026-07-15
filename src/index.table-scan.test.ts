@@ -296,6 +296,24 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.error.code).toBe("INTERNAL_TABLE_ACCESS_FORBIDDEN");
   });
 
+  // Codex P2 fix: isInternalTableName expects a normalized (unquoted,
+  // lowercased) name -- this route used to pass the raw request value
+  // straight through, so a case variant of an internal table name slipped
+  // past the guard. Same bug class as the case-sensitivity bypass that took
+  // several review rounds to fully close on /v1/sql earlier in this project.
+  it.each(["SQLite_master", "sqlite_MASTER", "__CF_row_owners", "__Cf_Row_Owners"])(
+    "rejects a case-variant internal table name (%s) with 403 INTERNAL_TABLE_ACCESS_FORBIDDEN, same as the lowercase form",
+    async (tableVariant) => {
+      await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+      const tenantId = tenantForCatalogShard(0, 4);
+      const token = await registerTenant(tenantId);
+      const res = await post("/v1/table-scan", { tenantId, table: tableVariant }, token);
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("INTERNAL_TABLE_ACCESS_FORBIDDEN");
+    },
+  );
+
   it("rejects a tenant token that doesn't match the claimed tenantId with 401, identically to /v1/index-query's existing check", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("scan_authmismatch_evt");
