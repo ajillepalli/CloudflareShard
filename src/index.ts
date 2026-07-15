@@ -1,11 +1,11 @@
 import { CatalogDO } from "./catalog";
-import { ShardDO } from "./shard";
+import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
 import { CoordinatorDO } from "./coordinator";
 import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth } from "./auth";
 import { log } from "./log";
-import { extractCreateTableName, isDangerous, isDangerousSchema, isMutation, mutationTargetIsInternal } from "./sql-safety";
+import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableName, isMutation, mutationTargetIsInternal } from "./sql-safety";
 import {
   compileMutation,
   IDENTIFIER_RE,
@@ -375,8 +375,17 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
     "/register-table",
     // schemaSql: Milestone 3, Chunk 5 — captured so migration backfill can
     // provision this table on a shard created after this fan-out ran (e.g.
-    // a split target).
-    () => ({ table: body.table, partitioning: body.partitioning, partitionKeyColumn: body.partitionKeyColumn, schemaSql: body.schema }),
+    // a split target). provenanceComplete: true — a table just created here
+    // has zero legacy rows (nothing predates its own existence), so it starts
+    // fully backfilled rather than 0 (see table_rules.provenance_complete's
+    // ensureSchema comment in catalog.ts).
+    () => ({
+      table: body.table,
+      partitioning: body.partitioning,
+      partitionKeyColumn: body.partitionKeyColumn,
+      schemaSql: body.schema,
+      provenanceComplete: true,
+    }),
     request.headers.get("authorization") ?? undefined,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register table.");
@@ -1020,6 +1029,13 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
   let attributed = 0;
   const ambiguous: AmbiguousRow[] = [];
   const orphaned: OrphanedRow[] = [];
+  // Tenant-scoped table scan: every table_name this run actually scanned
+  // (across every catalog shard processed), used below to flip
+  // table_rules.provenance_complete for the ones that came out clean. Only
+  // meaningful when catalogShardId was omitted (a genuinely full-cluster
+  // run) — a scoped single-catalog-shard run doesn't see every shard pool a
+  // table's rows could live in, so it can't certify completeness.
+  const scannedTableNames = new Set<string>();
 
   for (const catalogShardId of catalogShardIds) {
     const [tablesRes, tenantsRes, vbMapRes, shardsRes] = await Promise.all([
@@ -1042,6 +1058,7 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
     const tables = ((await tablesRes.json()) as { tables: Array<{ table_name: string; partition_key_column: string }> }).tables.filter(
       (t) => t.partition_key_column !== UNSET_PARTITION_KEY_COLUMN,
     );
+    for (const t of tables) scannedTableNames.add(t.table_name);
     const tenantIds = ((await tenantsRes.json()) as { tenantIds: string[] }).tenantIds;
     const vbMapBody = (await vbMapRes.json()) as { totalVBuckets: number; map: Array<{ vbucket: number; shardId: string }> };
     const totalVBuckets = vbMapBody.totalVBuckets;
@@ -1102,6 +1119,28 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
           if (pks.length < PROVENANCE_BACKFILL_PAGE_SIZE) break;
         }
       }
+    }
+  }
+
+  // Tenant-scoped table scan: only a genuinely full-cluster run (catalogShardId
+  // omitted) can certify a table's provenance complete — a scoped run only
+  // ever sees one catalog shard's own shard pool, which may leave other
+  // catalog shards' pools (and therefore other rows of the same table) unseen.
+  if (!body.catalogShardId) {
+    const orphanedTables = new Set(orphaned.map((o) => o.table));
+    const ambiguousTables = new Set(ambiguous.map((a) => a.table));
+    const completeTables = Array.from(scannedTableNames).filter(
+      (t) => !orphanedTables.has(t) && !ambiguousTables.has(t),
+    );
+    for (const tableName of completeTables) {
+      const markResults = await fanOutToAllCatalogs(
+        env,
+        "/mark-table-provenance-complete",
+        () => ({ table: tableName }),
+        authorization,
+      );
+      const markFailed = firstCatalogFanOutFailure(markResults, `Failed to mark ${tableName} provenance complete.`);
+      if (markFailed) return markFailed;
     }
   }
 
@@ -2418,6 +2457,287 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
   return json({ rows });
 }
 
+const DEFAULT_TABLE_SCAN_LIMIT = 100;
+const MAX_TABLE_SCAN_LIMIT = 500;
+
+/** Opaque cursor shape for POST /v1/table-scan: one afterPartitionKey per
+ * shard in the tenant's catalog shard's pool at the time this cursor was
+ * issued. A shard with no entry (either because the cursor predates it, or
+ * because a fresh scan hasn't touched it yet) starts at "" — scan from the
+ * beginning. Exported for direct unit testing of the encode/decode round-trip
+ * and the merge invariant, independent of the HTTP route. */
+export type TableScanCursor = { shardCursors: Record<string, string> };
+
+/** Base64-JSON encode, UTF-8-safe (partition keys are arbitrary strings, so a
+ * plain btoa() over the raw JSON string would throw on non-Latin1 input). */
+export function encodeTableScanCursor(cursor: TableScanCursor): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(cursor));
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+/** Decodes a client-supplied cursor. Returns null for anything that fails to
+ * base64/JSON-decode or doesn't have the expected shape — the caller turns
+ * that into 400 INVALID_CURSOR rather than guessing at a partial cursor
+ * (client-supplied input the Worker never itself produced this way is
+ * otherwise unvalidated). Does NOT check the shard-id keys against the
+ * current active shard set — that requires the live shard list, checked
+ * separately by the caller once it's fetched one. */
+export function decodeTableScanCursor(raw: string): TableScanCursor | null {
+  try {
+    const binary = atob(raw);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      "shardCursors" in parsed &&
+      (parsed as { shardCursors: unknown }).shardCursors !== null &&
+      typeof (parsed as { shardCursors: unknown }).shardCursors === "object" &&
+      !Array.isArray((parsed as { shardCursors: unknown }).shardCursors) &&
+      Object.values((parsed as { shardCursors: Record<string, unknown> }).shardCursors).every((v) => typeof v === "string")
+    ) {
+      return { shardCursors: (parsed as TableScanCursor).shardCursors };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+type ShardScanPage = { shardId: string; rows: Array<{ partitionKey: string; row: Record<string, unknown> }> };
+
+/** Merges every shard's page into one ascending-by-partition_key result
+ * (ties broken by shardId ascending — see criterion 2/the merge spec),
+ * truncates to `overallLimit`, and computes the next per-shard cursor map per
+ * the data-loss-avoiding invariant: a shard's cursor advances only to the
+ * partition_key of the LAST ROW FROM THAT SHARD actually kept in the
+ * truncated response — never to a row that was fetched but then cut, so the
+ * next call re-fetches (never skips) it. Exported (and kept side-effect-free)
+ * for direct unit testing of the merge/truncate invariant — the largest risk
+ * item per the spec. */
+export function mergeTableScanPages(
+  pages: ShardScanPage[],
+  overallLimit: number,
+  perShardLimit: number,
+  priorShardCursors: Record<string, string>,
+): { rows: Array<Record<string, unknown>>; nextShardCursors: Record<string, string> | null } {
+  type Entry = { shardId: string; partitionKey: string; row: Record<string, unknown> };
+  const all: Entry[] = [];
+  for (const page of pages) {
+    for (const r of page.rows) all.push({ shardId: page.shardId, partitionKey: r.partitionKey, row: r.row });
+  }
+  all.sort((a, b) => {
+    if (a.partitionKey < b.partitionKey) return -1;
+    if (a.partitionKey > b.partitionKey) return 1;
+    return a.shardId < b.shardId ? -1 : a.shardId > b.shardId ? 1 : 0;
+  });
+  const truncated = all.slice(0, overallLimit);
+
+  // Every shard this call touched keeps a cursor entry — either the prior
+  // value (untouched, or every one of its rows got truncated away) or an
+  // advanced one (some of its rows made the cut). A shard silently dropped
+  // from the map would restart from "" next time, re-scanning from the
+  // beginning instead of resuming — that's wasteful, not lossy, but still
+  // wrong, so every fanned-out shard gets an explicit entry.
+  const nextShardCursors: Record<string, string> = { ...priorShardCursors };
+  for (const page of pages) {
+    if (!(page.shardId in nextShardCursors)) nextShardCursors[page.shardId] = "";
+  }
+  for (const entry of truncated) {
+    const current = nextShardCursors[entry.shardId] ?? "";
+    if (entry.partitionKey > current) nextShardCursors[entry.shardId] = entry.partitionKey;
+  }
+
+  // nextCursor must be present whenever there's ANY reason to believe more
+  // rows exist beyond what was just returned:
+  //  - the OVERALL merge truncated away some fetched-but-unreturned rows
+  //    (a real bug found during implementation: a shard can return fewer
+  //    than its OWN perShardLimit — correctly signalling that shard has
+  //    nothing further beyond what it fetched — while still having had one
+  //    of ITS OWN fetched rows cut by the overall-limit truncation, because
+  //    another shard's rows sorted earlier. Checking only "did any shard hit
+  //    its own per-shard cap" misses this and silently drops the cut row —
+  //    its cursor legitimately didn't advance past it, but with no
+  //    nextCursor the client never calls again to pick it up), OR
+  //  - any single shard's fetch returned >= perShardLimit rows (that shard
+  //    may hold more beyond what it fetched this call, even if every one of
+  //    its returned rows made the cut).
+  const anyRowsTruncatedAway = all.length > truncated.length;
+  const anyShardMayHaveMore = anyRowsTruncatedAway || pages.some((page) => page.rows.length >= perShardLimit);
+  return {
+    rows: truncated.map((e) => e.row),
+    nextShardCursors: anyShardMayHaveMore ? nextShardCursors : null,
+  };
+}
+
+/** Milestone 4 (tenant-scoped table scan). Lists a tenant's own rows in a
+ * registered table, cursor-paginated, with no arbitrary filters — the query
+ * is mechanically constructed (table + tenantId + cursor + limit only),
+ * matching the safe-by-construction pattern /v1/mutate's compileMutation
+ * already established for writes, rather than the raw-SQL pattern that
+ * failed for the old (pre-Milestone-3) tenant read path. This is the direct
+ * replacement for that removed capability: /v1/index-query only supports
+ * exact-tuple lookups, and there was otherwise no way for a tenant to
+ * enumerate its own rows without already knowing an indexed value. */
+async function handleV1TableScan(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { tenantId?: string; table?: string; limit?: number; cursor?: string | null };
+  if (!body.tenantId || !body.table) {
+    return json({ error: { code: "MISSING_FIELDS", message: "Missing tenantId or table.", fix: "Provide both tenantId and table." } }, 400);
+  }
+  if (body.limit !== undefined && (typeof body.limit !== "number" || !Number.isFinite(body.limit) || body.limit > MAX_TABLE_SCAN_LIMIT)) {
+    return json(
+      {
+        error: {
+          code: "LIMIT_EXCEEDED",
+          message: `limit exceeds the maximum of ${MAX_TABLE_SCAN_LIMIT}.`,
+          fix: `Omit limit (default ${DEFAULT_TABLE_SCAN_LIMIT}) or pass a value <= ${MAX_TABLE_SCAN_LIMIT}.`,
+        },
+      },
+      400,
+    );
+  }
+  const limit = Math.max(1, Math.min(MAX_TABLE_SCAN_LIMIT, body.limit ?? DEFAULT_TABLE_SCAN_LIMIT));
+
+  // Defense-in-depth (structurally unreachable in practice — table_rules
+  // should never contain a __cf_*/sqlite_* name — checked explicitly anyway,
+  // per the spec). Cheap and needs no network round trip, so it runs first.
+  if (isInternalTableName(body.table)) {
+    return json(
+      {
+        error: {
+          code: "INTERNAL_TABLE_ACCESS_FORBIDDEN",
+          message: `Table ${body.table} is an internal system table and cannot be scanned.`,
+          fix: "Table scans are only available for tenant-registered tables.",
+        },
+      },
+      403,
+    );
+  }
+
+  // Syntactic cursor validation only — the semantic "shard-id keys are a
+  // subset of the CURRENT active shard set" check needs the live shard list,
+  // fetched below (topology can change between two calls).
+  let requestedCursor: TableScanCursor | null = null;
+  if (body.cursor) {
+    requestedCursor = decodeTableScanCursor(body.cursor);
+    if (!requestedCursor) {
+      return json(
+        {
+          error: {
+            code: "INVALID_CURSOR",
+            message: "cursor failed to decode.",
+            fix: "Omit cursor to restart the scan from the beginning.",
+          },
+        },
+        400,
+      );
+    }
+  }
+
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+
+  // Auth: identical tenant-token verification to /v1/index-query — reuses
+  // CatalogDO.checkTenantAuth via /lookup-table-scan (the same combined
+  // "auth + registry gate" role /lookup-index plays for /v1/index-query),
+  // rather than re-implementing the check here.
+  const lookupRes = await routeToCatalog(env, catalogShardId, "/lookup-table-scan", { table: body.table, tenantId: body.tenantId }, authorization);
+  if (!lookupRes.ok) {
+    return new Response(lookupRes.body, { status: lookupRes.status, headers: lookupRes.headers });
+  }
+  const lookupBody = (await lookupRes.json()) as { partitionKeyColumn: string; provenanceComplete: boolean };
+
+  const listRes = await routeToCatalog(env, catalogShardId, "/list-shards", {});
+  if (!listRes.ok) {
+    return new Response(listRes.body, { status: listRes.status, headers: listRes.headers });
+  }
+  const shardIds = ((await listRes.json()) as { shardIds: string[] }).shardIds;
+  if (shardIds.length === 0) {
+    return json({ error: { code: "NO_SHARDS", message: "No shards exist yet.", fix: "Call /admin/init first." } }, 400);
+  }
+
+  if (requestedCursor) {
+    const activeShardIdSet = new Set(shardIds);
+    const staleShardId = Object.keys(requestedCursor.shardCursors).find((id) => !activeShardIdSet.has(id));
+    if (staleShardId !== undefined) {
+      return json(
+        {
+          error: {
+            code: "INVALID_CURSOR",
+            message: `cursor names shard ${staleShardId}, which is no longer in this tenant's active shard set.`,
+            fix: "Omit cursor to restart the scan from the beginning.",
+          },
+        },
+        400,
+      );
+    }
+  }
+  const priorShardCursors = requestedCursor?.shardCursors ?? {};
+
+  const startedAt = Date.now();
+  const perShardLimit = Math.min(TENANT_SCAN_PAGE_SIZE, limit);
+
+  type ShardPageOutcome = { shardId: string; ok: boolean; rows: Array<{ partitionKey: string; row: Record<string, unknown> }> };
+  const pageResults = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, async (shardId): Promise<ShardPageOutcome> => {
+    const res = await routeToShard(env, shardId, "/tenant-scan-page", {
+      table: body.table,
+      partitionKeyColumn: lookupBody.partitionKeyColumn,
+      tenantId: body.tenantId,
+      afterPartitionKey: priorShardCursors[shardId] ?? "",
+      limit: perShardLimit,
+    });
+    if (!res.ok) return { shardId, ok: false, rows: [] };
+    const resBody = (await res.json()) as { rows?: Array<{ partitionKey: string; row: Record<string, unknown> }> };
+    return { shardId, ok: true, rows: resBody.rows ?? [] };
+  });
+
+  // Any shard failure fails the whole request — no silently-partial tenant
+  // data in this MVP (see the spec's "Non-goals: Partial-result mode").
+  const failed = pageResults.find((r) => !r.ok);
+  if (failed) {
+    return json(
+      {
+        error: {
+          code: "SHARD_UNREACHABLE",
+          shardId: failed.shardId,
+          message: `Shard ${failed.shardId} did not respond.`,
+          fix: "Retry — one or more shards did not respond.",
+        },
+      },
+      502,
+    );
+  }
+
+  const { rows, nextShardCursors } = mergeTableScanPages(
+    pageResults.map((r) => ({ shardId: r.shardId, rows: r.rows })),
+    limit,
+    perShardLimit,
+    priorShardCursors,
+  );
+
+  return json({
+    rows,
+    ...(nextShardCursors ? { nextCursor: encodeTableScanCursor({ shardCursors: nextShardCursors }) } : {}),
+    provenance: {
+      complete: lookupBody.provenanceComplete,
+      ...(lookupBody.provenanceComplete
+        ? {}
+        : {
+            fix: "Run POST /admin/backfill-provenance, then retry — some rows in this table have no owner recorded and are hidden from all scans until backfilled.",
+          }),
+    },
+    scan: {
+      catalogShardId,
+      shardCount: shardIds.length,
+      successCount: pageResults.length,
+      scanMs: Date.now() - startedAt,
+    },
+  });
+}
+
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
@@ -2528,6 +2848,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
   "/v1/index-query": handleV1IndexQuery,
+  "/v1/table-scan": handleV1TableScan,
   "/v1/scatter": handleV1Scatter,
 };
 
