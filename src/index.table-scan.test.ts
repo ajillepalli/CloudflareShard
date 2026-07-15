@@ -6,6 +6,7 @@ import type { ShardDO } from "./shard";
 import { compareBinaryCollation, decodeTableScanCursor, encodeTableScanCursor, mergeTableScanPages } from "./index";
 import { isInternalTableName } from "./sql-safety";
 import {
+  ALL_TEST_SHARD_IDS,
   AUTH,
   createIndexTestTable,
   findPartitionKeyPairOnDifferentShards,
@@ -1035,6 +1036,187 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Codex PR review round 3: the DDL-text-parsing collation checks above
+  // (extractColumnCollation) only ever looked at COLUMN-level definitions
+  // inside a CREATE TABLE's parenthesized body — they skipped anything
+  // recognized as a table-level constraint (PRIMARY KEY/UNIQUE/...) by its
+  // leading keyword. But SQLite's grammar also allows a COLLATE clause
+  // directly inside a TABLE-LEVEL constraint's column list, e.g.
+  // `PRIMARY KEY(id COLLATE NOCASE)` — genuinely valid, genuinely enforced
+  // syntax (empirically verified: a case-variant duplicate insert against it
+  // fails with a UNIQUE constraint violation, identical to the column-level
+  // form) that the old parser never even considered, since it actively
+  // skipped table-level constraints entirely. This is exactly the class of
+  // bug the empirical probe (replacing DDL-text-parsing entirely) is
+  // designed to make structurally impossible: the probe doesn't care how the
+  // COLLATE clause was spelled or where in the grammar it appeared, because
+  // it never parses SQL text at all — it inserts real rows and observes
+  // SQLite's real enforcement.
+  it("rejects partitionKeyColumn when it's declared with a non-BINARY COLLATE via TABLE-LEVEL constraint syntax (PRIMARY KEY(id COLLATE NOCASE)), which the old DDL-text parser never looked at", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_tablepk_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_tablepk_evt (id TEXT, v TEXT, PRIMARY KEY(id COLLATE NOCASE))",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_tablepk_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Companion to the table-level PRIMARY KEY test above, exercising the
+  // unique-index path with the equivalent table-level syntax:
+  // `UNIQUE(user_id COLLATE NOCASE)`. Also genuinely valid/enforced SQLite
+  // syntax the old parser's table-level-constraint skip-list would never
+  // have inspected for a COLLATE clause even if it had looked past the
+  // leading `UNIQUE` keyword.
+  it("rejects partitionKeyColumn when its UNIQUE constraint is declared with a non-BINARY COLLATE via TABLE-LEVEL constraint syntax (UNIQUE(user_id COLLATE NOCASE))", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_tableuniq_evt",
+        schema:
+          "CREATE TABLE IF NOT EXISTS scan_pku_collate_tableuniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT, UNIQUE(user_id COLLATE NOCASE))",
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_tableuniq_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // The probe (handleProbePartitionKeyCollation in shard.ts) inserts two real
+  // rows into the REAL target table and MUST roll both back unconditionally,
+  // regardless of outcome — this test confirms that promise directly rather
+  // than trusting it works because the accept/reject tests above pass. Uses
+  // a genuinely BINARY-safe sole-PK table (so the probe runs its full insert
+  // insert-both-then-rollback path, not just the "first insert failed"
+  // shortcut) and queries the real table on every shard afterward for any
+  // row whose id matches the probe's own marker naming convention.
+  it("leaves zero residual rows in the real table after checkPartitionKeyUnique runs its collation probe (no persisted side effects)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_probe_clean_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_probe_clean_evt (id TEXT PRIMARY KEY, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // /admin/create-table already ran checkPartitionKeyUnique (and therefore
+    // the probe) once at creation time. Re-run it via /admin/set-partition-key-column
+    // for a second pass, then check every shard's real table for anything
+    // matching the probe's marker prefix.
+    const setRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "scan_pku_probe_clean_evt", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(setRes.status).toBe(200);
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const { rows } = await shardExecute(
+        shardId,
+        `SELECT id FROM scan_pku_probe_clean_evt WHERE id LIKE '__cf_collation_probe_%'`,
+      );
+      expect(rows).toEqual([]);
+    }
+
+    // Sanity: the table itself is otherwise usable and genuinely accepted as
+    // unique/BINARY-safe (no over-rejection regression from the probe).
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_probe_clean_evt" }, token);
+    expect(res.status).toBe(200);
+  });
+
+  // The probe's placeholder-row construction can't safely satisfy an
+  // arbitrary CHECK constraint on a NOT NULL column with no default — this
+  // exercises that fail-closed path directly (rather than merely trusting
+  // the doc comment). The probe's own placeholder for a NOT NULL TEXT
+  // column with no default is a distinguishing marker string (deliberately
+  // non-empty and fairly long — see handleProbePartitionKeyCollation's doc
+  // comment on why placeholders differ per probe row), so a short
+  // max-length CHECK constraint (well under that placeholder's length) is
+  // guaranteed to reject it regardless of the exact marker text, and the
+  // probe's first insert genuinely cannot succeed. checkPartitionKeyUnique
+  // must report "not verified" (409), not crash and not fall back to
+  // reporting a false "safe".
+  it("fails closed (rejects, doesn't crash or falsely accept) when the probe can't construct a valid row due to an unrelated CHECK constraint", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_probe_unsatisfiable_evt",
+        schema:
+          "CREATE TABLE IF NOT EXISTS scan_pku_probe_unsatisfiable_evt (id TEXT PRIMARY KEY, other TEXT NOT NULL, CHECK (length(other) <= 3))",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_probe_unsatisfiable_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // The collation probe inserts a TEXT marker value into partitionKeyColumn
+  // to test case-sensitivity — but a column declared exactly `INTEGER
+  // PRIMARY KEY` on a normal (non-WITHOUT-ROWID) table becomes a rowid
+  // alias, and SQLite strictly rejects a non-integer value there
+  // ("datatype mismatch") rather than storing it as TEXT the way every
+  // other column type does. Without a carve-out for this specific,
+  // extremely common schema shape, the probe's own first insert would
+  // always fail and checkPartitionKeyUnique would misreport this
+  // legitimately safe, case-collision-proof column (it can never hold a
+  // non-integer value at all, so no case-variant duplicate can ever exist)
+  // as unsafe — a false-positive regression the empirical probe must not
+  // introduce relative to the old DDL-text-parsing behavior, which happened
+  // to accept this shape by construction (no COLLATE clause is ever found
+  // on it). Verified empirically (node:sqlite) before implementing: see
+  // handleProbePartitionKeyCollation's rowid-alias doc comment in shard.ts.
+  it("still accepts a sole-PK column declared exactly `INTEGER PRIMARY KEY` (rowid alias) — the probe's TEXT marker can't be inserted there, so this is short-circuited as safe by construction rather than misreported as unsafe", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_rowid_alias_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_rowid_alias_evt (pk INTEGER PRIMARY KEY, v TEXT)",
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_rowid_alias_evt" }, token);
+    expect(res.status).toBe(200);
   });
 
   // Codex-found P1 (re-review of the P1 fix above): PRAGMA index_list reports
