@@ -952,6 +952,91 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
   });
 
+  // Codex P1 fix (round 2, re-review): the collation-gate regex above
+  // (`/\bcollate\s+(\w+)/i`) only matched an UNQUOTED collation name.
+  // SQLite's grammar allows COLLATE's name to be double-quoted, backtick-
+  // quoted, bracket-quoted, or even single-quoted (a lenient historical
+  // misfeature) -- and genuinely enforces it under any of those forms
+  // (empirically verified: a case-variant duplicate insert against a
+  // `COLLATE "NOCASE"` column fails with a UNIQUE constraint violation, same
+  // as the unquoted form). The old regex silently treated any quoted form as
+  // "no explicit COLLATE" (null), reopening the exact cross-tenant leak the
+  // gate exists to close. This test exercises the double-quoted form via the
+  // sole-PK path (same path as the unquoted-NOCASE test above).
+  it("rejects partitionKeyColumn when it's declared with an explicit non-BINARY COLLATE using DOUBLE-QUOTED syntax (COLLATE \"NOCASE\"), even though it's the sole PRIMARY KEY", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_pk_dq_evt",
+        schema: 'CREATE TABLE IF NOT EXISTS scan_pku_collate_pk_dq_evt (id TEXT PRIMARY KEY COLLATE "NOCASE", v TEXT)',
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_pk_dq_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Companion to the double-quoted sole-PK test above, exercising the
+  // unique-index path (a non-PK column backed by a UNIQUE constraint) with
+  // the same double-quoted COLLATE syntax -- this is the path
+  // checkPartitionKeyUnique's `indexCollation` extraction (not
+  // extractColumnCollation) parses, so it needs the identical fix verified
+  // independently.
+  it("rejects partitionKeyColumn when its UNIQUE constraint is declared with an explicit non-BINARY COLLATE using DOUBLE-QUOTED syntax (unique-index path)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_uniq_dq_evt",
+        schema:
+          'CREATE TABLE IF NOT EXISTS scan_pku_collate_uniq_dq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE "NOCASE", v TEXT)',
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_uniq_dq_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Same fix, exercised with BACKTICK-quoted COLLATE syntax (verified
+  // empirically valid and enforced by SQLite in this exact grammar position,
+  // same as the double-quoted and bracket-quoted forms) on the sole-PK path,
+  // to confirm the fix isn't accidentally special-cased to double-quotes only.
+  it("rejects partitionKeyColumn when it's declared with an explicit non-BINARY COLLATE using BACKTICK-quoted syntax (COLLATE `NOCASE`), sole PRIMARY KEY", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_pk_bt_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_pk_bt_evt (id TEXT PRIMARY KEY COLLATE `NOCASE`, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_pk_bt_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
   // Codex-found P1 (re-review of the P1 fix above): PRAGMA index_list reports
   // unique=1 for a PARTIAL unique index too (CREATE UNIQUE INDEX ... WHERE
   // <predicate>), and PRAGMA index_info never exposes the predicate at all —
