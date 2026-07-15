@@ -1219,6 +1219,156 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     expect(res.status).toBe(200);
   });
 
+  // PR review round 4, gap 1: the round-3 probe only ran a case-flip pair,
+  // which never exercises SQLite's third built-in collation, RTRIM (ignores
+  // TRAILING whitespace — "a" and "a " compare equal under it, but case IS
+  // still distinguished). A column declared COLLATE RTRIM used to pass the
+  // gate as "safe" even though two literal strings differing only in
+  // trailing whitespace are the SAME row under the base table's own
+  // constraint — reopening the exact cross-tenant leak class this gate
+  // exists to close, just via whitespace-equivalence instead of
+  // case-equivalence. Verified empirically (node:sqlite) before implementing
+  // the fix: see handleProbePartitionKeyCollation's doc comment in shard.ts.
+  it("rejects partitionKeyColumn when it's declared with an explicit COLLATE RTRIM, even though it's the sole PRIMARY KEY (trailing-whitespace collation gap)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_rtrim_pk_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_collate_rtrim_pk_evt (id TEXT PRIMARY KEY COLLATE RTRIM, v TEXT)",
+        partitionKeyColumn: "id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_rtrim_pk_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  it("rejects partitionKeyColumn when its UNIQUE constraint is declared with an explicit COLLATE RTRIM (unique-index path, trailing-whitespace collation gap)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_collate_rtrim_uniq_evt",
+        schema:
+          "CREATE TABLE IF NOT EXISTS scan_pku_collate_rtrim_uniq_evt (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE COLLATE RTRIM, v TEXT)",
+        partitionKeyColumn: "user_id",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_collate_rtrim_uniq_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // PR review round 4, gap 2: the round-3 carve-out treated any column that's
+  // (a) the table's sole PK, (b) declared with the exact type "INTEGER", and
+  // (c) belongs to a rowid table as a genuine rowid alias and skipped probing
+  // it entirely. But SQLite's rowid-alias behavior applies ONLY to the exact
+  // declaration `INTEGER PRIMARY KEY` — NOT `... ASC` or `... DESC` — even
+  // though both satisfy all 3 static conditions. `pk INTEGER PRIMARY KEY DESC`
+  // accepts a non-integer TEXT value (verified empirically — a genuine alias
+  // would reject it with "datatype mismatch"), so it was being misreported as
+  // safe-by-construction without ever testing its real collation. This
+  // exercises the fix directly: a DESC column with an explicit COLLATE NOCASE
+  // must now be correctly identified as NOT a genuine alias, fall through to
+  // the normal probe, and be rejected.
+  it("correctly identifies `INTEGER PRIMARY KEY DESC` as NOT a genuine rowid alias and rejects it when declared COLLATE NOCASE (falls through to the normal probe instead of being misreported safe-by-construction)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_desc_nocase_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_nocase_evt (pk INTEGER PRIMARY KEY DESC COLLATE NOCASE, v TEXT)",
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_desc_nocase_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Companion to the rejection test above: an `INTEGER PRIMARY KEY DESC`
+  // column with NO explicit COLLATE (plain BINARY) must still be ACCEPTED —
+  // proving the DESC misdetection fix doesn't over-reject a genuinely safe
+  // DESC column now that it's routed through the normal probe instead of a
+  // static short-circuit.
+  it("accepts `INTEGER PRIMARY KEY DESC` with no explicit COLLATE (falls through to the normal probe, which passes it — no over-rejection regression)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_desc_binary_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_binary_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)",
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_desc_binary_evt" }, token);
+    expect(res.status).toBe(200);
+  });
+
+  // Companion to "leaves zero residual rows" above, but for a rowid-alias
+  // CANDIDATE that turns out NOT to be a genuine alias (INTEGER PRIMARY KEY
+  // DESC) — this is the only schema shape that exercises the round-4
+  // preliminary rowid-alias probe insert (a large distinctive integer,
+  // rowIndex 0) in addition to the normal case-flip/whitespace probe rows, so
+  // it needs its own residual-rows check: that preliminary insert must also
+  // roll back cleanly, leaving the table completely empty.
+  it("leaves zero residual rows for an INTEGER PRIMARY KEY DESC candidate (exercises the round-4 rowid-alias preliminary probe insert, not just the case/whitespace pairs)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_desc_residual_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_residual_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)",
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const setRes = await post(
+      "/admin/set-partition-key-column",
+      { table: "scan_pku_desc_residual_evt", partitionKeyColumn: "pk" },
+      AUTH(),
+    );
+    expect(setRes.status).toBe(200);
+
+    for (const shardId of ALL_TEST_SHARD_IDS) {
+      const { rows } = await shardExecute(shardId, `SELECT COUNT(*) AS n FROM scan_pku_desc_residual_evt`);
+      expect(rows[0]?.n).toBe(0);
+    }
+
+    // Sanity: still accepted (BINARY, falls through correctly), no
+    // over-rejection regression from the new preliminary probe row.
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_desc_residual_evt" }, token);
+    expect(res.status).toBe(200);
+  });
+
   // Codex-found P1 (re-review of the P1 fix above): PRAGMA index_list reports
   // unique=1 for a PARTIAL unique index too (CREATE UNIQUE INDEX ... WHERE
   // <predicate>), and PRAGMA index_info never exposes the predicate at all —
