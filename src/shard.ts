@@ -801,7 +801,25 @@ export class ShardDO extends DurableObject {
       if (baseRow === undefined) continue;
       rows.push({ partitionKey, row: baseRow });
     }
-    return json({ rows });
+
+    // Codex P2 fix (round-4, regression from the round-3 fix above): the
+    // Worker used to infer "this shard is exhausted" from `rows.length <
+    // limit` — but a single skipped owner row (base row deleted between the
+    // two queries above) makes `rows.length` fall below `limit` even though
+    // query 1's LIMIT was fully consumed, meaning __cf_row_owners may hold
+    // MORE keys beyond this batch. Report the query-1 scan position
+    // explicitly instead of leaving it to be inferred from the final row
+    // count, which the skip can no longer silently corrupt:
+    //   - ownerRowsScanned: the COUNT from query 1 (before any base-row
+    //     lookups/skips) — the Worker's true "did LIMIT get fully consumed"
+    //     signal for this shard.
+    //   - lastOwnerKeyScanned: the LAST partition_key query 1 returned
+    //     (undefined if it returned zero rows) — the true scan position,
+    //     safe to resume past even where a row was skipped, since nothing
+    //     relevant to this tenant/table exists there anymore.
+    const ownerRowsScanned = ownerRows.length;
+    const lastOwnerKeyScanned = ownerRows.length > 0 ? ownerRows[ownerRows.length - 1].partition_key : undefined;
+    return json({ rows, ownerRowsScanned, lastOwnerKeyScanned });
   }
 
   /** Milestone 3, Chunk 4 (internal): applies one exported batch — base rows
