@@ -403,9 +403,27 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
   // form. A cursor built from the coerced value would then be compared,
   // lexicographically, against __cf_row_owners' text form on the NEXT call --
   // string "10" sorts before "9" even though numeric 9 < 10 -- silently
-  // skipping rows. Keys below are chosen so the two orderings genuinely
-  // diverge ("10" < "2" < "9" lexicographically vs. 2 < 9 < 10 numerically).
-  it("regression (Codex-found P2, coercion divergence): paginates an INTEGER PRIMARY KEY partitionKeyColumn with no skips, in __cf_row_owners' canonical string order, even though its numeric sort order differs", async () => {
+  // skipping rows.
+  //
+  // Round-5 UPDATE: this test used to exercise that pagination scenario
+  // end-to-end against a real INTEGER PRIMARY KEY partitionKeyColumn (keys
+  // chosen so the lexicographic/numeric orderings diverge). Round 5 closes an
+  // unrelated, more fundamental gap in the SAME schema shape -- a bare
+  // `WHERE pk = ?` lookup against a genuine INTEGER-affinity column matches
+  // via numeric coercion, so "01"/"1"/"1.0" etc. can all resolve to the same
+  // physical row, an unbounded representation-ambiguity space (see
+  // checkPartitionKeyUnique's doc comment in index.ts) -- and the fix for
+  // that is a categorical scope restriction: table-scan now rejects ANY
+  // INTEGER/NUMERIC/REAL-affinity partitionKeyColumn outright, so this
+  // schema is no longer table-scan-eligible at all, and the coercion-
+  // divergence pagination bug this test used to guard can no longer manifest
+  // via table-scan (there's nothing left to paginate through). The
+  // mutate-path inserts below are unaffected (checkPartitionKeyUnique only
+  // gates /v1/table-scan, not /v1/mutate) -- only the table-scan call's
+  // expectation changes, from 200-with-correct-pagination to 409. The
+  // affinity gate itself is exercised directly by the "TEXT-affinity-only
+  // partition-key scope restriction" tests below.
+  it("regression (Codex-found P2, coercion divergence) superseded by round-5 scope restriction: an INTEGER PRIMARY KEY partitionKeyColumn is now rejected for table-scan outright, so the coercion-divergence pagination bug this test used to guard can no longer manifest via table-scan", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const table = "scan_coerce_evt";
     const createRes = await post(
@@ -420,27 +438,15 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
 
     const keys = ["01", "02", "10"];
     for (const k of keys) {
+      // Mutate path is unaffected by the table-scan-only affinity gate.
       const res = await post("/v1/mutate", { op: "insert", table, tenantId, partitionKey: k, values: { v: k } }, token);
       expect(res.status).toBe(200);
     }
 
-    const collected: string[] = [];
-    let cursor: string | undefined;
-    let calls = 0;
-    for (;;) {
-      calls += 1;
-      expect(calls).toBeLessThanOrEqual(10); // sanity bound -- must terminate
-      const res = await post("/v1/table-scan", { tenantId, table, limit: 1, cursor: cursor ?? null }, token);
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { rows: Array<{ pk: number; v: string }>; nextCursor?: string };
-      collected.push(...body.rows.map((r) => r.v));
-      if (!body.nextCursor) break;
-      cursor = body.nextCursor;
-    }
-
-    // Every key returned exactly once, with no skips, in __cf_row_owners'
-    // canonical (string) ascending order -- "01" < "02" < "10" lexicographically.
-    expect(collected).toEqual(["01", "02", "10"]);
+    const res = await post("/v1/table-scan", { tenantId, table, limit: 1 }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
   });
 
   it("paginates to exhaustion with no duplicates and no gaps, even when a page truncates a shard's contribution mid-list (criterion 3)", async () => {
@@ -1185,39 +1191,21 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
   });
 
-  // The collation probe inserts a TEXT marker value into partitionKeyColumn
-  // to test case-sensitivity — but a column declared exactly `INTEGER
-  // PRIMARY KEY` on a normal (non-WITHOUT-ROWID) table becomes a rowid
-  // alias, and SQLite strictly rejects a non-integer value there
-  // ("datatype mismatch") rather than storing it as TEXT the way every
-  // other column type does. Without a carve-out for this specific,
-  // extremely common schema shape, the probe's own first insert would
-  // always fail and checkPartitionKeyUnique would misreport this
-  // legitimately safe, case-collision-proof column (it can never hold a
-  // non-integer value at all, so no case-variant duplicate can ever exist)
-  // as unsafe — a false-positive regression the empirical probe must not
-  // introduce relative to the old DDL-text-parsing behavior, which happened
-  // to accept this shape by construction (no COLLATE clause is ever found
-  // on it). Verified empirically (node:sqlite) before implementing: see
-  // handleProbePartitionKeyCollation's rowid-alias doc comment in shard.ts.
-  it("still accepts a sole-PK column declared exactly `INTEGER PRIMARY KEY` (rowid alias) — the probe's TEXT marker can't be inserted there, so this is short-circuited as safe by construction rather than misreported as unsafe", async () => {
-    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
-    const createRes = await post(
-      "/admin/create-table",
-      {
-        table: "scan_pku_rowid_alias_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_rowid_alias_evt (pk INTEGER PRIMARY KEY, v TEXT)",
-        partitionKeyColumn: "pk",
-      },
-      AUTH(),
-    );
-    expect(createRes.status).toBe(200);
-
-    const tenantId = tenantForCatalogShard(0, 4);
-    const token = await registerTenant(tenantId);
-    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_rowid_alias_evt" }, token);
-    expect(res.status).toBe(200);
-  });
+  // Round-5 note: a round-3/4 test used to live here asserting that a sole-PK
+  // column declared exactly `INTEGER PRIMARY KEY` (a genuine rowid alias) was
+  // ACCEPTED as table-scan-eligible, short-circuited as safe-by-construction
+  // before the probe ever ran (the probe's TEXT marker can't be inserted into
+  // a real rowid alias at all). Round 5 categorically REJECTS this schema
+  // shape instead — see the "TEXT-affinity-only partition-key scope
+  // restriction" describe block below for why (numeric-string representation
+  // ambiguity, e.g. "01"/"1"/"1.0" all matching the same physical row via a
+  // bare `WHERE pk = ?` lookup, is an unbounded space, not a narrow case to
+  // carve out) — and the corresponding rowid-alias detection code in
+  // handleProbePartitionKeyCollation (shard.ts) has been deleted as
+  // unreachable, since an INTEGER-affinity partitionKeyColumn is now
+  // rejected by checkPartitionKeyUnique before the probe ever runs. The old
+  // "accepts" assertion for this exact schema is now replaced by a "rejects"
+  // assertion in that describe block.
 
   // PR review round 4, gap 1: the round-3 probe only ran a case-flip pair,
   // which never exercises SQLite's third built-in collation, RTRIM (ignores
@@ -1271,22 +1259,98 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
   });
+});
 
-  // PR review round 4, gap 2: the round-3 carve-out treated any column that's
-  // (a) the table's sole PK, (b) declared with the exact type "INTEGER", and
-  // (c) belongs to a rowid table as a genuine rowid alias and skipped probing
-  // it entirely. But SQLite's rowid-alias behavior applies ONLY to the exact
-  // declaration `INTEGER PRIMARY KEY` — NOT `... ASC` or `... DESC` — even
-  // though both satisfy all 3 static conditions. `pk INTEGER PRIMARY KEY DESC`
-  // accepts a non-integer TEXT value (verified empirically — a genuine alias
-  // would reject it with "datatype mismatch"), so it was being misreported as
-  // safe-by-construction without ever testing its real collation. This
-  // exercises the fix directly: a DESC column with an explicit COLLATE NOCASE
-  // must now be correctly identified as NOT a genuine alias, fall through to
-  // the normal probe, and be rejected.
-  it("correctly identifies `INTEGER PRIMARY KEY DESC` as NOT a genuine rowid alias and rejects it when declared COLLATE NOCASE (falls through to the normal probe instead of being misreported safe-by-construction)", async () => {
+// PR review round 5 fixes. See checkPartitionKeyUnique's doc comment
+// (index.ts) and handleProbePartitionKeyCollation's doc comment (shard.ts)
+// for the full rationale behind each fix below.
+describe("/v1/table-scan round-5 fixes: bare-predicate collation probe + TEXT-affinity-only scope restriction + hidden-column fail-closed", () => {
+  // Fix 1 (P1): the round-3/4 probe inferred safety purely from whether a
+  // case-variant marker's INSERT collided against the qualifying UNIQUE
+  // constraint. But /tenant-scan-page's real read query is a BARE
+  // `WHERE "<pkCol>" = ?` predicate with no explicit COLLATE -- and SQLite
+  // resolves that bare predicate's collation from the COLUMN's own declared
+  // collation, which can DIFFER from a specific INDEX's own COLLATE
+  // override. Here the column is declared NOCASE, but the qualifying UNIQUE
+  // INDEX overrides to BINARY -- so a case-variant insert SUCCEEDS (no
+  // insert-time collision, since the index's own BINARY override allows
+  // 'a' and 'A' to coexist), which the OLD probe read as "safe". But the
+  // real /tenant-scan-page query (`WHERE pk = ?`, bare, no COLLATE) resolves
+  // via the COLUMN's NOCASE collation and would return BOTH rows for a
+  // lookup on either literal -- a genuine cross-tenant leak the old probe
+  // missed entirely. The new probe catches this by running the actual
+  // bare-predicate query as part of the probe itself.
+  it("rejects partitionKeyColumn when the column declares COLLATE NOCASE but its qualifying UNIQUE INDEX overrides to COLLATE BINARY (index-COLLATE-override gap the insert-collision-only probe used to miss)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_pku_idx_override_evt";
+    const createRes = await post(
+      "/admin/create-table",
+      {
+        table,
+        schema: `CREATE TABLE IF NOT EXISTS ${table} (pk TEXT COLLATE NOCASE, v TEXT)`,
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    // The BINARY-overriding unique index can't be expressed in the same
+    // single-statement schema field, so reach into the ShardDO directly —
+    // same established pattern as the PARTIAL-unique-index test below.
+    const shardStub = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
+    await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(`CREATE UNIQUE INDEX ux_${table} ON ${table}(pk COLLATE BINARY)`);
+    });
+
+    const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "pk" }, AUTH());
+    expect(setRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  // Fix 2 (P1, scope restriction, not a probe): /tenant-scan-page's bare
+  // `WHERE pkCol = ?` predicate goes through SQLite's numeric type-affinity
+  // comparison rules for any INTEGER/NUMERIC/REAL-affinity column, not a
+  // byte-for-byte text comparison -- e.g. on a genuine INTEGER PRIMARY KEY,
+  // "01"/"1"/"1.0" all match the same physical row. That representation-
+  // ambiguity space is unbounded, so table-scan now rejects ANY
+  // non-TEXT/BLOB-affinity partitionKeyColumn outright, regardless of
+  // collation. This supersedes the round-3/4 rowid-alias detection logic
+  // entirely (an INTEGER PRIMARY KEY is by definition INTEGER-affinity, so
+  // it's excluded here before any probe would even run).
+  it("rejects a plain `INTEGER PRIMARY KEY` partitionKeyColumn outright (INTEGER affinity), regardless of collation -- supersedes the old rowid-alias 'accepts' behavior", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
+      "/admin/create-table",
+      { table: "scan_pku_int_affinity_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_int_affinity_evt (pk INTEGER PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_int_affinity_evt" }, token);
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+  });
+
+  it("rejects `INTEGER PRIMARY KEY DESC` outright (still INTEGER-affinity — DESC doesn't change the declared type), for BOTH a plain-BINARY and a COLLATE NOCASE variant, superseding the old round-4 collation-dependent behavior", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+
+    const binaryRes = await post(
+      "/admin/create-table",
+      { table: "scan_pku_desc_binary_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_binary_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)", partitionKeyColumn: "pk" },
+      AUTH(),
+    );
+    expect(binaryRes.status).toBe(200);
+
+    const nocaseRes = await post(
       "/admin/create-table",
       {
         table: "scan_pku_desc_nocase_evt",
@@ -1295,79 +1359,169 @@ describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix)", () 
       },
       AUTH(),
     );
-    expect(createRes.status).toBe(200);
+    expect(nocaseRes.status).toBe(200);
 
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
-    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_desc_nocase_evt" }, token);
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+
+    for (const table of ["scan_pku_desc_binary_evt", "scan_pku_desc_nocase_evt"]) {
+      const res = await post("/v1/table-scan", { tenantId, table }, token);
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+    }
   });
 
-  // Companion to the rejection test above: an `INTEGER PRIMARY KEY DESC`
-  // column with NO explicit COLLATE (plain BINARY) must still be ACCEPTED —
-  // proving the DESC misdetection fix doesn't over-reject a genuinely safe
-  // DESC column now that it's routed through the normal probe instead of a
-  // static short-circuit.
-  it("accepts `INTEGER PRIMARY KEY DESC` with no explicit COLLATE (falls through to the normal probe, which passes it — no over-rejection regression)", async () => {
+  it("rejects a NUMERIC-affinity partitionKeyColumn (declared type DECIMAL) and a REAL-affinity partitionKeyColumn (declared type REAL) outright", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+
+    const numericRes = await post(
+      "/admin/create-table",
+      {
+        table: "scan_pku_numeric_evt",
+        schema: "CREATE TABLE IF NOT EXISTS scan_pku_numeric_evt (pk DECIMAL PRIMARY KEY, v TEXT)",
+        partitionKeyColumn: "pk",
+      },
+      AUTH(),
+    );
+    expect(numericRes.status).toBe(200);
+
+    const realRes = await post(
+      "/admin/create-table",
+      { table: "scan_pku_real_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_real_evt (pk REAL PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
+      AUTH(),
+    );
+    expect(realRes.status).toBe(200);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    for (const table of ["scan_pku_numeric_evt", "scan_pku_real_evt"]) {
+      const res = await post("/v1/table-scan", { tenantId, table }, token);
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
+    }
+  });
+
+  // No over-rejection: a genuine TEXT-affinity column with no collation
+  // issues (already exercised extensively above via the sole-PK/unique-index
+  // acceptance tests) must still pass. This test adds a BLOB-affinity
+  // partitionKeyColumn specifically, since round 5 also allows BLOB (byte-
+  // for-byte comparison, no numeric coercion — same as TEXT).
+  it("still accepts a genuine BLOB-affinity partitionKeyColumn as table-scan-eligible (BLOB is allowed alongside TEXT — no numeric coercion, no over-rejection)", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      {
-        table: "scan_pku_desc_binary_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_binary_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)",
-        partitionKeyColumn: "pk",
-      },
+      { table: "scan_pku_blob_evt", schema: "CREATE TABLE IF NOT EXISTS scan_pku_blob_evt (pk BLOB PRIMARY KEY, v TEXT)", partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
 
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
-    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_desc_binary_evt" }, token);
+    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_blob_evt" }, token);
     expect(res.status).toBe(200);
   });
 
-  // Companion to "leaves zero residual rows" above, but for a rowid-alias
-  // CANDIDATE that turns out NOT to be a genuine alias (INTEGER PRIMARY KEY
-  // DESC) — this is the only schema shape that exercises the round-4
-  // preliminary rowid-alias probe insert (a large distinctive integer,
-  // rowIndex 0) in addition to the normal case-flip/whitespace probe rows, so
-  // it needs its own residual-rows check: that preliminary insert must also
-  // roll back cleanly, leaving the table completely empty.
-  it("leaves zero residual rows for an INTEGER PRIMARY KEY DESC candidate (exercises the round-4 rowid-alias preliminary probe insert, not just the case/whitespace pairs)", async () => {
+  // The affinity gate runs BEFORE the uniqueness/collation checks and before
+  // any shard round-trip beyond the table_info PRAGMA already fetched — so
+  // rejecting an INTEGER-affinity column must never insert any probe rows at
+  // all (the probe's shard round-trip is skipped entirely, not merely rolled
+  // back).
+  it("rejects an INTEGER-affinity partitionKeyColumn without ever running the collation probe (no probe-marker rows inserted, not even transiently)", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_pku_int_no_probe_evt";
     const createRes = await post(
       "/admin/create-table",
-      {
-        table: "scan_pku_desc_residual_evt",
-        schema: "CREATE TABLE IF NOT EXISTS scan_pku_desc_residual_evt (pk INTEGER PRIMARY KEY DESC, v TEXT)",
-        partitionKeyColumn: "pk",
-      },
+      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (pk INTEGER PRIMARY KEY, v TEXT)`, partitionKeyColumn: "pk" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
 
-    const setRes = await post(
-      "/admin/set-partition-key-column",
-      { table: "scan_pku_desc_residual_evt", partitionKeyColumn: "pk" },
-      AUTH(),
-    );
+    const setRes = await post("/admin/set-partition-key-column", { table, partitionKeyColumn: "pk" }, AUTH());
     expect(setRes.status).toBe(200);
 
     for (const shardId of ALL_TEST_SHARD_IDS) {
-      const { rows } = await shardExecute(shardId, `SELECT COUNT(*) AS n FROM scan_pku_desc_residual_evt`);
+      const { rows } = await shardExecute(shardId, `SELECT COUNT(*) AS n FROM ${table}`);
       expect(rows[0]?.n).toBe(0);
     }
-
-    // Sanity: still accepted (BINARY, falls through correctly), no
-    // over-rejection regression from the new preliminary probe row.
-    const tenantId = tenantForCatalogShard(0, 4);
-    const token = await registerTenant(tenantId);
-    const res = await post("/v1/table-scan", { tenantId, table: "scan_pku_desc_residual_evt" }, token);
-    expect(res.status).toBe(200);
   });
+
+  // Fix 3 (P2): handleProbePartitionKeyCollation's buildInsert loop skips any
+  // `hidden !== 0` column BEFORE checking whether it's partitionKeyColumn --
+  // so if partitionKeyColumn is ITSELF a generated/virtual column, the marker
+  // value is never assigned to it, silently making the probe meaningless.
+  //
+  // Reachability, verified empirically: a generated column CAN be backed by
+  // a separate UNIQUE INDEX (though it can NOT be part of the table's
+  // PRIMARY KEY -- SQLite rejects that at CREATE TABLE time outright with
+  // "generated columns cannot be part of the PRIMARY KEY"), so the
+  // unique-index path is structurally reachable in principle. BUT this exact
+  // schema shape can never be registered through this app's OWN public API
+  // surface at all: both /admin/create-table's COLUMN_NOT_IN_SCHEMA check and
+  // /admin/set-partition-key-column's equivalent check confirm
+  // partitionKeyColumn's existence via `PRAGMA table_info`, which (verified
+  // empirically) SILENTLY OMITS generated columns entirely (unlike `PRAGMA
+  // table_xinfo`, which is what this probe itself and checkPartitionKeyUnique
+  // use) -- so naming a generated column as partitionKeyColumn is rejected
+  // 400 COLUMN_NOT_IN_SCHEMA before ever reaching checkPartitionKeyUnique,
+  // let alone this probe. Layered on top of the write-path unreachability
+  // noted in this function's doc comment (compileMutation forces the
+  // partition key into `values`, and SQLite rejects an explicit assignment to
+  // a generated column outright), a generated partition-key column is
+  // unreachable via EVERY current call path in this app, not merely the write
+  // path. This test therefore can't be constructed against the public HTTP
+  // API (unlike the other round-5 tests above) -- it instead builds the
+  // schema directly on the ShardDO's own storage (bypassing the admin
+  // handlers' gating entirely, the same "reach into the ShardDO directly"
+  // pattern used elsewhere in this file for schema shapes /admin/create-table
+  // can't express) and calls the shard's /probe-partition-key-collation route
+  // directly, to prove the defensive fail-closed check holds on its own
+  // merits regardless of whether today's callers can ever reach it.
+  it("fails closed (binaryCollation: false) when partitionKeyColumn is itself a generated/virtual column backed by a UNIQUE INDEX -- exercised directly against ShardDO's /probe-partition-key-collation route, since this schema shape can never reach it via the public admin API (see comment above)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "scan_pku_generated_evt";
+    const shardStub = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
+    await runInDurableObject(shardStub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(`CREATE TABLE ${table} (a TEXT NOT NULL, pk TEXT GENERATED ALWAYS AS (a) STORED, v TEXT)`);
+      state.storage.sql.exec(`CREATE UNIQUE INDEX ux_${table} ON ${table}(pk)`);
+    });
+
+    const res = await shardStub.fetch(
+      new Request("https://shard.internal/probe-partition-key-collation", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ table, partitionKeyColumn: "pk" }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; binaryCollation: boolean };
+    expect(body.binaryCollation).toBe(false);
+
+    // No probe-marker rows left behind either (the hidden-column check fires
+    // before any insert is attempted at all).
+    const { rows } = await shardExecute("catalog-0-shard-0", `SELECT COUNT(*) AS n FROM ${table}`);
+    expect(rows[0]?.n).toBe(0);
+  });
+});
+
+describe("/v1/table-scan partitionKeyColumn uniqueness gate (Codex P1 fix), continued: partial-index gate + related uniqueness edge cases", () => {
+  // Round-5 note: round-4 tests used to live here asserting that
+  // `INTEGER PRIMARY KEY DESC` (a rowid-alias CANDIDATE that SQLite does NOT
+  // actually treat as a true alias) fell through to the normal collation
+  // probe — rejected when declared COLLATE NOCASE, accepted when plain
+  // BINARY, with a companion residual-rows check for the round-4 preliminary
+  // rowid-alias probe insert. Round 5 makes all of that unreachable: `pk` is
+  // still declared type "INTEGER" (DESC doesn't change the declared type
+  // name), so it's still INTEGER-affinity, so checkPartitionKeyUnique now
+  // rejects it via the affinity gate BEFORE any probe (collation or
+  // rowid-alias) ever runs — regardless of collation. Both the NOCASE and
+  // plain-BINARY DESC variants are now rejected for the SAME reason (affinity,
+  // not collation), which the "TEXT-affinity-only partition-key scope
+  // restriction" describe block below asserts directly, including a residual-
+  // rows check proving the affinity gate short-circuits before the shard
+  // round-trip that would have run the probe.
 
   // Codex-found P1 (re-review of the P1 fix above): PRAGMA index_list reports
   // unique=1 for a PARTIAL unique index too (CREATE UNIQUE INDEX ... WHERE
