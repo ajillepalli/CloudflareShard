@@ -253,6 +253,26 @@ the *identical* `schemaSql` remains allowed (idempotent re-registration), and a 
 `partition_key_unique` is still 0 (unverified) can have its `schemaSql` changed freely — the
 restriction only applies once uniqueness has actually been certified.
 
+**Never produces a verified `partition_key_unique` when `schemaSql` is also submitted (PR
+review round 10).** The live-schema probe described above (`checkPartitionKeyUnique`, run
+against whatever ALREADY physically exists on a representative shard right now) and the
+`schemaSql` text submitted in the same call (stored for a future split/migration target to
+execute verbatim) are two structurally disconnected sources that are only ever assumed to
+correspond, never checked against each other. Without this guard, a table that already
+physically exists somewhere with a genuinely unique constraint, but is being registered here
+for the FIRST time, could be registered with a `schemaSql` that's weaker than (and doesn't
+preserve) that live constraint — the probe would still verify `partition_key_unique = 1`
+against the real live shard, while the stored `schema_sql` a future split target provisions
+from lacks the constraint entirely. Rounds 8-9's guards above don't catch this because there's
+no prior `table_rules` row to compare against on a first registration. Instead: whenever
+`schemaSql` is present (a non-empty string) anywhere in the request, `/admin/register-table`
+skips the live probe entirely and always stores `partition_key_unique = 0`, regardless of what
+the probe would otherwise compute. A table registered this way can only become verified later
+via a separate, subsequent `POST /admin/set-partition-key-column` call (which re-verifies fresh
+against the live shard and has no `schemaSql` field to go stale against) — or by using
+`POST /admin/create-table`'s own atomic push-schema-then-verify flow instead, which doesn't go
+through this code path at all.
+
 POST /admin/create-table
 Request:
 - table string
