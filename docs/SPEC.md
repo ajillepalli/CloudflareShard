@@ -92,6 +92,18 @@ Table: table_rules
   never reset to 0 automatically. /admin/create-table sets it to 1 at creation — a
   brand-new table has no legacy rows to backfill. Read by POST /v1/table-scan's
   `provenance.complete` response field.)
+- partition_key_unique INTEGER NOT NULL DEFAULT 0 (Milestone 4: 1 iff `partition_key_column`
+  is verified backed by a real `UNIQUE` constraint, sole `PRIMARY KEY`, or a non-partial
+  UNIQUE index — merely being part of a composite unique key, or "unique" only via a
+  partial/`WHERE`-conditioned index, does not qualify. Computed automatically, never
+  client-supplied, at /admin/create-table, /admin/set-partition-key-column, and
+  /admin/register-table time via live `PRAGMA table_info`/`index_list`/`index_info`/
+  `sqlite_master` introspection against a representative shard (`checkPartitionKeyUnique` in
+  index.ts); fails closed to 0 on any introspection error or ambiguity. Gates
+  POST /v1/table-scan: a table where this isn't 1 is rejected 409 `PARTITION_KEY_NOT_UNIQUE`,
+  since `/tenant-scan-page`'s join keys purely by partition-key value against
+  `__cf_row_owners` — a non-unique column would let two tenants' rows share a value and the
+  join attribute both to whichever tenant currently owns that key, a cross-tenant read leak.)
 
 Table: index_rules (Milestone 2, extended in Milestone 3)
 - index_name TEXT PRIMARY KEY
@@ -200,6 +212,14 @@ Response:
 - table
 - metadataVersion
 
+This route is metadata-only (it doesn't create anything on any shard), but it still computes
+and caches `table_rules.partition_key_unique` against one active shard's existing schema for
+`table`, exactly as `/admin/create-table` does (see §5) — falling back to unverified (0) if no
+shards exist yet or listing them fails, since registration itself must succeed even when
+nothing can be verified. Any `partitionKeyUnique` present in the request body is always
+ignored (Codex P1 fix: accepting a client-supplied value would let a caller lie about
+uniqueness and bypass the check `POST /v1/table-scan` relies on).
+
 POST /admin/create-table
 Request:
 - table string
@@ -209,6 +229,11 @@ Request:
 Response:
 - ok
 - table
+
+Also computes and caches `table_rules.partition_key_unique` (§5) from the schema just
+created, checked against the same representative shard as the column-exists validation above
+— this is what gates whether `POST /v1/table-scan` will later accept this table (409
+`PARTITION_KEY_NOT_UNIQUE` if not verified unique).
 
 POST /admin/set-partition-key-column (ADMIN_TOKEN)
 Request:
@@ -220,7 +245,7 @@ Response:
 - table
 - partitionKeyColumn
 
-Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409.
+Upgrades a table still carrying the `'__unset__'` sentinel (registered before `partitionKeyColumn` was mandatory, including anything live from `v1.0.0.0`) — such tables are otherwise rejected from `/v1/mutate` and coordinated transactions with a 409. Also recomputes `table_rules.partition_key_unique` (§5) for the newly-set column — a stale "unique" flag left over from the table's *previous* `partitionKeyColumn` (or from before this column was ever set) must never carry forward to the new one.
 
 POST /admin/create-index (ADMIN_TOKEN) — Milestone 2, Chunk 1
 Request:
@@ -453,12 +478,13 @@ Response (200):
 
 Errors: 400 `MISSING_FIELDS` / `LIMIT_EXCEEDED` (limit > 500); 401 (tenant token doesn't match
 `tenantId`, identical to `/v1/index-query`'s check); 400 `TABLE_NOT_REGISTERED`; 409
-`PARTITION_KEY_COLUMN_UNSET`; 403 `INTERNAL_TABLE_ACCESS_FORBIDDEN` (defense-in-depth —
-`table_rules` should never contain a `__cf_*`/`sqlite_*` name); 400 `INVALID_CURSOR` (cursor
-fails to base64/JSON-decode, or names a shard no longer in the catalog shard's current active
-set — e.g. topology changed between calls; a client that gets this restarts with no cursor);
-502 `SHARD_UNREACHABLE` (naming the shard — any shard failure fails the whole request, no
-silently-partial result in this MVP).
+`PARTITION_KEY_COLUMN_UNSET`; 409 `PARTITION_KEY_NOT_UNIQUE` (`table_rules.partition_key_unique`
+isn't 1 for this table — see §5 and the paragraph below); 403 `INTERNAL_TABLE_ACCESS_FORBIDDEN`
+(defense-in-depth — `table_rules` should never contain a `__cf_*`/`sqlite_*` name); 400
+`INVALID_CURSOR` (cursor fails to base64/JSON-decode, or names a shard no longer in the
+catalog shard's current active set — e.g. topology changed between calls; a client that gets
+this restarts with no cursor); 502 `SHARD_UNREACHABLE` (naming the shard — any shard failure
+fails the whole request, no silently-partial result in this MVP).
 
 Lists a tenant's own rows in a registered table, with no arbitrary filters — the query is
 mechanically constructed (`table` + `tenantId` + `cursor` + `limit` only), the same
@@ -470,6 +496,21 @@ does: auth check + `table_rules` gate in one round trip). Resolves the tenant's 
 shard (`catalogShardIdForTenant`) and its *active* shard pool (`/list-shards`), then fans out
 to every shard's internal `POST /tenant-scan-page` (§6) at `SHARD_FANOUT_CONCURRENCY`
 concurrency (the same constant/`batchedMap` helper reused throughout this codebase).
+
+**Partition-key-uniqueness precondition (structural, not incidental).** `/tenant-scan-page`
+keys its `__cf_row_owners` join purely by partition-key VALUE, filtered by
+`(tenant_id, table_name)` — if `partitionKeyColumn` isn't actually guaranteed unique, two
+different tenants' rows could share the same value and the join would attribute both to
+whichever tenant currently owns that key in `__cf_row_owners`, a cross-tenant read leak. This
+is why `table_rules.partition_key_unique` (§5) exists: it's computed automatically — never
+accepted from a client — at `/admin/create-table`, `/admin/set-partition-key-column`, and
+`/admin/register-table` time via live schema introspection (`checkPartitionKeyUnique` in
+index.ts: a real `UNIQUE` constraint, sole `PRIMARY KEY`, or non-partial UNIQUE index counts;
+composite-key membership and partial/`WHERE`-conditioned unique indexes do not), and fails
+closed to unverified (0) on any introspection error or ambiguity. `POST /v1/table-scan`
+checks this flag on every call (via `/lookup-table-scan`) and rejects 409
+`PARTITION_KEY_NOT_UNIQUE` for any table where it isn't 1 — a hard requirement for using this
+route safely, not a soft recommendation.
 
 **Cursor and the "advance only on emit" invariant (the largest correctness risk in this
 feature).** The opaque `cursor` is a base64-JSON `{shardCursors: {[shardId]: afterPartitionKey}}`
