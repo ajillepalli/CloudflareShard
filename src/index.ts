@@ -344,6 +344,35 @@ function splitTopLevel(text: string): string[] {
   return parts;
 }
 
+/** Matches a `COLLATE <name>` clause's collation name in any of SQLite's four
+ * identifier-quoting forms (`"..."`, `` `...` ``, `[...]`, bare) PLUS the
+ * single-quoted `'...'` form -- SQLite's lenient historical misfeature of
+ * accepting a single-quoted string as an identifier when no string literal
+ * makes contextual sense, which collation names hit in practice (verified
+ * empirically: `COLLATE 'NOCASE'` is accepted and genuinely enforced, same as
+ * the other four forms). Deliberately broader than extractColumnCollation's
+ * own identRe below (used for COLUMN names, which don't hit the single-quote
+ * misfeature the same way in this codebase's identifier positions).
+ * Codex P1 fix (round 2): the previous `/\bcollate\s+(\w+)/i` only matched
+ * the bare form -- any quoted COLLATE clause silently fell through to `null`
+ * ("no explicit COLLATE" / safe BINARY default) even though SQLite was
+ * enforcing a real non-BINARY collation underneath the quotes, reopening the
+ * exact cross-tenant leak the collation gate exists to close. */
+const COLLATE_NAME_RE = /\bcollate\s+(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))/i;
+
+/** Extracts and upper-cases the collation name from a `COLLATE <name>` clause
+ * found anywhere in `text`, unwrapping whichever of SQLite's identifier
+ * quoting forms was used (see COLLATE_NAME_RE's doc comment). Returns null if
+ * no COLLATE clause is present. Shared by extractColumnCollation (column-level
+ * COLLATE, parsed from a CREATE TABLE's stored text) and checkPartitionKeyUnique's
+ * unique-index path (index-level COLLATE, parsed from a CREATE INDEX's stored
+ * text) so both call sites recognize identical quoting forms. */
+function extractCollationName(text: string): string | null {
+  const m = COLLATE_NAME_RE.exec(text);
+  if (!m) return null;
+  return (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? "").toUpperCase();
+}
+
 /** Parses `columnName`'s explicit `COLLATE <name>` clause out of a CREATE
  * TABLE statement's stored text (sqlite_master.sql) -- see
  * partitionKeyColumnIsBinaryCollation's doc comment for why this text-parsing
@@ -355,7 +384,9 @@ function splitTopLevel(text: string): string[] {
  * matches the remaining column definitions by their own leading identifier
  * (quoted `"..."`/`` `...` ``/`[...]` or bare, case-insensitive -- SQLite
  * identifiers are case-insensitive). Returns the collation name
- * (upper-cased) if an explicit COLLATE clause is present on that column's own
+ * (upper-cased, via extractCollationName -- handling all of SQLite's
+ * identifier-quoting forms for the COLLATE name itself, not just the column
+ * name) if an explicit COLLATE clause is present on that column's own
  * definition; null if the column definition was confidently isolated and has
  * NO explicit COLLATE (SQLite's safe BINARY default applies); undefined if
  * the column definition couldn't be confidently isolated at all (caller must
@@ -387,8 +418,7 @@ function extractColumnCollation(createTableSql: string, columnName: string): str
     if (!identMatch) continue;
     const ident = (identMatch[2] ?? identMatch[3] ?? identMatch[4] ?? identMatch[5] ?? "").toLowerCase();
     if (ident !== columnName.toLowerCase()) continue;
-    const collateMatch = /\bcollate\s+(\w+)/i.exec(part);
-    return collateMatch ? collateMatch[1].toUpperCase() : null;
+    return extractCollationName(part);
   }
   return undefined; // no matching column definition found -- fail closed
 }
@@ -510,8 +540,10 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
     // which carries no collation info of its own at all), it inherits
     // partitionKeyColumn's own declared collation, so that's checked
     // instead. See partitionKeyColumnIsBinaryCollation's doc comment for why
-    // a non-BINARY collation here is unsafe.
-    const indexCollation = indexSql !== null ? (/\bcollate\s+(\w+)/i.exec(indexSql)?.[1]?.toUpperCase() ?? null) : null;
+    // a non-BINARY collation here is unsafe. extractCollationName (shared
+    // with extractColumnCollation above) handles all of SQLite's
+    // identifier-quoting forms for the COLLATE name, not just the bare form.
+    const indexCollation = indexSql !== null ? extractCollationName(indexSql) : null;
     if (indexCollation !== null) {
       if (indexCollation !== "BINARY") continue;
     } else if (!(await partitionKeyColumnIsBinaryCollation(env, shardId, table, partitionKeyColumn))) {
