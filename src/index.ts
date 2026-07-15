@@ -2663,15 +2663,22 @@ type ShardScanPage = {
  *      row that was fetched but then cut by the overall-limit truncation, so
  *      the next call re-fetches (never skips) it.
  *
- * A shard's next cursor is the EARLIER (partition-key ascending) of the two
- * — (a) alone would skip a row truncated away by the cross-shard merge; (b)
- * alone is what let a skipped owner row (base row deleted between the
- * shard's two queries — see /tenant-scan-page) silently look like shard
- * exhaustion, because it only ever looked at rows the shard actually
- * *delivered*, never how far it had *scanned*. Composing them handles both
- * failure modes without either one masking the other. Exported (and kept
- * side-effect-free) for direct unit testing of the merge/truncate/exhaustion
- * invariants — the largest risk item per the spec. */
+ * These are NOT simply composed by taking whichever position is earlier
+ * (round-5 fix: that was the original, INCORRECT composition — see the inline
+ * comment above invariant (a)'s loop for why). Instead, per shard: if it
+ * fetched zero rows this batch, or every row it fetched survived truncation,
+ * (a) is free to advance the cursor past (b)'s position, all the way to
+ * `lastOwnerKeyScanned`; if cross-shard truncation cut some (but not all) of
+ * what it fetched, (a) must leave (b)'s bound untouched. (b) alone is what let
+ * a skipped owner row (base row deleted between the shard's two queries — see
+ * /tenant-scan-page) silently look like shard exhaustion, because it only
+ * ever looked at rows the shard actually *delivered*, never how far it had
+ * *scanned* — and naively letting (a) always win whenever it's later would
+ * skip a row truncated away by the cross-shard merge. Composing them
+ * correctly handles both failure modes without either one masking the other.
+ * Exported (and kept side-effect-free) for direct unit testing of the
+ * merge/truncate/exhaustion invariants — the largest risk item per the
+ * spec. */
 export function mergeTableScanPages(
   pages: ShardScanPage[],
   overallLimit: number,
@@ -2706,26 +2713,60 @@ export function mergeTableScanPages(
     const current = nextShardCursors[entry.shardId] ?? "";
     if (entry.partitionKey > current) nextShardCursors[entry.shardId] = entry.partitionKey;
   }
-  // Invariant (a), composed with (b) above by taking whichever position is
-  // EARLIER: a shard whose owner query fully consumed its LIMIT may hold
-  // more owner rows beyond this batch, and it's safe to resume scanning past
-  // everything it already scanned (lastOwnerKeyScanned) — provided that
-  // isn't LATER than invariant (b)'s bound, which already correctly pins the
-  // cursor earlier whenever some of this shard's fetched rows got truncated
-  // away by the cross-shard merge (lastOwnerKeyScanned can never be earlier
-  // than (b) in that case, since (b) is itself derived only from partition
-  // keys the shard fetched, which are always <= the last key it scanned —
-  // this loop only ever tightens (b)'s bound, never loosens it, e.g. when a
-  // skipped owner row — see /tenant-scan-page — put the shard's own LAST
-  // scanned key ahead of the last one it actually delivered).
+  // Invariant (a): a shard whose owner query fully consumed its LIMIT may
+  // hold more owner rows beyond this batch, and it's safe to resume scanning
+  // past everything it already scanned (lastOwnerKeyScanned) — but ONLY once
+  // we know invariant (b) isn't holding the cursor back on purpose. There are
+  // two genuinely different reasons a shard can end up with zero of its rows
+  // in `truncated` this round, and they demand opposite treatment (round-5
+  // fix: the composition below used to always take whichever of (a)/(b) was
+  // EARLIER, which silently assumed every such case was the first one):
+  //
+  //  (A) cross-shard truncation cut rows this shard DID fetch, because other
+  //      shards' rows sorted earlier — invariant (b) is already correctly
+  //      pinning the cursor at the last row this shard actually got to keep
+  //      (or its untouched prior cursor, if none survived), so those cut
+  //      rows get re-fetched, not skipped, next call. (a) must not loosen
+  //      that bound.
+  //  (B) every owner key in this shard's OWN batch resolved to zero rows —
+  //      e.g. every one of their base rows was deleted between
+  //      /tenant-scan-page's two queries (see shard.ts). There is nothing
+  //      fetched to hold back for, and since lastOwnerKeyScanned is always
+  //      >= the prior cursor (the owner query is `partition_key > prior`),
+  //      "the earlier of (a)/(b)" always picks the untouched prior cursor in
+  //      this case — the cursor never advances, the next call re-issues the
+  //      identical query, and the scan stalls forever instead of finishing.
+  //
+  // page.rows.length (what THIS shard itself fetched, before the cross-shard
+  // merge/truncate step) vs. how many of that shard's rows survived into
+  // `truncated` is what tells the two cases apart.
+  const deliveredCountByShard: Record<string, number> = {};
+  for (const entry of truncated) {
+    deliveredCountByShard[entry.shardId] = (deliveredCountByShard[entry.shardId] ?? 0) + 1;
+  }
   for (const page of pages) {
     const ownerRowsScanned = page.ownerRowsScanned ?? page.rows.length;
     if (ownerRowsScanned < perShardLimit) continue; // genuinely exhausted; nothing to bound
     if (page.lastOwnerKeyScanned === undefined) continue;
     const current = nextShardCursors[page.shardId] ?? "";
-    if (page.lastOwnerKeyScanned < current) {
-      nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+    if (page.rows.length === 0) {
+      // Case (B): this shard fetched nothing at all, so invariant (b) never
+      // touched it (there's no entry of its in `truncated` either way).
+      // Nothing to hold back for — always safe, and necessary, to advance
+      // past everything scanned.
+      if (page.lastOwnerKeyScanned > current) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
+      continue;
     }
+    const deliveredCount = deliveredCountByShard[page.shardId] ?? 0;
+    if (deliveredCount < page.rows.length) {
+      // Case (A): some of what this shard fetched was cut by cross-shard
+      // truncation. Leave invariant (b)'s bound exactly as computed.
+      continue;
+    }
+    // Everything this shard fetched made it into the response — safe to
+    // advance past a trailing skipped-owner-row gap beyond the last
+    // delivered row too.
+    if (page.lastOwnerKeyScanned > current) nextShardCursors[page.shardId] = page.lastOwnerKeyScanned;
   }
 
   // nextCursor must be present whenever there's ANY reason to believe more
