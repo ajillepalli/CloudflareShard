@@ -32,7 +32,10 @@ export async function initCluster(numShards = 2, totalVBuckets = 16) {
     "/admin/create-table",
     {
       table: "events",
-      schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, v TEXT)",
+      // PR review round 12: /admin/create-table now rejects IF NOT EXISTS
+      // schemas outright (see handleAdminCreateTable) — isolated per-test
+      // storage means no test needs this to be silently idempotent.
+      schema: "CREATE TABLE events (id TEXT PRIMARY KEY, v TEXT)",
       partitionKeyColumn: "id",
     },
     AUTH(),
@@ -60,7 +63,7 @@ export async function registerTenant(tenantId: string): Promise<string> {
 export async function createIndexTestTable(table: string): Promise<void> {
   const res = await post(
     "/admin/create-table",
-    { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+    { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
     AUTH(),
   );
   expect(res.status).toBe(200);

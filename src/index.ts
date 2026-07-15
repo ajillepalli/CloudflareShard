@@ -324,7 +324,11 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
     if (!listFailed) {
       const shardIds = listResults.flatMap((r) => (r.body as { shardIds: string[] }).shardIds);
       if (shardIds.length > 0) {
-        partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], payload.table, payload.partitionKeyColumn);
+        // PR review round 12 (P1 fix): this route's schema isn't guaranteed
+        // uniform across shards by construction (unlike /admin/create-table's
+        // call site below) — see checkPartitionKeyUniqueAcrossShards's doc
+        // comment. Every shard must independently confirm uniqueness.
+        partitionKeyUnique = await checkPartitionKeyUniqueAcrossShards(env, shardIds, payload.table, payload.partitionKeyColumn);
       }
     }
   }
@@ -456,10 +460,18 @@ function sqliteTypeAffinity(declaredType: string): SqliteAffinity {
  * composite PRIMARY KEY where partitionKeyColumn is only one part is NOT
  * sufficient — the value alone must be guaranteed unique on its own. Checked
  * against a single representative shard: schema is uniform across shards for
- * a table by construction, so one check suffices. Fails closed (false) on
- * any introspection error — callers must treat "unable to verify" as "not
- * safe to scan", matching table_rules.partition_key_unique's fail-closed
- * default.
+ * a table by construction, so one check suffices — but that "by construction"
+ * guarantee only actually holds for a caller that JUST pushed the identical
+ * DDL to every shard in this same request (currently, only
+ * /admin/create-table). A caller that reaches a table via a live probe
+ * against whatever ALREADY physically exists (/admin/register-table,
+ * /admin/set-partition-key-column) cannot assume uniformity — the table may
+ * have been created outside this system's own DDL-push path, with per-shard
+ * schema drift — and must use checkPartitionKeyUniqueAcrossShards below
+ * instead of calling this function directly against one shard. Fails closed
+ * (false) on any introspection error — callers must treat "unable to verify"
+ * as "not safe to scan", matching table_rules.partition_key_unique's
+ * fail-closed default.
  *
  * Round 3 addition: plain uniqueness alone is still not sufficient — see
  * partitionKeyColumnHasBinaryCollation's doc comment (in this file) /
@@ -559,6 +571,42 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
   return await partitionKeyColumnHasBinaryCollation(env, shardId, table, partitionKeyColumn);
 }
 
+/** PR review round 12 (P1 fix): checkPartitionKeyUnique's "schema is uniform
+ * across shards by construction, so one representative shard suffices"
+ * assumption only actually holds for /admin/create-table, which just pushed
+ * the identical DDL to every shard in this same request. /admin/register-table
+ * (via its own live probe) and /admin/set-partition-key-column can both run
+ * against a table that reached this system some other way — a legacy table,
+ * or one created by an external/manual process — with no guarantee every
+ * shard's copy of the table agrees. If shard A genuinely has the unique
+ * constraint but shard B (same table name) doesn't, checking only shard A and
+ * setting partition_key_unique=1 globally would let /v1/table-scan query
+ * shard B — which has no real uniqueness enforcement — and return
+ * duplicate-partition-key rows under the wrong tenant.
+ *
+ * Runs checkPartitionKeyUnique against EVERY shard in `shardIds` in parallel
+ * (bounded via batchedMap, matching this file's existing shard-fan-out
+ * convention) and returns true only if ALL of them independently confirm
+ * uniqueness + BINARY collation. If any shard disagrees, or is unreachable,
+ * the overall result is false — fail-closed, consistent with
+ * checkPartitionKeyUnique's own philosophy. Callers that CAN guarantee
+ * uniformity by construction (currently, only /admin/create-table) should
+ * keep calling checkPartitionKeyUnique directly against their own
+ * just-created representative shard instead of this wrapper, to avoid paying
+ * for redundant checks against shards whose schema is already known to
+ * match. */
+async function checkPartitionKeyUniqueAcrossShards(
+  env: Env,
+  shardIds: string[],
+  table: string,
+  partitionKeyColumn: string,
+): Promise<boolean> {
+  const results = await batchedMap(shardIds, SHARD_FANOUT_CONCURRENCY, (shardId) =>
+    checkPartitionKeyUnique(env, shardId, table, partitionKeyColumn),
+  );
+  return results.every((result) => result === true);
+}
+
 async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as {
     table?: string;
@@ -592,6 +640,31 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
   }
   if (isDangerousSchema(body.schema)) {
     return json({ error: "schema statement not permitted." }, 403);
+  }
+  // PR review round 12 (P1 fix): round 11's whole "schema_sql can only be
+  // trustworthy via create-table's atomic push-then-verify flow" fix assumed
+  // this route's OWN schema push and its subsequent uniqueness verification
+  // always correspond. IF NOT EXISTS breaks that: if body.table already
+  // physically existed (with some OTHER, possibly different schema) on one
+  // or more shards, the DDL push below silently no-ops there, and the
+  // verification that runs afterward reflects whatever was ALREADY live —
+  // unrelated to body.schema's content — while table_rules.schema_sql still
+  // gets stored as the submitted (possibly never-actually-applied) text.
+  // Rejecting IF NOT EXISTS outright converts that silent divergence into a
+  // loud, obvious failure: a genuinely new table still gets created normally
+  // via a plain CREATE TABLE; a colliding one now fails loudly with SQLite's
+  // own "table already exists" error instead of silently no-opping.
+  if (/if\s+not\s+exists/i.test(body.schema)) {
+    return json(
+      {
+        error: {
+          code: "SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED",
+          message: "schema must not use IF NOT EXISTS.",
+          fix: "/admin/create-table requires the table not already exist; use /admin/register-table for an existing table, or resolve the naming conflict first.",
+        },
+      },
+      400,
+    );
   }
 
   const schemaTableName = extractCreateTableName(body.schema);
@@ -776,7 +849,11 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
   // validation existed) — same verification as /admin/create-table, since a
   // stale "unique" flag for a PREVIOUS partitionKeyColumn must never carry
   // forward to a newly-set one.
-  const partitionKeyUnique = await checkPartitionKeyUnique(env, shardIds[0], body.table, body.partitionKeyColumn);
+  // PR review round 12 (P1 fix): unlike /admin/create-table, this route's
+  // table isn't guaranteed uniform across shards by construction — see
+  // checkPartitionKeyUniqueAcrossShards's doc comment. Every shard must
+  // independently confirm uniqueness.
+  const partitionKeyUnique = await checkPartitionKeyUniqueAcrossShards(env, shardIds, body.table, body.partitionKeyColumn);
 
   const results = await fanOutToAllCatalogs(
     env,

@@ -1,4 +1,4 @@
-import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+﻿import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
@@ -101,7 +101,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "events", schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY)" },
+      { table: "events", schema: "CREATE TABLE events (id TEXT PRIMARY KEY)" },
       AUTH(),
     );
     expect(res.status).toBe(400);
@@ -113,7 +113,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post("/admin/create-table", {
       table: "events",
-      schema: "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY)",
+      schema: "CREATE TABLE events (id TEXT PRIMARY KEY)",
     });
     expect(res.status).toBe(401);
   });
@@ -138,6 +138,78 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(403);
   });
 
+  // PR review round 12 (P1 fix): round 11's whole "schema_sql can only be
+  // trustworthy via create-table's atomic push-then-verify flow" fix assumed
+  // this route's own schema push and its subsequent uniqueness verification
+  // always correspond — but IF NOT EXISTS breaks that assumption: if
+  // body.table already physically existed (with some OTHER schema) on one or
+  // more shards, the DDL silently no-ops there while table_rules.schema_sql
+  // still gets stored as the submitted (never-actually-applied) text.
+  // Rejecting IF NOT EXISTS outright converts that silent divergence into a
+  // loud, obvious 400.
+  it("rejects a schema containing IF NOT EXISTS (case-insensitive), instead of silently risking a no-op DDL push (PR review round 12 fix)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "ifnotexists_evt", schema: "CREATE TABLE IF NOT EXISTS ifnotexists_evt (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED");
+  });
+
+  it("rejects IF NOT EXISTS regardless of casing", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "ifnotexists_mixedcase_evt", schema: "create table if NOT exists ifnotexists_mixedcase_evt (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SCHEMA_IF_NOT_EXISTS_NOT_ALLOWED");
+  });
+
+  it("still accepts a plain CREATE TABLE (no IF NOT EXISTS) — no regression", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const res = await post(
+      "/admin/create-table",
+      { table: "plain_create_evt", schema: "CREATE TABLE plain_create_evt (id TEXT PRIMARY KEY)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  // Note: a LITERAL repeat of the exact same /admin/create-table call (same
+  // table, same shardId) is NOT the right way to exercise "table already
+  // exists" — that route's own per-shard requestId
+  // (`create-table-${table}-${shardId}`) is deliberately STABLE, so a
+  // verbatim retry replays its cached success by design (the same
+  // established idempotent-retry contract the rollback path's comment above
+  // describes), and rightly so — this fix doesn't touch that. The scenario
+  // round 12 actually closes is a table that already exists via some path
+  // OTHER than this exact call (a legacy table, or a genuine out-of-band
+  // creation) when /admin/create-table is invoked for it for the first time.
+  it("genuinely fails (SQLite's real 'table already exists' error) when the table already exists on a shard from something other than this exact /admin/create-table call, instead of a plain CREATE TABLE silently no-oping", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "create_table_collide_evt";
+
+    // Simulate the table already physically existing on one shard from some
+    // OTHER process (bypassing /admin/create-table entirely) — the same
+    // "legacy table" / "external process" scenario round 12's fix targets.
+    await shardExecute("catalog-0-shard-0", `CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
+
+    const res = await post(
+      "/admin/create-table",
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY)`, partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("Failed to create table");
+  });
+
   it("/admin/init requires an admin token at the Worker level (structural /admin/* gate)", async () => {
     const res = await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true });
     expect(res.status).toBe(401);
@@ -160,7 +232,7 @@ describe("Worker multi-catalog-shard fan-out", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res = await post(
       "/admin/create-table",
-      { table: "quoted_regression_evt", schema: 'CREATE TABLE IF NOT EXISTS "quoted_regression_evt" (id TEXT PRIMARY KEY)', partitionKeyColumn: "id" },
+      { table: "quoted_regression_evt", schema: 'CREATE TABLE "quoted_regression_evt" (id TEXT PRIMARY KEY)', partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res.status).toBe(200);
@@ -378,7 +450,7 @@ describe("Worker tenant authorization", () => {
     await initCluster();
     await post(
       "/admin/create-table",
-      { table: "other_tbl", schema: "CREATE TABLE IF NOT EXISTS other_tbl (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "other_tbl", schema: "CREATE TABLE other_tbl (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
 
@@ -534,7 +606,7 @@ describe("Worker /admin/set-partition-key-column", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const createRes = await post(
       "/admin/create-table",
-      { table: "upgrade_me", schema: "CREATE TABLE IF NOT EXISTS upgrade_me (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "upgrade_me", schema: "CREATE TABLE upgrade_me (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -596,7 +668,7 @@ describe("Worker /admin/set-partition-key-column", () => {
       "/admin/create-table",
       {
         table: "already_set_via_create",
-        schema: "CREATE TABLE IF NOT EXISTS already_set_via_create (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
+        schema: "CREATE TABLE already_set_via_create (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -628,7 +700,7 @@ describe("Worker /admin/set-partition-key-column", () => {
       "/admin/create-table",
       {
         table: "already_set_via_upgrade",
-        schema: "CREATE TABLE IF NOT EXISTS already_set_via_upgrade (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
+        schema: "CREATE TABLE already_set_via_upgrade (id TEXT PRIMARY KEY, email TEXT, v TEXT)",
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -682,7 +754,7 @@ describe("Worker /admin/set-partition-key-column", () => {
   it("nulls out a previously-stored schema_sql when this call's own probe verifies partition_key_unique=1", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const table = "setpkcol_nulls_schemasql_evt";
-    const originalSchema = `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`;
+    const originalSchema = `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`;
     const createRes = await post(
       "/admin/create-table",
       { table, schema: originalSchema, partitionKeyColumn: "id" },
@@ -792,7 +864,7 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
       "/admin/create-table",
       {
         table,
-        schema: `CREATE TABLE IF NOT EXISTS ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)`,
+        schema: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)`,
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -832,7 +904,7 @@ describe("Worker /admin/register-table partitionKeyUnique trust bypass (Codex P1
       "/admin/create-table",
       {
         table,
-        schema: `CREATE TABLE IF NOT EXISTS ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`,
+        schema: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`,
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -897,7 +969,7 @@ describe("Worker /admin/register-table preserves provenance_complete across re-r
     const table = "reregister_provdone_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -931,7 +1003,7 @@ describe("Worker /admin/register-table preserves provenance_complete across re-r
     const table = "reregister_provpending_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -966,7 +1038,7 @@ describe("Worker /admin/create-table no longer auto-certifies provenance_complet
     const table = "create_table_no_autocert_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -978,7 +1050,7 @@ describe("Worker /admin/create-table no longer auto-certifies provenance_complet
     const table = "create_table_backfill_certifies_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -1012,7 +1084,7 @@ describe("Worker /admin/register-table rejects repointing an already-configured 
     const table = "reregister_same_pkcol_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -1030,7 +1102,7 @@ describe("Worker /admin/register-table rejects repointing an already-configured 
       "/admin/create-table",
       {
         table,
-        schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, email TEXT, v TEXT)`,
+        schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, email TEXT, v TEXT)`,
         partitionKeyColumn: "id",
       },
       AUTH(),
@@ -1061,7 +1133,7 @@ describe("Worker /admin/register-table rejects repointing an already-configured 
     const table = "register_sentinel_upgrade_evt";
     const createRes = await post(
       "/admin/create-table",
-      { table, schema: `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
+      { table, schema: `CREATE TABLE ${table} (id TEXT PRIMARY KEY, v TEXT)`, partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(createRes.status).toBe(200);
@@ -1254,6 +1326,62 @@ describe("Worker /admin/register-table nulls a previously-stored schema_sql when
     const token = await registerTenant(tenantId);
     const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
     expect(scanRes.status).toBe(200);
+  });
+});
+
+// PR review round 12 (P1 fix): checkPartitionKeyUnique's "schema is uniform
+// across shards for a table by construction, so one representative shard
+// suffices" assumption only actually holds for /admin/create-table, which
+// just pushed the identical DDL to every shard in this same request.
+// /admin/register-table's own live probe (this describe block) can run
+// against a table that reached this system some other way — a legacy table,
+// or one created by an external/manual process — with genuine per-shard
+// schema drift. Before this fix, checkPartitionKeyUnique was only ever
+// checked against shardIds[0] (whichever shard /list-shards happened to
+// return first), so a drifted OTHER shard's lack of a real unique constraint
+// was silently ignored, letting /v1/table-scan later query that shard and
+// return duplicate-partition-key rows under the wrong tenant. Fixed:
+// checkPartitionKeyUniqueAcrossShards requires EVERY shard to independently
+// agree; if any one disagrees, the whole result fails closed to 0/false.
+describe("Worker /admin/register-table verifies partitionKeyUnique across EVERY shard, not just one representative (PR review round 12 fix)", () => {
+  it("computes partitionKeyUnique: 0 when one shard genuinely has a UNIQUE constraint but another (same table name) doesn't — not just whichever shard happens to be checked first", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const table = "register_drift_evt";
+
+    // Bypass /admin/create-table's uniform DDL push entirely — create the
+    // physical table independently, per shard, simulating a table that
+    // reached this system with genuine per-shard schema drift.
+    // catalog-0-shard-0 is the FIRST shard /list-shards returns (the old
+    // shardIds[0] this fix replaces): give IT a genuine UNIQUE constraint on
+    // user_id, while catalog-1-shard-0 gets no constraint at all — the
+    // regression this test guards against is the check trusting shardIds[0]
+    // alone and missing that catalog-1-shard-0 disagrees.
+    await shardExecute(
+      "catalog-0-shard-0",
+      `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`,
+    );
+    await shardExecute(
+      "catalog-1-shard-0",
+      `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, v TEXT)`,
+    );
+    for (const shardId of ["catalog-2-shard-0", "catalog-3-shard-0"]) {
+      await shardExecute(shardId, `CREATE TABLE ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE, v TEXT)`);
+    }
+
+    const registerRes = await post("/admin/register-table", { table, partitionKeyColumn: "user_id" }, AUTH());
+    expect(registerRes.status).toBe(200);
+
+    // Before this fix, checking only shardIds[0] (catalog-0-shard-0, which
+    // DOES have the unique constraint) would have incorrectly set this to 1.
+    // Correct behavior: 0, because not EVERY shard agrees.
+    expect(await readTableRulesColumn(table, "partition_key_unique")).toBe(0);
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const scanRes = await post("/v1/table-scan", { tenantId, table }, token);
+    expect(scanRes.status).toBe(409);
+    const scanBody = (await scanRes.json()) as { error: { code: string } };
+    expect(scanBody.error.code).toBe("PARTITION_KEY_NOT_UNIQUE");
   });
 });
 

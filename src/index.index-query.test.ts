@@ -1,4 +1,4 @@
-import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+﻿import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
@@ -85,7 +85,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c4_partial_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c4_partial_evt (id TEXT PRIMARY KEY, a TEXT, b TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c4_partial_evt", schema: "CREATE TABLE idx_c4_partial_evt (id TEXT PRIMARY KEY, a TEXT, b TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);

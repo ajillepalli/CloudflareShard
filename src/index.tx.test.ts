@@ -1,4 +1,4 @@
-import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+﻿import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
@@ -236,7 +236,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     await post("/admin/init", { numShards: 2, totalVBuckets: 16, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c3_regress_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c3_regress_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c3_regress_evt", schema: "CREATE TABLE idx_c3_regress_evt (id TEXT PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);
@@ -277,7 +277,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c3_zerorow_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c3_zerorow_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c3_zerorow_evt", schema: "CREATE TABLE idx_c3_zerorow_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);
@@ -369,7 +369,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
-      { table: "idx_c3_simwhere_evt", schema: "CREATE TABLE IF NOT EXISTS idx_c3_simwhere_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
+      { table: "idx_c3_simwhere_evt", schema: "CREATE TABLE idx_c3_simwhere_evt (id TEXT PRIMARY KEY, v TEXT, status TEXT)", partitionKeyColumn: "id" },
       AUTH(),
     );
     expect(res0.status).toBe(200);
