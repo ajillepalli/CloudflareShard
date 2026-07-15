@@ -1834,6 +1834,70 @@ export class ShardDO extends DurableObject {
    * NOT try to parse WHY the first insert failed, matching this function's
    * fail-closed philosophy for every other ambiguous case, same as
    * checkPartitionKeyUnique itself in index.ts). */
+  /** Round-5 fixes (both approved Codex findings):
+   *
+   * (1) The round-3/4 probe inferred safety purely from whether a
+   * case-variant / whitespace-variant marker's INSERT collided against the
+   * qualifying UNIQUE/PRIMARY KEY constraint. But /tenant-scan-page's actual
+   * read query (see that handler above) is a BARE `WHERE "<pkCol>" = ?`
+   * predicate with no explicit COLLATE clause -- and SQLite resolves a bare
+   * predicate's collation from the COLUMN's own declared collation, which
+   * can DIFFER from a specific INDEX's own COLLATE override. Verified
+   * empirically:
+   *   CREATE TABLE t (pk TEXT COLLATE NOCASE, v TEXT);
+   *   CREATE UNIQUE INDEX ux ON t(pk COLLATE BINARY);
+   *   INSERT INTO t VALUES ('a', 'row-a');
+   *   INSERT INTO t VALUES ('A', 'row-A');  -- SUCCEEDS (index's own BINARY
+   *                                         -- override allows coexistence)
+   *   SELECT v FROM t WHERE pk = 'a';        -- returns BOTH rows -- the bare
+   *                                         -- predicate uses the column's
+   *                                         -- NOCASE collation, not the
+   *                                         -- index's BINARY override.
+   * A table shaped like this passed the old insert-collision-only probe as
+   * "safe" (the case-variant insert SUCCEEDS, so nothing collided at insert
+   * time) even though the real read query used by table-scan conflates the
+   * two rows -- a genuine cross-tenant leak. Fixed by no longer inferring
+   * safety from insert success/failure alone: each probe pair (case,
+   * whitespace) now also runs the SAME KIND of bare-predicate query
+   * /tenant-scan-page issues -- bound to one marker value from the pair --
+   * and checks whether it returns MORE than the one expected row. Two
+   * possible outcomes per pair:
+   *   - the second insert of the pair FAILS (a genuine UNIQUE/PK collision at
+   *     insert time -- the common case, e.g. a plain NOCASE column with no
+   *     index override): provably unsafe already, no need to run the SELECT
+   *     probe at all -- the constraint itself already proved the two values
+   *     are indistinguishable in this schema.
+   *   - the second insert SUCCEEDS (both rows coexist, e.g. the index-
+   *     override scenario above): run the bare-predicate SELECT bound to one
+   *     marker value and count matched rows. Exactly 1 (the literal's own
+   *     row) is safe; more than 1 means the bare predicate's own collation
+   *     conflated the pair, so it's unsafe.
+   *
+   * Verified empirically (node:sqlite) before implementing, against: (a) the
+   * index-COLLATE-override scenario above (now correctly reports unsafe --
+   * `SELECT COUNT(*) ... WHERE pk = 'markerlower'` returns cnt=2), (b) a
+   * genuinely BINARY-collated column with a plain matching index (still
+   * reports safe -- cnt=1, no over-rejection), (c) a genuinely
+   * NOCASE-collated column with a plain matching index (still reports
+   * unsafe via the insert-collision fast path -- no under-rejection
+   * regression).
+   *
+   * (2) The round-3/4 rowid-alias carve-out (a preliminary probe-insert of a
+   * large integer + a `WHERE pkCol = ? AND rowid = ?` check, to short-
+   * circuit a genuine `INTEGER PRIMARY KEY` column as safe-by-construction
+   * since a non-integer TEXT marker could never land there) is now
+   * UNREACHABLE and has been removed entirely: checkPartitionKeyUnique
+   * (index.ts) now rejects any INTEGER/NUMERIC/REAL-affinity
+   * partitionKeyColumn outright, before this probe ever runs -- see that
+   * function's doc comment for why (the representation-ambiguity space for
+   * numeric strings, e.g. "01" vs "1" vs "1.0" all matching the same rowid,
+   * is unbounded, not a narrow case to special-case around -- the same
+   * failure mode that sank DDL-text-parsing for collation detection in
+   * rounds 1-3). A rowid alias is by definition an INTEGER-affinity column,
+   * so it's now excluded upstream, and this probe only ever runs against
+   * TEXT/BLOB-affinity columns -- for which the TEXT marker values used
+   * below are always valid to insert, so no rowid-alias carve-out is needed
+   * at all. */
   private async handleProbePartitionKeyCollation(request: Request): Promise<Response> {
     const payload = (await request.json()) as { table?: string; partitionKeyColumn?: string };
     if (!payload.table || !payload.partitionKeyColumn) {
@@ -1842,6 +1906,7 @@ export class ShardDO extends DurableObject {
     const table = payload.table;
     const partitionKeyColumn = payload.partitionKeyColumn;
     const safeTable = escapeIdent(table);
+    const safePk = escapeIdent(partitionKeyColumn);
 
     const columns = this.many<{ name: string; type: string; notnull: number; dflt_value: string | null; pk: number; hidden: number }>(
       `PRAGMA table_xinfo("${safeTable}")`,
@@ -1851,57 +1916,38 @@ export class ShardDO extends DurableObject {
       return json({ ok: true, binaryCollation: false });
     }
 
-    // Round-4 fix: the previous carve-out treated ANY column matching 3
-    // STATIC conditions -- (a) the table's SOLE PRIMARY KEY column, (b)
-    // declared with the EXACT type name "INTEGER" (not "INT", "BIGINT", etc.
-    // -- SQLite is literal about this), and (c) belonging to a genuine rowid
-    // table (checked empirically via `SELECT rowid ... LIMIT 0` not
-    // throwing) -- as a genuine rowid alias and short-circuited it as
-    // safe-by-construction without ever probing it. That's wrong: SQLite's
-    // rowid-alias behavior applies ONLY to the exact declaration `INTEGER
-    // PRIMARY KEY` (optionally with AUTOINCREMENT) -- NOT to `INTEGER PRIMARY
-    // KEY ASC` and NOT to `INTEGER PRIMARY KEY DESC`, even though both DESC
-    // and ASC satisfy all 3 static conditions above (verified empirically:
-    // `id INTEGER PRIMARY KEY DESC` accepts a non-integer TEXT insert
-    // successfully, which a genuine rowid alias would reject outright with
-    // "datatype mismatch" -- proving DESC is NOT actually an alias). The
-    // static carve-out therefore misidentified `INTEGER PRIMARY KEY DESC` as
-    // a true alias and skipped probing it entirely, silently reporting
-    // "safe" without ever testing its real collation.
+    // Round-5 fix (fail closed for generated/hidden partition-key columns):
+    // buildInsert's loop below skips any `col.hidden !== 0` column BEFORE
+    // checking whether it's partitionKeyColumn -- so if partitionKeyColumn
+    // ITSELF is generated/virtual (hidden !== 0 in PRAGMA table_xinfo), the
+    // marker value would never be assigned to it at all, silently making the
+    // whole probe meaningless (neither probe row's actual partition-key
+    // value gets set to anything informative -- the "does it collide" test
+    // would prove nothing). Checked here, before any of that machinery runs,
+    // so it can't be reached: this schema shape can't be safely probed, so
+    // it can't be verified safe.
     //
-    // Fixed by replacing the static short-circuit with a genuinely empirical
-    // test, consistent with this whole function's design philosophy (test
-    // real behavior, never infer from declared type alone): as a preliminary
-    // step of the SAME always-rolled-back transaction, insert a row with the
-    // candidate column set to a large, distinctive negative integer (chosen
-    // well within Number.isSafeInteger range -- an i64-range extreme value
-    // was tried first and rejected: it silently loses precision when bound as
-    // a JS number, which would make the rowid-equality check below spuriously
-    // fail even for a genuine alias), then check whether
-    // `SELECT rowid FROM t WHERE pkCol = ? AND rowid = ?` (both bound to that
-    // same value) returns a row. A genuine alias's stored value and rowid are
-    // ALWAYS identical by definition, so a match proves it's a true alias
-    // (safe by construction -- a non-integer TEXT value could never land
-    // there in the first place, so no case/whitespace-variant duplicate can
-    // ever exist). No match -- either the query throws entirely ("no such
-    // column: rowid", the WITHOUT ROWID case) or returns zero rows (the
-    // ASC/DESC case, where the column has its own independent rowid rather
-    // than aliasing it) -- means it is NOT a real alias, so this falls
-    // through to the normal probe pairs below instead, exactly like any other
-    // column type. Verified empirically (node:sqlite) for: plain `INTEGER
-    // PRIMARY KEY` and `... ASC` (both detected as true aliases), `...
-    // DESC` (correctly NOT detected, falls through, and the normal probe
-    // correctly catches `COLLATE NOCASE` on it), and `WITHOUT ROWID` (no
-    // rowid column at all, correctly falls through).
-    //
-    // The static type/sole-PK check below is kept ONLY as a cheap pre-filter
-    // for which columns are even worth running this preliminary insert
-    // against (a non-INTEGER-typed or composite-PK column structurally can
-    // never be a rowid alias, full stop -- that part of the reasoning was
-    // never wrong), never as the final answer.
-    const pkColumns = columns.filter((c) => c.pk !== 0);
-    const looksLikeRowidAliasCandidate =
-      pkColumns.length === 1 && pkColumn.pk !== 0 && (pkColumn.type ?? "").trim().toUpperCase() === "INTEGER";
+    // Reachability, verified empirically: this is unreachable via TWO
+    // independent layers, not just one. (1) The normal WRITE path --
+    // compileMutation forces the partition key into `values` on every
+    // insert/upsert, and SQLite outright rejects an explicit assignment to a
+    // generated column ("cannot INSERT into generated column"), so a table
+    // with a generated partition-key column could never receive tenant
+    // writes at all. (2) Even the ADMIN REGISTRATION path is foreclosed:
+    // /admin/create-table and /admin/set-partition-key-column (index.ts) both
+    // confirm partitionKeyColumn's existence via `PRAGMA table_info`, which
+    // (unlike `PRAGMA table_xinfo`, used here and by checkPartitionKeyUnique)
+    // silently OMITS generated columns from its result set entirely -- so
+    // naming a generated column as partitionKeyColumn is rejected 400
+    // COLUMN_NOT_IN_SCHEMA before ever reaching checkPartitionKeyUnique, let
+    // alone this probe. Despite being unreachable via every current call
+    // path, this check is cheap and this function's whole philosophy is
+    // "never report safe when unverified", so it stays regardless -- and is
+    // exercised directly (bypassing the admin handlers) in
+    // index.table-scan.test.ts.
+    if (pkColumn.hidden !== 0) {
+      return json({ ok: true, binaryCollation: false });
+    }
 
     // Random per-invocation suffix: makes every marker/placeholder value
     // astronomically unlikely to collide with real tenant data, AND (combined
@@ -1919,11 +1965,6 @@ export class ShardDO extends DurableObject {
     // RTRIM's equivalence.
     const markerWsBase = `__cf_collation_probe_${uuidSuffix}__ws`;
     const markerWsPadded = `${markerWsBase} `;
-    // Round-4 addition: a large, distinctive negative integer for the
-    // rowid-alias preliminary probe (see doc comment above) -- kept well
-    // within Number.isSafeInteger range and derived from the same
-    // per-invocation randomness as the markers above for consistency.
-    const rowidProbeValue = -(9_000_000_000_000 + Number.parseInt(uuidSuffix.replace(/-/g, "").slice(0, 8), 16));
 
     const placeholderFor = (col: { type: string }, rowIndex: number): unknown => {
       const type = (col.type || "").toUpperCase();
@@ -1939,8 +1980,8 @@ export class ShardDO extends DurableObject {
     };
 
     // rowIndex distinguishes every probe row's OTHER-column placeholders from
-    // every other probe row in this same invocation (0 = rowid-alias
-    // preliminary probe, 1/2 = case-flip pair, 3/4 = whitespace pair).
+    // every other probe row in this same invocation (1/2 = case-flip pair,
+    // 3/4 = whitespace pair).
     const buildInsert = (rowIndex: number, markerValue: unknown): { sql: string; values: unknown[] } => {
       const names: string[] = [];
       const values: unknown[] = [];
@@ -1966,75 +2007,50 @@ export class ShardDO extends DurableObject {
     const insertWsBase = buildInsert(3, markerWsBase);
     const insertWsPadded = buildInsert(4, markerWsPadded);
 
+    // Round-5 fix: tests whether /tenant-scan-page's ACTUAL bare-predicate
+    // read query (`WHERE "<pkCol>" = ?`, no explicit COLLATE) conflates a
+    // first/second marker pair -- NOT merely whether the second insert
+    // collided with the first. See this function's doc comment above for the
+    // full rationale and the index-COLLATE-override case this closes.
+    const pairIsSafe = (
+      first: { sql: string; values: unknown[] },
+      second: { sql: string; values: unknown[] },
+      firstMarkerValue: unknown,
+    ): boolean => {
+      this.sql.exec(first.sql, ...first.values);
+      try {
+        this.sql.exec(second.sql, ...second.values);
+        // Second insert coexists alongside the first -- fall through to the
+        // bare-predicate SELECT probe below; insert success alone is no
+        // longer sufficient to call this pair safe.
+      } catch {
+        // Second insert collided with the first under whatever UNIQUE/
+        // PRIMARY KEY constraint backs this column -> the constraint itself
+        // already proved these two values are indistinguishable here ->
+        // unsafe, no need to run the SELECT probe at all.
+        return false;
+      }
+      // Both rows coexist -- now run the EXACT kind of bare predicate
+      // /tenant-scan-page issues, bound to one marker value from this pair,
+      // and check whether it ALSO incidentally returns the other marker's
+      // row. A value always matches itself under any collation, so this
+      // always returns >= 1; > 1 proves the bare predicate's own collation
+      // conflated the pair (the index-COLLATE-override scenario).
+      const matched = this.one<{ cnt: number }>(`SELECT COUNT(*) AS cnt FROM "${safeTable}" WHERE "${safePk}" = ?`, firstMarkerValue);
+      return (matched?.cnt ?? 0) <= 1;
+    };
+
     let binaryCollation = false;
     try {
       this.ctx.storage.transactionSync(() => {
-        if (looksLikeRowidAliasCandidate) {
-          const rowidProbeInsert = buildInsert(0, rowidProbeValue);
-          // If this throws, it propagates past this try block entirely (no
-          // local catch) — "cannot even construct a valid probe row" is a
-          // genuine cannot-determine case, matching the same philosophy as
-          // the main probe's first insert below.
-          this.sql.exec(rowidProbeInsert.sql, ...rowidProbeInsert.values);
-          let isGenuineRowidAlias: boolean;
-          try {
-            isGenuineRowidAlias =
-              this.one<{ matched: number }>(
-                `SELECT 1 AS matched FROM "${safeTable}" WHERE "${escapeIdent(partitionKeyColumn)}" = ? AND rowid = ? LIMIT 1`,
-                rowidProbeValue,
-                rowidProbeValue,
-              ) !== null;
-          } catch {
-            // No `rowid` column at all (WITHOUT ROWID table) -- definitely
-            // not a genuine alias.
-            isGenuineRowidAlias = false;
-          }
-          if (isGenuineRowidAlias) {
-            // Stored value and rowid are identical -> genuine alias -> a
-            // non-integer TEXT value (the whole class of key this probe
-            // exists to catch) can never land here -> safe by construction.
-            binaryCollation = true;
-            throw new CollationProbeRollback();
-          }
-          // Not a genuine alias (e.g. `INTEGER PRIMARY KEY DESC`, or a
-          // WITHOUT ROWID table) -- fall through to the normal probe below,
-          // same as any other column type. The rowid-probe row stays present
-          // (uncommitted) until the unconditional rollback at the end; its
-          // placeholder values (rowIndex 0) are distinct from every row
-          // inserted below, so it can't spuriously collide with them.
-        }
+        const caseSafe = pairIsSafe(insertCaseLower, insertCaseUpper, markerLower);
+        const wsSafe = pairIsSafe(insertWsBase, insertWsPadded, markerWsBase);
 
-        this.sql.exec(insertCaseLower.sql, ...insertCaseLower.values);
-        let caseCollided = false;
-        try {
-          this.sql.exec(insertCaseUpper.sql, ...insertCaseUpper.values);
-          // Case-variant marker inserted alongside the first without
-          // colliding -> the column's real constraint didn't treat them as
-          // equal under case-folding.
-        } catch {
-          // Second insert collided with the first under whatever
-          // UNIQUE/PRIMARY KEY constraint backs this column -> case-
-          // insensitive collation (e.g. NOCASE) -> unsafe.
-          caseCollided = true;
-        }
-
-        this.sql.exec(insertWsBase.sql, ...insertWsBase.values);
-        let whitespaceCollided = false;
-        try {
-          this.sql.exec(insertWsPadded.sql, ...insertWsPadded.values);
-          // Trailing-whitespace-variant marker inserted alongside the first
-          // without colliding -> the column's real constraint didn't treat
-          // them as equal under trailing-whitespace-folding.
-        } catch {
-          // Second insert collided with the first -> the collation ignores
-          // trailing whitespace (e.g. RTRIM) -> unsafe.
-          whitespaceCollided = true;
-        }
-
-        // Either dimension colliding is sufficient to be unsafe -- see this
-        // function's doc comment for why this closes the gate for every
-        // built-in SQLite collation without needing to name which one applies.
-        binaryCollation = !caseCollided && !whitespaceCollided;
+        // Either dimension being unsafe is sufficient to be unsafe overall --
+        // see this function's doc comment for why this closes the gate for
+        // every built-in SQLite collation without needing to name which one
+        // applies.
+        binaryCollation = caseSafe && wsSafe;
 
         // ALWAYS roll back — every insert above, success or failure — so the
         // probe never leaves residual rows in the real table.

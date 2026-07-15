@@ -363,6 +363,24 @@ async function uniqueIndexIsPartial(env: Env, shardId: string, indexName: string
   return indexSql !== null && /\bwhere\b/i.test(indexSql);
 }
 
+/** SQLite's own documented type-affinity rules (https://www.sqlite.org/datatype3.html
+ * §3.1), applied to a column's declared type-name string. Used by
+ * checkPartitionKeyUnique's round-5 affinity gate below — see that function's
+ * doc comment for why this matters. Order matters: SQLite checks "INT"
+ * before "CHAR"/"CLOB"/"TEXT" etc., so this mirrors that precedence exactly
+ * (a hypothetical type name matching more than one rule, e.g. containing both
+ * "INT" and "CHAR", resolves the same way SQLite itself would). */
+type SqliteAffinity = "TEXT" | "NUMERIC" | "INTEGER" | "REAL" | "BLOB";
+
+function sqliteTypeAffinity(declaredType: string): SqliteAffinity {
+  const t = (declaredType ?? "").toUpperCase();
+  if (t.includes("INT")) return "INTEGER";
+  if (t.includes("CHAR") || t.includes("CLOB") || t.includes("TEXT")) return "TEXT";
+  if (t.includes("BLOB") || t === "") return "BLOB";
+  if (t.includes("REAL") || t.includes("FLOA") || t.includes("DOUB")) return "REAL";
+  return "NUMERIC";
+}
+
 /** Codex P1 fix (cross-tenant table-scan leak): verifies that
  * `partitionKeyColumn` on `table` (already created/present on `shardId`) is
  * backed by a UNIQUE constraint or is the table's SOLE primary-key column.
@@ -392,7 +410,31 @@ async function uniqueIndexIsPartial(env: Env, shardId: string, indexName: string
  * old per-path DDL-text lookups did. This function first determines, via the
  * existing PRAGMA-based checks, whether SOME qualifying uniqueness mechanism
  * exists at all (sole PK, or a single-column non-partial unique index), and
- * only if one does, runs the collation probe ONCE as a final gate. */
+ * only if one does, runs the collation probe ONCE as a final gate.
+ *
+ * Round 5 addition (SCOPE RESTRICTION, not a probe): even a BINARY-collated,
+ * genuinely unique INTEGER/NUMERIC/REAL-affinity column is still not safe to
+ * scan, because /tenant-scan-page's bare `WHERE pkCol = ?` predicate goes
+ * through SQLite's numeric type-affinity comparison rules, not a byte-for-byte
+ * text comparison. On a genuine `INTEGER PRIMARY KEY` (rowid alias) column,
+ * `WHERE id = '01'`, `WHERE id = '1'`, and `WHERE id = '1.0'` all match the
+ * SAME physical row — three different literal strings, each of which could
+ * get its OWN separate __cf_row_owners entry (possibly owned by different
+ * tenants), all coercing to one physical row. Unlike collation (three known,
+ * enumerable built-in values), the representation-ambiguity space for numeric
+ * strings is unbounded (leading zeros, leading '+', decimal points,
+ * exponents, "0x..", etc.) — the same shape of problem that made DDL-text
+ * parsing for collation detection unwinnable in rounds 1-3. Rather than try
+ * to probe around an open-ended space, table-scan eligibility is restricted
+ * outright to TEXT-affinity (and BLOB-affinity, since BLOB is always compared
+ * byte-for-byte with no numeric coercion — `__cf_row_owners.partition_key`
+ * itself is TEXT and the canonical key is always bound as a string, so a BLOB
+ * partition-key column round-trips exactly the same way a TEXT one does)
+ * partition-key columns. This check runs BEFORE the uniqueness/collation
+ * checks below — it's a fast, purely-declarative read of the `table_info`
+ * PRAGMA already fetched above, so there's no reason to pay for the
+ * shard-round-trip collation probe on a column that's disqualified
+ * regardless. */
 async function checkPartitionKeyUnique(env: Env, shardId: string, table: string, partitionKeyColumn: string): Promise<boolean> {
   const tableInfoRes = await routeToShard(env, shardId, "/execute", {
     sql: `PRAGMA table_info("${table}")`,
@@ -400,8 +442,15 @@ async function checkPartitionKeyUnique(env: Env, shardId: string, table: string,
     isMutation: false,
   });
   if (!tableInfoRes.ok) return false;
-  const tableInfoBody = (await tableInfoRes.json()) as { rows?: Array<{ name: string; pk: number }> };
+  const tableInfoBody = (await tableInfoRes.json()) as { rows?: Array<{ name: string; type: string; pk: number }> };
   const columns = tableInfoBody.rows ?? [];
+
+  const pkColumn = columns.find((c) => c.name === partitionKeyColumn);
+  if (!pkColumn) return false; // column doesn't exist on this shard's table — can't verify anything about it.
+
+  const affinity = sqliteTypeAffinity(pkColumn.type);
+  if (affinity !== "TEXT" && affinity !== "BLOB") return false;
+
   const pkColumns = columns.filter((c) => c.pk !== 0);
 
   let uniquenessConfirmed = pkColumns.length === 1 && pkColumns[0].name === partitionKeyColumn;
