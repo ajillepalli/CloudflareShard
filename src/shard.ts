@@ -743,9 +743,17 @@ export class ShardDO extends DurableObject {
       return json({ rows: [] });
     }
 
+    // Codex P3 fix: no synthetic aliased partition-key column. The previous
+    // `ro.partition_key AS __cf_scan_pk` collided with, and silently
+    // overwrote in the destructure below, a real column literally named
+    // `__cf_scan_pk` on the tenant's table — that column's actual data was
+    // dropped from the returned row. The caller already knows
+    // partitionKeyColumn for this table (it's part of this very request), so
+    // the partition key is read directly off the returned row by its real
+    // column name instead of relying on a synthetic alias at all.
     const raw = this.many<Record<string, unknown>>(
       `
-      SELECT b.*, ro.partition_key AS __cf_scan_pk
+      SELECT b.*
       FROM __cf_row_owners ro
       JOIN "${safeTable}" b ON b."${safePk}" = ro.partition_key
       WHERE ro.tenant_id = ? AND ro.table_name = ? AND ro.partition_key > ?
@@ -758,10 +766,7 @@ export class ShardDO extends DurableObject {
       limit,
     );
 
-    const rows = raw.map((r) => {
-      const { __cf_scan_pk, ...rest } = r;
-      return { partitionKey: String(__cf_scan_pk), row: rest };
-    });
+    const rows = raw.map((r) => ({ partitionKey: String(r[body.partitionKeyColumn as string]), row: r }));
     return json({ rows });
   }
 
