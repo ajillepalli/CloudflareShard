@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.3.0.0] - 2026-07-16 — Durable Object RPC / service-binding support (admin/topology)
+
+Closes issue #15, the follow-up to #14. Every remaining `/admin/*` route, plus `/v1/sql`, `/v1/scatter`, and `/v1/tx`, is now also callable via `CloudflareShardRpc` (the same `WorkerEntrypoint` export #14 introduced), alongside the tenant data path it already covered.
+
+### Added
+- ~25 new `*Core` functions in `src/index.ts` (e.g. `adminInitCore`, `adminCreateTableCore`, `adminDrainShardCore`, `sqlCore`, `scatterCore`, `txCore`) — every remaining HTTP handler extracted into the same shared-core pattern #14 established, so the HTTP routes and their RPC equivalents run identical code. Verified by the full 485-test suite passing unchanged after the extraction.
+- ~27 new methods on `CloudflareShardRpc`: one per admin/topology handler (`adminInit`, `adminCreateTable`, `adminDrainShard`, `adminBackfillProvenance`, `sql`, `scatter`, etc.), plus `tx` for the tenant-facing cross-shard 2PC path that #14 didn't originally cover. Every admin/topology method takes `ADMIN_TOKEN` as an explicit argument and checks it internally via a new `assertAdminRpcAuth` helper — RPC calls have no URL path for the HTTP side's structural `/admin/*` gate to match against, so each method enforces the equivalent check itself. `tx` takes a tenant token, matching `mutate`/`tableScan`/`indexQuery`.
+- `examples/rpc-consumer/`'s integration test extended to cover an admin RPC call (`adminListTables`) and a topology RPC call (`adminTopologyLockStatus`) over the real service binding — 10/10 checks passing (verified against two live `wrangler dev` processes).
+- README's RPC section extended to document both token kinds (tenant vs. `ADMIN_TOKEN`) and note every route now has an RPC equivalent.
+
+### Fixed (found during the extraction, before merge)
+- `handleV1Sql` and `handleV1Scatter`'s thin HTTP wrappers initially parsed the request body before checking admin auth (the auth check moved inside the shared core function, which needs a parsed body). This flipped a narrow error-ordering case: an unauthenticated caller with a malformed JSON body would get 500 instead of 401. Fixed by checking auth in the thin wrapper first, before parsing — the core function still checks internally too (needed for an RPC caller, which skips the wrapper), a deliberate redundant defense-in-depth matching this codebase's existing `/admin/*` gate pattern.
+
 ## [2.2.0.0] - 2026-07-16 — Durable Object RPC / service-binding support (tenant data path)
 
 Closes issue #14. Additive to the HTTP API, not a replacement: a Worker running in the same Cloudflare account can now call `mutate`/`tableScan`/`indexQuery` directly via a service binding to a new named `WorkerEntrypoint` export, `CloudflareShardRpc`, instead of going over HTTP. The tenant token is still required and still checked internally (via the same `CatalogDO.checkTenantAuth` path the HTTP routes use) — holding the service binding is not, on its own, sufficient authorization.

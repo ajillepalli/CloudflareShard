@@ -15,9 +15,12 @@ service = "cloudflare-shard-mvp"
 entrypoint = "CloudflareShardRpc"
 ```
 
-`entrypoint` names the specific exported class in the main Worker (`src/index.ts`'s `CloudflareShardRpc`, a `WorkerEntrypoint` subclass) to bind to — without it, a service binding targets the default `fetch` export instead. The security boundary is this binding existing in this Worker's own config: there's no per-request credential the way an HTTP call needs a bearer token. The tenant token is still required and still checked — it's passed as an explicit method argument (e.g. `env.SHARD_API.mutate(tenantToken, ...)`) and validated internally by `CloudflareShardRpc`, the exact same `CatalogDO.checkTenantAuth` path an HTTP call goes through. Holding the binding is not, on its own, sufficient authorization.
+`entrypoint` names the specific exported class in the main Worker (`src/index.ts`'s `CloudflareShardRpc`, a `WorkerEntrypoint` subclass) to bind to — without it, a service binding targets the default `fetch` export instead. The security boundary is this binding existing in this Worker's own config: there's no per-request credential the way an HTTP call needs a bearer token. The token is still required and still checked, for both kinds of method `CloudflareShardRpc` exposes:
 
-Admin/topology operations aren't exposed here — see the main repo's follow-up issue.
+- Tenant methods (`mutate`, `tableScan`, `indexQuery`, `tx`) take the tenant token as an explicit argument (e.g. `env.SHARD_API.mutate(tenantToken, ...)`), validated internally via the same `CatalogDO.checkTenantAuth` path an HTTP call goes through.
+- Admin/topology methods (`adminInit`, `adminCreateTable`, `adminDrainShard`, `sql`, `scatter`, and the rest — one per `/admin/*` route) take `ADMIN_TOKEN` as an explicit argument instead (e.g. `env.SHARD_API.adminListTables(adminToken)`), checked the same way the HTTP side's structural `/admin/*` path gate would be.
+
+Holding the binding is not, on its own, sufficient authorization for either kind of method — this Worker demonstrates both (see `src/index.ts`'s `/demo/*` routes).
 
 ## Running it locally
 
@@ -40,7 +43,7 @@ Wrangler's local dev registry connects the two automatically — you'll see `env
 node scripts/integration-test.mjs http://localhost:8787 http://localhost:8788 <admin-token>
 ```
 
-This is a genuine integration test, not an in-process mock: it drives real setup (`/admin/init`, `/admin/register-tenant`, `/admin/create-table`, `/admin/create-index`) against the main Worker's existing HTTP admin API, then calls this consumer's `/demo/write-and-scan` and `/demo/index-query` routes — which internally call `env.SHARD_API.mutate()`, `.tableScan()`, and `.indexQuery()` over the real service binding — and asserts on the results.
+This is a genuine integration test, not an in-process mock: it drives real setup (`/admin/init`, `/admin/register-tenant`, `/admin/create-table`, `/admin/create-index`) against the main Worker's existing HTTP admin API, then calls this consumer's `/demo/write-and-scan`, `/demo/index-query`, `/demo/admin-list-tables`, and `/demo/admin-topology-lock-status` routes — which internally call `env.SHARD_API.mutate()`, `.tableScan()`, `.indexQuery()`, `.adminListTables()`, and `.adminTopologyLockStatus()` over the real service binding (the last two requiring `ADMIN_TOKEN`, the first three a tenant token) — and asserts on the results.
 
 ## Deployed (not just local dev)
 
