@@ -2,7 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
-## [2.3.0.0] - 2026-07-16 — Durable Object RPC / service-binding support (admin/topology)
+## [2.4.0.0] - 2026-07-16 — TPC-C-derived benchmark + demo project
+
+Closes issue #16. A teammate asked for a demo project and benchmark using "TPC" data; the originally-suggested TPC-DS (analytics/decision-support) doesn't fit — CloudflareShard has no join/aggregation engine, deliberately (raw cross-tenant SQL was found unsafe and removed during Milestone 4). TPC-C (the OLTP benchmark) fits instead: its transactions exercise exactly what `CoordinatorDO`'s 2PC and the sharded `mutate` path already do.
+
+### Added
+- `examples/tpc-c-benchmark/`: a 9-table TPC-C-derived schema (warehouse/district/customer/order/order-line/stock/etc.), a configurable-scale data generator, all 5 official transaction types (New-Order, Payment, Order-Status, Delivery, Stock-Level) implemented against CloudflareShard's `/v1/mutate`/`/v1/tx`/`/v1/index-query`/`/v1/table-scan` primitives, and a load-generator CLI producing a tpmC-equivalent throughput + per-transaction-type p50/p95/p99 latency report.
+- One tenant per warehouse (a CloudflareShard-specific tenancy model, not part of the TPC-C spec) — see `examples/tpc-c-benchmark/README.md`'s "Tenancy model" section.
+- Several deliberate, documented adaptations to CloudflareShard's real constraints: Order-Status/Payment's by-name lookup variants dropped (no text-search primitive), Stock-Level's server-side aggregate replaced with table-scan + client-side counting (no aggregation pushdown), New-Order's atomicity split into a 3-row header transaction plus one 2-row transaction per order line (the 8-participant `/v1/tx` cap can't fit a full 5-15-line order in one transaction), and cross-warehouse order lines (~1%) falling back to non-atomic writes (one tenant per `/v1/tx` call, one tenant per warehouse). Full list in the README's "Deviations from official TPC-C" section.
+
+### Fixed (found during verification, before merge)
+- Re-seeding a warehouse whose tenant was already registered (a normal workflow against a persistent local `wrangler dev` instance) crashed on the first row-level insert with a primary-key conflict. Fixed by using `op:"upsert"` instead of `op:"insert"` for every per-warehouse seed row, making a reseed a safe overwrite.
+- Seeding at the (previously) shipped defaults, including optional pre-existing orders, took over 3 minutes and didn't reliably finish in a reasonable time locally — defeating the "fast demo seeding" goal the reduced default cardinalities exist for. Pre-existing-order seeding (by far the most expensive part — thousands of extra `order_line` rows, and a proportionally slower index backfill) is now opt-in (`--seed-orders`) rather than default-on; the default seed now completes in under 2 minutes locally.
+
+
 
 Closes issue #15, the follow-up to #14. Every remaining `/admin/*` route, plus `/v1/sql`, `/v1/scatter`, and `/v1/tx`, is now also callable via `CloudflareShardRpc` (the same `WorkerEntrypoint` export #14 introduced), alongside the tenant data path it already covered.
 

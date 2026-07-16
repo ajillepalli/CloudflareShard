@@ -1,0 +1,14 @@
+{
+  "name": "cloudflare-shard-tpcc-benchmark",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "TPC-C-derived OLTP demo/benchmark for CloudflareShard (issue #16), adapted to this project's mutate/tx/index-query/table-scan HTTP primitives. Not the literal TPC-DS benchmark originally suggested, and not an official/certifiable TPC-C submission -- see src/generate.mjs and src/transactions.mjs for documented deviations.",
+  "scripts": {
+    "seed": "node src/run.mjs seed",
+    "benchmark": "node src/run.mjs benchmark"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
