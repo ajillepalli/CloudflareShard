@@ -23,9 +23,13 @@ if (!mainUrl || !consumerUrl || !adminToken) {
   process.exit(1);
 }
 
-const TABLE = "rpc_demo_items";
-const TENANT_ID = `rpc-demo-tenant-${Date.now()}`;
-const INDEX_NAME = "idx_note";
+// Suffixed per run — /admin/create-table rejects an already-existing table,
+// and index names are also global, so a fixed name would only work once
+// against a persistent dev/deployed Worker.
+const RUN_ID = Date.now();
+const TABLE = `rpc_demo_items_${RUN_ID}`;
+const TENANT_ID = `rpc-demo-tenant-${RUN_ID}`;
+const INDEX_NAME = `idx_note_${RUN_ID}`;
 
 const results = [];
 
