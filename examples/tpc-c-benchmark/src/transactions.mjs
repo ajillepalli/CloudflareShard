@@ -387,7 +387,43 @@ async function newOrder(world) {
   }
 }
 
-/** Payment: weight 43% of the standard TPC-C mix. */
+const MUTATION_RETRY_ATTEMPTS = 5;
+
+/** Payment: weight 43% of the standard TPC-C mix.
+ *
+ * Codex review round 7 P2 fix: warehouse/district/customer are updated via
+ * separate /v1/mutate calls with a bounded read-compute-write retry loop
+ * each, NOT bundled into one /v1/tx the way an earlier version did. This is
+ * a real, deliberate change in this transaction's shape, not a small patch
+ * -- worth explaining why. The earlier version's /v1/tx bundle used a
+ * compare-and-swap `where` guard on each update (matching mutateCore's
+ * pattern elsewhere in this file), which correctly turns a losing race into
+ * a no-op instead of a corruption -- but /v1/tx reports the whole
+ * transaction as "committed" with no per-mutation rowsAffected, so a losing
+ * guard is invisible: the benchmark would count the Payment as fully
+ * successful even when its warehouse/district/customer updates silently
+ * didn't apply (only the always-unconditional history insert would have
+ * landed). Every warehouse in the default mix gets hit by EVERY Payment in
+ * that warehouse (43% of the whole transaction mix), so this isn't a rare
+ * corner case -- it's the single hottest row in the whole benchmark.
+ *
+ * A verify-then-retry-the-whole-tx approach (re-read after commit, retry if
+ * the guarded fields don't match what was intended) was considered and
+ * rejected: it can't distinguish "my guarded update never applied" from "my
+ * update applied AND a later Payment's update applied on top of it" -- both
+ * look identical from a post-commit read, but retrying in the second case
+ * would silently apply this Payment's amount a SECOND time, a real
+ * double-charge bug. Only /v1/mutate's per-call rowsAffected can tell the
+ * two apart reliably, which is why each row here gets its own retry loop
+ * instead. The trade-off: warehouse/district/customer/history no longer
+ * commit as one atomic unit the way real TPC-C Payment specifies -- each
+ * row's own update is still individually safe (never corrupts, always
+ * either applies cleanly or is retried against a fresh read), but a crash
+ * between two of these calls could leave Payment partially applied across
+ * rows in a way a single real transaction wouldn't. Accepted for a
+ * benchmark whose point is exercising real primitives under load, not
+ * modeling failure-injection between individual HTTP calls.
+ */
 async function payment(world) {
   const home = world.randomWarehouse();
   const w = home.warehouseId;
@@ -395,75 +431,88 @@ async function payment(world) {
   const c_id = world.randomCustomerId();
   const amount = randomAmount(1.0, 5000.0);
 
+  let whRow, distRow;
+
   // Each of these tables has exactly one relevant row per tenant call here
   // (warehouse: singleton; district: small table filtered client-side), so a
   // cheap table-scan is simplest -- see New-Order's d_next_o_id comment for
   // why this can't be served from the client-side reference cache (w_ytd and
   // d_ytd both mutate on every Payment).
-  const whScan = await home.client.tableScan("tpcc_warehouse", 1);
-  const whRow = (whScan.rows || [])[0];
-  if (!whRow) throw new Error(`warehouse ${w} row missing`);
+  for (let attempt = 1; ; attempt++) {
+    const whScan = await home.client.tableScan("tpcc_warehouse", 1);
+    whRow = (whScan.rows || [])[0];
+    if (!whRow) throw new Error(`warehouse ${w} row missing`);
+    const result = await home.client.mutate({
+      op: "update",
+      table: "tpcc_warehouse",
+      partitionKey: whRow.wh_key,
+      values: { w_ytd: round2(whRow.w_ytd + amount) },
+      where: { w_ytd: whRow.w_ytd },
+      requestId: crypto.randomUUID(),
+    });
+    if (result.rowsAffected > 0) break;
+    if (attempt >= MUTATION_RETRY_ATTEMPTS) {
+      throw new Error(`warehouse ${w} w_ytd update did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
+    }
+  }
 
-  const distScan = await home.client.tableScan("tpcc_district", world.config.districtsPerWarehouse);
-  const distRow = (distScan.rows || []).find((r) => r.d_id === d);
-  if (!distRow) throw new Error(`district ${d} not found in warehouse ${w}`);
+  for (let attempt = 1; ; attempt++) {
+    const distScan = await home.client.tableScan("tpcc_district", world.config.districtsPerWarehouse);
+    distRow = (distScan.rows || []).find((r) => r.d_id === d);
+    if (!distRow) throw new Error(`district ${d} not found in warehouse ${w}`);
+    const result = await home.client.mutate({
+      op: "update",
+      table: "tpcc_district",
+      partitionKey: distRow.d_key,
+      values: { d_ytd: round2(distRow.d_ytd + amount) },
+      where: { d_ytd: distRow.d_ytd },
+      requestId: crypto.randomUUID(),
+    });
+    if (result.rowsAffected > 0) break;
+    if (attempt >= MUTATION_RETRY_ATTEMPTS) {
+      throw new Error(`district ${d} d_ytd update did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
+    }
+  }
 
-  const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id });
-  const custRow = (custRes.rows || [])[0];
-  if (!custRow) throw new Error(`customer ${c_id} in district ${d} of warehouse ${w} not found`);
+  for (let attempt = 1; ; attempt++) {
+    const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id });
+    const custRow = (custRes.rows || [])[0];
+    if (!custRow) throw new Error(`customer ${c_id} in district ${d} of warehouse ${w} not found`);
+    const result = await home.client.mutate({
+      op: "update",
+      table: "tpcc_customer",
+      partitionKey: custRow.c_key,
+      values: {
+        c_balance: round2(custRow.c_balance - amount),
+        c_ytd_payment: round2(custRow.c_ytd_payment + amount),
+        c_payment_cnt: custRow.c_payment_cnt + 1,
+      },
+      where: { c_balance: custRow.c_balance, c_ytd_payment: custRow.c_ytd_payment, c_payment_cnt: custRow.c_payment_cnt },
+      requestId: crypto.randomUUID(),
+    });
+    if (result.rowsAffected > 0) break;
+    if (attempt >= MUTATION_RETRY_ATTEMPTS) {
+      throw new Error(`customer ${c_id} balance update did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
+    }
+  }
 
-  // Codex review P2 fix: compare-and-swap guards on every counter update
-  // below, same reasoning as New-Order's stock update above -- warehouse/
-  // district/customer rows are hot (every Payment in the warehouse touches
-  // the same warehouse row and one of a handful of district rows), and these
-  // are absolute values computed from a read that happened before this
-  // write. Without a guard, a second concurrent Payment reading the same
-  // stale value would silently overwrite this one's increment; with it, the
-  // conflicting write becomes a no-op instead (still not retried -- see the
-  // New-Order comment for why /v1/tx can't signal that back to the caller).
-  await home.client.tx(
-    [
-      {
-        op: "update",
-        table: "tpcc_warehouse",
-        partitionKey: whRow.wh_key,
-        values: { w_ytd: whRow.w_ytd + amount },
-        where: { w_ytd: whRow.w_ytd },
-      },
-      {
-        op: "update",
-        table: "tpcc_district",
-        partitionKey: distRow.d_key,
-        values: { d_ytd: distRow.d_ytd + amount },
-        where: { d_ytd: distRow.d_ytd },
-      },
-      {
-        op: "update",
-        table: "tpcc_customer",
-        partitionKey: custRow.c_key,
-        values: {
-          c_balance: custRow.c_balance - amount,
-          c_ytd_payment: custRow.c_ytd_payment + amount,
-          c_payment_cnt: custRow.c_payment_cnt + 1,
-        },
-        where: { c_balance: custRow.c_balance, c_ytd_payment: custRow.c_ytd_payment, c_payment_cnt: custRow.c_payment_cnt },
-      },
-      {
-        op: "insert",
-        table: "tpcc_history",
-        partitionKey: historyKey(),
-        values: {
-          w_id: w,
-          d_id: d,
-          c_id,
-          h_amount: amount,
-          h_date: new Date().toISOString(),
-          h_data: `${whRow.w_name ?? ""} ${distRow.d_name ?? ""}`.trim(),
-        },
-      },
-    ],
-    crypto.randomUUID(),
-  );
+  // Unconditional side effect -- only recorded once the three updates above
+  // are all confirmed applied, so a retried/abandoned Payment never leaves
+  // a phantom history row behind for an update that didn't actually happen.
+  await home.client.mutate({
+    op: "insert",
+    table: "tpcc_history",
+    partitionKey: historyKey(),
+    values: {
+      w_id: w,
+      d_id: d,
+      c_id,
+      h_amount: amount,
+      h_date: new Date().toISOString(),
+      h_data: `${whRow.w_name ?? ""} ${distRow.d_name ?? ""}`.trim(),
+    },
+    requestId: crypto.randomUUID(),
+  });
 }
 
 /** Order-Status: weight 4%, read-only. ID-only lookup -- the official
@@ -536,48 +585,80 @@ async function delivery(world) {
     });
     if (claimResult.rowsAffected === 0) continue; // already claimed by a concurrent Delivery worker
 
-    const orderRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_id", { d_id: d, o_id });
-    const orderRow = (orderRes.rows || [])[0];
-    if (!orderRow) throw new Error(`order ${o_id} in district ${d} of warehouse ${w} not found despite a new_order row`);
+    // Codex review P2 fix: the marker is gone the moment the claim above
+    // commits -- if ANYTHING below fails (a not-found lookup, contention on
+    // the customer row exhausting its retry budget, a network error), the
+    // order would otherwise be permanently invisible to every future
+    // Delivery pass (claimed, but never actually delivered, with no marker
+    // left to find it by again). Restore the marker on any failure here so
+    // a later Delivery pass can retry the whole thing from scratch.
+    try {
+      const orderRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_id", { d_id: d, o_id });
+      const orderRow = (orderRes.rows || [])[0];
+      if (!orderRow) throw new Error(`order ${o_id} in district ${d} of warehouse ${w} not found despite a new_order row`);
 
-    const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id: orderRow.c_id });
-    const custRow = (custRes.rows || [])[0];
-    if (!custRow) throw new Error(`customer ${orderRow.c_id} in district ${d} of warehouse ${w} not found`);
+      // o_carrier_id is a plain SET, not derived from a prior read, so no
+      // compare-and-swap guard (or retry) is needed here.
+      await home.client.mutate({
+        op: "update",
+        table: "tpcc_orders",
+        partitionKey: orderRow.o_key,
+        values: { o_carrier_id: randInt(1, 10) },
+        requestId: crypto.randomUUID(),
+      });
 
-    const linesRes = await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id }, 15);
-    const lines = linesRes.rows || [];
-    const sumAmount = round2(lines.reduce((acc, l) => acc + (l.ol_amount || 0), 0));
+      const linesRes = await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id }, 15);
+      const lines = linesRes.rows || [];
+      const sumAmount = round2(lines.reduce((acc, l) => acc + (l.ol_amount || 0), 0));
 
-    // The marker is already claimed above -- this tx only needs to update
-    // orders + customer now.
-    await home.client.tx(
-      [
-        // o_carrier_id is a plain SET, not derived from a prior read, so no
-        // compare-and-swap guard is needed here (unlike the customer update
-        // below).
-        { op: "update", table: "tpcc_orders", partitionKey: orderRow.o_key, values: { o_carrier_id: randInt(1, 10) } },
-        {
-          // Codex review P2 fix: same compare-and-swap guard as Payment's
-          // customer update above -- c_balance/c_delivery_cnt are absolute
-          // values computed from a read predating this write.
+      // Codex review round 7 P2 fix: same reasoning as Payment's retry loops
+      // -- this used to be a compare-and-swap-guarded update bundled into a
+      // /v1/tx alongside the orders update above, but /v1/tx doesn't report
+      // per-mutation rowsAffected, so a losing guard here would have been
+      // invisible: the customer's balance/delivery_cnt simply wouldn't
+      // update, yet the whole Delivery attempt would still be recorded as
+      // successful. A plain /v1/mutate call DOES report rowsAffected, making
+      // a real bounded retry-against-a-fresh-read possible and safe here
+      // (unlike a naive verify-then-retry-the-whole-tx approach, which can't
+      // tell "my update never applied" apart from "my update applied and a
+      // later Payment's also applied on top of it" -- see Payment's longer
+      // comment above for why that distinction matters).
+      for (let attempt = 1; ; attempt++) {
+        const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id: orderRow.c_id });
+        const custRow = (custRes.rows || [])[0];
+        if (!custRow) throw new Error(`customer ${orderRow.c_id} in district ${d} of warehouse ${w} not found`);
+        const result = await home.client.mutate({
           op: "update",
           table: "tpcc_customer",
           partitionKey: custRow.c_key,
-          values: { c_balance: custRow.c_balance + sumAmount, c_delivery_cnt: custRow.c_delivery_cnt + 1 },
+          values: { c_balance: round2(custRow.c_balance + sumAmount), c_delivery_cnt: custRow.c_delivery_cnt + 1 },
           where: { c_balance: custRow.c_balance, c_delivery_cnt: custRow.c_delivery_cnt },
-        },
-      ],
-      crypto.randomUUID(),
-    );
+          requestId: crypto.randomUUID(),
+        });
+        if (result.rowsAffected > 0) break;
+        if (attempt >= MUTATION_RETRY_ATTEMPTS) {
+          throw new Error(`customer ${orderRow.c_id} delivery credit did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
+        }
+      }
+
+      await deliverLines(lines);
+    } catch (err) {
+      await home.client
+        .mutate({ op: "insert", table: "tpcc_new_order", partitionKey: oldest.no_key, values: { w_id: w, d_id: d, o_id }, requestId: crypto.randomUUID() })
+        .catch(() => {
+          // Best-effort restoration -- surfacing the ORIGINAL error below
+          // matters more than this recovery attempt's own outcome.
+        });
+      throw err;
+    }
 
     // Marking each line delivered is done non-transactionally, one
-    // /v1/mutate per line, deliberately OUTSIDE the tx above: these rows are
-    // already committed by the time we get here, there's no cross-row
-    // invariant requiring them to land atomically with the tx (or with each
-    // other), and folding them in would burn scarce participant-count
-    // headroom against the 8-row /v1/tx cap for orders with many lines, for
-    // no correctness benefit.
-    if (lines.length > 0) {
+    // /v1/mutate per line, deliberately OUTSIDE the customer-credit update
+    // above: these rows are already committed by the time we get here,
+    // there's no cross-row invariant requiring them to land atomically with
+    // it (or with each other).
+    async function deliverLines(lines) {
+      if (lines.length === 0) return;
       const deliveredAt = new Date().toISOString();
       await runPool(lines, Math.min(4, lines.length), (line) =>
         home.client.mutate({
