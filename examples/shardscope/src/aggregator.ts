@@ -1,8 +1,7 @@
 /** TopologyAggregator — the single shared topology poller/fan-out Durable
  * Object behind Shardscope's /api/stream.
  *
- * Target architecture (Phase 2+, NOT implemented yet — see the TODOs below):
- * exactly one instance of this DO exists per Shardscope deployment (always
+ * Exactly one instance of this DO exists per Shardscope deployment (always
  * addressed via idFromName("singleton") from src/index.ts). On a repeating
  * alarm() tick, it makes ONE round of admin API calls against
  * cloudflare-shard-mvp (via env.SHARD_API, the RPC service binding — see
@@ -11,59 +10,115 @@
  * never cause their own poll — they just register as a subscriber and wait
  * for the next tick's fan-out. This keeps admin API load O(1) in the number
  * of watching operators, not O(subscribers).
- *
- * Phase 1 (this file, right now): no real polling. alarm() is a stub, and
- * the one thing /api/stream actually does is send a single "hello" SSE event
- * so the wiring between src/index.ts, this DO, and a browser EventSource can
- * be verified end to end before the real data plane exists.
  */
-import type { Env } from "./env";
+import type { Env, ShardApiBinding } from "./env";
 
-// TODO(shardscope): this is a placeholder shape. The real snapshot needs to
-// merge three admin sources into one payload:
-//   - GET /admin/status            (cluster-level counters: writes, lost,
-//                                    checksum, quorum — the invariant
-//                                    scoreboard per DESIGN.md's layout
-//                                    section)
-//   - GET /admin/vbucket-map       (vBucket -> shard ownership + any
-//                                    in-flight migration state — this is the
-//                                    endpoint the in-flight companion task is
-//                                    adding; it does not exist yet as of this
-//                                    skeleton, neither as an HTTP route nor
-//                                    an adminXxx RPC method. Do not build
-//                                    against it until that task lands.)
-//   - GET /admin/shard-stats       (per-shard load, fanned out across every
-//                                    shard — this DOES exist today, both as
-//                                    an HTTP route (handleAdminShardStats)
-//                                    and should get an RPC-equivalent method
-//                                    the same way adminListTables /
-//                                    adminTopologyLockStatus do; verify
-//                                    before wiring)
-// The merged shape should let the Topology room render heat-ramp coloring
-// per shard (DESIGN.md's "Heat ramp" palette) and in-flight migration paths
-// (DESIGN.md's "--migration" cyan) without a second round trip.
-interface TopologySnapshot {
-  // TODO(shardscope): replace with the real merged shape once
-  // /admin/vbucket-map exists. Left minimal on purpose.
-  tick: number;
-  generatedAt: string;
+// ----------------------------------------------------------------------------
+// Response shapes for the three admin calls this DO makes over env.SHARD_API.
+// These are cast-targets for the `unknown` ShardApiBinding returns (see
+// env.d.ts) — they mirror the actual JSON bodies produced by
+// adminStatusCore / adminVbucketMapCore (src/index.ts) and
+// ShardDO.handleStats (src/shard.ts). Kept local to this file because
+// nothing else in Shardscope needs them yet.
+// ----------------------------------------------------------------------------
+
+interface AdminStatusResponse {
+  initialized: boolean;
+  catalogShardCount: number;
+  shards: { total: number; active: number; draining: number };
+  catalogs: Array<{
+    catalogShardId: string;
+    initialized: boolean;
+    shards?: { total: number; active: number; draining: number };
+  }>;
 }
+
+interface VbucketMapRow {
+  vbucket: number;
+  shardId: string;
+  migrationStatus: string;
+  targetShardId: string | null;
+  cutoverStartedAt: string | null;
+}
+
+interface AdminVbucketMapResponse {
+  catalogShardCount: number;
+  totalVBuckets: number;
+  catalogs: Array<{ catalogShardId: string; totalVBuckets: number; map: VbucketMapRow[] }>;
+}
+
+// adminShardStatsCore just forwards ShardDO's /stats body verbatim (see
+// ShardDO.handleStats in src/shard.ts) — typed loosely since the aggregator
+// only needs to attach it to a shardId, not interpret its fields.
+type AdminShardStatsResponse = Record<string, unknown>;
+
+// ----------------------------------------------------------------------------
+// Merged snapshot shape fanned out over SSE. Small and JSON-serializable by
+// design — one SSE frame per tick, per subscriber. Lets the Topology room
+// render heat-ramp coloring per shard (DESIGN.md's "Heat ramp" palette) and
+// in-flight migration paths (DESIGN.md's "--migration" cyan) off one payload,
+// no second round trip.
+// ----------------------------------------------------------------------------
+
+interface TopologySnapshot {
+  ts: number;
+  cluster: {
+    initialized: boolean;
+    catalogShardCount: number;
+    shards: { total: number; active: number; draining: number };
+  };
+  catalogs: Array<{
+    catalogShardId: string;
+    totalVBuckets: number;
+    vbuckets: VbucketMapRow[];
+  }>;
+  // Per-shard stats. `stats` is null (with a short `error`) when that one
+  // shard's adminShardStats call failed this tick — a shard mid-drain, a
+  // chaos "blip shard" attack, or a briefly-unreachable node. This is
+  // deliberately non-fatal: the rest of the topology (the map + every
+  // healthy shard) still broadcasts, so the dashboard stays composed and
+  // renders the affected shard distinctly instead of the whole view going
+  // dark. That "calm under chaos" contrast is the product thesis (DESIGN.md).
+  shards: Array<{ shardId: string; stats: AdminShardStatsResponse | null; error?: string }>;
+}
+
+// Tick cadence: how often the singleton polls cloudflare-shard-mvp's admin
+// API while >=1 subscriber is connected. Not a measured value — a
+// placeholder guess at "fast enough to feel live, slow enough not to hammer
+// the control plane it's filming." Revisit once real load numbers exist.
+const TICK_INTERVAL_MS = 900;
+
+// Caps how many /admin/shard-stats calls run concurrently per tick, so a
+// cluster with a large shard count doesn't fan out hundreds of simultaneous
+// RPC calls from a single alarm tick.
+const MAX_CONCURRENT_SHARD_STATS_CALLS = 8;
 
 export class TopologyAggregator {
   private state: DurableObjectState;
   private env: Env;
 
   // Open SSE subscribers, one WritableStreamDefaultWriter per connected
-  // browser tab. alarm() (once real) writes the merged snapshot to every
-  // entry in this set on each tick; fetch() adds an entry when a new
-  // /api/stream connection comes in and removes it when the connection
-  // closes/errors.
+  // browser tab. Each tick writes the merged snapshot to every entry in this
+  // set; handleStream() adds an entry when a new /api/stream connection
+  // comes in, and entries are dropped as soon as a write to them fails
+  // (client gone) or the request's AbortSignal fires (client disconnected
+  // cleanly).
   //
   // NOTE: this is in-memory, not persisted — correct, because subscriber
   // connections don't survive a DO eviction/restart anyway (the browser's
   // EventSource will auto-reconnect and re-register). Do not try to persist
   // this set to state.storage.
   private subscribers: Set<WritableStreamDefaultWriter<Uint8Array>> = new Set();
+
+  // Guards against overlapping ticks (e.g. an alarm firing while the
+  // "kick off the first tick immediately" path from handleStream() is still
+  // in flight for the same instance).
+  private polling = false;
+
+  // Last successfully merged snapshot, sent immediately to any new
+  // subscriber so they don't have to wait a full tick interval for their
+  // first frame.
+  private lastSnapshot: TopologySnapshot | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -74,29 +129,42 @@ export class TopologyAggregator {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/stream") {
-      return this.handleStream();
+      return this.handleStream(request);
     }
 
     return new Response("Not found", { status: 404 });
   }
 
-  private async handleStream(): Promise<Response> {
+  private async handleStream(request: Request): Promise<Response> {
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
+    const isFirstSubscriber = this.subscribers.size === 0;
     this.subscribers.add(writer);
 
-    // TODO(shardscope): once alarm()-driven polling is real, kick off the
-    // first tick here if one isn't already scheduled, so the very first
-    // subscriber doesn't wait a full alarm period for data. For now, send a
-    // single stub event so the SSE wiring (Worker -> DO -> browser
-    // EventSource) is provably connected end to end, then leave the
-    // connection open with no further events.
-    await writer.write(sseEvent("hello", { message: "shardscope aggregator: skeleton online, no real polling yet" }));
+    const cleanup = () => {
+      this.subscribers.delete(writer);
+    };
+    // Cloudflare Workers aborts a Request's signal when the client
+    // disconnects — drop the subscriber immediately rather than waiting for
+    // the next tick's write() to discover it's gone.
+    request.signal.addEventListener("abort", cleanup);
 
-    // TODO(shardscope): call scheduleNextTick() here once alarm() actually
-    // does something — right now there is nothing useful for an alarm to
-    // produce, so no alarm is scheduled and this subscriber will just see
-    // the one hello event until this Phase 1 stub is replaced.
+    await writer.write(sseEvent("hello", { message: "shardscope aggregator: connected, waiting for first tick" }));
+
+    // Don't make a brand-new subscriber wait a full tick interval for data
+    // that's already sitting in memory.
+    if (this.lastSnapshot) {
+      await this.safeWrite(writer, sseEvent("snapshot", this.lastSnapshot));
+    }
+
+    if (isFirstSubscriber) {
+      // Fire-and-forget: kick the shared poll loop off right away instead of
+      // waiting for the first alarm to fire, so the first viewer of an idle
+      // dashboard doesn't stare at nothing for a whole TICK_INTERVAL_MS.
+      // runTick() reschedules itself via scheduleNextTick() when it's done,
+      // so this single call is enough to keep the loop alive.
+      void this.runTick();
+    }
 
     return new Response(readable, {
       status: 200,
@@ -108,42 +176,153 @@ export class TopologyAggregator {
     });
   }
 
-  /** Schedules the next shared poll tick. Call this once real polling exists
-   * (from the constructor / first subscriber, and again at the end of each
-   * alarm() run) to keep the tick loop going as long as at least one
-   * subscriber cares. Left as a standalone method now so alarm() can call it
-   * without this file needing to change shape later. */
-  private async scheduleNextTick(intervalMs = 2000): Promise<void> {
-    // TODO(shardscope): pick a real tick interval once we know the cost of
-    // an /admin/status + /admin/vbucket-map + fanned /admin/shard-stats
-    // round trip. 2s is a placeholder guess, not a measured value.
-    await this.state.storage.setAlarm(Date.now() + intervalMs);
+  /** Schedules the next shared poll tick. */
+  private async scheduleNextTick(): Promise<void> {
+    await this.state.storage.setAlarm(Date.now() + TICK_INTERVAL_MS);
   }
 
-  /** alarm() — the one place the real shared poll + fan-out will happen.
-   *
-   * TODO(shardscope): implement the real body once /admin/vbucket-map
-   * exists:
-   *   1. If this.subscribers is empty, do nothing (don't poll for no one)
-   *      and don't reschedule — let the alarm loop go idle. The next
-   *      handleStream() call is responsible for restarting it.
-   *   2. Otherwise, call env.SHARD_API for /admin/status,
-   *      /admin/vbucket-map, and fanned /admin/shard-stats (however many
-   *      calls "fanned" turns out to require — see CloudflareShardRpc's
-   *      admin method surface in the main Worker's src/index.ts for what's
-   *      actually callable over the RPC binding vs. still HTTP-only today).
-   *   3. Merge the three results into one TopologySnapshot.
-   *   4. Write one SSE "snapshot" event, JSON-encoded, to every writer in
-   *      this.subscribers. Drop/remove any writer whose write() throws
-   *      (the tab disconnected).
-   *   5. Call scheduleNextTick() again to keep the loop going.
-   */
+  /** alarm() — fired by the platform per scheduleNextTick(). Just runs one
+   * tick; all the real logic (overlap guard, empty-subscriber guard,
+   * rescheduling) lives in runTick() so the same path can also be triggered
+   * synchronously the moment the first subscriber connects. */
   async alarm(): Promise<void> {
-    // Intentionally empty in Phase 1. See TODO block above.
+    await this.runTick();
+  }
+
+  /** Runs (at most) one poll+fan-out cycle, then reschedules the next tick
+   * if there's still someone to serve. Safe to call both from alarm() and
+   * directly from handleStream() — the in-flight guard makes overlapping
+   * calls a no-op. */
+  private async runTick(): Promise<void> {
+    if (this.polling) return; // a tick is already in flight; let it finish
+    if (this.subscribers.size === 0) return; // nobody watching; don't poll into the void
+
+    this.polling = true;
+    try {
+      const snapshot = await this.pollSnapshot();
+      this.lastSnapshot = snapshot;
+      await this.broadcast(sseEvent("snapshot", snapshot));
+    } catch (err) {
+      await this.broadcast(sseEvent("error", { message: this.safeErrorMessage(err) }));
+    } finally {
+      this.polling = false;
+    }
+
+    if (this.subscribers.size > 0) {
+      await this.scheduleNextTick();
+    }
+    // else: last subscriber disconnected while this tick was running — go
+    // idle. The next handleStream() call is responsible for restarting the
+    // loop.
+  }
+
+  /** One round of admin calls, merged into a single TopologySnapshot.
+   * Throws on any failure (cluster not initialized, RPC error, etc.) —
+   * callers are responsible for turning that into an SSE "error" event. */
+  private async pollSnapshot(): Promise<TopologySnapshot> {
+    const shardApi: ShardApiBinding = this.env.SHARD_API;
+    const adminToken = this.env.ADMIN_TOKEN;
+
+    const [statusRaw, vbucketMapRaw] = await Promise.all([
+      shardApi.adminStatus(adminToken),
+      shardApi.adminVbucketMap(adminToken),
+    ]);
+    const status = statusRaw as AdminStatusResponse;
+    const vbucketMap = vbucketMapRaw as AdminVbucketMapResponse;
+
+    // Authoritative shard-id set comes from the vbucket map (the union of
+    // every row's current shardId AND non-null targetShardId across every
+    // catalog) — NOT from /admin/status, which only reports shard counts,
+    // not ids.
+    const shardIds = new Set<string>();
+    for (const catalog of vbucketMap.catalogs) {
+      for (const row of catalog.map) {
+        shardIds.add(row.shardId);
+        if (row.targetShardId) shardIds.add(row.targetShardId);
+      }
+    }
+
+    // Per-shard stats are fetched independently and a single shard's failure
+    // is NON-FATAL: a shard mid-drain / under a chaos "blip" / briefly
+    // unreachable must not blank the whole topology. Each call gets its own
+    // try/catch here; a failure becomes a `{ stats: null, error }` marker the
+    // UI can render distinctly, while every healthy shard and the vbucket map
+    // still broadcast. Only adminStatus/adminVbucketMap failing (above) is
+    // snapshot-fatal — without those there's no topology to draw at all.
+    const shards = await mapWithConcurrencyLimit(
+      [...shardIds],
+      MAX_CONCURRENT_SHARD_STATS_CALLS,
+      async (shardId): Promise<{ shardId: string; stats: AdminShardStatsResponse | null; error?: string }> => {
+        try {
+          const stats = (await shardApi.adminShardStats(adminToken, { shardId })) as AdminShardStatsResponse;
+          return { shardId, stats };
+        } catch (err) {
+          return { shardId, stats: null, error: this.safeErrorMessage(err) };
+        }
+      },
+    );
+
+    return {
+      ts: Date.now(),
+      cluster: {
+        initialized: status.initialized,
+        catalogShardCount: status.catalogShardCount,
+        shards: status.shards,
+      },
+      catalogs: vbucketMap.catalogs.map((c) => ({
+        catalogShardId: c.catalogShardId,
+        totalVBuckets: c.totalVBuckets,
+        vbuckets: c.map,
+      })),
+      shards,
+    };
+  }
+
+  /** Writes `payload` to every open subscriber, dropping any writer whose
+   * write() throws (the tab disconnected without a clean abort signal). */
+  private async broadcast(payload: Uint8Array): Promise<void> {
+    await Promise.all([...this.subscribers].map((writer) => this.safeWrite(writer, payload)));
+  }
+
+  private async safeWrite(writer: WritableStreamDefaultWriter<Uint8Array>, payload: Uint8Array): Promise<void> {
+    try {
+      await writer.write(payload);
+    } catch {
+      this.subscribers.delete(writer);
+    }
+  }
+
+  /** Strips the admin token out of an error message before it's allowed
+   * anywhere near an SSE frame a browser will read — defense in depth on top
+   * of the fact that nothing in the admin API is expected to echo it back. */
+  private safeErrorMessage(err: unknown): string {
+    const raw = err instanceof Error ? err.message : String(err);
+    const token = this.env.ADMIN_TOKEN;
+    return token ? raw.split(token).join("[redacted]") : raw;
   }
 }
 
 function sseEvent(event: string, data: unknown): Uint8Array {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   return new TextEncoder().encode(payload);
+}
+
+/** Runs `fn` over `items` with at most `limit` calls in flight at once,
+ * preserving input order in the result array. Used to bound how many
+ * /admin/shard-stats RPC calls a single tick fans out concurrently. */
+async function mapWithConcurrencyLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }

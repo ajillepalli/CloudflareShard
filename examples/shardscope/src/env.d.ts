@@ -12,18 +12,36 @@
  * cloudflare-shard-mvp directly.
  */
 
-// TODO(shardscope): replace this with the real hand-mirrored RPC contract
-// once the admin/topology RPC surface this dashboard actually needs is
-// settled (mirrors examples/rpc-consumer/src/index.ts's ShardApiBinding
-// interface, which hand-mirrors CloudflareShardRpc — see src/index.ts there
-// for the pattern). In particular this needs an `adminVBucketMap` method,
-// which doesn't exist on CloudflareShardRpc / as an HTTP /admin/* route yet
-// (tracked as a separate in-flight task) — today's confirmed methods this
-// dashboard will use are `adminListTables`/`adminTopologyLockStatus`-shaped
-// calls plus the not-yet-RPC'd HTTP routes /admin/status and
-// /admin/shard-stats. Typed loosely as `any` until that contract lands so
-// this skeleton isn't blocked on it.
-export type ShardApiBinding = any;
+// Hand-mirrored RPC contract (mirrors examples/rpc-consumer/src/index.ts's
+// ShardApiBinding pattern, which hand-mirrors CloudflareShardRpc — see
+// src/index.ts's CloudflareShardRpc class there for the source of truth).
+// Only the three admin methods TopologyAggregator actually calls are
+// declared here; add more as Shardscope grows into mutating admin controls
+// (Reshard/Chaos rooms per DESIGN.md).
+//
+// Return types are intentionally `unknown`, exactly matching
+// CloudflareShardRpc's own declared signatures in src/index.ts
+// (`adminStatus(adminToken: string): Promise<unknown>`, etc. — the RPC
+// entrypoint doesn't narrow these itself). aggregator.ts casts each result
+// to its own local response-shape interfaces (mirroring adminStatusCore /
+// adminVbucketMapCore / handleStats's actual JSON bodies in src/index.ts and
+// src/shard.ts) after receiving it, rather than trusting the binding type to
+// do that narrowing.
+export interface ShardApiBinding {
+  /** Cluster-level counters, fanned out + merged across every catalog shard.
+   * See adminStatusCore in src/index.ts. */
+  adminStatus(adminToken: string): Promise<unknown>;
+  /** Per-vBucket -> shard ownership + in-flight migration state, fanned out
+   * + merged across every catalog shard. See adminVbucketMapCore in
+   * src/index.ts. CATALOG-AWARE: vbucket ids are only unique within a single
+   * catalog's map. */
+  adminVbucketMap(adminToken: string): Promise<unknown>;
+  /** Per-shard load/table stats for exactly one shard. See
+   * adminShardStatsCore in src/index.ts (body.shardId is required — the core
+   * function 400s without it) and ShardDO.handleStats in src/shard.ts for
+   * the actual JSON body shape. */
+  adminShardStats(adminToken: string, body: { shardId: string }): Promise<unknown>;
+}
 
 export interface Env {
   /** Service binding to cloudflare-shard-mvp's CloudflareShardRpc entrypoint.
