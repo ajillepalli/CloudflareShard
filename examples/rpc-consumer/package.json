@@ -1,25 +1,22 @@
 {
-  "name": "cloudflare-shard",
-  "version": "2.2.0.0",
+  "name": "cloudflare-shard-rpc-consumer",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
+  "description": "Demo Worker showing CloudflareShard's RPC / Durable Object service-binding surface (issue #14) called from another Cloudflare Worker in the same account.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "smoke": "node scripts/smoke-test.mjs"
+    "integration-test": "node scripts/integration-test.mjs"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.18.2",
     "@cloudflare/workers-types": "^4.20260610.0",
     "typescript": "^5.9.2",
-    "vitest": "^4.1.10",
     "wrangler": "^4.24.0"
   },
   "allowScripts": {
     "esbuild@0.28.1": true,
-    "sharp@0.34.5": true,
-    "workerd@1.20260625.1": true
+    "workerd@1.20260710.1": true
   }
 }

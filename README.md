@@ -26,6 +26,7 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 - `src/catalog.ts`: Catalog durable object (metadata, routing, map changes).
 - `src/shard.ts`: Shard durable object (SQLite execution + idempotency).
 - `docs/SPEC.md`: Concrete architecture and protocol spec.
+- `examples/rpc-consumer/`: Demo Worker calling the tenant data path over a Durable Object RPC / service binding instead of HTTP.
 
 ## Prerequisites
 
@@ -495,6 +496,41 @@ still refuses *writes* to internal bookkeeping tables (fence/provenance/
 mirror), while allowing reads of them for debugging. `/v1/scatter` reads
 across every tenant indiscriminately, so it requires `ADMIN_TOKEN` for the
 same reason.
+
+## RPC / Worker service-binding access (additive, not a replacement)
+
+Every route above is also reachable without HTTP by a Worker running in the
+same Cloudflare account, via a [service binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/)
+to `CloudflareShardRpc` — a named `WorkerEntrypoint` export in `src/index.ts`
+exposing `mutate()`, `tableScan()`, and `indexQuery()` (the tenant data path;
+admin/topology operations aren't exposed this way yet — see the tracked
+follow-up issue). A consumer Worker declares this in its own `wrangler.toml`:
+
+```toml
+[[services]]
+binding = "SHARD_API"
+service = "cloudflare-shard-mvp"
+entrypoint = "CloudflareShardRpc"
+```
+
+...and calls it directly, with no HTTP request or `Authorization` header to
+build:
+
+```ts
+const result = await env.SHARD_API.mutate(tenantToken, {
+  table: "events", tenantId, partitionKey, op: "insert", values: { ... },
+});
+```
+
+The security boundary shifts from "possessing a bearer token per request" to
+"this binding is wired into the caller's own config" — but the tenant token
+is still required and still checked: it's passed as an explicit argument and
+validated internally via the same `CatalogDO.checkTenantAuth` path the HTTP
+routes use. Holding the binding alone is not sufficient authorization.
+
+A full working example — a second Worker, wired via service binding, with a
+real integration test proving the round trip over the actual binding (not an
+in-process mock) — lives in [`examples/rpc-consumer/`](examples/rpc-consumer/).
 
 ## Known limitations
 
