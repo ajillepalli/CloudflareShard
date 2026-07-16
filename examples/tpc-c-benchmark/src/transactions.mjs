@@ -122,7 +122,28 @@ const MUTATION_RETRY_ATTEMPTS = 5;
 // retry loop once this narrow resolution step itself is exhausted (an
 // actual repeated, sustained network failure, not a single transient blip)
 // or hits a genuine, definitive ApiError (which needs no resolving at all).
-const AMBIGUITY_RESOLUTION_ATTEMPTS = 3;
+//
+// Codex review round 17 P2 fix: rounds 15/16 tried to cover this
+// function's own exhaustion (all attempts below hitting an ambiguous
+// error) at the two call sites most exposed to it, by re-reading the row
+// afterward and comparing against the exact intended business values.
+// That verification read has the SAME class of race this whole function
+// exists to avoid: a DIFFERENT, unrelated concurrent write to the SAME
+// row between the ambiguous failure and the verification read moves the
+// row's state away from the exact match, even though this attempt's
+// update DID genuinely apply -- a false negative, misclassifying a real
+// success as a failure. Retrying the IDENTICAL call under the SAME
+// requestId, by contrast, has NO such race: ShardDO's applied_requests
+// dedupe cache is a pure requestId+hash -> cached-result lookup,
+// completely indifferent to how many OTHER writes have touched the row
+// since -- it keeps returning the ORIGINAL, true outcome no matter what
+// else happens to the row in the meantime. There is no reason to keep
+// this bound as low as a "quick ambiguity check" would suggest, since
+// every extra attempt is exactly as safe as the first: raised so that
+// full exhaustion (a sustained, repeated network failure across every
+// single attempt) becomes vanishingly rare, rather than reaching for a
+// second, weaker verification mechanism when this one already suffices.
+const AMBIGUITY_RESOLUTION_ATTEMPTS = 8;
 
 async function mutateResolvingAmbiguity(client, mutation) {
   let lastErr;
@@ -550,43 +571,25 @@ async function newOrder(world) {
           s_remote_cnt: stockRow.s_remote_cnt,
         };
 
-        let result;
-        try {
-          result = await mutateResolvingAmbiguity(supplyWarehouse.client, {
-            op: "update",
-            table: "tpcc_stock",
-            partitionKey: stockRow.s_key,
-            values: stockValues,
-            where: stockWhere,
-            requestId: crypto.randomUUID(),
-          });
-        } catch (err) {
-          // Codex review round 16 P2 fix: mutateResolvingAmbiguity itself
-          // can exhaust its own bounded attempts on a sustained, repeated
-          // network failure. Simply rethrowing here would fall straight to
-          // the outer catch below, which deletes this line's order_line and
-          // reports the line failed WITHOUT knowing the stock decrement
-          // might have genuinely applied -- permanently stranding it
-          // uncompensated even though the rest of this "failed" order goes
-          // on to be compensated. Resolved the same way Delivery's credit
-          // is (item 11): one final read, compared against the EXACT
-          // values this specific update intended across all four stock
-          // fields together -- a coincidental unrelated concurrent write
-          // matching s_quantity, s_ytd, s_order_cnt, AND s_remote_cnt
-          // simultaneously is vanishingly unlikely (s_ytd and s_order_cnt
-          // in particular only ever increase, so an exact match to THIS
-          // update's specific resulting values is effectively conclusive).
-          const verifyRes = await supplyWarehouse.client.indexQuery("tpcc_stock", "idx_stock_by_item", { i_id: line.i_id });
-          const verifyRow = (verifyRes.rows || [])[0];
-          const applied =
-            verifyRow &&
-            verifyRow.s_quantity === stockValues.s_quantity &&
-            verifyRow.s_ytd === stockValues.s_ytd &&
-            verifyRow.s_order_cnt === stockValues.s_order_cnt &&
-            verifyRow.s_remote_cnt === stockValues.s_remote_cnt;
-          if (!applied) throw err;
-          result = { rowsAffected: 1 };
-        }
+        // Codex review round 17 P2 fix: round 16 added a verification read
+        // here for when mutateResolvingAmbiguity itself exhausts -- removed
+        // again, because comparing the row's CURRENT state against this
+        // update's exact intended values has its own race: a DIFFERENT,
+        // unrelated concurrent write to this SAME stock row landing between
+        // the ambiguous failure and the verification read moves the row
+        // away from the exact match even when THIS update genuinely
+        // applied, misclassifying a real success as a failure. See
+        // mutateResolvingAmbiguity's own comment for why relying purely on
+        // retrying the identical call (which this already does, now with a
+        // higher bound) is the safe answer instead.
+        const result = await mutateResolvingAmbiguity(supplyWarehouse.client, {
+          op: "update",
+          table: "tpcc_stock",
+          partitionKey: stockRow.s_key,
+          values: stockValues,
+          where: stockWhere,
+          requestId: crypto.randomUUID(),
+        });
         if (result.rowsAffected > 0) {
           // Compensation data for compensateFailedOrder, if a LATER sibling
           // line fails and this already-committed one needs to be reversed.
@@ -967,39 +970,26 @@ async function delivery(world) {
         // Delivery's marker-restore-then-retry mechanism is exactly the kind
         // of "someone retries this same logical credit later" scenario the
         // file-header/Payment comments warn never to create.
-        const intendedBalance = round2(custRow.c_balance + sumAmount);
-        const intendedDeliveryCnt = custRow.c_delivery_cnt + 1;
-        let result;
-        try {
-          result = await mutateResolvingAmbiguity(home.client, {
-            op: "update",
-            table: "tpcc_customer",
-            partitionKey: custRow.c_key,
-            values: { c_balance: intendedBalance, c_delivery_cnt: intendedDeliveryCnt },
-            where: { c_balance: custRow.c_balance, c_delivery_cnt: custRow.c_delivery_cnt },
-            requestId: crypto.randomUUID(),
-          });
-        } catch (err) {
-          // Codex review round 15 P2 fix: mutateResolvingAmbiguity itself
-          // can still throw if EVERY one of its own bounded attempts hits
-          // an ambiguous (non-ApiError) failure -- a rare, sustained
-          // network problem, but escalating straight to the outer catch's
-          // marker restoration would reopen the exact double-credit risk
-          // the round-13 fix exists to close, if this credit actually DID
-          // apply on some attempt whose response was lost every time.
-          // Resolve it for good with one final read: this order's marker
-          // was already claimed via its own checked delete before this
-          // function ever got here, so no OTHER Delivery worker can be
-          // concurrently processing THIS SAME order -- an exact match on
-          // BOTH c_balance AND c_delivery_cnt together can only mean this
-          // specific credit applied, not a coincidental unrelated write.
-          const verifyRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id: orderRow.c_id });
-          const verifyRow = (verifyRes.rows || [])[0];
-          if (verifyRow && verifyRow.c_balance === intendedBalance && verifyRow.c_delivery_cnt === intendedDeliveryCnt) {
-            break; // confirmed applied -- treat as success, do not restore the marker
-          }
-          throw err; // genuinely unresolved -- safe to let the marker be restored
-        }
+        // Codex review round 17 P2 fix: round 15 added a verification read
+        // here for when mutateResolvingAmbiguity itself exhausts -- removed
+        // again, because comparing the row's CURRENT state against this
+        // credit's exact intended values has its own race: a DIFFERENT,
+        // unrelated concurrent Payment or Delivery for the SAME customer
+        // landing between the ambiguous failure and the verification read
+        // moves c_balance away from the exact match even when THIS credit
+        // genuinely applied, misclassifying a real success as a failure
+        // and letting the outer catch restore the marker regardless. See
+        // mutateResolvingAmbiguity's own comment for why relying purely on
+        // retrying the identical call (which this already does, now with a
+        // higher bound) is the safe answer instead.
+        const result = await mutateResolvingAmbiguity(home.client, {
+          op: "update",
+          table: "tpcc_customer",
+          partitionKey: custRow.c_key,
+          values: { c_balance: round2(custRow.c_balance + sumAmount), c_delivery_cnt: custRow.c_delivery_cnt + 1 },
+          where: { c_balance: custRow.c_balance, c_delivery_cnt: custRow.c_delivery_cnt },
+          requestId: crypto.randomUUID(),
+        });
         if (result.rowsAffected > 0) break;
         if (attempt >= MUTATION_RETRY_ATTEMPTS) {
           throw new Error(`customer ${orderRow.c_id} delivery credit did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
