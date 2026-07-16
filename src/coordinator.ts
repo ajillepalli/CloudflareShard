@@ -41,6 +41,12 @@ export class CoordinatorDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly coordinatorEnv: Cloudflare.Env;
   private readonly routes: Record<string, (request: Request) => Promise<Response>>;
+  /** ensureSchema() is idempotent but not free (several DDL/PRAGMA
+   * statements) — running it once per in-memory instance instead of once
+   * per request is safe because the schema lives in durable storage: a
+   * fresh instance (new isolate) re-runs it on its first request, and
+   * nothing ever drops these tables mid-lifetime. */
+  private schemaEnsured = false;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -62,6 +68,8 @@ export class CoordinatorDO extends DurableObject {
   }
 
   private ensureSchema(): void {
+    if (this.schemaEnsured) return;
+    this.schemaEnsured = true;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS transactions (
         tx_id TEXT PRIMARY KEY,
