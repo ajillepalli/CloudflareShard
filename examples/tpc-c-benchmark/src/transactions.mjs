@@ -237,13 +237,52 @@ async function newOrder(world) {
 
   // Only now -- after every line has actually committed -- does this order
   // become visible to Delivery. See the comment on the header tx above.
-  await home.client.mutate({
-    op: "insert",
-    table: "tpcc_new_order",
-    partitionKey: newOrderKey(w, d, o_id),
-    values: { w_id: w, d_id: d, o_id },
-    requestId: crypto.randomUUID(),
-  });
+  //
+  // Codex review round 10 P2 fix: if THIS call itself fails (a transient
+  // network/topology error, not a rejection), every line and the header have
+  // already committed -- there's nothing left to compensate, but without the
+  // marker the order is still permanently invisible to Delivery (the same
+  // failure mode compensateFailedOrder exists for, just one step later).
+  // Retrying with a bounded loop closes that gap, and it's safe to retry
+  // blindly (no fresh read/compare-and-swap needed, unlike the counter
+  // updates elsewhere in this file) because every attempt reuses the SAME
+  // requestId: /v1/mutate's underlying ShardDO records each requestId in an
+  // applied_requests dedupe cache (see src/shard.ts), so a retry after the
+  // first attempt actually applied but its response was merely lost replays
+  // the cached "already applied" outcome instead of double-inserting.
+  const markerRequestId = crypto.randomUUID();
+  let markerInserted = false;
+  let lastMarkerError;
+  for (let attempt = 1; attempt <= MUTATION_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await home.client.mutate({
+        op: "insert",
+        table: "tpcc_new_order",
+        partitionKey: newOrderKey(w, d, o_id),
+        values: { w_id: w, d_id: d, o_id },
+        requestId: markerRequestId,
+      });
+      markerInserted = true;
+      break;
+    } catch (err) {
+      lastMarkerError = err;
+    }
+  }
+  if (!markerInserted) {
+    // Deliberately does NOT fall back to compensateFailedOrder here: after
+    // exhausting retries there's no way to tell "never applied on the
+    // server" apart from "applied on some earlier attempt, response lost
+    // every time since" (the dedupe cache only helps a RETRY converge, it
+    // doesn't let the caller distinguish these cases in hindsight). Reverting
+    // the lines/stock in the second case would corrupt a real, already-marked
+    // order. Throwing loudly and leaving the order exactly as committed is
+    // the same choice this file makes everywhere else under that ambiguity
+    // (see Payment's retry loops) -- a rare, visible failed attempt instead
+    // of a rarer but silent double-corruption.
+    throw new Error(
+      `New-Order's line(s) and header committed but the new_order marker insert failed after ${MUTATION_RETRY_ATTEMPTS} attempts -- order ${o_id} is committed but may be invisible to Delivery: ${lastMarkerError instanceof Error ? lastMarkerError.message : String(lastMarkerError)}`,
+    );
+  }
 
   /** Reverses whatever already-committed lines a failed New-Order left
    * behind, plus the orphaned header row -- a real compensating-transaction
@@ -720,23 +759,55 @@ async function delivery(world) {
  * below the threshold in this warehouse. The server-side aggregate is
  * replaced with index-query/table-scan + client-side counting (no
  * aggregation pushdown exists), but the actual QUESTION being measured
- * still matches the spec -- Codex review P2 fix: an earlier version
- * table-scanned the whole warehouse's stock table regardless of district or
- * recent-order scoping, which reports a materially different (and
- * inflated/irrelevant) number than real Stock-Level measures. */
+ * still matches the spec -- Codex review P2 fix (round 1): an earlier
+ * version table-scanned the whole warehouse's stock table regardless of
+ * district or recent-order scoping, which reports a materially different
+ * (and inflated/irrelevant) number than real Stock-Level measures.
+ *
+ * Codex review P2 fix (round 10): the version that replaced round 1's fix
+ * used idx_orders_by_district with limit:100 and took the tail
+ * (orderRows.slice(-20)), reasoning it was the same "limit:100, take the
+ * tail" residual as Order-Status. It isn't -- index-query has NO cursor and
+ * hard-caps at 100 (MAX_INDEX_QUERY_LIMIT in src/index.ts), and it always
+ * returns the FIRST 100 matches in ascending o_id order, never the last.
+ * Once a district has more than 100 orders (the default --seed-orders
+ * baseline of 100 customers already produces exactly 100 pre-existing
+ * orders per district before the benchmark places a single new one), the
+ * slice(-20) tail is stuck on orders 81-100 forever -- every subsequent
+ * benchmark-created order (o_id 101+) is permanently excluded, not just
+ * occasionally missed. Order-Status's limit:100 residual is genuinely rare
+ * (a customer needs >100 lifetime orders) and self-correcting once it does
+ * happen (index-query's ordering means the visible window still SLIDES
+ * forward as older entries fall out); this one is neither.
+ *
+ * Fixed by using table-scan instead, which DOES support a cursor
+ * (nextCursor / cursor), to walk tpcc_orders directly. Every order key is
+ * `o-{w}-{d}-{o_id}`, all zero-padded (see keys.mjs) -- ascending
+ * partition-key order therefore groups ALL of one district's orders into a
+ * single contiguous block, ordered by o_id, strictly before the next
+ * district's block. That means finding district d's last 20 orders only
+ * ever requires scanning up through the END of district d's own block, not
+ * the whole orders table: skip rows before it, collect a sliding window of
+ * the last 20 rows within it, and stop as soon as a row from a LATER
+ * district appears (or the scan itself ends). */
 async function stockLevel(world) {
   const home = world.randomWarehouse();
   const d = world.randomDistrictId();
   const threshold = randInt(10, 20);
 
-  // idx_orders_by_district returns entries ascending by o_key (zero-padded
-  // o_id), so the LAST up to 20 of up to 100 returned are this district's
-  // most recent orders -- same "limit:100, take the tail" residual-limit
-  // reasoning as Order-Status above (see that function's comment) applies
-  // here too, at this benchmark's realistic scale.
-  const ordersRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_district", { d_id: d }, 100);
-  const orderRows = ordersRes.rows || [];
-  const recentOrders = orderRows.slice(-20);
+  const recentOrders = [];
+  let cursor;
+  scanLoop: for (;;) {
+    const page = await home.client.tableScan("tpcc_orders", 200, cursor);
+    for (const row of page.rows || []) {
+      if (row.d_id < d) continue;
+      if (row.d_id > d) break scanLoop; // past district d's contiguous block -- done
+      recentOrders.push(row);
+      if (recentOrders.length > 20) recentOrders.shift(); // keep only the most recent 20 seen so far
+    }
+    if (!page.nextCursor) break;
+    cursor = page.nextCursor;
+  }
   if (recentOrders.length === 0) return 0; // no orders yet for this district
 
   const itemIds = new Set();

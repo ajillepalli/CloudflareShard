@@ -78,9 +78,13 @@ async function runSeedCmd(flags) {
   });
 }
 
+// Codex review P3 fix (round 10): Math.floor((p/100) * n) overstates small or
+// exact-boundary samples -- e.g. with 20 successful samples, p95 used to
+// select index 19 (the max value) instead of the nearest-rank 95th
+// percentile at index 18. Nearest-rank definition: ceil((p/100) * n) - 1.
 function percentile(sortedAscending, p) {
   if (sortedAscending.length === 0) return null;
-  const idx = Math.min(sortedAscending.length - 1, Math.floor((p / 100) * sortedAscending.length));
+  const idx = Math.min(sortedAscending.length - 1, Math.max(0, Math.ceil((p / 100) * sortedAscending.length) - 1));
   return sortedAscending[idx];
 }
 
