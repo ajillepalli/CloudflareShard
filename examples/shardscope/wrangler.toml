@@ -30,9 +30,26 @@ entrypoint = "CloudflareShardRpc"
 name = "AGGREGATOR"
 class_name = "TopologyAggregator"
 
+# LoadDriver (Shardscope T3): a singleton Durable Object (see
+# src/load/load-driver.ts) that runs alarm-driven rolling batches of a
+# TPC-C-style transaction mix against cloudflare-shard-mvp's gateway, in
+# either uniform (normal random keys) or deterministic hot-shard skew mode.
+# One instance ("singleton", via idFromName) for the whole Worker, same
+# reasoning as AGGREGATOR above.
+[[durable_objects.bindings]]
+name = "LOAD_DRIVER"
+class_name = "LoadDriver"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TopologyAggregator"]
+
+# New migration tag for LoadDriver rather than appending to v1 -- once a
+# migration tag has shipped, editing its class list retroactively is unsafe;
+# a new DO class always gets its own migration entry.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["LoadDriver"]
 
 # --- Future: static SPA assets ---------------------------------------------
 # Phase 1 (this file) serves a stub HTML placeholder straight from

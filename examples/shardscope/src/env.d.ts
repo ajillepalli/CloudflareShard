@@ -53,6 +53,13 @@ export interface Env {
    * there is exactly one aggregator instance for the whole Worker. */
   AGGREGATOR: DurableObjectNamespace;
 
+  /** Durable Object namespace for the single shared load driver (Shardscope
+   * T3). See src/load/load-driver.ts — a Worker-native TPC-C-style load engine
+   * with a deterministic hot-shard skew mode. Always addressed via
+   * idFromName("singleton"): one shared load run for the whole Worker, not one
+   * per caller. */
+  LOAD_DRIVER: DurableObjectNamespace;
+
   /** Bearer token this Worker presents to cloudflare-shard-mvp's /admin/*
    * surface (HTTP today; RPC methods that take an explicit adminToken
    * argument, once used). Server-side secret only — the browser never sees

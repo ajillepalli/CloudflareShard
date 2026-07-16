@@ -33,9 +33,10 @@
  * what is stubbed vs. real.
  */
 import { TopologyAggregator } from "./aggregator";
+import { LoadDriver } from "./load/load-driver";
 import type { Env } from "./env";
 
-export { TopologyAggregator };
+export { TopologyAggregator, LoadDriver };
 
 // Shardscope palette (DESIGN.md) — inlined here only because this is a
 // placeholder stub page. The real SPA build should pull these from a shared
@@ -110,6 +111,14 @@ function placeholderHtml(): string {
 const json = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json" } });
 
+/** Forwards to the LoadDriver singleton DO (see src/load/load-driver.ts).
+ * LOAD_DRIVER is declared on Env (env.d.ts) and bound in wrangler.toml. */
+function forwardToLoadDriver(request: Request, env: Env): Promise<Response> {
+  const id = env.LOAD_DRIVER.idFromName("singleton");
+  const stub = env.LOAD_DRIVER.get(id);
+  return stub.fetch(request);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -141,6 +150,26 @@ export default {
       const id = env.AGGREGATOR.idFromName("singleton");
       const stub = env.AGGREGATOR.get(id);
       return stub.fetch(request);
+    }
+
+    // /api/load/*: forwards to the LoadDriver singleton DO (see
+    // src/load/load-driver.ts) — a Worker-native TPC-C-style load engine
+    // with a deterministic hot-shard skew mode. Exactly one instance for the
+    // whole Worker (idFromName("singleton")), mirroring AGGREGATOR's own
+    // singleton pattern above: one shared load run, not one per caller.
+    //
+    // TODO(shardscope): same auth gap as /api/stream above — gate with
+    // SHARDSCOPE_GATE_TOKEN once a real auth/session story exists. Starting
+    // a load run is a mutating operation (unlike /api/stream's read-only
+    // topology view), so this is a sharper gap than that TODO; acceptable
+    // for now only because real transaction issuance itself still throws
+    // "pending T5" (no tenant tokens wired up yet — see
+    // src/load/token-provider.ts) until a later task lands.
+    if (
+      (request.method === "POST" && (url.pathname === "/api/load/start" || url.pathname === "/api/load/stop")) ||
+      (request.method === "GET" && url.pathname === "/api/load/status")
+    ) {
+      return forwardToLoadDriver(request, env);
     }
 
     return json({ error: `Unknown route: ${url.pathname}` }, 404);
