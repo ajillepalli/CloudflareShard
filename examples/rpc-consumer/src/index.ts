@@ -29,6 +29,13 @@ export interface ShardApiBinding {
     tenantToken: string,
     body: { table: string; indexName: string; tenantId: string; values: Record<string, unknown>; limit?: number },
   ): Promise<{ rows: Array<Record<string, unknown>> }>;
+  // Admin/topology (issue #15) — every method takes adminToken explicitly,
+  // just like an HTTP call to the equivalent /admin/* route needs
+  // Authorization: Bearer <ADMIN_TOKEN>. Two representative methods are
+  // exercised here (one plain admin op, one topology op); the rest follow
+  // the identical shape.
+  adminListTables(adminToken: string): Promise<unknown>;
+  adminTopologyLockStatus(adminToken: string): Promise<unknown>;
 }
 
 export interface Env {
@@ -74,9 +81,10 @@ export default {
     }
 
     // POST /demo/index-query: exact-tuple lookup via RPC indexQuery(). Needs
-    // an index already registered on `table` for `column` (via the existing
-    // HTTP /admin/create-index — admin operations aren't in this issue's
-    // RPC scope, see the follow-up issue).
+    // an index already registered on `table` for `column` (the integration
+    // test sets this up via the existing HTTP admin API — admin RPC methods
+    // exist too now, see /demo/admin-list-tables and
+    // /demo/admin-topology-lock-status below for two examples of those).
     if (request.method === "POST" && url.pathname === "/demo/index-query") {
       const body = (await request.json()) as {
         tenantToken: string;
@@ -93,6 +101,23 @@ export default {
         values: { [body.column]: body.value },
       });
       return json({ indexQueryResult });
+    }
+
+    // POST /demo/admin-list-tables: a plain admin RPC call, still gated by
+    // ADMIN_TOKEN passed explicitly (this Worker holding the service binding
+    // is not, on its own, sufficient authorization for admin operations).
+    if (request.method === "POST" && url.pathname === "/demo/admin-list-tables") {
+      const body = (await request.json()) as { adminToken: string };
+      const adminListTablesResult = await env.SHARD_API.adminListTables(body.adminToken);
+      return json({ adminListTablesResult });
+    }
+
+    // POST /demo/admin-topology-lock-status: a topology RPC call, same
+    // ADMIN_TOKEN gating.
+    if (request.method === "POST" && url.pathname === "/demo/admin-topology-lock-status") {
+      const body = (await request.json()) as { adminToken: string };
+      const adminTopologyLockStatusResult = await env.SHARD_API.adminTopologyLockStatus(body.adminToken);
+      return json({ adminTopologyLockStatusResult });
     }
 
     return json({ error: `Unknown route: ${url.pathname}` }, 404);
