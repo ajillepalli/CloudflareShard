@@ -47,7 +47,17 @@
       <span class="sep">·</span>
       <span class="sb-item" data-hook="sb-cluster-status">cluster —</span>
       <span class="sep">·</span>
-      <span class="sb-item placeholder" data-hook="sb-lost" title="Not wired yet — the write-loss/checksum invariant ships with T4 (correctness core). This slot is a deliberate placeholder, not a fabricated value.">lost — · checksum —</span>
+      <!-- Shardscope T4 — the invariant scoreboard (DESIGN.md: "writes N ·
+           lost 0 · checksum OK"). Rendered from snapshot.scoreboard (see
+           ../src/aggregator.ts's Scoreboard type + app.js's renderScoreboard).
+           lost/checksum get a distinct RED treatment when lost > 0 — the ONE
+           legitimate health-red per DESIGN.md's "red never means health"
+           rule, because a lost write IS a health failure. -->
+      <span class="sb-item" data-hook="sb-writes" title="Writes acknowledged by the load engine this run (idempotent replays and known/legitimate TPC-C aborts are tracked separately, never folded into this count or into `lost`).">writes —</span>
+      <span class="sep">·</span>
+      <span class="sb-item safe" data-hook="sb-lost" title="Read-back verification of tracked keys, biased toward keys on the currently-migrating vBucket during a reshard. A missing or mismatched read-back is the ONLY thing that can make this red.">lost —</span>
+      <span class="sep">·</span>
+      <span class="sb-item safe" data-hook="sb-checksum" title="The migration checksum is a CUTOVER EVENT (computed once, inside cutover), not a continuously-readable invariant — this label reflects the cluster's live migration state, not a fabricated permanent &quot;OK&quot;.">checksum —</span>
     </div>
   </header>
 

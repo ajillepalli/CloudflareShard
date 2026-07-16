@@ -97,6 +97,20 @@ export function stockKey(w: number, i: number): string {
   return `s-${pad(w, 4)}-${pad(i, 6)}`;
 }
 
+/** Inverse of stockKey — recovers (warehouseId, itemId) from a tpcc_stock
+ * partition key. Exported for ./correctness.ts's write-tracking TxExecutor
+ * decorator, which needs to reconstruct a read-back lookup (an
+ * idx_stock_by_item indexQuery) from a raw MutateCall it observes — rather
+ * than re-deriving stockKey's exact zero-padded format with a second,
+ * possibly-drifting regex. Returns null for anything that doesn't match the
+ * exact format (defensive: never throws on an unexpected partitionKey, e.g.
+ * a key some future table reuses this decorator against). */
+export function parseStockKey(partitionKey: string): { warehouseId: number; itemId: number } | null {
+  const m = /^s-(\d{4})-(\d{6})$/.exec(partitionKey);
+  if (!m) return null;
+  return { warehouseId: Number(m[1]), itemId: Number(m[2]) };
+}
+
 function newOrderKey(w: number, d: number, o: number): string {
   return `no-${pad(w, 4)}-${pad(d, 2)}-${pad(o, 9)}`;
 }

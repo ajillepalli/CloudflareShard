@@ -25,6 +25,15 @@
  *   snapshot.shards[].stats                          -> heat load proxy (see
  *                                                        computeLoadScore below)
  *   snapshot.shards[].error                          -> "unavailable" node state
+ *   snapshot.scoreboard.writesAcked                  -> topbar "writes N"
+ *   snapshot.scoreboard.lost                         -> topbar "lost N" (RED if > 0)
+ *   snapshot.scoreboard.meterState                   -> "green" | "red"
+ *   snapshot.scoreboard.loadRunning                  -> false -> writes/lost render as 0, not stale
+ *   snapshot.scoreboard.checksum.{label,state}        -> topbar "checksum <label>"
+ *                                                        (see ../src/aggregator.ts's
+ *                                                        deriveChecksumStatus — a
+ *                                                        derived, honest label, never
+ *                                                        a fabricated permanent "OK")
  *
  * event: error frames -> { message } -> shown as a calm inline banner; last
  * good render is left on screen (this is the whole point of the aggregator's
@@ -45,6 +54,9 @@ const el = {
   clusterInit: hook("cluster-init"),
   sbShards: hook("sb-shards"),
   sbClusterStatus: hook("sb-cluster-status"),
+  sbWrites: hook("sb-writes"),
+  sbLost: hook("sb-lost"),
+  sbChecksum: hook("sb-checksum"),
   liveDot: hook("live-dot"),
   canvasStatus: hook("canvas-status"),
   canvasSub: hook("canvas-sub"),
@@ -184,6 +196,20 @@ function buildSampleSnapshot() {
       { shardId: "shard-4", stats: statsFor([{ table: "orders", rowCount: 1510 }, { table: "order_line", rowCount: 5920 }], 3, 1) },
       { shardId: "shard-5", stats: statsFor([{ table: "orders", rowCount: 96 }, { table: "order_line", rowCount: 310 }], 0, 0) },
     ],
+    // Shardscope T4 — shaped exactly like aggregator.ts's Scoreboard (see
+    // that file's header comment). Illustrative only: "verifying…" matches
+    // this sample's in-flight cutover row (vbucket 7, above) — always
+    // rendered behind the "SAMPLE DATA" badge, never mistaken for a live
+    // read.
+    scoreboard: {
+      writesAcked: 48213,
+      writesRetriedIdempotent: 12,
+      txAbortedExpected: 340,
+      lost: 0,
+      meterState: "green",
+      loadRunning: true,
+      checksum: { label: "verifying…", state: "verifying" },
+    },
   };
 }
 
@@ -311,6 +337,65 @@ function showSampleBadge(show) {
 function setCanvasStatus(text) {
   el.canvasStatus.textContent = "Topology — " + text;
 }
+
+// ============================================================================
+// Shardscope T4 — invariant scoreboard (writes / lost / checksum). Renders
+// snapshot.scoreboard exactly as aggregator.ts's Scoreboard shapes it (see
+// this file's field-mapping doc comment at the top) — replaces the earlier
+// "not wired yet" placeholder. Per DESIGN.md: --safe breathing glow when
+// lost is 0 and the checksum is idle/verified; a distinct, solid RED
+// treatment when lost > 0 — the ONE legitimate health-red this dashboard
+// ever shows, because a lost write IS a health failure (DESIGN.md: "red
+// never means health" — this is the documented exception, not a violation
+// of it).
+// ============================================================================
+
+/** Maps a checksum state (aggregator.ts's ChecksumState) onto the scoreboard
+ * chip's visual treatment. "idle"/"verified" are calm, settled GREEN states
+ * (nothing wrong, nothing in flight). "backfilling"/"verifying"/"aborting"
+ * are ACTIVE, routine states — a reshard in progress is normal, not scary
+ * (DESIGN.md: migration reads as calm flow, hence --migration cyan, not
+ * red). "stalled" is the one checksum state worth flagging for operator
+ * attention (amber, matching this scoreboard's existing "degraded" amber
+ * convention) — NOT red, because a stalled cutover is an operational
+ * concern, not by itself a proven data loss (only `lost` reports that).
+ * "aborted" is neutral: an operator or an automatic guard cancelled a
+ * migration, which is expected admin behavior, not a failure signal. */
+function checksumClassFor(state) {
+  if (state === "idle" || state === "verified") return "safe";
+  if (state === "backfilling" || state === "verifying" || state === "aborting") return "migrate";
+  if (state === "stalled") return "degraded";
+  return ""; // "aborted" and any unrecognized future state — neutral, no color claim either way
+}
+
+function renderScoreboard(scoreboard) {
+  if (!el.sbWrites || !el.sbLost || !el.sbChecksum) return; // defensive: hooks always exist in the shipped index.html, but never crash a render over a missing DOM node
+  if (!scoreboard) {
+    el.sbWrites.textContent = "writes —";
+    el.sbLost.className = "sb-item";
+    el.sbLost.textContent = "lost —";
+    el.sbChecksum.className = "sb-item";
+    el.sbChecksum.textContent = "checksum —";
+    return;
+  }
+
+  // scoreboard.loadRunning === false already means writesAcked/lost are 0 at
+  // the source (aggregator.ts's mergeScoreboard forces this — see that
+  // file's Scoreboard doc comment on why a previous run's stale totals are
+  // never shown as if they were live). Rendered here exactly as received,
+  // no separate client-side zeroing — one source of truth for "honest, not
+  // fake-green".
+  el.sbWrites.textContent = `writes ${fmtInt(scoreboard.writesAcked)}`;
+
+  const isRed = scoreboard.meterState === "red" || scoreboard.lost > 0;
+  el.sbLost.className = "sb-item" + (isRed ? " lost-red" : " safe");
+  el.sbLost.textContent = `lost ${fmtInt(scoreboard.lost)}`;
+
+  const checksum = scoreboard.checksum || { label: "—", state: "idle" };
+  const checksumClass = checksumClassFor(checksum.state);
+  el.sbChecksum.className = "sb-item" + (checksumClass ? " " + checksumClass : "");
+  el.sbChecksum.textContent = `checksum ${checksum.label}`;
+}
 /** state: 'connecting' | 'live' | 'warn' | 'demo' */
 function setLiveState(state, label) {
   const isLive = state === "live";
@@ -414,6 +499,8 @@ function renderInner(snapshot) {
   const anyShardError = shardStatsList.some((s) => s.stats == null);
   el.sbClusterStatus.className = "sb-item" + (!cluster.initialized ? "" : anyShardError ? " degraded" : "");
   el.sbClusterStatus.textContent = !cluster.initialized ? "cluster: not initialized" : anyShardError ? "cluster: degraded" : "cluster: healthy";
+
+  renderScoreboard(snapshot.scoreboard);
 
   // ---- empty state: cluster not initialized ----
   if (!cluster.initialized) {

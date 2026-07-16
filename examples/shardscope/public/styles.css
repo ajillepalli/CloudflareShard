@@ -155,6 +155,41 @@ html, body {
   border-bottom: 1px dashed var(--text-dim);
 }
 
+/* Shardscope T4 — invariant scoreboard states (writes/lost/checksum). See
+   app.js's renderScoreboard + checksumClassFor for exactly when each of
+   these applies. */
+
+/* --safe: lost 0, or an idle/last-known-verified checksum. THE hero accent
+   — a slow (~4s) breathing glow, per DESIGN.md's motion section, calm and
+   settled, never urgent. */
+.scoreboard .sb-item.safe {
+  color: var(--safe);
+  animation: scoreboardBreathe 4s ease-in-out infinite;
+}
+.scoreboard .sb-item.safe b { color: var(--safe); }
+@keyframes scoreboardBreathe {
+  0%, 100% { opacity: .72; text-shadow: none; }
+  50% { opacity: 1; text-shadow: 0 0 8px rgba(53, 227, 176, .35); }
+}
+
+/* --migrate: an active, routine reshard state (backfilling/verifying a
+   cutover/aborting a migration) — reads as calm flow, NOT alarm, same
+   reasoning as the topology canvas's own migration-path cyan. Steady, no
+   breathing (it's already visibly "in motion" via its changing label). */
+.scoreboard .sb-item.migrate { color: var(--migrate); }
+
+/* lost > 0 — the ONE legitimate health-red on this entire dashboard (see
+   DESIGN.md: "red never means health", except a genuine lost write, which
+   IS a health failure). Deliberately solid, not breathing — breathing is
+   reserved for "calm and alive"; this is a real alarm and should read as
+   one. No pulsing/flashing either (DESIGN.md: "never frantic pulsing"),
+   just a steady, unmistakable red. */
+.scoreboard .sb-item.lost-red {
+  color: var(--danger-bright);
+  font-weight: 600;
+}
+.scoreboard .sb-item.lost-red b { color: var(--danger-bright); }
+
 /* ============ MAIN AREA ============ */
 .main {
   flex: 1 1 auto;
