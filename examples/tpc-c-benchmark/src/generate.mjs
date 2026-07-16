@@ -290,7 +290,7 @@ export async function seed(opts) {
       client.mutate({
         op: "upsert",
         table: "tpcc_item",
-        partitionKey: itemKey(item.i_id),
+        partitionKey: itemKey(w, item.i_id),
         values: { i_id: item.i_id, i_name: item.i_name, i_price: item.i_price, i_data: item.i_data },
       }),
     );

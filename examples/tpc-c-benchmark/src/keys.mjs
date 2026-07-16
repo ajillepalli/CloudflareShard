@@ -46,8 +46,29 @@ export function orderLineKey(w, d, o, l) {
   return `ol-${pad(w, 4)}-${pad(d, 2)}-${pad(o, 9)}-${pad(l, 2)}`;
 }
 
-export function itemKey(i) {
-  return `i-${pad(i, 6)}`;
+// Codex review round 18 P2 fix: this key used to omit the warehouse
+// entirely (`i-{i}`), identical across every tenant. Item catalog rows are
+// deliberately DUPLICATED per warehouse-tenant (see generate.mjs and README
+// item 7 -- one global catalog, like real TPC-C has, isn't possible under
+// this project's one-tenant-per-warehouse model with no cross-tenant read
+// path), but sharing the exact same partition key across tenants doesn't
+// give each tenant its OWN copy at all: CloudflareShard's row provenance
+// (__cf_row_owners) attributes a physical (table, partitionKey) row to
+// exactly ONE tenant at a time, "latest write wins" with no cross-tenant
+// conflict check (src/shard.ts's upsertRowOwner). Seeding multiple
+// warehouses in sequence meant each later warehouse's upsert silently
+// stole ownership of the SAME physical rows away from every earlier
+// warehouse -- only the last-seeded warehouse actually retained a
+// provenance-valid tpcc_item catalog; every earlier one's rows were still
+// physically present but no longer attributed to it. This never surfaced
+// in this benchmark's own transaction logic (item name/price are read
+// from generate.mjs's client-side cache -- see README item 6 -- never
+// read back from the server at runtime), but it's a real violation of the
+// "each warehouse gets its own copy" design this key was supposed to
+// implement, exactly like stockKey below already does correctly. Fixed by
+// including the warehouse, matching stockKey's own pattern.
+export function itemKey(w, i) {
+  return `i-${pad(w, 4)}-${pad(i, 6)}`;
 }
 
 export function stockKey(w, i) {
