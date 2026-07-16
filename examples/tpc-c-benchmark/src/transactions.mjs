@@ -550,14 +550,43 @@ async function newOrder(world) {
           s_remote_cnt: stockRow.s_remote_cnt,
         };
 
-        const result = await mutateResolvingAmbiguity(supplyWarehouse.client, {
-          op: "update",
-          table: "tpcc_stock",
-          partitionKey: stockRow.s_key,
-          values: stockValues,
-          where: stockWhere,
-          requestId: crypto.randomUUID(),
-        });
+        let result;
+        try {
+          result = await mutateResolvingAmbiguity(supplyWarehouse.client, {
+            op: "update",
+            table: "tpcc_stock",
+            partitionKey: stockRow.s_key,
+            values: stockValues,
+            where: stockWhere,
+            requestId: crypto.randomUUID(),
+          });
+        } catch (err) {
+          // Codex review round 16 P2 fix: mutateResolvingAmbiguity itself
+          // can exhaust its own bounded attempts on a sustained, repeated
+          // network failure. Simply rethrowing here would fall straight to
+          // the outer catch below, which deletes this line's order_line and
+          // reports the line failed WITHOUT knowing the stock decrement
+          // might have genuinely applied -- permanently stranding it
+          // uncompensated even though the rest of this "failed" order goes
+          // on to be compensated. Resolved the same way Delivery's credit
+          // is (item 11): one final read, compared against the EXACT
+          // values this specific update intended across all four stock
+          // fields together -- a coincidental unrelated concurrent write
+          // matching s_quantity, s_ytd, s_order_cnt, AND s_remote_cnt
+          // simultaneously is vanishingly unlikely (s_ytd and s_order_cnt
+          // in particular only ever increase, so an exact match to THIS
+          // update's specific resulting values is effectively conclusive).
+          const verifyRes = await supplyWarehouse.client.indexQuery("tpcc_stock", "idx_stock_by_item", { i_id: line.i_id });
+          const verifyRow = (verifyRes.rows || [])[0];
+          const applied =
+            verifyRow &&
+            verifyRow.s_quantity === stockValues.s_quantity &&
+            verifyRow.s_ytd === stockValues.s_ytd &&
+            verifyRow.s_order_cnt === stockValues.s_order_cnt &&
+            verifyRow.s_remote_cnt === stockValues.s_remote_cnt;
+          if (!applied) throw err;
+          result = { rowsAffected: 1 };
+        }
         if (result.rowsAffected > 0) {
           // Compensation data for compensateFailedOrder, if a LATER sibling
           // line fails and this already-committed one needs to be reversed.
