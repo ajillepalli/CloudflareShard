@@ -1262,7 +1262,11 @@ async function adminCreateIndexLockedCore(
   return json({ ok: true, indexName, table, columns });
 }
 
-async function adminSplitVbucketCore(env: Env, payload: { catalogShardId?: string }, authorization: string | undefined): Promise<Response> {
+async function adminSplitVbucketCore(
+  env: Env,
+  payload: { catalogShardId?: string; vbucket: number; newShardId?: string },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
   }
@@ -1291,11 +1295,15 @@ async function adminSplitVbucketCore(env: Env, payload: { catalogShardId?: strin
 }
 
 async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as { catalogShardId?: string };
+  const payload = (await request.json()) as { catalogShardId?: string; vbucket: number; newShardId?: string };
   return adminSplitVbucketCore(env, payload, request.headers.get("authorization") ?? undefined);
 }
 
-async function adminMigrateVbucketCore(env: Env, payload: { catalogShardId?: string }, authorization: string | undefined): Promise<Response> {
+async function adminMigrateVbucketCore(
+  env: Env,
+  payload: { catalogShardId?: string; vbucket?: number; targetShardId?: string },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
   }
@@ -1313,7 +1321,7 @@ async function adminMigrateVbucketCore(env: Env, payload: { catalogShardId?: str
 }
 
 async function handleAdminMigrateVbucket(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as { catalogShardId?: string };
+  const payload = (await request.json()) as { catalogShardId?: string; vbucket?: number; targetShardId?: string };
   return adminMigrateVbucketCore(env, payload, request.headers.get("authorization") ?? undefined);
 }
 
@@ -1321,7 +1329,16 @@ async function handleAdminMigrateVbucket(request: Request, env: Env): Promise<Re
  * migration endpoints — the catalog owns the state machine and drives the
  * shard-level export/import/fence orchestration from its own alarm. Read-only
  * status / abort forwarders do NOT take the topology lock. */
-function makeCatalogMigrationForwarderCore(path: string): (env: Env, body: { catalogShardId?: string }, authorization: string | undefined) => Promise<Response> {
+// Generic over Body so each instantiation below can declare the real fields
+// its target route needs (vbucket for the two migrate-vbucket-* forwarders,
+// shardId for drain-shard-status) — Codex review P2: the un-parameterized
+// version only declared catalogShardId, which made the RPC methods derived
+// from these Core functions (via Parameters<typeof ...>) type-check callers
+// out of passing vbucket/shardId at all, even though the underlying route
+// requires them.
+function makeCatalogMigrationForwarderCore<Body extends { catalogShardId?: string }>(
+  path: string,
+): (env: Env, body: Body, authorization: string | undefined) => Promise<Response> {
   return async (env, payload, authorization) => {
     if (!payload.catalogShardId) {
       return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
@@ -1331,22 +1348,27 @@ function makeCatalogMigrationForwarderCore(path: string): (env: Env, body: { cat
   };
 }
 
-function makeCatalogMigrationForwarder(path: string): (request: Request, env: Env) => Promise<Response> {
-  const core = makeCatalogMigrationForwarderCore(path);
+function makeCatalogMigrationForwarder<Body extends { catalogShardId?: string }>(
+  path: string,
+): (request: Request, env: Env) => Promise<Response> {
+  const core = makeCatalogMigrationForwarderCore<Body>(path);
   return async (request, env) => {
-    const payload = (await request.json()) as { catalogShardId?: string };
+    const payload = (await request.json()) as Body;
     return core(env, payload, request.headers.get("authorization") ?? undefined);
   };
 }
 
-const handleAdminMigrateVbucketStatus = makeCatalogMigrationForwarder("/migrate-vbucket-status");
-const handleAdminMigrateVbucketAbort = makeCatalogMigrationForwarder("/migrate-vbucket-abort");
-// Milestone 3, Chunk 5: progress of a shard drain's two evacuation loops.
-const handleAdminDrainShardStatus = makeCatalogMigrationForwarder("/drain-shard-status");
+type MigrateVbucketStatusOrAbortBody = { catalogShardId?: string; vbucket?: number };
+type DrainShardStatusBody = { catalogShardId?: string; shardId?: string };
 
-const adminMigrateVbucketStatusCore = makeCatalogMigrationForwarderCore("/migrate-vbucket-status");
-const adminMigrateVbucketAbortCore = makeCatalogMigrationForwarderCore("/migrate-vbucket-abort");
-const adminDrainShardStatusCore = makeCatalogMigrationForwarderCore("/drain-shard-status");
+const handleAdminMigrateVbucketStatus = makeCatalogMigrationForwarder<MigrateVbucketStatusOrAbortBody>("/migrate-vbucket-status");
+const handleAdminMigrateVbucketAbort = makeCatalogMigrationForwarder<MigrateVbucketStatusOrAbortBody>("/migrate-vbucket-abort");
+// Milestone 3, Chunk 5: progress of a shard drain's two evacuation loops.
+const handleAdminDrainShardStatus = makeCatalogMigrationForwarder<DrainShardStatusBody>("/drain-shard-status");
+
+const adminMigrateVbucketStatusCore = makeCatalogMigrationForwarderCore<MigrateVbucketStatusOrAbortBody>("/migrate-vbucket-status");
+const adminMigrateVbucketAbortCore = makeCatalogMigrationForwarderCore<MigrateVbucketStatusOrAbortBody>("/migrate-vbucket-abort");
+const adminDrainShardStatusCore = makeCatalogMigrationForwarderCore<DrainShardStatusBody>("/drain-shard-status");
 
 async function adminStatusCore(env: Env, authorization: string | undefined): Promise<Response> {
   const results = await fanOutToAllCatalogs(env, "/status", () => ({}), authorization);
