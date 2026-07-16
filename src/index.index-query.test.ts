@@ -4,7 +4,7 @@ import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { ALL_TEST_SHARD_IDS, AUTH, createIndexTestTable, initCluster, pollIndexRows, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
+import { ALL_TEST_SHARD_IDS, AUTH, createIndexTestTable, driveIndexBackfillToCompletion, initCluster, pollIndexRows, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -19,6 +19,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_mutate_evt");
     await post("/admin/create-index", { indexName: "idx_c4_mutate_by_v", table: "idx_c4_mutate_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_mutate_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -37,6 +38,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_tx_evt");
     await post("/admin/create-index", { indexName: "idx_c4_tx_by_v", table: "idx_c4_tx_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_tx_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -53,6 +55,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_empty_evt");
     await post("/admin/create-index", { indexName: "idx_c4_empty_by_v", table: "idx_c4_empty_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_empty_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -90,6 +93,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     );
     expect(res0.status).toBe(200);
     await post("/admin/create-index", { indexName: "idx_c4_partial_by_ab", table: "idx_c4_partial_evt", columns: ["a", "b"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_partial_by_ab");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -103,6 +107,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_stale_evt");
     await post("/admin/create-index", { indexName: "idx_c4_stale_by_v", table: "idx_c4_stale_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_stale_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -136,6 +141,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_limit_evt");
     await post("/admin/create-index", { indexName: "idx_c4_limit_by_v", table: "idx_c4_limit_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_limit_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -154,6 +160,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c4_pagestale_evt");
     await post("/admin/create-index", { indexName: "idx_c4_pagestale_by_v", table: "idx_c4_pagestale_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c4_pagestale_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -218,6 +225,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_tenantcap_evt");
     await post("/admin/create-index", { indexName: "idx_tenantcap_by_v", table: "idx_tenantcap_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_tenantcap_by_v");
     const tenantA = tenantForCatalogShard(0, 4);
     const tokenA = await registerTenant(tenantA);
 
@@ -304,6 +312,7 @@ describe("Worker /v1/index-query (Milestone 2 Chunk 4)", () => {
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
     await createIndexTestTable("idx_iso_evt");
     await post("/admin/create-index", { indexName: "idx_iso_by_v", table: "idx_iso_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_iso_by_v");
 
     const tenantA = tenantForCatalogShard(0, 4);
     const tokenA = await registerTenant(tenantA);
@@ -355,6 +364,7 @@ describe("Worker /v1/index-query dual-lookup during ring evacuation (Codex round
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("p2dual_evt");
     await post("/admin/create-index", { indexName: "p2dual_by_v", table: "p2dual_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("p2dual_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -409,6 +419,7 @@ describe("Worker /v1/index-query dual-lookup during ring evacuation (Codex round
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("union_evt");
     await post("/admin/create-index", { indexName: "union_by_v", table: "union_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("union_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -476,6 +487,7 @@ describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", (
     await post("/admin/init", { numShards: 2, totalVBuckets: 64, force: true }, AUTH());
     await createIndexTestTable("idx_c2_reroute_evt");
     await post("/admin/create-index", { indexName: "idx_c2_reroute_by_v", table: "idx_c2_reroute_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c2_reroute_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -579,9 +591,20 @@ describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", (
       }),
     );
 
+    // Codex live-deployment finding: backfill is no longer synchronous, so
+    // /admin/create-index itself always returns 200 (registration succeeds,
+    // backfill merely STARTS) — the PROVENANCE_MISSING_FOR_INDEX condition
+    // now surfaces only inside catalog-0's alarm loop, which logs it and
+    // retries the SAME unresolved row forever (see advanceIndexBackfill's
+    // doc comment) rather than ever completing. The observable behavior is
+    // that the index never reaches 'ready', not a synchronous error
+    // response — driveIndexBackfillToCompletion throwing after exhausting
+    // its tick budget is exactly that non-completion, asserted directly.
     const res = await post("/admin/create-index", { indexName: "idx_c2_noprov_by_v", table: "idx_c2_noprov_evt", columns: ["v"] }, AUTH());
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("PROVENANCE_MISSING_FOR_INDEX");
+    expect(res.status).toBe(200);
+    await expect(driveIndexBackfillToCompletion("idx_c2_noprov_by_v", 5)).rejects.toThrow();
+    const statusRes = await post("/admin/create-index-status", { indexName: "idx_c2_noprov_by_v" }, AUTH());
+    const statusBody = (await statusRes.json()) as { status: string };
+    expect(statusBody.status).toBe("building");
   });
 });

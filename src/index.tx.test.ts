@@ -4,7 +4,7 @@ import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { ALL_TEST_SHARD_IDS, AUTH, createIndexTestTable, findPartitionKeyPairOnDifferentShards, initCluster, pollIndexRows, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
+import { ALL_TEST_SHARD_IDS, AUTH, createIndexTestTable, driveIndexBackfillToCompletion, findPartitionKeyPairOnDifferentShards, initCluster, pollIndexRows, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -324,6 +324,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c3_samerow_evt");
     await post("/admin/create-index", { indexName: "idx_c3_samerow_by_v", table: "idx_c3_samerow_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c3_samerow_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -374,6 +375,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     );
     expect(res0.status).toBe(200);
     await post("/admin/create-index", { indexName: "idx_c3_simwhere_by_v", table: "idx_c3_simwhere_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c3_simwhere_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
@@ -420,6 +422,7 @@ describe("Worker /v1/tx index-ring write fence (Codex round-14 P1)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 8, force: true }, AUTH());
     await createIndexTestTable("txfence_evt");
     await post("/admin/create-index", { indexName: "txfence_by_v", table: "txfence_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("txfence_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
