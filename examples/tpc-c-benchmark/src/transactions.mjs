@@ -61,6 +61,24 @@
 //     would make the reversal itself safely no-op (never corrupt) rather
 //     than fully undo -- doubly unlikely, and a dropped compensation is a
 //     stranded stock decrement, not silent corruption.
+//     A FOURTH round of review found two more, both closed: (a) a remote
+//     line whose order_line insert succeeded but whose stock update then
+//     failed threw before processOrderLine could return its compensation
+//     record, so compensateFailedOrder never learned about that already-
+//     inserted row -- fixed by compensating it immediately, inline, right
+//     where the failure happens, instead of relying on the outer mechanism
+//     to know about a partial success it was never told about. (b) two
+//     lines within the SAME order referencing the same (supplyWarehouseId,
+//     i_id) stock row could race their compare-and-swap updates -- for a
+//     same-warehouse pair, /v1/tx still reports "committed" even when the
+//     second update's `where` guard silently didn't match, so the order
+//     could end up "successful" with both order_line rows inserted but only
+//     ONE of the two stock decrements actually applied (undetectable after
+//     the fact, since /v1/tx doesn't report per-mutation rowsAffected) --
+//     fixed by preventing the collision outright: line generation now
+//     dedupes (supplyWarehouseId, i_id) pairs within one order (bounded
+//     retry, falling back to accepting a duplicate only if --items is
+//     configured smaller than the line count).
 //   - Remote (cross-warehouse) order lines in New-Order (~1% of lines) fall
 //     back to two independent, non-atomic /v1/mutate calls instead of a
 //     2-participant tx -- a consequence of /v1/tx's one-tenantId-per-call
@@ -92,8 +110,23 @@ async function newOrder(world) {
 
   const lineCount = randInt(5, 15);
   const lines = [];
+  // Codex review P2 fix: no two lines in ONE order may reference the same
+  // (supplyWarehouseId, i_id) stock row. If they did, both lines' workers
+  // could read the same stock row before either writes, then race their
+  // compare-and-swap updates -- for a same-warehouse line pair, `/v1/tx`
+  // still reports "committed" even when the second update's `where` guard
+  // silently failed to match (no per-mutation rowsAffected from /v1/tx), so
+  // the order would end up "successful" with both order_line rows inserted
+  // but only ONE of the two stock decrements actually applied. A real
+  // arithmetic UPDATE wouldn't have this problem at all; CloudflareShard's
+  // structured mutations don't offer one, so the fix here is to prevent the
+  // collision from ever occurring instead of trying to detect it after the
+  // fact. Bounded retry: if a configured --items pool is smaller than this
+  // order's line count (only reachable with an unusually small --items
+  // value relative to the realistic 5-15 line count), falls back to
+  // accepting a duplicate rather than looping forever.
+  const usedSupplyItemKeys = new Set();
   for (let l = 1; l <= lineCount; l++) {
-    const i_id = world.randomItemId();
     let supplyWarehouseId = w;
     // 1% cross-warehouse rate, matching the real spec's convention -- only
     // possible when more than one warehouse was seeded.
@@ -102,6 +135,15 @@ async function newOrder(world) {
         supplyWarehouseId = world.warehouses[randInt(0, world.warehouses.length - 1)].warehouseId;
       } while (supplyWarehouseId === w);
     }
+    let i_id;
+    let key;
+    let attempts = 0;
+    do {
+      i_id = world.randomItemId();
+      key = `${supplyWarehouseId}-${i_id}`;
+      attempts++;
+    } while (usedSupplyItemKeys.has(key) && attempts < 20);
+    usedSupplyItemKeys.add(key);
     lines.push({ ol_number: l, i_id, supplyWarehouseId, qty: randInt(1, 10), remote: supplyWarehouseId !== w });
   }
 
@@ -310,16 +352,35 @@ async function newOrder(world) {
       // the same compare-and-swap `where` guard here can actually be
       // detected and surfaced as a real error rather than silently no-oping.
       await home.client.mutate({ op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues, requestId: crypto.randomUUID() });
-      const stockMutateResult = await supplyWarehouse.client.mutate({
-        op: "update",
-        table: "tpcc_stock",
-        partitionKey: stockRow.s_key,
-        values: stockValues,
-        where: stockWhere,
-        requestId: crypto.randomUUID(),
-      });
-      if (stockMutateResult.rowsAffected === 0) {
-        throw new Error(`stock row ${stockRow.s_key} changed concurrently -- remote line's stock update did not apply`);
+      try {
+        const stockMutateResult = await supplyWarehouse.client.mutate({
+          op: "update",
+          table: "tpcc_stock",
+          partitionKey: stockRow.s_key,
+          values: stockValues,
+          where: stockWhere,
+          requestId: crypto.randomUUID(),
+        });
+        if (stockMutateResult.rowsAffected === 0) {
+          throw new Error(`stock row ${stockRow.s_key} changed concurrently -- remote line's stock update did not apply`);
+        }
+      } catch (err) {
+        // Codex review P2 fix: the order_line insert above already
+        // committed, but processOrderLine is about to throw (leaving this
+        // line out of the caller's succeededLines array entirely, since it
+        // never returns) -- compensateFailedOrder only knows how to reverse
+        // lines it actually receives back, so an already-inserted order_line
+        // from a line that fails HERE would otherwise never get cleaned up.
+        // Compensate it right here, immediately, rather than depend on the
+        // outer mechanism knowing about a partial success it was never told
+        // about.
+        await home.client
+          .mutate({ op: "delete", table: "tpcc_order_line", partitionKey: olKey, requestId: crypto.randomUUID() })
+          .catch(() => {
+            // Best-effort -- surfacing the ORIGINAL error below matters more
+            // than this cleanup attempt's own outcome.
+          });
+        throw err;
       }
     }
     return compensation;
