@@ -17,74 +17,65 @@
 //   - Payment's by-name lookup variant is dropped (ID-only), same reason.
 //   - Stock-Level's server-side aggregate is replaced with table-scan +
 //     client-side counting -- no aggregation pushdown exists.
-//   - New-Order's per-order-line atomicity is split from the order header
-//     (district update + order insert are one tx; each line's order_line
-//     insert + stock update is a SEPARATE tx) -- a direct consequence of the
-//     8-participant cap: a New-Order with the spec's default 5-15 lines
-//     could touch 2 + 2*15 = 32 distinct rows, far past the cap, if
-//     attempted as one transaction. The new_order marker itself (what makes
-//     an order visible to Delivery at all) is deliberately inserted LAST,
-//     as its own standalone write after every line has committed -- not
-//     alongside district+orders in the header tx -- specifically so a
-//     concurrent Delivery pass can never observe an order that's still
-//     mid-flight (Codex review found this: inserting the marker up front
-//     let Delivery race New-Order's own line-processing loop, summing an
-//     incomplete order and orphaning whichever lines hadn't landed yet).
-//     A second, narrower gap was found the same way (confirmed live:
-//     seeding fresh warehouses and running under contention reliably
-//     produced a small number of these): runPool's own `Promise.all`
-//     rejects on the FIRST line to throw without waiting for other
-//     still-in-flight lines, so if one line failed (a TX_ABORTED, a
-//     detected stock conflict), the New-Order function threw and skipped
-//     the marker insert entirely -- while OTHER lines already in flight in
-//     parallel workers could still commit successfully in the background
-//     afterward, leaving a real, partial, permanently-undelivered order
-//     behind. Fixed by catching each line's own error INSIDE the pool
-//     callback instead of letting it propagate through Promise.all: every
-//     line is now always awaited to completion (success or caught failure)
-//     before the function decides whether to insert the marker or report an
-//     aggregate failure. A THIRD round of review (Codex, again) correctly
-//     pointed out that this still left the header + any already-succeeded
-//     lines committed with no rollback when one line failed -- a real,
-//     permanent partial order. compensateFailedOrder (below, in newOrder)
-//     now actually reverses those: deletes each already-committed line and
-//     reverts its stock update (itself a compare-and-swap against exactly
-//     the values that line applied, so it safely no-ops rather than
-//     corrupts if some OTHER write touched the row again meanwhile), then
-//     deletes the orphaned orders row. d_next_o_id is deliberately NOT
-//     decremented back (a different, newer New-Order may have already
-//     claimed the incremented value) -- the resulting gap in the o_id
-//     sequence is expected and harmless, like a rolled-back insert leaving
-//     a gap in a real database's auto-increment sequence. Genuinely
-//     residual after this: a THIRD concurrent write landing in the narrow
-//     window between a line's own update and its compensation reversal
-//     would make the reversal itself safely no-op (never corrupt) rather
-//     than fully undo -- doubly unlikely, and a dropped compensation is a
-//     stranded stock decrement, not silent corruption.
-//     A FOURTH round of review found two more, both closed: (a) a remote
-//     line whose order_line insert succeeded but whose stock update then
-//     failed threw before processOrderLine could return its compensation
-//     record, so compensateFailedOrder never learned about that already-
-//     inserted row -- fixed by compensating it immediately, inline, right
-//     where the failure happens, instead of relying on the outer mechanism
-//     to know about a partial success it was never told about. (b) two
-//     lines within the SAME order referencing the same (supplyWarehouseId,
-//     i_id) stock row could race their compare-and-swap updates -- for a
-//     same-warehouse pair, /v1/tx still reports "committed" even when the
-//     second update's `where` guard silently didn't match, so the order
-//     could end up "successful" with both order_line rows inserted but only
-//     ONE of the two stock decrements actually applied (undetectable after
-//     the fact, since /v1/tx doesn't report per-mutation rowsAffected) --
-//     fixed by preventing the collision outright: line generation now
-//     dedupes (supplyWarehouseId, i_id) pairs within one order (bounded
-//     retry, falling back to accepting a duplicate only if --items is
-//     configured smaller than the line count).
-//   - Remote (cross-warehouse) order lines in New-Order (~1% of lines) fall
-//     back to two independent, non-atomic /v1/mutate calls instead of a
-//     2-participant tx -- a consequence of /v1/tx's one-tenantId-per-call
-//     rule combined with the one-tenant-per-warehouse model. Only
-//     same-warehouse order lines (~99%) get full order_line+stock
-//     atomicity.
+//   - New-Order's atomicity is split across several pieces, not one single
+//     transaction covering the whole order -- a direct consequence of two
+//     platform limits working together: the 8-participant /v1/tx cap (a
+//     5-15 line order could touch 30+ rows if attempted as one transaction)
+//     and /v1/tx not reporting per-mutation rowsAffected (a compare-and-swap
+//     `where` guard bundled inside a /v1/tx is undetectable on failure --
+//     the whole transaction still reports "committed" even when the guard
+//     silently matched zero rows). The header (district update + order
+//     insert) is one small tx (2 rows, always fits, no guard needed --
+//     see below). Each line does its order_line insert and stock update as
+//     TWO separate /v1/mutate calls -- same-warehouse and remote lines are
+//     no longer distinguished for atomicity, both trade order_line+stock
+//     atomicity for the ability to actually detect and retry a losing
+//     stock CAS guard (which /v1/mutate's rowsAffected makes possible,
+//     unlike /v1/tx). The new_order marker (what makes an order visible to
+//     Delivery at all) is inserted LAST, only once every line has
+//     genuinely committed -- not alongside the header -- so a concurrent
+//     Delivery pass can never observe an order that's still mid-flight.
+//     Five real bugs were found here across four rounds of review, each
+//     verified live against fresh warehouses under contention, before this
+//     shape converged: (1) inserting the marker alongside the header let
+//     Delivery race New-Order's own line-processing loop, summing an
+//     incomplete order. (2) `runPool`'s `Promise.all` used to reject on the
+//     first line to fail without waiting for other still-in-flight lines,
+//     so other lines could keep committing in the background after the
+//     function had already thrown past the marker insert -- fixed by
+//     catching each line's own error inside the pool instead of letting it
+//     propagate. (3) even with that fix, a genuinely failed line still left
+//     its already-committed siblings and the header uncompensated forever
+//     -- fixed with `compensateFailedOrder`, a real compensating-transaction
+//     step: reverses each already-committed line (deletes its order_line
+//     row, reverts its stock update via its own compare-and-swap matching
+//     exactly the values that line applied, so it safely no-ops rather than
+//     corrupts if a different write touched the row again meanwhile), then
+//     deletes the orphaned `orders` row (`d_next_o_id` deliberately not
+//     decremented back, since a different, newer order may have already
+//     claimed the incremented value -- an expected, harmless gap in the
+//     o_id sequence, like a rolled-back insert leaving a gap in a real
+//     database's auto-increment sequence). (4) a remote line whose
+//     order_line insert succeeded but whose stock update then failed threw
+//     before it could return its compensation record, so a partial insert
+//     went uncompensated -- fixed by compensating it inline, immediately,
+//     at the point of failure. (5) two DIFFERENT concurrent orders racing
+//     the SAME stock item (this benchmark's reduced default --items pool
+//     makes this real, not theoretical) could have the losing one's stock
+//     CAS guard silently fail to match while the same-warehouse case's
+//     /v1/tx bundle still reported "committed" -- undetectable and
+//     unretriable from inside /v1/tx. Fixed by unifying same-warehouse and
+//     remote lines onto the same /v1/mutate-plus-bounded-retry pattern (see
+//     MUTATION_RETRY_ATTEMPTS), giving up order_line+stock atomicity
+//     entirely in exchange for a stock CAS that's always detectable and
+//     safely retryable. Genuinely residual after all five fixes: a THIRD
+//     concurrent write landing in the narrow window between a line's
+//     update and its own compensation reversal makes that reversal safely
+//     no-op rather than fully undo -- doubly unlikely, and results in a
+//     stranded stock decrement, not silent corruption. Round 6's
+//     within-one-order (supplyWarehouseId, i_id) dedup remains in place
+//     too -- it reduces how often the retry loop is even needed, though it
+//     no longer needs to carry the whole correctness burden by itself.
 
 import { runPool } from "./client.mjs";
 import { orderKey, orderLineKey, newOrderKey, historyKey } from "./keys.mjs";
@@ -96,6 +87,14 @@ function randInt(min, max) {
 function randomAmount(min, max) {
   return Math.round((min + Math.random() * (max - min)) * 100) / 100;
 }
+
+// Shared by every read-compute-write retry loop in this file (New-Order's
+// stock update, Payment's warehouse/district/customer updates, Delivery's
+// customer credit) -- see their own comments for why a bounded retry
+// against a fresh read, backed by /v1/mutate's per-call rowsAffected, is
+// the only safe way to make a compare-and-swap-guarded counter update both
+// correct AND detectable.
+const MUTATION_RETRY_ATTEMPTS = 5;
 
 function round2(n) {
   return Math.round(n * 100) / 100;
@@ -266,45 +265,7 @@ async function newOrder(world) {
   async function processOrderLine(line) {
     const item = world.itemByI_id.get(line.i_id);
     const supplyWarehouse = world.warehouseById.get(line.supplyWarehouseId);
-
-    // This index-query always targets the SUPPLY warehouse's own tenant's
-    // stock table (which only has stock for its own warehouse) -- for a
-    // remote line that means looking up the OTHER warehouse's cached token,
-    // the honest way to model "remote supply warehouse" under the
-    // one-tenant-per-warehouse model.
-    const stockRes = await supplyWarehouse.client.indexQuery("tpcc_stock", "idx_stock_by_item", { i_id: line.i_id });
-    const stockRow = (stockRes.rows || [])[0];
-    if (!stockRow) throw new Error(`no stock row for item ${line.i_id} in warehouse ${line.supplyWarehouseId}`);
-
-    let newQty = stockRow.s_quantity - line.qty;
-    if (newQty < 10) newQty += 91;
-    const stockValues = {
-      s_quantity: newQty,
-      s_ytd: stockRow.s_ytd + line.qty,
-      s_order_cnt: stockRow.s_order_cnt + 1,
-      s_remote_cnt: stockRow.s_remote_cnt + (line.remote ? 1 : 0),
-    };
-    // Codex review P2 fix: these are absolute values computed from a read
-    // that happened before this write -- CloudflareShard's structured
-    // mutations have no server-side arithmetic UPDATE (`values` always SETs
-    // to a literal, never `col - ?`), so a second concurrent New-Order line
-    // touching the SAME stock row (a popular item, or a small --items pool)
-    // could otherwise silently overwrite this decrement with its own
-    // equally-stale computation, losing one of the two entirely with no
-    // error from either caller. `where` makes the UPDATE a compare-and-swap
-    // against the exact row this was computed from: if another write beat
-    // this one to the row, the predicate won't match and this UPDATE becomes
-    // a no-op instead of corrupting the counter with a stale value. Note this
-    // still isn't a full fix -- /v1/tx doesn't report per-mutation
-    // rowsAffected, so there's no signal here to retry on (see the mutate
-    // path below, which can detect and at least surface it). A dropped
-    // update is silently safer than a corrupting one, not a correct one.
-    const stockWhere = {
-      s_quantity: stockRow.s_quantity,
-      s_ytd: stockRow.s_ytd,
-      s_order_cnt: stockRow.s_order_cnt,
-      s_remote_cnt: stockRow.s_remote_cnt,
-    };
+    const olKey = orderLineKey(w, d, o_id, line.ol_number);
     const ol_amount = round2(item.i_price * line.qty);
     const orderLineValues = {
       w_id: w,
@@ -317,43 +278,53 @@ async function newOrder(world) {
       ol_amount,
       ol_delivery_d: null,
     };
-    const olKey = orderLineKey(w, d, o_id, line.ol_number);
 
-    // Compensation data for compensateFailedOrder, if a LATER sibling line
-    // fails and this already-committed one needs to be reversed.
-    const compensation = {
-      orderLineClient: home.client,
-      stockClient: supplyWarehouse.client,
-      olKey,
-      stockKey: stockRow.s_key,
-      originalStock: stockWhere,
-      appliedStock: stockValues,
-    };
+    // Codex review round 8 P2 fix: same-warehouse and remote lines now share
+    // the IDENTICAL pattern -- insert order_line via /v1/mutate, then
+    // retry-loop the stock update via /v1/mutate (checked rowsAffected),
+    // compensating the order_line insert if the stock update ultimately
+    // can't apply. An earlier version bundled the same-warehouse case into
+    // one atomic 2-participant /v1/tx instead, for full order_line+stock
+    // atomicity -- but review found that atomicity comes at the cost of
+    // detectability: two DIFFERENT concurrent New-Orders racing the SAME
+    // stock item (this benchmark's deliberately reduced default --items
+    // pool makes this a real, not theoretical, scenario -- round 6's
+    // within-one-order dedup doesn't help here, since these are two
+    // SEPARATE orders) could have the losing one's stock CAS guard silently
+    // fail to match while /v1/tx still reported the whole line's tx
+    // "committed" -- order_line inserted, stock decrement silently dropped,
+    // and the New-Order counted as fully successful. Only /v1/mutate's
+    // per-call rowsAffected makes a safe retry possible, the same reasoning
+    // already applied to Payment/Delivery's counter updates.
+    await home.client.mutate({ op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues, requestId: crypto.randomUUID() });
 
-    if (!line.remote) {
-      // Same-warehouse line: order_line insert + stock update as one
-      // 2-participant tx -- full atomicity, both mutations share this
-      // warehouse's tenantId.
-      await home.client.tx(
-        [
-          { op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues },
-          { op: "update", table: "tpcc_stock", partitionKey: stockRow.s_key, values: stockValues, where: stockWhere },
-        ],
-        crypto.randomUUID(),
-      );
-    } else {
-      // Remote line (~1%): order_line belongs to the ORDERING warehouse's
-      // tenant, the stock update belongs to the SUPPLY warehouse's tenant --
-      // /v1/tx requires every mutation in one call to share one tenantId, so
-      // this pair can't be a single atomic tx across two tenants. Falls back
-      // to two independent /v1/mutate calls (see file header comment) --
-      // trades away order_line+stock atomicity for the ~1% of lines this
-      // happens to. /v1/mutate (unlike /v1/tx) DOES report rowsAffected, so
-      // the same compare-and-swap `where` guard here can actually be
-      // detected and surfaced as a real error rather than silently no-oping.
-      await home.client.mutate({ op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues, requestId: crypto.randomUUID() });
-      try {
-        const stockMutateResult = await supplyWarehouse.client.mutate({
+    try {
+      for (let attempt = 1; ; attempt++) {
+        // This index-query always targets the SUPPLY warehouse's own
+        // tenant's stock table (which only has stock for its own
+        // warehouse) -- for a remote line that means looking up the OTHER
+        // warehouse's cached token, the honest way to model "remote supply
+        // warehouse" under the one-tenant-per-warehouse model.
+        const stockRes = await supplyWarehouse.client.indexQuery("tpcc_stock", "idx_stock_by_item", { i_id: line.i_id });
+        const stockRow = (stockRes.rows || [])[0];
+        if (!stockRow) throw new Error(`no stock row for item ${line.i_id} in warehouse ${line.supplyWarehouseId}`);
+
+        let newQty = stockRow.s_quantity - line.qty;
+        if (newQty < 10) newQty += 91;
+        const stockValues = {
+          s_quantity: newQty,
+          s_ytd: stockRow.s_ytd + line.qty,
+          s_order_cnt: stockRow.s_order_cnt + 1,
+          s_remote_cnt: stockRow.s_remote_cnt + (line.remote ? 1 : 0),
+        };
+        const stockWhere = {
+          s_quantity: stockRow.s_quantity,
+          s_ytd: stockRow.s_ytd,
+          s_order_cnt: stockRow.s_order_cnt,
+          s_remote_cnt: stockRow.s_remote_cnt,
+        };
+
+        const result = await supplyWarehouse.client.mutate({
           op: "update",
           table: "tpcc_stock",
           partitionKey: stockRow.s_key,
@@ -361,33 +332,38 @@ async function newOrder(world) {
           where: stockWhere,
           requestId: crypto.randomUUID(),
         });
-        if (stockMutateResult.rowsAffected === 0) {
-          throw new Error(`stock row ${stockRow.s_key} changed concurrently -- remote line's stock update did not apply`);
+        if (result.rowsAffected > 0) {
+          // Compensation data for compensateFailedOrder, if a LATER sibling
+          // line fails and this already-committed one needs to be reversed.
+          return {
+            orderLineClient: home.client,
+            stockClient: supplyWarehouse.client,
+            olKey,
+            stockKey: stockRow.s_key,
+            originalStock: stockWhere,
+            appliedStock: stockValues,
+          };
         }
-      } catch (err) {
-        // Codex review P2 fix: the order_line insert above already
-        // committed, but processOrderLine is about to throw (leaving this
-        // line out of the caller's succeededLines array entirely, since it
-        // never returns) -- compensateFailedOrder only knows how to reverse
-        // lines it actually receives back, so an already-inserted order_line
-        // from a line that fails HERE would otherwise never get cleaned up.
-        // Compensate it right here, immediately, rather than depend on the
-        // outer mechanism knowing about a partial success it was never told
-        // about.
-        await home.client
-          .mutate({ op: "delete", table: "tpcc_order_line", partitionKey: olKey, requestId: crypto.randomUUID() })
-          .catch(() => {
-            // Best-effort -- surfacing the ORIGINAL error below matters more
-            // than this cleanup attempt's own outcome.
-          });
-        throw err;
+        if (attempt >= MUTATION_RETRY_ATTEMPTS) {
+          throw new Error(`stock row ${stockRow.s_key} update did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
+        }
       }
+    } catch (err) {
+      // The order_line insert above already committed, but this line as a
+      // whole is about to fail -- compensate it right here, immediately,
+      // rather than depend on the outer succeededLines/compensateFailedOrder
+      // mechanism knowing about a partial success it was never told about
+      // (processOrderLine never returns in this path, so it can't).
+      await home.client
+        .mutate({ op: "delete", table: "tpcc_order_line", partitionKey: olKey, requestId: crypto.randomUUID() })
+        .catch(() => {
+          // Best-effort -- surfacing the ORIGINAL error below matters more
+          // than this cleanup attempt's own outcome.
+        });
+      throw err;
     }
-    return compensation;
   }
 }
-
-const MUTATION_RETRY_ATTEMPTS = 5;
 
 /** Payment: weight 43% of the standard TPC-C mix.
  *
@@ -586,12 +562,21 @@ async function delivery(world) {
     if (claimResult.rowsAffected === 0) continue; // already claimed by a concurrent Delivery worker
 
     // Codex review P2 fix: the marker is gone the moment the claim above
-    // commits -- if ANYTHING below fails (a not-found lookup, contention on
-    // the customer row exhausting its retry budget, a network error), the
-    // order would otherwise be permanently invisible to every future
-    // Delivery pass (claimed, but never actually delivered, with no marker
-    // left to find it by again). Restore the marker on any failure here so
-    // a later Delivery pass can retry the whole thing from scratch.
+    // commits -- if anything before the customer credit below fails (a
+    // not-found lookup, contention on the customer row exhausting its
+    // retry budget, a network error), the order would otherwise be
+    // permanently invisible to every future Delivery pass (claimed, but
+    // never actually delivered, with no marker left to find it by again).
+    // Restore the marker on any SUCH failure so a later Delivery pass can
+    // retry the whole thing from scratch. Codex review round 8 P2 fix:
+    // this try/catch must end the MOMENT the customer credit is confirmed
+    // applied, not wrap deliverLines(lines) too -- an earlier version
+    // wrapped both, so a failure in deliverLines (marking individual lines'
+    // delivery dates, well after the customer was already credited) would
+    // restore the marker and let a future Delivery pass pick up and
+    // re-credit the SAME order a second time. Once the credit is confirmed,
+    // this order must never be reprocessed, regardless of what happens next.
+    let lines;
     try {
       const orderRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_id", { d_id: d, o_id });
       const orderRow = (orderRes.rows || [])[0];
@@ -608,7 +593,7 @@ async function delivery(world) {
       });
 
       const linesRes = await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id }, 15);
-      const lines = linesRes.rows || [];
+      lines = linesRes.rows || [];
       const sumAmount = round2(lines.reduce((acc, l) => acc + (l.ol_amount || 0), 0));
 
       // Codex review round 7 P2 fix: same reasoning as Payment's retry loops
@@ -640,8 +625,6 @@ async function delivery(world) {
           throw new Error(`customer ${orderRow.c_id} delivery credit did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
         }
       }
-
-      await deliverLines(lines);
     } catch (err) {
       await home.client
         .mutate({ op: "insert", table: "tpcc_new_order", partitionKey: oldest.no_key, values: { w_id: w, d_id: d, o_id }, requestId: crypto.randomUUID() })
@@ -651,6 +634,15 @@ async function delivery(world) {
         });
       throw err;
     }
+
+    // Deliberately OUTSIDE the try/catch above: the customer is already
+    // credited at this point, so a failure here must NOT restore the
+    // marker (that would let a future Delivery pass re-credit the same
+    // order). A failure marking lines delivered is recorded as this
+    // Delivery attempt's own failure, but the order itself is done --
+    // narrower and more benign than losing the credit-vs-no-credit
+    // distinction would be.
+    await deliverLines(lines);
 
     // Marking each line delivered is done non-transactionally, one
     // /v1/mutate per line, deliberately OUTSIDE the customer-credit update
