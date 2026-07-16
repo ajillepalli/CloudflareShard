@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.1.0.3] - 2026-07-15 — CoordinatorDO schema-guard
+
+No functional changes, minor perf fix. `CoordinatorDO.ensureSchema()` was the one Durable Object class in the codebase still running its DDL/PRAGMA statements on every `alarm()`/`handle()` call instead of once per in-memory instance — `ShardDO` and `CatalogDO` have both used a `schemaEnsured` boolean-guard flag for this since earlier milestones. Applied the same guard here so all three DO classes are consistent. Found via teammate code review.
+
 ## [2.1.0.2] - 2026-07-15 — README screenshots
 
 No functional changes. Deployed the Worker to Cloudflare for the first time (`cloudflare-shard-mvp.ananth-jillepalli.workers.dev`) and ran the API quickstart end to end against the live deployment. Added two screenshots to README.md's quickstart, built from that real run (not fabricated example output): cluster init through tenant registration, and `/v1/table-scan`'s `provenance.complete` transitioning from `false` to `true` across a `/admin/backfill-provenance` call.
