@@ -960,12 +960,12 @@ html, body {
 }
 
 /* ============ CHAOS "BREAK IT" PANEL (T9) ============
-   Every enabled .danger-btn fires a REAL attack (see ../src/chaos.ts +
-   app.js's chaos section) — --danger is reserved for exactly this: attack
-   EVENTS, never a health/state color (DESIGN.md's "red never means health"
-   rule). The one honestly-disabled button (blip-shard-offline) keeps the
-   older, dimmer "placeholder" treatment so it visually reads as inert next
-   to its live siblings. */
+   Every .danger-btn fires a REAL attack (see ../src/chaos.ts + app.js's
+   chaos section) — --danger is reserved for exactly this: attack EVENTS,
+   never a health/state color (DESIGN.md's "red never means health" rule).
+   .danger-btn.disabled (below) is unused today (every attack, including
+   blip-shard-offline, is a live button) but kept as the dimmer "placeholder"
+   treatment for any future not-yet-wired attack. */
 .section-divider {
   display: flex;
   align-items: center;

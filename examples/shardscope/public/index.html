@@ -261,25 +261,22 @@
 
           <div class="reshard-error" data-hook="reshard-error" hidden></div>
 
-          <!-- Chaos "Break It" panel — T9. Every enabled button fires a REAL
-               attack (POST /api/chaos/<attack> — see ../src/chaos.ts) against
-               the live cluster over the same surfaces the rest of this app
+          <!-- Chaos "Break It" panel — T9. Every button fires a REAL attack
+               (POST /api/chaos/<attack> — see ../src/chaos.ts) against the
+               live cluster over the same surfaces the rest of this app
                already uses (the gateway's /v1/mutate for double-submit /
                mismatched-replay; ../src/reshard.ts's admin RPC wrappers,
-               reused verbatim, for the topology attacks). The ONE attack that
-               cannot be made genuinely destructive without a core change
-               (making a shard's Durable Object unreachable mid-cutover) is a
-               disabled, honestly-labeled control, never a faked button — see
-               its title attribute below and src/chaos.ts's header comment.
-               The T4 scoreboard in the top strip stays visible the whole
-               time this room is open — that's the point: fire an attack,
-               watch `lost` stay 0. -->
+               reused verbatim, for the topology attacks; the core's
+               admin-gated fault-injection primitive, called directly, for
+               "Blip shard offline"). The T4 scoreboard in the top strip
+               stays visible the whole time this room is open — that's the
+               point: fire an attack, watch `lost` stay 0. -->
           <div class="section-divider">
             <span class="label">Chaos — Break It</span>
             <span class="line"></span>
           </div>
           <div class="chaos-panel-body">
-            <div class="chaos-note">Every enabled button fires a real attack against the live cluster (same gateway + same reshard RPCs the rest of this console uses). Watch the scoreboard above — <span class="mono">lost</span> should stay 0.</div>
+            <div class="chaos-note">Every button fires a real attack against the live cluster (same gateway + same reshard RPCs the rest of this console uses). Watch the scoreboard above — <span class="mono">lost</span> should stay 0.</div>
             <div class="danger-stack" data-hook="chaos-attack-stack">
               <button class="danger-btn" type="button" data-hook="chaos-btn-double-submit" data-attack="double-submit">
                 <span class="bullet"></span>Double-submit
@@ -299,14 +296,18 @@
               <button class="danger-btn" type="button" data-hook="chaos-btn-abort-migration" data-attack="abort-migration">
                 <span class="bullet"></span>Abort migration
               </button>
-              <div
-                class="danger-btn disabled"
-                data-hook="chaos-btn-not-wired"
-                tabindex="0"
-                title="Genuinely making a shard's Durable Object unreachable mid-cutover needs a core fault-injection primitive that cloudflare-shard-mvp doesn't have. Rather than fake this button's effect, it's honestly disabled — see src/chaos.ts's header comment."
+              <button
+                class="danger-btn"
+                type="button"
+                data-hook="chaos-btn-blip-shard-offline"
+                data-attack="blip-shard-offline"
+                title="Fires the core's real fault-injection primitive (a genuine 503 from one shard's Durable Object for a few seconds) — needs FAULT_INJECTION_ENABLED=&quot;true&quot; on the cloudflare-shard-mvp Worker (off by default; a 403 here just means the flag isn't set). Targets a shard NOT currently mid-migration by default, for the cleanest &quot;shard drops, cluster holds, shard recovers&quot; story."
               >
-                <span class="bullet"></span>Blip shard offline — needs core fault-injection (not wired)
-              </div>
+                <span class="bullet"></span>Blip shard offline
+              </button>
+            </div>
+            <div class="chaos-note" data-hook="chaos-note-blip">
+              <span class="mono">Blip shard offline</span> needs <span class="mono">FAULT_INJECTION_ENABLED="true"</span> on the cluster's core Worker (off by default — a 403 here is expected until it's set, not a bug). It targets a shard that isn't currently mid-migration, unless you override the target.
             </div>
             <div class="chaos-result" data-hook="chaos-result" hidden>
               <div class="chaos-result-top">

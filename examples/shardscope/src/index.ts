@@ -66,7 +66,6 @@ import {
   forceReleaseTopologyLock,
 } from "./reshard";
 import {
-  CHAOS_NOT_WIRED_ATTACK,
   ChaosPreconditionError,
   parseDoubleSubmitInput,
   runDoubleSubmitAttack,
@@ -80,6 +79,8 @@ import {
   runMigrateHotVbucketAttack,
   parseAbortMigrationInput,
   runAbortMigrationAttack,
+  parseBlipShardOfflineInput,
+  runBlipShardOfflineAttack,
 } from "./chaos";
 import type { Env } from "./env";
 
@@ -387,23 +388,17 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/chaos/abort-migration") {
         return runChaosOp(async () => runAbortMigrationAttack(env, parseAbortMigrationInput(await readChaosJsonBody(request))));
       }
-      // "Blip shard offline mid-cutover" (make a shard's Durable Object
-      // genuinely unreachable) is the ONE attack this demo cannot honestly
-      // implement: cloudflare-shard-mvp has no fault-injection primitive for
-      // it. There is deliberately NO runXxxAttack function for
-      // CHAOS_NOT_WIRED_ATTACK in src/chaos.ts — this route exists only to
-      // give a caller hitting it directly (curl, a stale UI build) an honest
-      // 501 explanation instead of an ambiguous 404, matching the UI's
-      // disabled button (public/index.html's "Blip shard offline" control) —
-      // never a faked 200.
-      if (request.method === "POST" && url.pathname === `/api/chaos/${CHAOS_NOT_WIRED_ATTACK}`) {
-        return json(
-          {
-            error:
-              "blip-shard-offline needs core fault-injection support that cloudflare-shard-mvp does not have today (a way to make one shard's Durable Object genuinely unreachable mid-cutover). Not wired — see examples/shardscope/src/chaos.ts's header comment. The UI's button for this attack is disabled, not faked.",
-          },
-          501,
-        );
+      // "Blip shard offline" — makes a real shard's Durable Object genuinely
+      // unreachable via the core's admin-gated fault-injection primitive
+      // (env.SHARD_API.adminFaultInject; see src/chaos.ts's header comment
+      // and env.d.ts's doc comment on that method). Off by default (the core
+      // Worker's FAULT_INJECTION_ENABLED must be "true"); a disabled cluster
+      // rejects with 403, which runBlipShardOfflineAttack classifies via
+      // classifyBlipFaultInjectError into a calm ChaosPreconditionError (400,
+      // via runChaosOp below) explaining the flag requirement — never a
+      // fabricated success or a generic 502.
+      if (request.method === "POST" && url.pathname === "/api/chaos/blip-shard-offline") {
+        return runChaosOp(async () => runBlipShardOfflineAttack(env, parseBlipShardOfflineInput(await readChaosJsonBody(request))));
       }
     }
 

@@ -134,6 +134,33 @@ export interface ShardApiBinding {
    * adminTopologyLockStatus first to find the current operationId; this call
    * 400s without one. Response body: `{ ok: true, released: boolean }`. */
   adminForceReleaseTopologyLock(adminToken: string, payload: { operationId?: string }): Promise<unknown>;
+
+  // ---- Demo-only fault injection (Shardscope chaos mode, T9's blip-shard-
+  // offline attack) — see the main repo's src/index.ts
+  // (requireFaultInjectionEnabled, adminFaultInjectCore/adminFaultClearCore)
+  // and src/shard.ts (ShardDO.handleFaultInject/handleFaultClear, FAULT_MAX_MS)
+  // for the real primitive these two methods call. Off unless the core
+  // Worker's FAULT_INJECTION_ENABLED env var is exactly "true" — a disabled
+  // deployment rejects BEFORE auth, BEFORE routing, with 403 (the exact
+  // string "Fault injection is disabled" always appears in that rejection's
+  // `error` field — see ../src/chaos.ts's classifyBlipFaultInjectError,
+  // which matches on it). An unknown shardId (not currently in the live
+  // vbucket map) rejects with 404 `{ error: { code: "UNKNOWN_SHARD", ... } }`
+  // rather than ever materializing a cold Durable Object.
+
+  /** Makes ONE named shard's Durable Object genuinely return 503 for up to
+   * `durationMs` (server clamps to a HARD, absolute 30s cap — FAULT_MAX_MS in
+   * src/shard.ts — regardless of how this is called or how many times).
+   * `catalogShardId` is accepted for shape-consistency with every other
+   * shard-targeted admin call here but is NOT used for routing — this
+   * targets exactly one shard by `shardId`, never a fan-out. Success body:
+   * `{ ok: true, mode: "unreachable", faultExpiresAt: <epoch ms> }`. */
+  adminFaultInject(adminToken: string, body: { shardId: string; catalogShardId?: string; mode?: "unreachable"; durationMs?: number }): Promise<unknown>;
+
+  /** Clears an active fault on one shard before its window elapses on its
+   * own. Idempotent — succeeds even if no fault is currently active. Success
+   * body: `{ ok: true }`. */
+  adminFaultClear(adminToken: string, body: { shardId: string; catalogShardId?: string }): Promise<unknown>;
 }
 
 export interface Env {

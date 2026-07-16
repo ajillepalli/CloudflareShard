@@ -1133,18 +1133,21 @@ function resetLockReleaseButton() {
 
 // ============================================================================
 // Chaos "Break It" panel (T9): fires POST /api/chaos/<attack> for every
-// real, enabled attack button (see ../src/chaos.ts's header comment for the
-// full thesis — every enabled button does the REAL destructive thing against
-// the live cluster; nothing here is simulated). Reuses reshardFetch (above)
-// verbatim: same same-origin credentials, same 401 -> re-login handling, same
-// error-message unwrapping every other /api/* call in this room already
-// gets — chaos attacks are gated identically, not specially.
+// attack button (see ../src/chaos.ts's header comment for the full thesis —
+// every button does the REAL destructive thing against the live cluster;
+// nothing here is simulated). Reuses reshardFetch (above) verbatim: same
+// same-origin credentials, same 401 -> re-login handling, same error-message
+// unwrapping every other /api/* call in this room already gets — chaos
+// attacks are gated identically, not specially.
 //
-// The one honestly-disabled attack ("Blip shard offline") is a plain <div>
-// in index.html, not a <button data-attack>, so it is structurally excluded
-// from `stackButtons`/the click wiring below — there is no code path here
-// that could ever fire a request for it, not just a `disabled` attribute
-// hiding a working handler.
+// "Blip shard offline" fires the core's real, admin-gated fault-injection
+// primitive (env.SHARD_API.adminFaultInject via ../src/chaos.ts's
+// runBlipShardOfflineAttack) — off by default (needs FAULT_INJECTION_ENABLED
+// on the core Worker). A 403 from a disabled cluster is classified
+// server-side into a calm ChaosPreconditionError (see chaos.ts's
+// classifyBlipFaultInjectError), which surfaces here through the SAME
+// `.catch()` path as any other "attack couldn't fire" precondition below
+// (setChaosError + a "warn"-styled log line) — never a fabricated ✗ broke.
 //
 // The T4 invariant scoreboard (topbar, renderScoreboard above) is NOT
 // duplicated here — it's already always visible in the top strip regardless
@@ -1481,9 +1484,8 @@ function init() {
   el.drainCatalogSelect.addEventListener("change", () => refreshShardPicker(el.drainCatalogSelect, el.drainShardSelect));
 
   // ---- Chaos "Break It" panel (T9) wiring ----
-  // Only real <button data-attack> controls get a handler — the disabled
-  // "Blip shard offline" placeholder in index.html is a plain <div> with no
-  // data-attack, so querySelectorAll("button[data-attack]") never matches it.
+  // Every attack, including "Blip shard offline", is a real
+  // <button data-attack> now — one generic handler for all of them.
   if (el.chaosAttackStack) {
     el.chaosAttackStack.querySelectorAll("button[data-attack]").forEach((btn) => btn.addEventListener("click", handleChaosAttackClick));
   }

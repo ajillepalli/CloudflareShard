@@ -19,15 +19,21 @@
  *     call ./reshard.ts's EXISTING adminXxx wrappers directly — the exact same
  *     code path the Reshard console's manual operator controls use. Nothing
  *     is reimplemented.
- *   - Exactly ONE attack this module could plausibly offer ("blip a shard
- *     offline mid-cutover" — make a shard's Durable Object genuinely
- *     unreachable) has NO real implementation, because cloudflare-shard-mvp
- *     has no fault-injection primitive to make that happen. There is
- *     DELIBERATELY no runXxxAttack function for it in this file, and
- *     src/index.ts wires NO working route for it either (see
- *     CHAOS_NOT_WIRED_ATTACK below and index.ts's explicit 501 stub) — the
- *     UI renders it as a disabled button labeled "needs core fault-injection
- *     — not wired", never a fake success.
+ *   - blip-shard-offline calls env.SHARD_API.adminFaultInject directly — the
+ *     core's REAL, admin-gated fault-injection primitive (see env.d.ts's
+ *     adminFaultInject/adminFaultClear + the main repo's src/shard.ts,
+ *     FAULT_MAX_MS): a genuine 503 from the targeted shard's Durable Object
+ *     for a real, bounded window (this file caps its own request at
+ *     MAX_BLIP_DURATION_MS, itself well under the core's absolute 30s hard
+ *     cap). It is OFF unless the core Worker sets
+ *     FAULT_INJECTION_ENABLED="true" — a disabled cluster rejects with a
+ *     403 this file classifies honestly (classifyBlipFaultInjectError below)
+ *     as "needs the flag", never a generic failure and never a fabricated
+ *     ✗ broke. Target selection (pickBlipShardTarget) deliberately avoids a
+ *     shard that's currently mid-migration by default, so the clean "shard
+ *     drops, cluster holds lost:0, shard recovers" story isn't muddied by
+ *     the also-by-design "blipping a mid-reshard shard parks the topology
+ *     op" interaction (see src/shard.ts's own header comment on that).
  *
  * ----------------------------------------------------------------------------
  * DESIGN — pure classification core + thin impure gatherers, mirroring
@@ -124,15 +130,9 @@ export const CHAOS_ATTACKS = [
   "split-hot-vbucket",
   "migrate-hot-vbucket",
   "abort-migration",
+  "blip-shard-offline",
 ] as const;
 export type ChaosAttackKey = (typeof CHAOS_ATTACKS)[number];
-
-/** The one attack this module deliberately does NOT implement — see this
- * file's header comment. Never appears in CHAOS_ATTACKS, has no runXxxAttack
- * function, and src/index.ts wires its route to an explicit, honest 501
- * rather than routing it here. Exported so the UI/tests can both point at
- * one canonical string instead of inventing their own. */
-export const CHAOS_NOT_WIRED_ATTACK = "blip-shard-offline";
 
 // ----------------------------------------------------------------------------
 // Small request-body parsing helpers (self-contained — deliberately not
@@ -509,16 +509,32 @@ export interface LoadStatusLike {
     targetShardId: string | null;
     baseUrl: string | null;
   } | null;
+  /** Correctness meter at the instant of the read — same two fields
+   * aggregator.ts's own LoadDriverStatusResponse.correctness carries (see
+   * that file's Scoreboard type). Optional/nullable: older callers of this
+   * type (every attack above blip-shard-offline) never populate it, and a
+   * failed/cold-start status read degrades to no data, same non-fatal
+   * contract as every other field on this loosely-typed slice. Deliberately
+   * NOT zeroed-out here the way aggregator.ts's mergeScoreboard zeroes it for
+   * display when `running` is false — that's a PRESENTATION choice for the
+   * scoreboard; blip-shard-offline's own classifier (classifyBlipShardOfflineFire)
+   * makes its own honest "no load running" call using `loadRunning` instead
+   * of silently coercing a possibly-stale `lost` to 0. */
+  correctness?: { lost: number; meterState: "green" | "red" } | null;
 }
 
 /** Loosely-typed slice of adminVbucketMap's response — only the fields
  * target-resolution reads (mirrors aggregator.ts's own local
- * AdminVbucketMapResponse). */
+ * AdminVbucketMapResponse). `targetShardId` is optional/nullable — only
+ * blip-shard-offline's pickBlipShardTarget reads it (to also treat a
+ * migration's TARGET shard as "currently mid-migration", not just its
+ * source); every other target-resolution function in this file ignores it,
+ * same as before this field was added. */
 export interface VbucketMapLike {
   catalogs: Array<{
     catalogShardId: string;
     totalVBuckets: number;
-    map: Array<{ vbucket: number; shardId: string; migrationStatus: string }>;
+    map: Array<{ vbucket: number; shardId: string; migrationStatus: string; targetShardId?: string | null }>;
   }>;
 }
 
@@ -633,32 +649,100 @@ export function pickInFlightMigrationTarget(
   );
 }
 
+export interface BlipShardTarget extends HotShardTarget {
+  /** true iff this shard is currently the SOURCE or TARGET of an in-flight
+   * migration (migrationStatus !== "none") anywhere in the live vbucket map
+   * — computed and returned even for an explicit override, so the caller
+   * can honestly warn instead of silently muddying the "clean blip" story. */
+  isMigrating: boolean;
+}
+
+/** Pure target resolution for blip-shard-offline: an explicit
+ * {catalogShardId, shardId} override wins outright; otherwise picks the
+ * lowest shardId (deterministic, same "pick the lowest" convention as
+ * pickHotVbucketTarget above) that is NOT currently the source or target of
+ * any in-flight migration anywhere in the live map.
+ *
+ * WHY avoid migrating shards by default: blipping a shard mid-reshard PARKS
+ * that topology op until its lock lease expires or an operator
+ * force-releases it — a real, by-design recovery path (see src/shard.ts's
+ * own header comment on this exact interaction), not a bug. That's a
+ * legitimate thing to demonstrate on purpose, but it's a DIFFERENT story
+ * than the clean "shard drops, cluster holds lost:0, shard recovers" demo
+ * this attack is meant to tell — mixing them by accident would make the
+ * clean story look flaky. If every known shard happens to be mid-migration
+ * (or the map is empty of migration-status data), this still returns the
+ * lowest shardId rather than refusing outright — `isMigrating` on the
+ * result tells the caller (runBlipShardOfflineAttack) whether to warn, so
+ * nothing is silently muddied either way. Throws only when there are no
+ * shards at all in the live map (nothing to target, override or not, unless
+ * the override itself supplies its own shardId). */
+export function pickBlipShardTarget(vbucketMap: VbucketMapLike, override?: HotShardOverride): BlipShardTarget {
+  const migratingShardIds = new Set<string>();
+  const candidatesByShardId = new Map<string, HotShardTarget>();
+  for (const catalog of vbucketMap.catalogs) {
+    for (const row of catalog.map) {
+      if (!candidatesByShardId.has(row.shardId)) {
+        candidatesByShardId.set(row.shardId, { catalogShardId: catalog.catalogShardId, shardId: row.shardId });
+      }
+      if (row.migrationStatus && row.migrationStatus !== "none") {
+        migratingShardIds.add(row.shardId);
+        if (row.targetShardId) migratingShardIds.add(row.targetShardId);
+      }
+    }
+  }
+
+  if (override?.catalogShardId && override?.shardId) {
+    return { catalogShardId: override.catalogShardId, shardId: override.shardId, isMigrating: migratingShardIds.has(override.shardId) };
+  }
+
+  const candidates = [...candidatesByShardId.values()].sort((a, b) => (a.shardId < b.shardId ? -1 : a.shardId > b.shardId ? 1 : 0));
+  if (candidates.length === 0) {
+    throw new ChaosPreconditionError(
+      "No shards found in the live vBucket map — nothing to target for blip-shard-offline. Wait for the cluster to initialize, or pass an explicit {catalogShardId, shardId}.",
+    );
+  }
+  const nonMigrating = candidates.find((c) => !migratingShardIds.has(c.shardId));
+  const chosen = nonMigrating ?? candidates[0];
+  return { ...chosen, isMigrating: migratingShardIds.has(chosen.shardId) };
+}
+
 // ---- impure gatherers: real DO/RPC calls -----------------------------------
 
 interface RawLoadStatusResponse {
   running?: boolean;
   config?: { mode?: string; targetShardId?: string | null; baseUrl?: string | null } | null;
+  correctness?: { lost?: number; meterState?: string } | null;
 }
 
 /** Same fetch()-over-DO-binding pattern as ./aggregator.ts's own
  * fetchLoadDriverStatus — never throws; a failure/cold-start degrades to
  * "not running", which every caller here already treats as "auto-detection
- * unavailable" (via ChaosPreconditionError), never a hard crash. */
+ * unavailable" (via ChaosPreconditionError), never a hard crash. Also
+ * carries `correctness` (blip-shard-offline's own need — see
+ * LoadStatusLike's doc comment) straight off the LoadDriver DO's raw
+ * response, same as aggregator.ts's fetchLoadDriverStatus reads it, with no
+ * "zero it out if not running" massaging here (that's a presentation
+ * decision left to each caller/classifier). */
 async function fetchLoadStatus(env: Env): Promise<LoadStatusLike> {
   try {
     const id = env.LOAD_DRIVER.idFromName("singleton");
     const stub = env.LOAD_DRIVER.get(id);
     const res = await stub.fetch("https://load-driver.internal/api/load/status");
-    if (!res.ok) return { running: false, config: null };
+    if (!res.ok) return { running: false, config: null, correctness: null };
     const body = (await res.json()) as RawLoadStatusResponse;
     return {
       running: !!body.running,
       config: body.config
         ? { mode: body.config.mode ?? null, targetShardId: body.config.targetShardId ?? null, baseUrl: body.config.baseUrl ?? null }
         : null,
+      correctness:
+        body.correctness && typeof body.correctness.lost === "number"
+          ? { lost: body.correctness.lost, meterState: body.correctness.meterState === "red" ? "red" : "green" }
+          : null,
     };
   } catch {
-    return { running: false, config: null };
+    return { running: false, config: null, correctness: null };
   }
 }
 
@@ -762,4 +846,196 @@ export async function runAbortMigrationAttack(env: Env, input: AbortMigrationInp
     survived: !!result?.ok && result?.status === "aborted",
     note: "this attack only FIRES the abort — watch the always-visible T4 scoreboard above to confirm lost stays 0 through the rollback.",
   };
+}
+
+// ============================================================================
+// Attack f — blip-shard-offline. Calls env.SHARD_API.adminFaultInject
+// directly (the core's real, admin-gated fault-injection primitive — see
+// env.d.ts's doc comment on that method and this file's header comment) on a
+// TARGET shard chosen by pickBlipShardTarget above. Unlike the topology
+// attacks (which reuse ./reshard.ts's wrappers), this one calls SHARD_API
+// itself because there is no Reshard-console equivalent to reuse — blipping
+// a shard offline isn't a manual operator control this app exposes anywhere
+// else, only a chaos attack.
+// ============================================================================
+
+// ~9s: long enough to be visibly watchable on the live dashboard (topology
+// canvas + T4 scoreboard), comfortably under the core's absolute 30s hard
+// cap (FAULT_MAX_MS in src/shard.ts).
+const DEFAULT_BLIP_DURATION_MS = 9000;
+// Shardscope's OWN conservative ceiling for this one-click button — well
+// under the core's 30s cap, not a re-implementation of it (the core clamps
+// independently and absolutely regardless of what this file sends; this is
+// just a sane upper bound for a demo button an operator might otherwise type
+// an enormous number into).
+const MAX_BLIP_DURATION_MS = 15000;
+
+/** Coerces a caller-supplied durationMs into a safe range for this button:
+ * any non-positive-integer input (including omitted) falls back to
+ * DEFAULT_BLIP_DURATION_MS; anything larger than MAX_BLIP_DURATION_MS is
+ * clamped down to it. Never forwards an unbounded value to SHARD_API — even
+ * though the core clamps independently too, this keeps the request itself
+ * honest about what it's asking for. */
+function clampBlipDurationMs(value: unknown): number {
+  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return DEFAULT_BLIP_DURATION_MS;
+  return Math.min(n, MAX_BLIP_DURATION_MS);
+}
+
+export interface BlipShardOfflineInput extends HotShardOverride {
+  durationMs?: number;
+}
+
+export function parseBlipShardOfflineInput(body: unknown): BlipShardOfflineInput {
+  const b = asRecord(body);
+  return {
+    catalogShardId: optionalNonEmptyString(b.catalogShardId),
+    shardId: optionalNonEmptyString(b.shardId),
+    durationMs: clampBlipDurationMs(b.durationMs),
+  };
+}
+
+// Substrings this file matches against a thrown "CloudflareShard RPC error
+// <status>: <body>" message (see the main repo's src/index.ts's
+// unwrapForRpc) to tell apart the two SPECIFIC, expected rejection shapes
+// adminFaultInjectCore can produce (see that function + requireFaultInjectionEnabled
+// / rejectIfUnknownShard in the main repo's src/index.ts) from any other,
+// unrelated failure. Matching on a stable substring of the core's own error
+// text (not the full string, which also embeds a status-dependent JSON
+// envelope) — same "match a documented contract substring, not the whole
+// message" idiom this file already uses for MISMATCH_REJECTION_SUBSTRING
+// above.
+const FAULT_INJECTION_DISABLED_SUBSTRING = "Fault injection is disabled";
+const UNKNOWN_SHARD_SUBSTRING = "UNKNOWN_SHARD";
+
+/** Pure classification of a thrown SHARD_API.adminFaultInject rejection's
+ * message into a specific, honest ChaosPreconditionError message — or `null`
+ * if the message matches neither expected rejection shape, telling
+ * runBlipShardOfflineAttack to let it propagate UNCHANGED (so an unrelated
+ * failure, e.g. an unexpected 5xx, still surfaces via runChaosOp's own
+ * generic "CloudflareShard RPC error <status>: <body>" unpacking, exactly
+ * like every other chaos attack that calls a SHARD_API method directly).
+ *
+ * Exported and unit-tested directly (chaos.test.ts) so the "a 403 means the
+ * flag is off, not a generic failure or a false ✗ broke" requirement is
+ * provably correct without a live cluster or a mocked SHARD_API — this is
+ * exactly the kind of "must not silently misclassify" logic this module's
+ * pure-classification-core convention (see this file's header comment)
+ * exists for. */
+export function classifyBlipFaultInjectError(errorMessage: string, target: HotShardTarget): string | null {
+  if (errorMessage.includes(FAULT_INJECTION_DISABLED_SUBSTRING)) {
+    return (
+      'blip-shard-offline requires the core\'s fault-injection primitive, which is OFF by default. ' +
+      'Set FAULT_INJECTION_ENABLED="true" on the cloudflare-shard-mvp Worker (never in production) to enable it — ' +
+      "this is intentional, not a bug: an admin-gated, off-by-default fault surface is the whole point."
+    );
+  }
+  if (errorMessage.includes(UNKNOWN_SHARD_SUBSTRING)) {
+    return `blip-shard-offline's target shard (${target.shardId}) is not a currently-known shard in the live vBucket map — topology may have just changed underneath this attack; retry.`;
+  }
+  return null;
+}
+
+export interface BlipShardOfflineRawResult {
+  target: BlipShardTarget;
+  durationMs: number;
+  /** true iff the core's adminFaultInject call itself came back `{ ok: true,
+   * ... }` — this DOES mean the shard is now genuinely returning 503, not a
+   * simulation (a rejection never reaches this point at all — see
+   * runBlipShardOfflineAttack, which throws before ever calling this
+   * classifier). */
+  injectOk: boolean;
+  /** Raw success body (JSON.stringify'd) for the receipt — e.g.
+   * `{"ok":true,"mode":"unreachable","faultExpiresAt":...}` (see
+   * src/shard.ts's handleFaultInject). */
+  injectResponseSummary: string;
+  /** Correctness meter read at the MOMENT of firing — null when no load run
+   * is currently active or the read failed (see LoadStatusLike's doc
+   * comment). */
+  lostAtFireTime: number | null;
+  meterStateAtFireTime: "green" | "red" | null;
+  loadRunning: boolean;
+}
+
+/** Pure judge for blip-shard-offline's FIRING step only. Unlike
+ * classifyDoubleSubmit/classifyMismatchedReplay (which judge a FULLY
+ * completed round trip), this attack's full claim — lost stays 0 through the
+ * WHOLE injected window, AND the shard is reachable again after — can't be
+ * verified synchronously inside one HTTP request without blocking the
+ * button for the entire durationMs (and still wouldn't prove "reachable
+ * again" without a THIRD round trip after that). So this classifier judges
+ * only what's knowable the instant the fault was injected:
+ *   (1) the core actually accepted the fault (`injectOk` — a genuine
+ *       503-producing primitive fired, not a simulation), and
+ *   (2) the correctness meter was NOT already showing a loss the moment it
+ *       fired (a pre-existing red meter can't be attributed to this attack).
+ * The returned outcome's `note` is explicit that the REAL proof — lost
+ * staying 0 through the whole window, and the shard coming back — is a LIVE
+ * thing to watch on the always-visible T4 scoreboard + Topology canvas
+ * after this call returns, exactly like drain-hot-node/split-hot-vbucket/
+ * migrate-hot-vbucket/abort-migration's own notes already say for their own
+ * async, multi-tick completions. */
+export function classifyBlipShardOfflineFire(r: BlipShardOfflineRawResult): ChaosOutcome {
+  const meterAlreadyRed = r.lostAtFireTime !== null && r.lostAtFireTime > 0;
+  const survived = r.injectOk && !meterAlreadyRed;
+
+  const migrationNote = r.target.isMigrating
+    ? `NOTE: ${r.target.shardId} is currently mid-migration (source or target of an in-flight reshard) — blipping it can PARK that topology op until its lock lease expires or an operator force-releases it (a real, by-design recovery path, not a bug — see src/shard.ts). That's a legitimately different story than the clean "shard drops, cluster holds, shard recovers" demo; for that cleaner story, retry once no migration is in flight, or pass an explicit non-migrating {catalogShardId, shardId}.`
+    : `${r.target.shardId} was NOT part of any in-flight migration at fire time — a clean, isolated blip.`;
+
+  let note: string;
+  if (!r.injectOk) {
+    note = "The core's adminFaultInject call did not come back ok — see 'observed'. This is NOT a confirmed fault; nothing was necessarily injected.";
+  } else if (meterAlreadyRed) {
+    note = `The fault WAS injected, but the correctness meter already showed lost:${r.lostAtFireTime} at the moment of firing — that predates this attack and should be investigated independently; this attack's own contribution can't be isolated from a meter that was already red. ${migrationNote}`;
+  } else {
+    note = `Fault genuinely injected on ${r.target.shardId} for ~${r.durationMs}ms (hard-capped at 30s by the core) — it will return 503 for that window, then recover on its own. ${migrationNote} This call only FIRES the blip and reads the meter/topology AT THAT INSTANT — the real proof is live: watch the always-visible T4 scoreboard above for lost staying 0 through the window, and the Topology canvas for ${r.target.shardId} marked unavailable then reachable again.`;
+  }
+
+  return {
+    attack: "blip-shard-offline",
+    did: `called adminFaultInject on shard ${r.target.shardId} (catalog ${r.target.catalogShardId}), mode "unreachable", for ~${r.durationMs}ms`,
+    expected:
+      'the core genuinely returns 503 from this shard\'s Durable Object for the injected window (real, admin-gated, off unless FAULT_INJECTION_ENABLED="true") while the rest of the cluster keeps serving; the T4 scoreboard\'s lost stays 0 throughout, and the shard recovers on its own once the window elapses.',
+    observed: `adminFaultInject: ${r.injectResponseSummary} · correctness meter at fire time: ${
+      r.loadRunning ? `lost ${r.lostAtFireTime ?? "?"} (${r.meterStateAtFireTime ?? "?"})` : "no load run currently active"
+    }`,
+    survived,
+    note,
+  };
+}
+
+export async function runBlipShardOfflineAttack(env: Env, input: BlipShardOfflineInput): Promise<ChaosOutcome> {
+  const [loadStatus, vbucketMap] = await Promise.all([fetchLoadStatus(env), fetchVbucketMap(env)]);
+  const target = pickBlipShardTarget(vbucketMap, input);
+  const durationMs = input.durationMs ?? DEFAULT_BLIP_DURATION_MS;
+
+  let injectResult: { ok?: boolean; mode?: string; faultExpiresAt?: number };
+  try {
+    injectResult = (await env.SHARD_API.adminFaultInject(env.ADMIN_TOKEN, {
+      shardId: target.shardId,
+      catalogShardId: target.catalogShardId,
+      mode: "unreachable",
+      durationMs,
+    })) as typeof injectResult;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const classified = classifyBlipFaultInjectError(message, target);
+    if (classified) throw new ChaosPreconditionError(classified);
+    // Anything else (an unexpected 5xx, an auth misconfiguration) surfaces
+    // via runChaosOp's generic "CloudflareShard RPC error <status>: <body>"
+    // unpacking in src/index.ts, same as every other chaos attack that calls
+    // a SHARD_API method directly.
+    throw err;
+  }
+
+  return classifyBlipShardOfflineFire({
+    target,
+    durationMs,
+    injectOk: !!injectResult?.ok,
+    injectResponseSummary: JSON.stringify(injectResult),
+    lostAtFireTime: loadStatus.correctness?.lost ?? null,
+    meterStateAtFireTime: loadStatus.correctness?.meterState ?? null,
+    loadRunning: loadStatus.running,
+  });
 }
