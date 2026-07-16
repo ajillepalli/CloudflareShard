@@ -77,7 +77,7 @@
 //     too -- it reduces how often the retry loop is even needed, though it
 //     no longer needs to carry the whole correctness burden by itself.
 
-import { runPool } from "./client.mjs";
+import { runPool, ApiError } from "./client.mjs";
 import { orderKey, orderLineKey, newOrderKey, historyKey } from "./keys.mjs";
 
 function randInt(min, max) {
@@ -191,7 +191,7 @@ async function newOrder(world) {
   // step, only once every line has actually committed, closes that window:
   // an order is never visible to Delivery until it's actually complete.
   //
-  // Codex review round 10 P2 fix: the district update below now carries a
+  // Codex review round 11 P2 fix: the district update below now carries a
   // `where: { d_next_o_id: o_id }` guard against d_next_o_id regressing.
   // Without it, a request that read d_next_o_id=o_id, then stalled (e.g.
   // behind a slow line/compensation elsewhere), could still commit this
@@ -206,28 +206,60 @@ async function newOrder(world) {
   // regression, while the insert independently succeeds (reusing a key a
   // prior compensation already freed -- harmless) or fails as a duplicate
   // (self-resolving: recorded as an ordinary failed New-Order attempt, the
-  // same as any other TX_ABORTED). No retry loop is needed here (unlike
-  // Payment/Delivery's counters): there's no legitimate reason to retry a
-  // guard miss -- a fresh New-Order attempt just reads whatever d_next_o_id
-  // is current next time around.
-  await home.client.tx(
-    [
-      {
-        op: "update",
-        table: "tpcc_district",
-        partitionKey: districtRow.d_key,
-        values: { d_next_o_id: o_id + 1 },
-        where: { d_next_o_id: o_id },
-      },
-      {
-        op: "insert",
-        table: "tpcc_orders",
-        partitionKey: orderKey(w, d, o_id),
-        values: { w_id: w, d_id: d, o_id, c_id, o_entry_d: entryDate, o_carrier_id: null, o_ol_cnt: lineCount },
-      },
-    ],
-    crypto.randomUUID(),
-  );
+  // same as any other TX_ABORTED). No retry loop is needed here for a
+  // GUARD MISS (unlike Payment/Delivery's counters): there's no legitimate
+  // reason to retry one -- a fresh New-Order attempt just reads whatever
+  // d_next_o_id is current next time around.
+  //
+  // Codex review round 12 P2 fix: a bounded retry IS needed for a different
+  // failure mode though -- this call itself can throw on an ambiguous
+  // network error (the tx actually committed on the coordinator, but the
+  // response never reached the client). Before this fix, that error exited
+  // newOrder immediately, before line processing or compensation ever ran,
+  // leaving a genuinely committed tpcc_orders row with no lines and no
+  // new_order marker -- permanently invisible to Delivery AND never
+  // compensated (compensateFailedOrder only runs once at least one line has
+  // been attempted). Safe to retry blindly under the SAME stable
+  // headerRequestId: txId is derived from (tenantId, requestId) (see
+  // src/coordinator.ts's handleBegin), so a retry of an already-committed
+  // header replays its cached "committed" outcome instead of re-executing
+  // (double-incrementing d_next_o_id or double-inserting the order). This
+  // must NOT retry on a clean, definitive error response, though -- a real
+  // 409 TX_ABORTED (e.g. genuine prepare-phase lock contention) means the
+  // coordinator has already recorded this txId as aborted for good;
+  // retrying with the same requestId would just replay that same aborted
+  // response every time (see handleBegin's `status === "aborted"` branch),
+  // burning the whole retry budget for nothing instead of surfacing the
+  // real, immediate failure this benchmark already handles correctly
+  // elsewhere. Only a thrown error that ISN'T a clean ApiError (a
+  // network-level failure with no definitive server response at all) is
+  // genuinely ambiguous enough to warrant a retry here.
+  const headerRequestId = crypto.randomUUID();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await home.client.tx(
+        [
+          {
+            op: "update",
+            table: "tpcc_district",
+            partitionKey: districtRow.d_key,
+            values: { d_next_o_id: o_id + 1 },
+            where: { d_next_o_id: o_id },
+          },
+          {
+            op: "insert",
+            table: "tpcc_orders",
+            partitionKey: orderKey(w, d, o_id),
+            values: { w_id: w, d_id: d, o_id, c_id, o_entry_d: entryDate, o_carrier_id: null, o_ol_cnt: lineCount },
+          },
+        ],
+        headerRequestId,
+      );
+      break;
+    } catch (err) {
+      if (err instanceof ApiError || attempt >= MUTATION_RETRY_ATTEMPTS) throw err;
+    }
+  }
 
   // Process lines with a little concurrency -- independent rows in the
   // common (same-warehouse) case, so there's no reason to serialize them.
@@ -383,9 +415,23 @@ async function newOrder(world) {
     // and the New-Order counted as fully successful. Only /v1/mutate's
     // per-call rowsAffected makes a safe retry possible, the same reasoning
     // already applied to Payment/Delivery's counter updates.
-    await home.client.mutate({ op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues, requestId: crypto.randomUUID() });
-
+    // Codex review round 12 P2 fix: the order_line insert now runs INSIDE
+    // the same try block as the stock retry loop below (it used to run
+    // before it). If this insert call itself throws on an ambiguous
+    // network error (the response lost after the insert actually
+    // committed server-side), the old code exited processOrderLine
+    // immediately, before ever entering the try -- so the catch block's
+    // cleanup (deleting the just-inserted order_line row) never ran, and
+    // this line was reported as failed to the caller without ever
+    // appearing in succeededLines. compensateFailedOrder only reverses
+    // lines IT was told about, so a maybe-already-committed order_line row
+    // from an ambiguous insert failure would have been left behind,
+    // orphaned under a header that goes on to get deleted. Moving the
+    // insert inside the try means this exact failure now hits the SAME
+    // best-effort delete-then-rethrow cleanup the stock-update failure
+    // path already relies on.
     try {
+      await home.client.mutate({ op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues, requestId: crypto.randomUUID() });
       for (let attempt = 1; ; attempt++) {
         // This index-query always targets the SUPPLY warehouse's own
         // tenant's stock table (which only has stock for its own
@@ -436,11 +482,15 @@ async function newOrder(world) {
         }
       }
     } catch (err) {
-      // The order_line insert above already committed, but this line as a
-      // whole is about to fail -- compensate it right here, immediately,
-      // rather than depend on the outer succeededLines/compensateFailedOrder
-      // mechanism knowing about a partial success it was never told about
-      // (processOrderLine never returns in this path, so it can't).
+      // This line as a whole is about to fail -- delete the order_line row
+      // right here, immediately, rather than depend on the outer
+      // succeededLines/compensateFailedOrder mechanism knowing about a
+      // partial success it was never told about (processOrderLine never
+      // returns in this path, so it can't). Covers both the case the stock
+      // retry loop threw (the insert definitely committed) and the case the
+      // insert call itself threw ambiguously (round 12 fix -- it may or may
+      // not have committed); a delete of a row that was never actually
+      // inserted is a harmless no-op either way.
       await home.client
         .mutate({ op: "delete", table: "tpcc_order_line", partitionKey: olKey, requestId: crypto.randomUUID() })
         .catch(() => {
@@ -494,7 +544,7 @@ async function payment(world) {
   const c_id = world.randomCustomerId();
   const amount = randomAmount(1.0, 5000.0);
 
-  // Codex review round 10 P2 fix: real TPC-C's Payment draws a REMOTE
+  // Codex review round 11 P2 fix: real TPC-C's Payment draws a REMOTE
   // customer (a different warehouse than the terminal/home processing the
   // payment) ~15% of the time whenever more than one warehouse exists --
   // an earlier version always resolved the customer against `home`,
@@ -680,7 +730,7 @@ async function delivery(world) {
     // response doesn't report per-mutation rowsAffected -- a stale-read
     // second worker's delete would silently no-op there while its customer
     // credit still committed, double-crediting the customer for one order.
-    // Codex review round 10 P2 fix: if this call itself THROWS (a transient
+    // Codex review round 11 P2 fix: if this call itself THROWS (a transient
     // network/topology error, not a clean rowsAffected:0 response), we can't
     // tell whether the delete actually committed before the error -- unlike
     // the marker-restore try/catch below, this failure happens BEFORE that

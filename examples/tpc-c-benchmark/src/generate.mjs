@@ -112,7 +112,15 @@ export async function seed(opts) {
     customersPerDistrict = 100,
     items = 200,
     tenantsFile = ".tpcc-tenants.json",
-    seedOrders = true,
+    // Codex review round 12 P3 fix: this default must match the documented
+    // "opt-in, off by default" behavior (README's seed options table, item
+    // 8 of "Deviations from official TPC-C") -- the CLI (src/run.mjs)
+    // always passes this explicitly (Boolean(flags["seed-orders"]),
+    // defaulting false), so it was never actually reachable from `node
+    // src/run.mjs seed`, but a caller importing seed() directly and
+    // omitting this option would silently get the expensive path instead
+    // of the documented fast default.
+    seedOrders = false,
     // Not part of the original design doc's CLI surface -- added while
     // verifying this package: warehouse IDs (and therefore tenantIds/row
     // keys) are deterministic, so seeding always starting at warehouse 1

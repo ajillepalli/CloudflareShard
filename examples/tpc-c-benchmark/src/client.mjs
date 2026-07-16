@@ -14,8 +14,16 @@ export class ApiError extends Error {
   }
 }
 
+// Codex review round 12 P3 fix: a trailing-slash base URL (a common way to
+// pass one, e.g. "http://localhost:8787/") used to concatenate directly into
+// "//admin/create-table" -- the Worker's routes are keyed on exact pathnames,
+// so every call 404'd even though the host itself was reachable and correct.
+function joinUrl(baseUrl, path) {
+  return `${baseUrl.replace(/\/+$/, "")}${path}`;
+}
+
 async function post(baseUrl, token, path, body) {
-  const res = await fetch(`${baseUrl}${path}`, {
+  const res = await fetch(joinUrl(baseUrl, path), {
     method: "POST",
     headers: {
       "content-type": "application/json",
