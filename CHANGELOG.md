@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.2.0.0] - 2026-07-16 — Durable Object RPC / service-binding support (tenant data path)
+
+Closes issue #14. Additive to the HTTP API, not a replacement: a Worker running in the same Cloudflare account can now call `mutate`/`tableScan`/`indexQuery` directly via a service binding to a new named `WorkerEntrypoint` export, `CloudflareShardRpc`, instead of going over HTTP. The tenant token is still required and still checked internally (via the same `CatalogDO.checkTenantAuth` path the HTTP routes use) — holding the service binding is not, on its own, sufficient authorization.
+
+### Added
+- `CloudflareShardRpc` (`src/index.ts`): a `WorkerEntrypoint<Env>` export with `mutate(tenantToken, body)`, `tableScan(tenantToken, body)`, and `indexQuery(tenantToken, body)` RPC methods. Each takes the tenant token as an explicit argument and enforces it exactly as the HTTP route does.
+- `mutateCore`/`tableScanCore`/`indexQueryCore`: the three HTTP handlers' logic extracted into shared typed core functions (taking a parsed body and a raw `authorization` header value rather than a `Request`) so the HTTP routes and the new RPC methods run the exact same code — zero behavior duplication, verified by the full 485-test suite passing unchanged after the extraction.
+- `examples/rpc-consumer/`: a real second Worker, service-bound to the main Worker via `entrypoint = "CloudflareShardRpc"`, with a genuine integration test (`scripts/integration-test.mjs`) that drives real setup through the main Worker's existing HTTP admin API, then exercises all three RPC methods over the actual live service binding (verified locally: two concurrent `wrangler dev` processes, Wrangler's local dev registry connecting them, 8/8 checks passing).
+- README: new "RPC / Worker service-binding access" section between "Tenant authorization" and "Known limitations".
+
+### Not in this release (tracked separately)
+- Admin/topology operations are not exposed over RPC yet — see the follow-up issue. Exposing them requires the same "still require `ADMIN_TOKEN` as an explicit argument" treatment this release gave the tenant token, just extended across ~27 more handlers.
+
 ## [2.1.0.3] - 2026-07-15 — CoordinatorDO schema-guard
 
 No functional changes, minor perf fix. `CoordinatorDO.ensureSchema()` was the one Durable Object class in the codebase still running its DDL/PRAGMA statements on every `alarm()`/`handle()` call instead of once per in-memory instance — `ShardDO` and `CatalogDO` have both used a `schemaEnsured` boolean-guard flag for this since earlier milestones. Applied the same guard here so all three DO classes are consistent. Found via teammate code review.
