@@ -96,6 +96,47 @@ function randomAmount(min, max) {
 // correct AND detectable.
 const MUTATION_RETRY_ATTEMPTS = 5;
 
+// Codex review round 13 P2 fix: every read-compute-write retry loop below
+// computes a fresh delta from a fresh read each attempt (a stale-read guard
+// on the SAME balance/quantity value it just read), which means a plain
+// "just try the next attempt" response to any failure is only safe for a
+// DEFINITIVE one (a clean rowsAffected:0 -- the guard genuinely didn't
+// match, so the next attempt's fresh read correctly picks up whatever the
+// true current state is). If the mutate() call itself instead THROWS
+// ambiguously (ordinary network/DO-level flakiness, not a clean HTTP
+// response), a naive "move to the next attempt" is unsafe: the next
+// attempt's fresh read might show this attempt's change ALREADY applied,
+// and computing a new delta on top of that would apply this SAME
+// intended change a second time (Delivery: double-credits the customer;
+// Payment: double-counts one payment into w_ytd/d_ytd/balance; New-Order's
+// stock: double-decrements one line's quantity). Retrying the identical
+// mutate call (same values/where/requestId, no re-read) resolves the
+// ambiguity safely instead of guessing: ShardDO's applied_requests table
+// keys on requestId and stores a request_hash of the actual sql/params
+// (src/shard.ts) -- replaying the SAME call with the SAME id either
+// replays the ORIGINAL attempt's true, cached rowsAffected (if it actually
+// applied) or genuinely executes for the first time (if it never did,
+// against the SAME where-guard this attempt already committed to), without
+// ever risking a second, independently-computed delta landing on top of an
+// unknown prior state. Only escalates to the caller's normal per-attempt
+// retry loop once this narrow resolution step itself is exhausted (an
+// actual repeated, sustained network failure, not a single transient blip)
+// or hits a genuine, definitive ApiError (which needs no resolving at all).
+const AMBIGUITY_RESOLUTION_ATTEMPTS = 3;
+
+async function mutateResolvingAmbiguity(client, mutation) {
+  let lastErr;
+  for (let i = 0; i < AMBIGUITY_RESOLUTION_ATTEMPTS; i++) {
+    try {
+      return await client.mutate(mutation);
+    } catch (err) {
+      if (err instanceof ApiError) throw err; // definitive -- nothing to resolve
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 // Codex review round 9 P1 fix: CloudflareShard's secondary-index maintenance
 // for /v1/mutate is dispatched via ctx.waitUntil() AFTER the base row write
 // already succeeded and its response was returned (see mutateCore's own
@@ -457,7 +498,7 @@ async function newOrder(world) {
           s_remote_cnt: stockRow.s_remote_cnt,
         };
 
-        const result = await supplyWarehouse.client.mutate({
+        const result = await mutateResolvingAmbiguity(supplyWarehouse.client, {
           op: "update",
           table: "tpcc_stock",
           partitionKey: stockRow.s_key,
@@ -578,7 +619,7 @@ async function payment(world) {
     const whScan = await home.client.tableScan("tpcc_warehouse", 1);
     whRow = (whScan.rows || [])[0];
     if (!whRow) throw new Error(`warehouse ${w} row missing`);
-    const result = await home.client.mutate({
+    const result = await mutateResolvingAmbiguity(home.client, {
       op: "update",
       table: "tpcc_warehouse",
       partitionKey: whRow.wh_key,
@@ -596,7 +637,7 @@ async function payment(world) {
     const distScan = await home.client.tableScan("tpcc_district", world.config.districtsPerWarehouse);
     distRow = (distScan.rows || []).find((r) => r.d_id === d);
     if (!distRow) throw new Error(`district ${d} not found in warehouse ${w}`);
-    const result = await home.client.mutate({
+    const result = await mutateResolvingAmbiguity(home.client, {
       op: "update",
       table: "tpcc_district",
       partitionKey: distRow.d_key,
@@ -615,7 +656,7 @@ async function payment(world) {
     const custRes = await customerHome.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: customerDistrictId, c_id });
     custRow = (custRes.rows || [])[0];
     if (!custRow) throw new Error(`customer ${c_id} in district ${customerDistrictId} of warehouse ${customerHome.warehouseId} not found`);
-    const result = await customerHome.client.mutate({
+    const result = await mutateResolvingAmbiguity(customerHome.client, {
       op: "update",
       table: "tpcc_customer",
       partitionKey: custRow.c_key,
@@ -832,7 +873,20 @@ async function delivery(world) {
         const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id: orderRow.c_id });
         const custRow = (custRes.rows || [])[0];
         if (!custRow) throw new Error(`customer ${orderRow.c_id} in district ${d} of warehouse ${w} not found`);
-        const result = await home.client.mutate({
+        // Codex review round 13 P2 fix: this call now goes through
+        // mutateResolvingAmbiguity rather than a bare mutate(). This loop
+        // sits inside the try block below that restores the new_order
+        // marker on failure -- if this specific call threw an ambiguous
+        // (non-ApiError) error after actually applying server-side, the old
+        // code would fall straight to that catch and restore the marker
+        // anyway, letting a LATER Delivery pass rediscover this same order
+        // and credit the customer a SECOND time for it. That's strictly
+        // worse than New-Order/Payment's equivalent gap (a one-off stranded
+        // amount with no retry mechanism to double it) specifically because
+        // Delivery's marker-restore-then-retry mechanism is exactly the kind
+        // of "someone retries this same logical credit later" scenario the
+        // file-header/Payment comments warn never to create.
+        const result = await mutateResolvingAmbiguity(home.client, {
           op: "update",
           table: "tpcc_customer",
           partitionKey: custRow.c_key,
