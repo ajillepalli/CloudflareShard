@@ -320,6 +320,81 @@ html, body {
   line-height: 1.6;
 }
 
+/* ============ LOGIN PANEL (auth gate) ============ */
+.login-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(7, 10, 15, .72);
+  backdrop-filter: blur(3px);
+}
+.login-card {
+  width: min(320px, 86%);
+  padding: 22px 22px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  box-shadow: 0 12px 40px -12px rgba(0, 0, 0, .6);
+  text-align: center;
+}
+.login-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+.login-sub {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.login-panel form {
+  margin-top: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.login-input {
+  width: 100%;
+  padding: 9px 11px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg-well);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color .2s ease, box-shadow .2s ease;
+}
+.login-input::placeholder { color: var(--text-dim); }
+.login-input:focus {
+  border-color: var(--safe);
+  box-shadow: 0 0 0 3px rgba(53, 227, 176, .15);
+}
+.login-submit {
+  padding: 9px 11px;
+  border-radius: 5px;
+  border: 1px solid var(--safe);
+  background: rgba(53, 227, 176, .12);
+  color: var(--safe);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: background .2s ease, opacity .2s ease;
+}
+.login-submit:hover { background: rgba(53, 227, 176, .2); }
+.login-submit:disabled { opacity: .55; cursor: default; }
+.login-error {
+  margin-top: 12px;
+  font-size: 11.5px;
+  color: var(--danger-bright);
+}
+
 /* legend */
 .legend {
   position: absolute;
@@ -544,6 +619,25 @@ html, body {
   font-size: 11px; font-weight: 700; letter-spacing: .12em;
   text-transform: uppercase; color: var(--text-primary);
 }
+.console-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.logout-btn {
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color .2s ease, border-color .2s ease;
+}
+.logout-btn:hover { color: var(--text-muted); border-color: var(--border); }
 .live-chip {
   display: flex; align-items: center; gap: 5px;
   font-size: 9.5px; font-weight: 600; letter-spacing: .08em;

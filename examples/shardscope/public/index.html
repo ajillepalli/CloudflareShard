@@ -106,6 +106,29 @@
         <div class="empty-state-sub">Waiting for an admin bootstrap. The topology will render as soon as the cluster reports <span class="mono">initialized: true</span>.</div>
       </div>
 
+      <!-- login panel: shown only on the live path, when /api/load/status
+           preflights to 401 (see src/gate.ts, app.js's authPreflight()).
+           ?demo=1 and the no-live-cluster sample fallback never call
+           /api/*, so they never reach this panel. -->
+      <div class="login-panel" data-hook="login-panel" hidden>
+        <div class="login-card">
+          <div class="login-title">Shardscope is gated</div>
+          <div class="login-sub">Enter the gate token to open the live topology stream.</div>
+          <form data-hook="login-form" autocomplete="off">
+            <input
+              class="login-input mono"
+              type="password"
+              placeholder="gate token"
+              data-hook="login-token-input"
+              autocomplete="current-password"
+              spellcheck="false"
+            />
+            <button class="login-submit" type="submit" data-hook="login-submit">Connect</button>
+          </form>
+          <div class="login-error" data-hook="login-error" hidden></div>
+        </div>
+      </div>
+
       <!-- connective SVG layer: migration paths, drawn/updated by app.js -->
       <svg class="arc-layer" data-hook="arc-layer" viewBox="0 0 100 100" preserveAspectRatio="none">
         <defs>
@@ -141,7 +164,10 @@
     <aside class="console">
       <div class="console-header">
         <span class="title">Live Feed</span>
-        <span class="live-chip" data-hook="live-chip"><span class="d"></span><span data-hook="live-chip-label">connecting</span></span>
+        <div class="console-header-right">
+          <span class="live-chip" data-hook="live-chip"><span class="d"></span><span data-hook="live-chip-label">connecting</span></span>
+          <button class="logout-btn" data-hook="logout-btn" type="button" title="Disconnect and clear the gate session" hidden>Disconnect</button>
+        </div>
       </div>
 
       <div class="console-body">

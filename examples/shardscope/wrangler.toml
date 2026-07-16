@@ -68,15 +68,18 @@ new_sqlite_classes = ["LoadDriver"]
 tag = "v3"
 new_sqlite_classes = ["TenantTokenStore"]
 
-# --- Future: static SPA assets ---------------------------------------------
-# Phase 1 (this file) serves a stub HTML placeholder straight from
-# src/index.ts. Once the real dashboard SPA lands (see DESIGN.md), it should
-# be served as static assets rather than inlined in the Worker, e.g.:
+# --- Static SPA assets (the Topology room, public/) ------------------------
+# Serves the public/ dashboard SPA. Static assets are matched first for GET
+# requests; anything with no matching file (every /api/* route, plus POST
+# /login,/logout) falls through to the Worker (src/index.ts). GET / therefore
+# serves public/index.html, and the inline placeholderHtml() in src/index.ts
+# is now dead (kept only as a documented fallback).
 #
-# [assets]
-# directory = "./public"
-# binding = "ASSETS"
-# not_found_handling = "single-page-application"
-#
-# with src/index.ts falling back to env.ASSETS.fetch(request) for any
-# non-/api/* GET route. Left commented out until that build exists.
+# Deliberately NO `not_found_handling = "single-page-application"`: SPA mode
+# would serve index.html for any unmatched path — INCLUDING GET /api/stream —
+# shadowing the Worker's own routes. The dashboard is tab-based (no
+# client-side deep-link routing), so plain file serving with Worker
+# fall-through is the correct model here.
+[assets]
+directory = "./public"
+binding = "ASSETS"

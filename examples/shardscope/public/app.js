@@ -55,6 +55,12 @@ const el = {
   liveChip: hook("live-chip"),
   liveChipLabel: hook("live-chip-label"),
   eventLog: hook("event-log"),
+  loginPanel: hook("login-panel"),
+  loginForm: hook("login-form"),
+  loginTokenInput: hook("login-token-input"),
+  loginSubmit: hook("login-submit"),
+  loginError: hook("login-error"),
+  logoutBtn: hook("logout-btn"),
 };
 
 // ============================================================================
@@ -575,11 +581,134 @@ function renderInner(snapshot) {
 }
 
 // ============================================================================
+// Auth gate (src/gate.ts): /api/* requires SHARDSCOPE_GATE_TOKEN, presented
+// as a `shardscope_gate` HttpOnly cookie set by POST /login. EventSource
+// can't read response status codes or set an Authorization header, so we
+// preflight with a plain fetch (which CAN read the status) before ever
+// opening the stream, and drive a small login panel off the result. ?demo=1
+// and the no-live-cluster sample fallback never call /api/*, so neither
+// touches this gate at all.
+// ============================================================================
+
+/** Resolves to "authorized" (200), "unauthorized" (401), or "error" (any
+ * other status / the request itself failed — worker unreachable, static
+ * preview with no backend, network drop, etc.). Never rejects. */
+function authPreflight() {
+  return fetch("/api/load/status", { credentials: "same-origin" })
+    .then((res) => {
+      if (res.status === 200) return "authorized";
+      if (res.status === 401) return "unauthorized";
+      return "error";
+    })
+    .catch(() => "error");
+}
+
+function setLoginError(msg) {
+  if (!msg) {
+    el.loginError.hidden = true;
+    el.loginError.textContent = "";
+    return;
+  }
+  el.loginError.hidden = false;
+  el.loginError.textContent = msg;
+}
+
+function setLoginSubmitting(submitting) {
+  el.loginSubmit.disabled = submitting;
+  el.loginSubmit.textContent = submitting ? "Connecting…" : "Connect";
+}
+
+function showLoginPanel() {
+  el.loginPanel.hidden = false;
+  el.logoutBtn.hidden = true;
+  setCanvasStatus("login required");
+  setLiveState("warn", "login required");
+  if (el.loginTokenInput) el.loginTokenInput.focus();
+}
+
+function hideLoginPanel() {
+  el.loginPanel.hidden = true;
+  setLoginError(null);
+}
+
+function handleLoginSubmit(evt) {
+  evt.preventDefault();
+  const token = el.loginTokenInput.value.trim();
+  if (!token) {
+    setLoginError("enter the gate token");
+    return;
+  }
+  setLoginSubmitting(true);
+  fetch("/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ token }),
+  })
+    .then((res) => {
+      if (res.status === 200) {
+        el.loginTokenInput.value = "";
+        hideLoginPanel();
+        connectLive();
+        return;
+      }
+      if (res.status === 401) {
+        setLoginError("invalid gate token");
+        return;
+      }
+      setLoginError(`login failed (${res.status}) — try again`);
+    })
+    .catch(() => {
+      setLoginError("network error — check your connection and try again");
+    })
+    .finally(() => setLoginSubmitting(false));
+}
+
+function handleLogout() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+  clearTimeout(fallbackTimer);
+  // Best-effort — the panel goes back up regardless of whether this
+  // round-trip succeeds; there's no server-side session to leak if it fails.
+  fetch("/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+  mode = "connecting";
+  showSampleBadge(false);
+  clearBanner();
+  el.nodesLayer.innerHTML = "";
+  el.arcLayer.querySelectorAll("path.migration-path").forEach((p) => p.remove());
+  el.canvasSub.textContent = "";
+  logLine("logged out", "warn");
+  showLoginPanel();
+}
+
+/** Entry point for the live (non-demo) path: preflight the gate, then either
+ * open the stream (already authorized) or show the login panel (401). Any
+ * other outcome (worker unreachable, network error) falls back to the
+ * embedded sample exactly like the old no-auth build did. */
+function startLiveFlow() {
+  setCanvasStatus("checking session");
+  setLiveState("connecting", "checking session");
+  authPreflight().then((result) => {
+    if (result === "authorized") {
+      hideLoginPanel();
+      connectLive();
+    } else if (result === "unauthorized") {
+      showLoginPanel();
+    } else {
+      fallbackToSample("couldn't reach the server");
+    }
+  });
+}
+
+// ============================================================================
 // Connection lifecycle: live SSE, ?demo=1, and the no-live-cluster fallback
 // ============================================================================
 
 let mode = "connecting"; // connecting | live | sample-fallback | demo
 let fallbackTimer = null;
+let es = null;
 
 function fallbackToSample(reason) {
   if (mode === "live") return; // real data already arrived; ignore a racing timer
@@ -594,6 +723,11 @@ function fallbackToSample(reason) {
 }
 
 function connectLive() {
+  // connectLive() is only ever reached after the gate preflight or a
+  // successful POST /login, so we're authorized from here on — surface the
+  // logout affordance.
+  el.logoutBtn.hidden = false;
+
   if (typeof EventSource === "undefined") {
     fallbackToSample("EventSource unsupported in this browser");
     return;
@@ -607,7 +741,7 @@ function connectLive() {
     if (mode === "connecting") fallbackToSample("no live cluster detected within 6s");
   }, FALLBACK_TIMEOUT_MS);
 
-  const es = new EventSource("/api/stream");
+  es = new EventSource("/api/stream");
 
   es.addEventListener("hello", () => {
     logLine("connected to aggregator, waiting for first tick…", "mig");
@@ -664,18 +798,24 @@ function connectLive() {
 }
 
 function init() {
+  el.loginForm.addEventListener("submit", handleLoginSubmit);
+  el.logoutBtn.addEventListener("click", handleLogout);
+
   const params = new URLSearchParams(location.search);
   if (params.get("demo") === "1") {
+    // Sample mode never touches /api/*, so it never touches the gate either
+    // — skip the login flow entirely.
     mode = "demo";
     showSampleBadge(true);
     el.canvasStatus.dataset.mode = "demo";
     setCanvasStatus("demo");
     setLiveState("demo", "demo");
+    el.logoutBtn.hidden = true;
     render(buildSampleSnapshot());
     logLine("demo mode (?demo=1) — rendering embedded sample snapshot, no live connection opened", "mig");
     return;
   }
-  connectLive();
+  startLiveFlow();
 }
 
 init();
