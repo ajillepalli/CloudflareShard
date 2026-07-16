@@ -96,6 +96,28 @@ function randomAmount(min, max) {
 // correct AND detectable.
 const MUTATION_RETRY_ATTEMPTS = 5;
 
+// Codex review round 9 P1 fix: CloudflareShard's secondary-index maintenance
+// for /v1/mutate is dispatched via ctx.waitUntil() AFTER the base row write
+// already succeeded and its response was returned (see mutateCore's own
+// comment in src/index.ts) -- deliberately non-blocking for the caller, but
+// it means a /v1/mutate response saying "ok" does NOT guarantee that row's
+// secondary-index entry is queryable yet. Delivery's order_line lookup
+// (idx_order_line_by_order) depends on exactly that index, and depending on
+// an incomplete result there isn't just stale data (like Order-Status
+// possibly missing a just-placed order for a moment) -- it's a genuine data
+// loss: Delivery would sum only the visible lines, credit the customer too
+// little, and delete the new_order marker, permanently losing any lines
+// whose index entry hadn't caught up yet (no marker survives to let a later
+// pass find them). ORDERS_LINES_VISIBILITY_RETRY_ATTEMPTS/_DELAY_MS bound
+// how long Delivery waits for the index to catch up to the order's own
+// known `o_ol_cnt` before giving up.
+const ORDER_LINES_VISIBILITY_RETRY_ATTEMPTS = 10;
+const ORDER_LINES_VISIBILITY_RETRY_DELAY_MS = 150;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
@@ -492,7 +514,18 @@ async function payment(world) {
 }
 
 /** Order-Status: weight 4%, read-only. ID-only lookup -- the official
- * spec's by-name-substring variant is dropped, see file header. */
+ * spec's by-name-substring variant is dropped, see file header.
+ *
+ * This reads via index-query the same way Delivery does (see
+ * ORDER_LINES_VISIBILITY_RETRY_ATTEMPTS's comment for the underlying
+ * secondary-index-maintenance lag /v1/mutate can have), but deliberately
+ * doesn't wait/retry for it here: the consequence of a moment's staleness
+ * is fundamentally different. Delivery's staleness deletes the only marker
+ * that makes a lagging line ever findable again -- real, permanent data
+ * loss. Order-Status is read-only and reports live, current state on its
+ * NEXT call regardless; missing a just-placed order for a few hundred
+ * milliseconds is ordinary, self-healing eventual consistency, not a bug
+ * worth adding retry machinery for. */
 async function orderStatus(world) {
   const home = world.randomWarehouse();
   const d = world.randomDistrictId();
@@ -592,8 +625,25 @@ async function delivery(world) {
         requestId: crypto.randomUUID(),
       });
 
-      const linesRes = await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id }, 15);
-      lines = linesRes.rows || [];
+      // Wait for idx_order_line_by_order to catch up to this order's own
+      // known line count before trusting it -- see
+      // ORDER_LINES_VISIBILITY_RETRY_ATTEMPTS's comment for why this
+      // matters here specifically (unlike Order-Status's read-only,
+      // non-data-losing exposure to the same underlying index-maintenance
+      // lag). o_ol_cnt is a base-row field on `orders`, written
+      // synchronously in New-Order's header tx -- always trustworthy as
+      // the target count to wait for, independent of index lag.
+      for (let attempt = 1; ; attempt++) {
+        const linesRes = await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id }, 15);
+        lines = linesRes.rows || [];
+        if (lines.length >= orderRow.o_ol_cnt) break;
+        if (attempt >= ORDER_LINES_VISIBILITY_RETRY_ATTEMPTS) {
+          throw new Error(
+            `order ${o_id} in district ${d} of warehouse ${w}: only ${lines.length}/${orderRow.o_ol_cnt} order_line index entries visible after ${ORDER_LINES_VISIBILITY_RETRY_ATTEMPTS} attempts -- index maintenance lag did not clear`,
+          );
+        }
+        await sleep(ORDER_LINES_VISIBILITY_RETRY_DELAY_MS);
+      }
       const sumAmount = round2(lines.reduce((acc, l) => acc + (l.ol_amount || 0), 0));
 
       // Codex review round 7 P2 fix: same reasoning as Payment's retry loops
