@@ -1,3 +1,4 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
 import { CatalogDO } from "./catalog";
 import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
 import { CoordinatorDO } from "./coordinator";
@@ -2276,8 +2277,17 @@ async function maintainIndexesAsync(
  * succeeds and the response is ready — non-blocking for the caller, with
  * ShardDO's alarm()-driven retry queue as the repair path for a failed
  * attempt (see maintainIndexesAsync). */
-async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const body = (await request.json()) as StructuredMutation & { requestId?: string };
+/** Shared by both the HTTP /v1/mutate route and the RPC entrypoint's mutate()
+ * method — takes an already-parsed body and a raw `authorization` header
+ * value (either forwarded from an HTTP request or built by the RPC
+ * entrypoint from a tenant token argument) so both transports run the exact
+ * same logic and can never silently drift apart in behavior. */
+async function mutateCore(
+  env: Env,
+  ctx: ExecutionContext,
+  body: StructuredMutation & { requestId?: string },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!body.table || !body.tenantId || !body.partitionKey) {
     return json({ error: "Missing required fields: table, tenantId, partitionKey." }, 400);
   }
@@ -2288,7 +2298,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
     catalogShardId,
     "/route",
     { table: body.table, tenantId: body.tenantId, partitionKey: body.partitionKey },
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   if (!routeRes.ok) {
     return new Response(routeRes.body, { status: routeRes.status, headers: routeRes.headers });
@@ -2407,6 +2417,11 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
   }
 
   return json({ ok: true, rowsAffected });
+}
+
+async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const body = (await request.json()) as StructuredMutation & { requestId?: string };
+  return mutateCore(env, ctx, body, request.headers.get("authorization") ?? undefined);
 }
 
 /** Cross-shard atomic write via CoordinatorDO's 2PC. Every mutation is
@@ -2741,14 +2756,19 @@ const DEFAULT_INDEX_QUERY_LIMIT = 20;
  * it's read — the base row is re-checked against the queried tuple before
  * being returned, so a stale delete/update never surfaces a wrong result;
  * it's silently excluded, same as if the index entry didn't exist yet. */
-async function handleV1IndexQuery(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as {
+/** Shared by both the HTTP /v1/index-query route and the RPC entrypoint's
+ * indexQuery() method — see mutateCore's doc comment for why. */
+async function indexQueryCore(
+  env: Env,
+  body: {
     table?: string;
     indexName?: string;
     tenantId?: string;
     values?: Record<string, unknown>;
     limit?: number;
-  };
+  },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!body.table || !body.indexName || !body.tenantId || !body.values) {
     return json({ error: { code: "MISSING_FIELDS", message: "Missing table, indexName, tenantId, or values." } }, 400);
   }
@@ -2760,7 +2780,7 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     catalogShardId,
     "/lookup-index",
     { table: body.table, indexName: body.indexName, tenantId: body.tenantId },
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   if (!lookupRes.ok) {
     return new Response(lookupRes.body, { status: lookupRes.status, headers: lookupRes.headers });
@@ -2869,7 +2889,7 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
       tenantCatalogShardId,
       "/route-batch",
       { table: body.table, tenantId: body.tenantId, partitionKeys: ownMatches.map((m) => m.partition_key) },
-      request.headers.get("authorization") ?? undefined,
+      authorization,
     );
     if (!batchRes.ok) {
       return new Response(batchRes.body, { status: batchRes.status, headers: batchRes.headers });
@@ -2909,6 +2929,17 @@ async function handleV1IndexQuery(request: Request, env: Env): Promise<Response>
     if (rows.length >= limit) break;
   }
   return json({ rows });
+}
+
+async function handleV1IndexQuery(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as {
+    table?: string;
+    indexName?: string;
+    tenantId?: string;
+    values?: Record<string, unknown>;
+    limit?: number;
+  };
+  return indexQueryCore(env, body, request.headers.get("authorization") ?? undefined);
 }
 
 const DEFAULT_TABLE_SCAN_LIMIT = 100;
@@ -3163,8 +3194,13 @@ export function mergeTableScanPages(
  * replacement for that removed capability: /v1/index-query only supports
  * exact-tuple lookups, and there was otherwise no way for a tenant to
  * enumerate its own rows without already knowing an indexed value. */
-async function handleV1TableScan(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { tenantId?: string; table?: string; limit?: number; cursor?: string | null };
+/** Shared by both the HTTP /v1/table-scan route and the RPC entrypoint's
+ * tableScan() method — see mutateCore's doc comment for why. */
+async function tableScanCore(
+  env: Env,
+  body: { tenantId?: string; table?: string; limit?: number; cursor?: string | null },
+  authorization: string | undefined,
+): Promise<Response> {
   // Codex-found P2 fix: truthiness alone let a type-confused table (e.g.
   // `{}`, which is truthy) slip past this gate and reach normalizeTableName's
   // .trim() call below, crashing with an unhandled TypeError before
@@ -3257,7 +3293,6 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
     }
   }
 
-  const authorization = request.headers.get("authorization") ?? undefined;
   const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
 
   // Auth: identical tenant-token verification to /v1/index-query — reuses
@@ -3393,6 +3428,11 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   });
 }
 
+async function handleV1TableScan(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { tenantId?: string; table?: string; limit?: number; cursor?: string | null };
+  return tableScanCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
 async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
@@ -3471,6 +3511,60 @@ async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
     perShard: outputs,
     ...(errors.length > 0 ? { errors } : {}),
   });
+}
+
+/** mutateCore/tableScanCore/indexQueryCore return a Response (built via the
+ * same json()/passthrough helpers the HTTP routes use, so HTTP and RPC can
+ * never disagree on status/error shape) — an RPC method isn't allowed to
+ * return a Response, so this unwraps it into a plain value on success, or
+ * throws an Error carrying the same status/body an HTTP caller would have
+ * seen otherwise. Throwing is the idiomatic RPC failure mode (the caller
+ * gets a rejected promise), unlike HTTP's JSON error body. */
+async function unwrapForRpc<T>(res: Response): Promise<T> {
+  const body = await res.json();
+  if (!res.ok) {
+    throw new Error(`CloudflareShard RPC error ${res.status}: ${JSON.stringify(body)}`);
+  }
+  return body as T;
+}
+
+export type MutateRpcResult = { ok: true; rowsAffected: number };
+export type IndexQueryRpcResult = { rows: Array<Record<string, unknown>> };
+export type TableScanRpcResult = {
+  rows: Array<Record<string, unknown>>;
+  nextCursor?: string;
+  provenance: { complete: boolean; fix?: string };
+  scan: { catalogShardId: string; shardCount: number; successCount: number; scanMs: number };
+};
+
+/** RPC / Worker-service-binding entrypoint for the tenant data path
+ * (mutate/tableScan/indexQuery) — additive to the HTTP API (/v1/mutate,
+ * /v1/table-scan, /v1/index-query), not a replacement. A consumer running as
+ * another Cloudflare Worker in the same account (or explicitly cross-account
+ * bound) can call these methods directly via a service binding, with no HTTP
+ * round trip. The tenant token is still required and checked internally via
+ * the exact same CatalogDO.checkTenantAuth path the HTTP routes use — having
+ * the service binding wired in is not, on its own, sufficient authorization.
+ * Admin/topology operations are deliberately not exposed here — see the
+ * follow-up issue that covers them. */
+export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
+  async mutate(tenantToken: string, body: StructuredMutation & { requestId?: string }): Promise<MutateRpcResult> {
+    return unwrapForRpc<MutateRpcResult>(await mutateCore(this.env, this.ctx, body, `Bearer ${tenantToken}`));
+  }
+
+  async tableScan(
+    tenantToken: string,
+    body: { tenantId: string; table: string; limit?: number; cursor?: string | null },
+  ): Promise<TableScanRpcResult> {
+    return unwrapForRpc<TableScanRpcResult>(await tableScanCore(this.env, body, `Bearer ${tenantToken}`));
+  }
+
+  async indexQuery(
+    tenantToken: string,
+    body: { table: string; indexName: string; tenantId: string; values: Record<string, unknown>; limit?: number },
+  ): Promise<IndexQueryRpcResult> {
+    return unwrapForRpc<IndexQueryRpcResult>(await indexQueryCore(this.env, body, `Bearer ${tenantToken}`));
+  }
 }
 
 const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext) => Promise<Response>> = {
