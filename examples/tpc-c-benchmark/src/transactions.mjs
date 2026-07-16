@@ -120,6 +120,27 @@ async function newOrder(world) {
       s_order_cnt: stockRow.s_order_cnt + 1,
       s_remote_cnt: stockRow.s_remote_cnt + (line.remote ? 1 : 0),
     };
+    // Codex review P2 fix: these are absolute values computed from a read
+    // that happened before this write -- CloudflareShard's structured
+    // mutations have no server-side arithmetic UPDATE (`values` always SETs
+    // to a literal, never `col - ?`), so a second concurrent New-Order line
+    // touching the SAME stock row (a popular item, or a small --items pool)
+    // could otherwise silently overwrite this decrement with its own
+    // equally-stale computation, losing one of the two entirely with no
+    // error from either caller. `where` makes the UPDATE a compare-and-swap
+    // against the exact row this was computed from: if another write beat
+    // this one to the row, the predicate won't match and this UPDATE becomes
+    // a no-op instead of corrupting the counter with a stale value. Note this
+    // still isn't a full fix -- /v1/tx doesn't report per-mutation
+    // rowsAffected, so there's no signal here to retry on (see the mutate
+    // path below, which can detect and at least surface it). A dropped
+    // update is silently safer than a corrupting one, not a correct one.
+    const stockWhere = {
+      s_quantity: stockRow.s_quantity,
+      s_ytd: stockRow.s_ytd,
+      s_order_cnt: stockRow.s_order_cnt,
+      s_remote_cnt: stockRow.s_remote_cnt,
+    };
     const ol_amount = round2(item.i_price * line.qty);
     const orderLineValues = {
       w_id: w,
@@ -141,7 +162,7 @@ async function newOrder(world) {
       await home.client.tx(
         [
           { op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues },
-          { op: "update", table: "tpcc_stock", partitionKey: stockRow.s_key, values: stockValues },
+          { op: "update", table: "tpcc_stock", partitionKey: stockRow.s_key, values: stockValues, where: stockWhere },
         ],
         crypto.randomUUID(),
       );
@@ -152,9 +173,21 @@ async function newOrder(world) {
       // this pair can't be a single atomic tx across two tenants. Falls back
       // to two independent /v1/mutate calls (see file header comment) --
       // trades away order_line+stock atomicity for the ~1% of lines this
-      // happens to.
+      // happens to. /v1/mutate (unlike /v1/tx) DOES report rowsAffected, so
+      // the same compare-and-swap `where` guard here can actually be
+      // detected and surfaced as a real error rather than silently no-oping.
       await home.client.mutate({ op: "insert", table: "tpcc_order_line", partitionKey: olKey, values: orderLineValues, requestId: crypto.randomUUID() });
-      await supplyWarehouse.client.mutate({ op: "update", table: "tpcc_stock", partitionKey: stockRow.s_key, values: stockValues, requestId: crypto.randomUUID() });
+      const stockMutateResult = await supplyWarehouse.client.mutate({
+        op: "update",
+        table: "tpcc_stock",
+        partitionKey: stockRow.s_key,
+        values: stockValues,
+        where: stockWhere,
+        requestId: crypto.randomUUID(),
+      });
+      if (stockMutateResult.rowsAffected === 0) {
+        throw new Error(`stock row ${stockRow.s_key} changed concurrently -- remote line's stock update did not apply`);
+      }
     }
   });
 }
@@ -184,10 +217,31 @@ async function payment(world) {
   const custRow = (custRes.rows || [])[0];
   if (!custRow) throw new Error(`customer ${c_id} in district ${d} of warehouse ${w} not found`);
 
+  // Codex review P2 fix: compare-and-swap guards on every counter update
+  // below, same reasoning as New-Order's stock update above -- warehouse/
+  // district/customer rows are hot (every Payment in the warehouse touches
+  // the same warehouse row and one of a handful of district rows), and these
+  // are absolute values computed from a read that happened before this
+  // write. Without a guard, a second concurrent Payment reading the same
+  // stale value would silently overwrite this one's increment; with it, the
+  // conflicting write becomes a no-op instead (still not retried -- see the
+  // New-Order comment for why /v1/tx can't signal that back to the caller).
   await home.client.tx(
     [
-      { op: "update", table: "tpcc_warehouse", partitionKey: whRow.wh_key, values: { w_ytd: whRow.w_ytd + amount } },
-      { op: "update", table: "tpcc_district", partitionKey: distRow.d_key, values: { d_ytd: distRow.d_ytd + amount } },
+      {
+        op: "update",
+        table: "tpcc_warehouse",
+        partitionKey: whRow.wh_key,
+        values: { w_ytd: whRow.w_ytd + amount },
+        where: { w_ytd: whRow.w_ytd },
+      },
+      {
+        op: "update",
+        table: "tpcc_district",
+        partitionKey: distRow.d_key,
+        values: { d_ytd: distRow.d_ytd + amount },
+        where: { d_ytd: distRow.d_ytd },
+      },
       {
         op: "update",
         table: "tpcc_customer",
@@ -197,6 +251,7 @@ async function payment(world) {
           c_ytd_payment: custRow.c_ytd_payment + amount,
           c_payment_cnt: custRow.c_payment_cnt + 1,
         },
+        where: { c_balance: custRow.c_balance, c_ytd_payment: custRow.c_ytd_payment, c_payment_cnt: custRow.c_payment_cnt },
       },
       {
         op: "insert",
@@ -282,12 +337,19 @@ async function delivery(world) {
     await home.client.tx(
       [
         { op: "delete", table: "tpcc_new_order", partitionKey: oldest.no_key },
+        // o_carrier_id is a plain SET, not derived from a prior read, so no
+        // compare-and-swap guard is needed here (unlike the customer update
+        // below).
         { op: "update", table: "tpcc_orders", partitionKey: orderRow.o_key, values: { o_carrier_id: randInt(1, 10) } },
         {
+          // Codex review P2 fix: same compare-and-swap guard as Payment's
+          // customer update above -- c_balance/c_delivery_cnt are absolute
+          // values computed from a read predating this write.
           op: "update",
           table: "tpcc_customer",
           partitionKey: custRow.c_key,
           values: { c_balance: custRow.c_balance + sumAmount, c_delivery_cnt: custRow.c_delivery_cnt + 1 },
+          where: { c_balance: custRow.c_balance, c_delivery_cnt: custRow.c_delivery_cnt },
         },
       ],
       crypto.randomUUID(),

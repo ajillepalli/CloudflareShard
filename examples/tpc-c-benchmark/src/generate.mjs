@@ -188,17 +188,35 @@ export async function seed(opts) {
     }
     const client = new TenantClient(baseUrl, token, tenantId);
 
-    const wTax = randomPrice(0.0, 0.2);
+    // Codex review P2 fix: read what's already there BEFORE upserting.
+    // Warehouse/district rows accumulate real state during a benchmark run
+    // (w_ytd/d_ytd from Payment, d_next_o_id from New-Order) -- blindly
+    // upserting fixed initial values on every reseed would silently reset
+    // d_next_o_id backwards on a warehouse that already has real orders,
+    // which is actively broken (every subsequent New-Order in that district
+    // collides on an already-used order key and keeps failing until manual
+    // cleanup), not just a lost-history nicety like w_ytd/d_ytd.
+    const existingWarehouse = (await client.tableScan("tpcc_warehouse", 1)).rows?.[0];
+    const existingDistrictsRes = await client.tableScan("tpcc_district", districtsPerWarehouse);
+    const existingDistrictsById = new Map((existingDistrictsRes.rows ?? []).map((r) => [r.d_id, r]));
+
+    const wTax = existingWarehouse?.w_tax ?? randomPrice(0.0, 0.2);
     await client.mutate({
       op: "upsert",
       table: "tpcc_warehouse",
       partitionKey: warehouseKey(w),
-      values: { w_id: w, w_name: `WH${w}`, w_tax: wTax, w_ytd: 300000.0 },
+      values: {
+        w_id: w,
+        w_name: existingWarehouse?.w_name ?? `WH${w}`,
+        w_tax: wTax,
+        w_ytd: existingWarehouse?.w_ytd ?? 300000.0,
+      },
     });
 
     const districts = [];
     for (let d = 1; d <= districtsPerWarehouse; d++) {
-      const dTax = randomPrice(0.0, 0.2);
+      const existingDistrict = existingDistrictsById.get(d);
+      const dTax = existingDistrict?.d_tax ?? randomPrice(0.0, 0.2);
       districts.push({ d_id: d, d_tax: dTax });
       await client.mutate({
         op: "upsert",
@@ -207,12 +225,14 @@ export async function seed(opts) {
         values: {
           w_id: w,
           d_id: d,
-          d_name: `D${w}-${d}`,
+          d_name: existingDistrict?.d_name ?? `D${w}-${d}`,
           d_tax: dTax,
-          d_ytd: 30000.0,
-          // Matches real TPC-C's initial-load convention: o_id 1..customersPerDistrict
-          // are pre-existing orders, so the next fresh order starts right after them.
-          d_next_o_id: customersPerDistrict + 1,
+          d_ytd: existingDistrict?.d_ytd ?? 30000.0,
+          // Preserve an already-advanced counter across reseeds (see comment
+          // above) -- only a genuinely new district starts at the real
+          // TPC-C initial-load convention (o_id 1..customersPerDistrict are
+          // pre-existing orders, so the next fresh order starts right after them).
+          d_next_o_id: existingDistrict?.d_next_o_id ?? customersPerDistrict + 1,
         },
       });
     }
