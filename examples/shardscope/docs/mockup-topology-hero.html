@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shardscope — Topology</title>
+<style>
+  :root{
+    --bg-base:   #0A0E14;
+    --bg-panel:  #121826;
+    --bg-well:   #070A0F;
+    --border:    #1E2733;
+    --border-soft: #17202B;
+
+    --text-primary: #E6EAF2;
+    --text-muted:   #8A94A6;
+    --text-dim:     #5A6474;
+
+    --safe: #35E3B0;
+
+    --heat-idle: #1B4D5C;
+    --heat-warm: #3FA796;
+    --heat-amber:#E0B341;
+    --heat-hot:  #E0603A;
+    --heat-crit: #F04A4A;
+
+    --migrate: #37C7FF;
+    --migrate-bright: #7FDBFF;
+
+    --danger: #F04A4A;
+    --danger-bright: #FF7A6B;
+
+    --font-mono: 'JetBrains Mono','Berkeley Mono',ui-monospace,'SFMono-Regular',Menlo,monospace;
+    --font-sans: 'Space Grotesk','Söhne',system-ui,sans-serif;
+  }
+
+  *{ box-sizing:border-box; }
+
+  html,body{
+    margin:0; padding:0; height:100vh; width:100vw;
+    background:var(--bg-base); color:var(--text-primary);
+    font-family:var(--font-sans);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .mono{
+    font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums;
+  }
+
+  .micro{
+    font-family:var(--font-sans);
+    font-size:10.5px;
+    font-weight:600;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    color:var(--text-dim);
+  }
+
+  /* ============ APP SHELL ============ */
+  .app{
+    display:flex;
+    flex-direction:column;
+    height:100vh;
+    min-width:960px;
+  }
+
+  /* ============ TOP STATUS BAR ============ */
+  .topbar{
+    flex:0 0 56px;
+    height:56px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:0 20px;
+    border-bottom:1px solid var(--border);
+    background:var(--bg-base);
+    position:relative;
+    z-index:5;
+  }
+
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    flex:0 0 auto;
+  }
+  .brand .mark{ display:block; flex:0 0 auto; }
+  .brand .word{
+    font-family:var(--font-sans);
+    font-size:14px;
+    font-weight:700;
+    letter-spacing:.12em;
+    color:var(--text-primary);
+  }
+
+  .cluster-id{
+    flex:1 1 auto;
+    text-align:center;
+    color:var(--text-muted);
+    font-size:12px;
+    letter-spacing:.02em;
+    white-space:nowrap;
+  }
+  .cluster-id b{
+    color:var(--text-primary);
+    font-weight:500;
+  }
+  .cluster-id .sep{ color:var(--text-dim); margin:0 8px; }
+
+  .scoreboard{
+    flex:0 0 auto;
+    display:flex;
+    align-items:baseline;
+    gap:10px;
+    font-size:14px;
+    white-space:nowrap;
+  }
+  .scoreboard .writes{ color:var(--text-muted); }
+  .scoreboard .writes .n{ color:var(--text-primary); font-weight:500; }
+  .scoreboard .sep{ color:var(--text-dim); }
+  .scoreboard .safe{
+    color:var(--safe);
+    font-weight:600;
+    animation:safeBreathe 4.2s ease-in-out infinite;
+  }
+
+  @keyframes safeBreathe{
+    0%,100%{ text-shadow:0 0 6px rgba(53,227,176,.35), 0 0 1px rgba(53,227,176,.5); }
+    50%{ text-shadow:0 0 12px rgba(53,227,176,.6), 0 0 2px rgba(53,227,176,.7); }
+  }
+
+  /* ============ MAIN AREA ============ */
+  .main{
+    flex:1 1 auto;
+    display:flex;
+    min-height:0;
+  }
+
+  /* ============ LEFT RAIL ============ */
+  .rail{
+    flex:0 0 64px;
+    width:64px;
+    border-right:1px solid var(--border);
+    background:var(--bg-base);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding-top:22px;
+    gap:26px;
+  }
+  .rail-item{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:6px;
+    color:var(--text-dim);
+    position:relative;
+    width:100%;
+  }
+  .rail-item svg{ display:block; }
+  .rail-item .rlabel{
+    font-size:9px;
+    font-weight:600;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:inherit;
+  }
+  .rail-item.active{ color:var(--safe); }
+  .rail-item.active::before{
+    content:"";
+    position:absolute;
+    left:0; top:-3px; bottom:-3px;
+    width:2px;
+    background:var(--safe);
+    box-shadow:0 0 8px rgba(53,227,176,.6);
+    border-radius:0 2px 2px 0;
+  }
+  .rail-item.active svg{
+    filter:drop-shadow(0 0 5px rgba(53,227,176,.45));
+  }
+
+  /* ============ CANVAS ============ */
+  .canvas-wrap{
+    flex:1 1 auto;
+    position:relative;
+    background:
+      radial-gradient(ellipse 900px 620px at 62% 55%, rgba(55,199,255,.05), transparent 60%),
+      var(--bg-well);
+    overflow:hidden;
+    min-width:0;
+  }
+  .canvas-grid{
+    position:absolute; inset:0;
+    background-image:
+      linear-gradient(to right, rgba(30,39,51,.5) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(30,39,51,.5) 1px, transparent 1px);
+    background-size:42px 42px;
+    -webkit-mask-image:radial-gradient(ellipse 80% 80% at 50% 50%, #000 40%, transparent 90%);
+            mask-image:radial-gradient(ellipse 80% 80% at 50% 50%, #000 40%, transparent 90%);
+    opacity:.55;
+  }
+
+  .canvas-label{
+    position:absolute;
+    top:18px; left:22px;
+    display:flex;
+    align-items:center;
+    gap:8px;
+  }
+  .canvas-label .dot-live{
+    width:6px; height:6px; border-radius:50%;
+    background:var(--safe);
+    box-shadow:0 0 6px rgba(53,227,176,.7);
+    animation:livePulse 2.4s ease-in-out infinite;
+  }
+  @keyframes livePulse{
+    0%,100%{ opacity:.55; }
+    50%{ opacity:1; }
+  }
+
+  .canvas-sub{
+    position:absolute;
+    top:18px; right:24px;
+    font-size:11px;
+    color:var(--text-dim);
+    text-align:right;
+    line-height:1.6;
+  }
+  .canvas-sub .mono{ color:var(--text-muted); }
+
+  /* legend */
+  .legend{
+    position:absolute;
+    left:22px; bottom:20px;
+    display:flex;
+    align-items:center;
+    gap:18px;
+    padding:10px 14px;
+    background:rgba(18,24,38,.55);
+    border:1px solid var(--border-soft);
+    border-radius:6px;
+    backdrop-filter:blur(2px);
+  }
+  .legend-group{ display:flex; align-items:center; gap:8px; }
+  .legend-group .lg-label{
+    font-size:9.5px; font-weight:600; letter-spacing:.08em;
+    text-transform:uppercase; color:var(--text-dim);
+  }
+  .heat-strip{
+    width:88px; height:6px; border-radius:3px;
+    background:linear-gradient(to right, var(--heat-idle), var(--heat-warm), var(--heat-amber), var(--heat-hot), var(--heat-crit));
+  }
+  .legend-swatch{
+    width:10px; height:10px; border-radius:50%;
+    background:var(--migrate);
+    box-shadow:0 0 6px rgba(55,199,255,.7);
+  }
+  .legend-divider{ width:1px; height:18px; background:var(--border); }
+
+  /* SVG connective layer */
+  .arc-layer{ position:absolute; inset:0; width:100%; height:100%; }
+  .migration-path{
+    fill:none;
+    stroke:var(--migrate);
+    stroke-width:1.6;
+    stroke-dasharray:1.4 3.2;
+    vector-effect:non-scaling-stroke;
+    opacity:.6;
+    animation:marchAnts 1.1s linear infinite;
+  }
+  @keyframes marchAnts{
+    to{ stroke-dashoffset:-9.2; }
+  }
+
+  .drain-arrow{
+    stroke:var(--text-dim);
+    stroke-width:1.4;
+    fill:none;
+    vector-effect:non-scaling-stroke;
+    opacity:.7;
+  }
+
+  /* in-flight migration dots */
+  .flight-dot{
+    position:absolute;
+    width:6px; height:6px;
+    margin:-3px 0 0 -3px;
+    border-radius:50%;
+    background:var(--migrate-bright);
+    box-shadow:0 0 8px 2px rgba(127,219,255,.75);
+    animation:flightPulse 2.6s ease-in-out infinite;
+  }
+  @keyframes flightPulse{
+    0%,100%{ opacity:.45; transform:scale(.85); }
+    50%{ opacity:1; transform:scale(1.25); }
+  }
+
+  /* ============ SHARD NODES ============ */
+  .shard{
+    position:absolute;
+    transform:translate(-50%,-50%);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+  .shard-core{
+    position:relative;
+    width:var(--sz);
+    height:var(--sz);
+    border-radius:50%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--heat) 22%, var(--bg-well)), var(--bg-well) 78%);
+    border:1.5px solid var(--heat);
+    box-shadow:0 0 0 1px rgba(0,0,0,.4) inset, 0 0 18px -6px var(--heat);
+  }
+  .shard-id{
+    font-family:var(--font-mono);
+    font-size:13px;
+    font-weight:600;
+    color:var(--text-primary);
+    line-height:1.2;
+    text-align:center;
+    font-variant-numeric:tabular-nums;
+  }
+  .shard-rate{
+    font-family:var(--font-mono);
+    font-size:9.5px;
+    color:var(--text-muted);
+    text-align:center;
+    font-variant-numeric:tabular-nums;
+    margin-top:1px;
+  }
+  .shard-tag{
+    position:absolute;
+    left:50%;
+    bottom:calc(-1 * var(--sz) / 2 - 20px);
+    transform:translateX(-50%);
+    white-space:nowrap;
+    font-size:9.5px;
+    font-weight:600;
+    letter-spacing:.05em;
+    text-transform:uppercase;
+    padding:2px 7px;
+    border-radius:3px;
+    border:1px solid var(--border-soft);
+    background:rgba(7,10,15,.7);
+  }
+
+  /* vbucket ring */
+  .vring{ position:absolute; inset:0; pointer-events:none; }
+  .vdot{
+    position:absolute;
+    top:50%; left:50%;
+    width:5px; height:5px;
+    margin:-2.5px 0 0 -2.5px;
+    border-radius:50%;
+    background:var(--heat);
+  }
+  .vring .vdot:nth-child(1){ transform:rotate(0deg)   translateY(calc(-1 * var(--ring-r))); }
+  .vring .vdot:nth-child(2){ transform:rotate(45deg)  translateY(calc(-1 * var(--ring-r))); opacity:.85;}
+  .vring .vdot:nth-child(3){ transform:rotate(90deg)  translateY(calc(-1 * var(--ring-r))); }
+  .vring .vdot:nth-child(4){ transform:rotate(135deg) translateY(calc(-1 * var(--ring-r))); opacity:.8;}
+  .vring .vdot:nth-child(5){ transform:rotate(180deg) translateY(calc(-1 * var(--ring-r))); }
+  .vring .vdot:nth-child(6){ transform:rotate(225deg) translateY(calc(-1 * var(--ring-r))); opacity:.85;}
+  .vring .vdot:nth-child(7){ transform:rotate(270deg) translateY(calc(-1 * var(--ring-r))); }
+  .vring .vdot:nth-child(8){ transform:rotate(315deg) translateY(calc(-1 * var(--ring-r))); opacity:.8;}
+
+  /* hot shard specifics */
+  .shard.hot .shard-core{
+    box-shadow:0 0 0 1px rgba(0,0,0,.4) inset, 0 0 36px -4px var(--heat-crit), 0 0 70px -20px var(--heat-crit);
+    animation:hotGlow 2.8s ease-in-out infinite;
+  }
+  @keyframes hotGlow{
+    0%,100%{ box-shadow:0 0 0 1px rgba(0,0,0,.4) inset, 0 0 34px -6px var(--heat-crit), 0 0 60px -18px var(--heat-crit); }
+    50%{ box-shadow:0 0 0 1px rgba(0,0,0,.4) inset, 0 0 48px -2px var(--heat-crit), 0 0 90px -14px var(--heat-crit); }
+  }
+  .shard.hot .shard-tag{
+    color:#FFD3CC;
+    border-color:rgba(240,74,74,.5);
+    background:rgba(240,74,74,.12);
+  }
+  .impact-flash{
+    position:absolute;
+    inset:-40px;
+    border-radius:50%;
+    background:radial-gradient(circle, rgba(240,74,74,.30), transparent 70%);
+    animation:impactFlash 3.6s ease-in-out infinite;
+    pointer-events:none;
+  }
+  @keyframes impactFlash{
+    0%,100%{ opacity:.25; }
+    45%{ opacity:.7; }
+    60%{ opacity:.15; }
+  }
+
+  /* migration target shard specifics */
+  .shard.target .shard-core{
+    border-color:var(--migrate);
+    box-shadow:0 0 0 1px rgba(0,0,0,.4) inset, 0 0 22px -6px var(--migrate);
+  }
+  .shard.target .shard-tag{
+    color:var(--migrate-bright);
+    border-color:rgba(55,199,255,.45);
+    background:rgba(55,199,255,.12);
+  }
+
+  /* draining shard specifics */
+  .shard.draining{ opacity:.5; }
+  .shard.draining .shard-core{
+    border-style:dashed;
+    box-shadow:none;
+  }
+  .shard.draining .shard-tag{
+    color:var(--text-dim);
+    border-color:var(--border-soft);
+    background:rgba(7,10,15,.7);
+  }
+
+  /* ============ RIGHT PANEL — RESHARD CONSOLE ============ */
+  .console{
+    flex:0 0 320px;
+    width:320px;
+    background:var(--bg-panel);
+    border-left:1px solid var(--border);
+    display:flex;
+    flex-direction:column;
+    min-height:0;
+  }
+  .console-header{
+    padding:16px 18px 14px;
+    border-bottom:1px solid var(--border);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    flex:0 0 auto;
+  }
+  .console-header .title{
+    font-size:11px; font-weight:700; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--text-primary);
+  }
+  .live-chip{
+    display:flex; align-items:center; gap:5px;
+    font-size:9.5px; font-weight:600; letter-spacing:.08em;
+    text-transform:uppercase; color:var(--safe);
+  }
+  .live-chip .d{
+    width:5px; height:5px; border-radius:50%; background:var(--safe);
+    box-shadow:0 0 5px rgba(53,227,176,.7);
+    animation:livePulse 2.4s ease-in-out infinite;
+  }
+
+  .console-body{
+    padding:16px 18px;
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+    overflow-y:auto;
+    flex:1 1 auto;
+    min-height:0;
+  }
+
+  .op-card{
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:12px 13px;
+    background:rgba(55,199,255,.04);
+  }
+  .op-card .op-top{
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:9px;
+  }
+  .op-name{
+    font-size:12.5px; color:var(--text-primary); font-weight:500;
+  }
+  .op-name .phase{ color:var(--migrate-bright); }
+  .op-pct{
+    font-size:11px; color:var(--migrate-bright);
+    font-variant-numeric:tabular-nums;
+  }
+  .progress-track{
+    height:4px; border-radius:2px;
+    background:var(--border);
+    overflow:hidden;
+    position:relative;
+    margin-bottom:9px;
+  }
+  .progress-fill{
+    position:absolute; inset:0 auto 0 0;
+    width:62%;
+    background:linear-gradient(to right, var(--migrate), var(--migrate-bright));
+    border-radius:2px;
+  }
+  .progress-fill::after{
+    content:"";
+    position:absolute; top:0; bottom:0; width:36px;
+    background:linear-gradient(to right, transparent, rgba(255,255,255,.55), transparent);
+    animation:shimmer 2.2s linear infinite;
+  }
+  @keyframes shimmer{
+    0%{ left:-40px; }
+    100%{ left:100%; }
+  }
+  .op-detail{
+    font-size:11px; color:var(--text-muted);
+    display:flex; align-items:center; gap:6px;
+  }
+  .op-detail .arrow{ color:var(--text-dim); }
+  .op-detail b{ color:var(--text-primary); font-weight:600; }
+
+  .btn-row{
+    display:flex; gap:8px;
+  }
+  .btn{
+    flex:1 1 0;
+    padding:8px 0;
+    border-radius:5px;
+    border:1px solid var(--border);
+    background:transparent;
+    color:var(--text-muted);
+    font-family:var(--font-sans);
+    font-size:11px;
+    font-weight:600;
+    letter-spacing:.03em;
+    text-align:center;
+    cursor:default;
+  }
+  .btn.selected{
+    border-color:var(--migrate);
+    color:var(--migrate-bright);
+    box-shadow:0 0 0 1px rgba(55,199,255,.15) inset;
+  }
+
+  .section-divider{
+    display:flex; align-items:center; gap:10px;
+    margin-top:2px;
+  }
+  .section-divider .line{
+    flex:1 1 auto; height:1px;
+    background:linear-gradient(to right, rgba(240,74,74,.4), transparent);
+  }
+  .section-divider .label{
+    font-size:10px; font-weight:700; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--danger);
+    white-space:nowrap;
+  }
+
+  .danger-stack{
+    display:flex; flex-direction:column; gap:7px;
+  }
+  .danger-btn{
+    display:flex; align-items:center; gap:9px;
+    padding:9px 11px;
+    border-radius:5px;
+    border:1px solid rgba(240,74,74,.35);
+    background:rgba(240,74,74,.045);
+    color:#E8A7A0;
+    font-family:var(--font-sans);
+    font-size:11.5px;
+    font-weight:500;
+    box-shadow:0 0 14px -10px rgba(240,74,74,.6);
+  }
+  .danger-btn .bullet{
+    width:5px; height:5px; border-radius:1px;
+    background:var(--danger);
+    box-shadow:0 0 6px rgba(240,74,74,.8);
+    flex:0 0 auto;
+    transform:rotate(45deg);
+  }
+
+  .log-wrap{
+    display:flex; flex-direction:column;
+    flex:1 1 auto;
+    min-height:120px;
+  }
+  .log-head{
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:8px;
+  }
+  .log-box{
+    flex:1 1 auto;
+    background:var(--bg-well);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:10px 11px;
+    overflow-y:auto;
+    display:flex;
+    flex-direction:column;
+    gap:5px;
+  }
+  .log-line{
+    font-family:var(--font-mono);
+    font-size:10.5px;
+    line-height:1.55;
+    color:var(--text-muted);
+    font-variant-numeric:tabular-nums;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .log-line .t{ color:var(--text-dim); }
+  .log-line.safe{ color:var(--safe); }
+  .log-line.mig{ color:var(--migrate-bright); }
+  .log-line.crit{ color:var(--heat-crit); }
+  .log-line.cursor::after{
+    content:"_";
+    color:var(--text-muted);
+    animation:caretBlink 1.1s step-end infinite;
+  }
+  @keyframes caretBlink{
+    0%,49%{ opacity:1; }
+    50%,100%{ opacity:0; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ TOP STATUS BAR ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <svg class="mark" width="20" height="20" viewBox="0 0 20 20" fill="none">
+        <circle cx="10" cy="10" r="8.5" stroke="#35E3B0" stroke-width="1.3" opacity=".55"/>
+        <circle cx="10" cy="4.2" r="2.1" fill="#35E3B0"/>
+        <circle cx="14.8" cy="13.2" r="2.1" fill="#37C7FF"/>
+        <circle cx="5.2" cy="13.2" r="2.1" fill="#3FA796"/>
+        <line x1="10" y1="4.2" x2="14.8" y2="13.2" stroke="#5A6474" stroke-width="0.8"/>
+        <line x1="10" y1="4.2" x2="5.2" y2="13.2" stroke="#5A6474" stroke-width="0.8"/>
+        <line x1="5.2" y1="13.2" x2="14.8" y2="13.2" stroke="#5A6474" stroke-width="0.8"/>
+      </svg>
+      <span class="word">SHARDSCOPE</span>
+    </div>
+
+    <div class="cluster-id mono">
+      cluster: <b>tpcc-demo</b><span class="sep">·</span><b>8</b> shards<span class="sep">·</span><b>1024</b> vBuckets<span class="sep">·</span><b>2</b> catalogs
+    </div>
+
+    <div class="scoreboard mono">
+      <span class="writes">writes <span class="n">48,203</span></span>
+      <span class="sep">·</span>
+      <span class="safe">lost 0</span>
+      <span class="sep">·</span>
+      <span class="safe">checksum OK</span>
+    </div>
+  </header>
+
+  <div class="main">
+
+    <!-- ============ LEFT RAIL ============ -->
+    <nav class="rail">
+      <div class="rail-item">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <rect x="4" y="4" width="12" height="12" rx="2.5" stroke="currentColor" stroke-width="1.3"/>
+        </svg>
+        <span class="rlabel">App</span>
+      </div>
+      <div class="rail-item active">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <circle cx="10" cy="5" r="2" fill="currentColor"/>
+          <circle cx="15" cy="14" r="2" fill="currentColor"/>
+          <circle cx="5" cy="14" r="2" fill="currentColor"/>
+          <line x1="10" y1="5" x2="15" y2="14" stroke="currentColor" stroke-width="1"/>
+          <line x1="10" y1="5" x2="5" y2="14" stroke="currentColor" stroke-width="1"/>
+        </svg>
+        <span class="rlabel">Topology</span>
+      </div>
+      <div class="rail-item">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10 H16 M11 5 L16 10 L11 15" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="rlabel">Reshard</span>
+      </div>
+      <div class="rail-item">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M7 5 L15 10 L7 15 Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>
+        </svg>
+        <span class="rlabel">Play</span>
+      </div>
+    </nav>
+
+    <!-- ============ CENTER: HERO TOPOLOGY CANVAS ============ -->
+    <div class="canvas-wrap">
+      <div class="canvas-grid"></div>
+
+      <div class="canvas-label">
+        <span class="dot-live"></span>
+        <span class="micro">Topology &mdash; Live</span>
+      </div>
+
+      <div class="canvas-sub">
+        <div><span class="mono">shard-3</span> reshard in progress</div>
+        <div>rebalance eta <span class="mono">00:41</span></div>
+      </div>
+
+      <!-- connective SVG layer: migration arc + drain arrow -->
+      <svg class="arc-layer" viewBox="0 0 100 100" preserveAspectRatio="none">
+        <path class="migration-path" d="M 86 44 Q 60 72 42 84" />
+        <path class="drain-arrow" d="M 30 44 L 16 32" marker-end="url(#arrow)" />
+        <defs>
+          <marker id="arrow" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#5A6474" />
+          </marker>
+        </defs>
+      </svg>
+
+      <!-- in-flight migration dots along the arc -->
+      <div class="flight-dot" style="left:78.4%; top:52.0%; animation-delay:0s;"></div>
+      <div class="flight-dot" style="left:66.5%; top:63.8%; animation-delay:.6s;"></div>
+      <div class="flight-dot" style="left:57.7%; top:71.8%; animation-delay:1.2s;"></div>
+      <div class="flight-dot" style="left:47.6%; top:80.0%; animation-delay:1.8s;"></div>
+
+      <!-- ===== shard nodes ===== -->
+
+      <!-- shard-0 -->
+      <div class="shard" style="left:12%; top:18%; --sz:82px; --heat:var(--heat-warm);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:45px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-0</div>
+            <div class="shard-rate">310 w/s</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- shard-1 -->
+      <div class="shard" style="left:40%; top:10%; --sz:76px; --heat:var(--heat-idle);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:42px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-1</div>
+            <div class="shard-rate">90 w/s</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- shard-2 -->
+      <div class="shard" style="left:70%; top:16%; --sz:86px; --heat:var(--heat-warm);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:47px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-2</div>
+            <div class="shard-rate">640 w/s</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- shard-3 : HOT -->
+      <div class="shard hot" style="left:86%; top:44%; --sz:128px; --heat:var(--heat-crit);">
+        <div class="impact-flash"></div>
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:68px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-3</div>
+            <div class="shard-rate">2,140 w/s</div>
+          </div>
+          <div class="shard-tag">hot &middot; 2,140 w/s</div>
+        </div>
+      </div>
+
+      <!-- shard-4 -->
+      <div class="shard" style="left:74%; top:76%; --sz:90px; --heat:var(--heat-amber);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:49px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-4</div>
+            <div class="shard-rate">1,180 w/s</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- shard-5 : migration target -->
+      <div class="shard target" style="left:42%; top:84%; --sz:82px; --heat:var(--heat-idle);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:45px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-5</div>
+            <div class="shard-rate">420 w/s</div>
+          </div>
+          <div class="shard-tag">receiving</div>
+        </div>
+      </div>
+
+      <!-- shard-6 -->
+      <div class="shard" style="left:10%; top:66%; --sz:74px; --heat:var(--heat-idle);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:41px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-6</div>
+            <div class="shard-rate">150 w/s</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- shard-7 : draining -->
+      <div class="shard draining" style="left:30%; top:44%; --sz:68px; --heat:var(--text-dim);">
+        <div class="shard-core">
+          <div class="vring" style="--ring-r:38px;">
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+            <span class="vdot"></span><span class="vdot"></span><span class="vdot"></span><span class="vdot"></span>
+          </div>
+          <div>
+            <div class="shard-id">shard-7</div>
+            <div class="shard-rate">draining</div>
+          </div>
+          <div class="shard-tag">draining</div>
+        </div>
+      </div>
+
+      <!-- legend -->
+      <div class="legend">
+        <div class="legend-group">
+          <span class="lg-label">Heat</span>
+          <div class="heat-strip"></div>
+        </div>
+        <div class="legend-divider"></div>
+        <div class="legend-group">
+          <span class="legend-swatch"></span>
+          <span class="lg-label">In migration</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ============ RIGHT PANEL: RESHARD CONSOLE ============ -->
+    <aside class="console">
+      <div class="console-header">
+        <span class="title">Reshard Console</span>
+        <span class="live-chip"><span class="d"></span>Live</span>
+      </div>
+
+      <div class="console-body">
+
+        <div class="op-card">
+          <div class="op-top">
+            <span class="op-name">migrate-vbucket &middot; <span class="phase">cutover</span></span>
+            <span class="op-pct mono">62%</span>
+          </div>
+          <div class="progress-track"><div class="progress-fill"></div></div>
+          <div class="op-detail mono">
+            vbucket <b>417</b> <span class="arrow">&rarr;</span> <b>shard-5</b>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <div class="btn">Split</div>
+          <div class="btn selected">Migrate</div>
+          <div class="btn">Drain</div>
+        </div>
+
+        <div class="section-divider">
+          <span class="label">Chaos &mdash; Break It</span>
+          <span class="line"></span>
+        </div>
+
+        <div class="danger-stack">
+          <div class="danger-btn"><span class="bullet"></span>Kill shard mid-migration</div>
+          <div class="danger-btn"><span class="bullet"></span>Drain hot node</div>
+          <div class="danger-btn"><span class="bullet"></span>Double-submit</div>
+          <div class="danger-btn"><span class="bullet"></span>Blip shard</div>
+          <div class="danger-btn"><span class="bullet"></span>Replay mismatch</div>
+        </div>
+
+        <div class="log-wrap">
+          <div class="log-head">
+            <span class="micro">Event Log</span>
+          </div>
+          <div class="log-box">
+            <div class="log-line"><span class="t">03:41:08</span>&nbsp; migrate-vbucket started &middot; vbucket 417</div>
+            <div class="log-line"><span class="t">03:41:09</span>&nbsp; fenced writes on shard-3</div>
+            <div class="log-line mig"><span class="t">03:41:10</span>&nbsp; vbucket 418 queued for migration</div>
+            <div class="log-line crit"><span class="t">03:41:11</span>&nbsp; shard-3 heat critical &middot; 2,140 w/s</div>
+            <div class="log-line"><span class="t">03:41:12</span>&nbsp; cutover fenced vbucket 417</div>
+            <div class="log-line safe"><span class="t">03:41:12</span>&nbsp; checksum verified</div>
+            <div class="log-line mig"><span class="t">03:41:13</span>&nbsp; shard-5 accepting vbucket 417</div>
+            <div class="log-line safe cursor"><span class="t">03:41:13</span>&nbsp; writes 48,203 &middot; lost 0</div>
+          </div>
+        </div>
+
+      </div>
+    </aside>
+
+  </div>
+</div>
+</body>
+</html>

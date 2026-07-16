@@ -3,7 +3,7 @@
 > Scope: this design system applies ONLY to Shardscope, the demo/mission-control UI
 > under `examples/shardscope/`. The CloudflareShard core is a headless database and
 > has no UI. Created by /design-consultation on 2026-07-16. Rendered preview:
-> `~/.gstack/projects/ajillepalli-CloudflareShard/designs/mockup-20260716/shardscope-hero.html`.
+> [`docs/mockup-topology-hero.html`](./docs/mockup-topology-hero.html).
 
 ## Product Context
 - **What this is:** A live "mission control" dashboard that makes a sharded edge
