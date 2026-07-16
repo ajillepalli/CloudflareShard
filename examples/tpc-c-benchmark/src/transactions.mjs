@@ -43,14 +43,24 @@
 //     callback instead of letting it propagate through Promise.all: every
 //     line is now always awaited to completion (success or caught failure)
 //     before the function decides whether to insert the marker or report an
-//     aggregate failure. Residual gap after that fix: if the FINAL
-//     marker-insert call itself fails (a genuine, separate possibility, not
-//     the race above), the order/lines/stock writes that already committed
-//     are still not rolled back, and the order is then never visible to
-//     Delivery -- accepted as out of proportion to close for a benchmark
-//     (would need saga-style compensating rollback, real machinery for a
-//     demo project), and rare enough at this benchmark's realistic scale
-//     not to meaningfully affect the numbers it reports.
+//     aggregate failure. A THIRD round of review (Codex, again) correctly
+//     pointed out that this still left the header + any already-succeeded
+//     lines committed with no rollback when one line failed -- a real,
+//     permanent partial order. compensateFailedOrder (below, in newOrder)
+//     now actually reverses those: deletes each already-committed line and
+//     reverts its stock update (itself a compare-and-swap against exactly
+//     the values that line applied, so it safely no-ops rather than
+//     corrupts if some OTHER write touched the row again meanwhile), then
+//     deletes the orphaned orders row. d_next_o_id is deliberately NOT
+//     decremented back (a different, newer New-Order may have already
+//     claimed the incremented value) -- the resulting gap in the o_id
+//     sequence is expected and harmless, like a rolled-back insert leaving
+//     a gap in a real database's auto-increment sequence. Genuinely
+//     residual after this: a THIRD concurrent write landing in the narrow
+//     window between a line's own update and its compensation reversal
+//     would make the reversal itself safely no-op (never corrupt) rather
+//     than fully undo -- doubly unlikely, and a dropped compensation is a
+//     stranded stock decrement, not silent corruption.
 //   - Remote (cross-warehouse) order lines in New-Order (~1% of lines) fall
 //     back to two independent, non-atomic /v1/mutate calls instead of a
 //     2-participant tx -- a consequence of /v1/tx's one-tenantId-per-call
@@ -143,16 +153,22 @@ async function newOrder(world) {
   // decides whether to insert the marker or report a failure -- no line's
   // write can land after the caller has already given up on it.
   const lineErrors = [];
+  const succeededLines = [];
   await runPool(lines, Math.min(4, lines.length), async (line) => {
     try {
-      await processOrderLine(line);
+      succeededLines.push(await processOrderLine(line));
     } catch (err) {
       lineErrors.push({ ol_number: line.ol_number, error: err instanceof Error ? err.message : String(err) });
     }
   });
   if (lineErrors.length > 0) {
+    // Codex review P2 fix: compensate already-committed lines (and the
+    // header) instead of just leaving them behind as a permanent partial
+    // order. See compensateFailedOrder's own comment for the mechanics and
+    // its own residual limits.
+    await compensateFailedOrder(succeededLines);
     throw new Error(
-      `New-Order failed on ${lineErrors.length}/${lines.length} line(s): ${lineErrors.map((e) => `line ${e.ol_number}: ${e.error}`).join("; ")}`,
+      `New-Order failed on ${lineErrors.length}/${lines.length} line(s) (compensated ${succeededLines.length} already-committed line(s)): ${lineErrors.map((e) => `line ${e.ol_number}: ${e.error}`).join("; ")}`,
     );
   }
 
@@ -165,6 +181,45 @@ async function newOrder(world) {
     values: { w_id: w, d_id: d, o_id },
     requestId: crypto.randomUUID(),
   });
+
+  /** Reverses whatever already-committed lines a failed New-Order left
+   * behind, plus the orphaned header row -- a real compensating-transaction
+   * (saga) step, not just documentation, per Codex round 5 review.
+   * Each line's stock reversal is itself a compare-and-swap (`where` matches
+   * exactly the values THIS line's own update applied): if some OTHER write
+   * touched the stock row again since, the reversal safely no-ops instead of
+   * corrupting that newer state -- a genuine, if now much narrower and
+   * doubly-unlikely, residual (a THIRD concurrent write landing in the
+   * exact window between this line's update and its own compensation).
+   * The orphaned `tpcc_orders` row is deleted outright; `d_next_o_id` is
+   * deliberately NOT decremented back -- a different, newer New-Order may
+   * have already claimed the incremented value, and reversing it could
+   * collide with that legitimately-different order. The resulting gap in
+   * the o_id sequence is expected and harmless, the same way a rolled-back
+   * insert leaves a gap in a real database's auto-increment sequence. */
+  async function compensateFailedOrder(succeeded) {
+    for (const line of succeeded) {
+      try {
+        // order_line always belongs to the ORDERING warehouse's tenant;
+        // stock belongs to the SUPPLY warehouse's tenant -- the same two
+        // (possibly different, for a remote line) tenants processOrderLine
+        // itself wrote to, so reversal must address each independently.
+        await line.orderLineClient.mutate({ op: "delete", table: "tpcc_order_line", partitionKey: line.olKey, requestId: crypto.randomUUID() });
+        await line.stockClient.mutate({
+          op: "update",
+          table: "tpcc_stock",
+          partitionKey: line.stockKey,
+          values: line.originalStock,
+          where: line.appliedStock,
+          requestId: crypto.randomUUID(),
+        });
+      } catch {
+        // Best-effort: keep compensating the rest of the lines rather than
+        // aborting the whole rollback over one failed reversal.
+      }
+    }
+    await home.client.mutate({ op: "delete", table: "tpcc_orders", partitionKey: orderKey(w, d, o_id), requestId: crypto.randomUUID() });
+  }
 
   async function processOrderLine(line) {
     const item = world.itemByI_id.get(line.i_id);
@@ -222,6 +277,17 @@ async function newOrder(world) {
     };
     const olKey = orderLineKey(w, d, o_id, line.ol_number);
 
+    // Compensation data for compensateFailedOrder, if a LATER sibling line
+    // fails and this already-committed one needs to be reversed.
+    const compensation = {
+      orderLineClient: home.client,
+      stockClient: supplyWarehouse.client,
+      olKey,
+      stockKey: stockRow.s_key,
+      originalStock: stockWhere,
+      appliedStock: stockValues,
+    };
+
     if (!line.remote) {
       // Same-warehouse line: order_line insert + stock update as one
       // 2-participant tx -- full atomicity, both mutations share this
@@ -256,6 +322,7 @@ async function newOrder(world) {
         throw new Error(`stock row ${stockRow.s_key} changed concurrently -- remote line's stock update did not apply`);
       }
     }
+    return compensation;
   }
 }
 
@@ -389,6 +456,25 @@ async function delivery(world) {
     const oldest = noRows[0];
     const o_id = oldest.o_id;
 
+    // Codex review P2 fix: CLAIM the marker first, via its own /v1/mutate
+    // delete (checked for rowsAffected), before reading or touching anything
+    // else. This is the actual concurrency-safe fence: a second Delivery
+    // worker that read this SAME "oldest" row (before this delete committed)
+    // will see rowsAffected: 0 here and correctly skip the order as already
+    // claimed by someone else, instead of proceeding to re-credit the
+    // customer for an order someone else already delivered. The previous
+    // version deleted the marker as part of the closing /v1/tx below, whose
+    // response doesn't report per-mutation rowsAffected -- a stale-read
+    // second worker's delete would silently no-op there while its customer
+    // credit still committed, double-crediting the customer for one order.
+    const claimResult = await home.client.mutate({
+      op: "delete",
+      table: "tpcc_new_order",
+      partitionKey: oldest.no_key,
+      requestId: crypto.randomUUID(),
+    });
+    if (claimResult.rowsAffected === 0) continue; // already claimed by a concurrent Delivery worker
+
     const orderRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_id", { d_id: d, o_id });
     const orderRow = (orderRes.rows || [])[0];
     if (!orderRow) throw new Error(`order ${o_id} in district ${d} of warehouse ${w} not found despite a new_order row`);
@@ -401,9 +487,10 @@ async function delivery(world) {
     const lines = linesRes.rows || [];
     const sumAmount = round2(lines.reduce((acc, l) => acc + (l.ol_amount || 0), 0));
 
+    // The marker is already claimed above -- this tx only needs to update
+    // orders + customer now.
     await home.client.tx(
       [
-        { op: "delete", table: "tpcc_new_order", partitionKey: oldest.no_key },
         // o_carrier_id is a plain SET, not derived from a prior read, so no
         // compare-and-swap guard is needed here (unlike the customer update
         // below).
