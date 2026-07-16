@@ -40,6 +40,17 @@ class_name = "TopologyAggregator"
 name = "LOAD_DRIVER"
 class_name = "LoadDriver"
 
+# TenantTokenStore (Shardscope T5): a singleton Durable Object (see
+# src/load/tenant-token-store.ts) that durably get-or-creates the per-
+# warehouse tenant bearer tokens LoadDriver needs to issue real /v1/*
+# transactions. Chosen over a KV namespace: get-or-create needs real
+# atomicity (never register the same tenant twice, never rotate an existing
+# token) that KV's eventually-consistent, no-compare-and-swap put() can't
+# give without extra locking of its own -- see that file's header comment.
+[[durable_objects.bindings]]
+name = "TENANT_TOKEN_STORE"
+class_name = "TenantTokenStore"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TopologyAggregator"]
@@ -50,6 +61,12 @@ new_sqlite_classes = ["TopologyAggregator"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["LoadDriver"]
+
+# Same reasoning as v2 above: TenantTokenStore is a new DO class, so it gets
+# its own migration entry rather than joining v1 or v2 retroactively.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["TenantTokenStore"]
 
 # --- Future: static SPA assets ---------------------------------------------
 # Phase 1 (this file) serves a stub HTML placeholder straight from

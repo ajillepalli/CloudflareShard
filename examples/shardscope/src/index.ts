@@ -17,16 +17,27 @@
  *
  * Both are secrets bound server-side only (see src/env.d.ts) — the browser
  * never receives either token in any response body, header, or inline
- * script. All admin-facing calls (SHARD_API.adminXxx(...)) happen inside
- * this Worker or the TopologyAggregator DO, never in client-side JS.
+ * script; the browser only ever holds a SHARDSCOPE_GATE_TOKEN-derived
+ * session artifact (see src/gate.ts). All admin-facing calls
+ * (SHARD_API.adminXxx(...)) happen inside this Worker or a Durable Object
+ * (TopologyAggregator, LoadDriver, TenantTokenStore), never in client-side
+ * JS.
  *
- * TODO(shardscope): once real routes exist beyond /api/stream, every route
- * that can *mutate* topology (force a reshard, drain a shard, etc. — the
- * eventual "Reshard" / "Chaos" room controls per DESIGN.md) must check
- * SHARDSCOPE_GATE_TOKEN (viewer is allowed to operate Shardscope) AND thread
+ * T5: every /api/* route is now gated behind SHARDSCOPE_GATE_TOKEN (see
+ * src/gate.ts's isGateAuthorized, and the routing below) — this covers both
+ * mutating routes (/api/load/start, /api/load/stop — starting a load run is
+ * a cluster-affecting action) and read-only ones (/api/stream, topology is
+ * sensitive; /api/load/status). GET / (the page shell) and POST /login,
+ * /logout (how a browser obtains the gate artifact) are deliberately NOT
+ * gated. src/gate.ts's header comment explains exactly what this gate is —
+ * and, importantly, is NOT (a real multi-user auth system).
+ *
+ * TODO(shardscope): once topology-mutating admin controls exist beyond the
+ * load engine (force a reshard, drain a shard — the eventual "Reshard" /
+ * "Chaos" room controls per DESIGN.md), each such route must ALSO thread
  * ADMIN_TOKEN through to the underlying SHARD_API call (the call is allowed
- * to touch cloudflare-shard-mvp). Read-only topology display only needs the
- * former.
+ * to touch cloudflare-shard-mvp) in addition to the SHARDSCOPE_GATE_TOKEN
+ * check every /api/* route already gets.
  * ============================================================================
  *
  * STATUS: Phase 1 skeleton. See README.md's "Status" section for exactly
@@ -34,9 +45,11 @@
  */
 import { TopologyAggregator } from "./aggregator";
 import { LoadDriver } from "./load/load-driver";
+import { TenantTokenStore } from "./load/tenant-token-store";
+import { isGateAuthorized, handleLogin, handleLogout } from "./gate";
 import type { Env } from "./env";
 
-export { TopologyAggregator, LoadDriver };
+export { TopologyAggregator, LoadDriver, TenantTokenStore };
 
 // Shardscope palette (DESIGN.md) — inlined here only because this is a
 // placeholder stub page. The real SPA build should pull these from a shared
@@ -130,6 +143,26 @@ export default {
       });
     }
 
+    // POST /login, /logout: how a browser obtains (or clears) the
+    // SHARDSCOPE_GATE_TOKEN session artifact — see src/gate.ts. Deliberately
+    // NOT behind the /api/* gate below; that's how you'd get the artifact in
+    // the first place.
+    if (request.method === "POST" && url.pathname === "/login") {
+      return handleLogin(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/logout") {
+      return handleLogout();
+    }
+
+    // Every /api/* route requires SHARDSCOPE_GATE_TOKEN (header or session
+    // cookie — see src/gate.ts). This fails CLOSED by default for any
+    // current or future /api/* route, not just the specific ones matched
+    // below — see this file's header comment for what this gate is (and
+    // isn't).
+    if (url.pathname.startsWith("/api/") && !isGateAuthorized(request, env)) {
+      return json({ error: "Unauthorized. Provide 'authorization: Bearer <SHARDSCOPE_GATE_TOKEN>', or log in via POST /login first." }, 401);
+    }
+
     // GET /api/stream: Server-Sent Events stream of live topology snapshots.
     //
     // Target architecture (see src/aggregator.ts for the DO side of this):
@@ -140,12 +173,6 @@ export default {
     // forward the browser's SSE connection into that DO — it must NOT poll
     // the admin API itself (that would defeat the whole point of having one
     // shared poller instead of one poll per open tab).
-    //
-    // TODO(shardscope): gate this route with SHARDSCOPE_GATE_TOKEN once a
-    // real auth/session story exists (cookie or header check) — right now
-    // it is wide open, which is fine only because the DO behind it doesn't
-    // do any real polling yet either. Do not ship this open once real
-    // topology data flows through it.
     if (request.method === "GET" && url.pathname === "/api/stream") {
       const id = env.AGGREGATOR.idFromName("singleton");
       const stub = env.AGGREGATOR.get(id);
@@ -157,14 +184,6 @@ export default {
     // with a deterministic hot-shard skew mode. Exactly one instance for the
     // whole Worker (idFromName("singleton")), mirroring AGGREGATOR's own
     // singleton pattern above: one shared load run, not one per caller.
-    //
-    // TODO(shardscope): same auth gap as /api/stream above — gate with
-    // SHARDSCOPE_GATE_TOKEN once a real auth/session story exists. Starting
-    // a load run is a mutating operation (unlike /api/stream's read-only
-    // topology view), so this is a sharper gap than that TODO; acceptable
-    // for now only because real transaction issuance itself still throws
-    // "pending T5" (no tenant tokens wired up yet — see
-    // src/load/token-provider.ts) until a later task lands.
     if (
       (request.method === "POST" && (url.pathname === "/api/load/start" || url.pathname === "/api/load/stop")) ||
       (request.method === "GET" && url.pathname === "/api/load/status")

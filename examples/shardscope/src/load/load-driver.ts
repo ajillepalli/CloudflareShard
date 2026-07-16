@@ -15,9 +15,10 @@
  * and this must stay well under that cap) and reschedules the next tick only
  * while still running. The actual per-transaction network I/O goes through
  * an injected TxExecutor (./gateway-client.ts's HttpTxExecutor, built from a
- * TokenProvider — see ./token-provider.ts) — with today's stub
- * TokenProvider, every real transaction attempt throws a "pending T5" error
- * immediately; the mix/skew/batch logic in this file is complete and correct
+ * TokenProvider — see ./token-provider.ts). As of T5, that TokenProvider is
+ * ./tenant-token-store.ts's TenantTokenStoreTokenProvider, backed by a
+ * durable get-or-create tenant-token store, so real transactions actually
+ * issue; the mix/skew/batch logic in this file is complete and correct
  * independent of that, and is exercised directly by the vitest suite
  * alongside ./transactions.ts and ./skew.ts.
  */
@@ -36,7 +37,8 @@ import {
   type TxExecutor,
 } from "./transactions";
 import { generateSkewedKeys, type VBucketOwnership } from "./skew";
-import { EnvTokenProvider, type TokenProvider } from "./token-provider";
+import type { TokenProvider } from "./token-provider";
+import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
 import { HttpTxExecutor } from "./gateway-client";
 
 export type LoadMode = "uniform" | "skew";
@@ -216,10 +218,14 @@ export class LoadDriver {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
-    // T5 seam: no durable tenant-token source exists yet, so this always
-    // throws "pending T5" the moment a real transaction is issued — see
-    // ./token-provider.ts's header comment for how T5 plugs in.
-    this.tokenProvider = new EnvTokenProvider(undefined);
+    // T5: real, durable tenant-token storage now exists (see
+    // ./tenant-token-store.ts) — every warehouse's tenant token is
+    // get-or-created (never rotated once issued) on first use and persisted
+    // in the TenantTokenStore singleton DO. ./token-provider.ts's
+    // EnvTokenProvider stub remains available as an explicit fallback (e.g.
+    // for tests that want to inject fixed tokens) but is no longer the
+    // default here.
+    this.tokenProvider = new TenantTokenStoreTokenProvider(this.env);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -350,11 +356,12 @@ export class LoadDriver {
       picker = new SkewKeyPicker(new UniformKeyPicker(cfg), this.skewPools);
     }
 
-    // T5 seam: the executor is fully wired (real HTTP + token resolution),
-    // but with today's stub TokenProvider every call throws immediately —
-    // see this file's header comment. baseUrl is optional at /api/load/start
-    // time for exactly this reason: nothing downstream can reach the network
-    // successfully yet regardless.
+    // As of T5 the executor is fully wired end-to-end: real HTTP + real
+    // token resolution via TenantTokenStoreTokenProvider (see this file's
+    // header comment and ./tenant-token-store.ts). baseUrl is still optional
+    // at /api/load/start time — if unset, every call's fetch() targets an
+    // empty base URL and fails at the network layer, a clear, obvious
+    // failure mode rather than a silent no-op.
     const exec: TxExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
 
     const batchSize = Math.min(config.concurrency, MAX_TRANSACTIONS_PER_TICK);

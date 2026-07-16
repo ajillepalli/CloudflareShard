@@ -41,6 +41,19 @@ export interface ShardApiBinding {
    * function 400s without it) and ShardDO.handleStats in src/shard.ts for
    * the actual JSON body shape. */
   adminShardStats(adminToken: string, body: { shardId: string }): Promise<unknown>;
+  /** Registers (or, with `rotate: true`, re-issues) a tenant's bearer token.
+   * See adminRegisterTenantCore + CatalogDO.handleRegisterTenant in the main
+   * repo's src/index.ts / src/catalog.ts. Success response body:
+   * `{ ok: true, tenantId, token }` — the token is returned ONLY on this
+   * call; the catalog stores just its hash from then on. Without
+   * `rotate: true`, registering an already-registered tenantId rejects (the
+   * underlying RPC throws, since CloudflareShardRpc's adminRegisterTenant
+   * unwraps a non-2xx HTTP response into a thrown Error) with a message
+   * containing `TENANT_ALREADY_REGISTERED` rather than returning a new
+   * token — see src/load/tenant-token-store.ts, whose entire get-or-create
+   * design exists to never pass `rotate: true` for a tenant it didn't
+   * itself just create. */
+  adminRegisterTenant(adminToken: string, body: { tenantId: string; rotate?: boolean }): Promise<unknown>;
 }
 
 export interface Env {
@@ -59,6 +72,16 @@ export interface Env {
    * idFromName("singleton"): one shared load run for the whole Worker, not one
    * per caller. */
   LOAD_DRIVER: DurableObjectNamespace;
+
+  /** Durable Object namespace for the single shared tenant-token store
+   * (Shardscope T5). See src/load/tenant-token-store.ts — durable
+   * get-or-create storage for the per-warehouse tenant bearer tokens
+   * LoadDriver needs to issue real /v1/* transactions. Always addressed via
+   * idFromName("singleton"), same reasoning as AGGREGATOR/LOAD_DRIVER above.
+   * A Durable Object (not a KV namespace) was chosen specifically because
+   * get-or-create needs real atomicity — see tenant-token-store.ts's header
+   * comment for why. */
+  TENANT_TOKEN_STORE: DurableObjectNamespace;
 
   /** Bearer token this Worker presents to cloudflare-shard-mvp's /admin/*
    * surface (HTTP today; RPC methods that take an explicit adminToken
