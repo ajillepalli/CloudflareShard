@@ -105,6 +105,59 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     expect(listBody.indexes.map((i) => i.indexName)).toContain("idx_backfill_by_v");
   });
 
+  // Codex review P1 fix: a fresh shard's FIRST backfill page used to run
+  // `WHERE pk > ''`. For a TEXT-affinity partition key that's a correct
+  // "everything" sentinel (any non-empty TEXT sorts after ''), but for an
+  // INTEGER-affinity partition key column, SQLite's type-ordering ranks
+  // every INTEGER below every TEXT value, so `id > ''` is FALSE for every
+  // existing integer -- the first page would silently scan zero rows, the
+  // shard-exhausted branch would advance past it as if it had no data, and
+  // the index would reach 'ready' having silently skipped every pre-existing
+  // row on a table using a non-TEXT-affinity partition key.
+  it("backfills pre-existing rows on a table whose partition key column is INTEGER-affinity, not just TEXT (Codex review P1 fix)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      { table: "idx_intpk_evt", schema: "CREATE TABLE idx_intpk_evt (id INTEGER PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Insert rows BEFORE the index exists, same as the TEXT-partition-key
+    // test above -- proves backfill actually indexes pre-existing data on
+    // an INTEGER-affinity column, not just a TEXT one.
+    await post("/v1/mutate", { op: "insert", table: "idx_intpk_evt", tenantId, partitionKey: "1", values: { v: "alpha" } }, token);
+    await post("/v1/mutate", { op: "insert", table: "idx_intpk_evt", tenantId, partitionKey: "2", values: { v: "beta" } }, token);
+
+    const res = await post("/admin/create-index", { indexName: "idx_intpk_by_v", table: "idx_intpk_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_intpk_by_v");
+
+    const foundRows: Array<{ partition_key: string; index_key_json: string }> = [];
+    for (const candidateShardId of ["catalog-0-shard-0", "catalog-1-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"]) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        foundRows.push(
+          ...(Array.from(
+            state.storage.sql.exec("SELECT partition_key, index_key_json FROM __cf_indexes WHERE index_name = ?", "idx_intpk_by_v"),
+          ) as Array<{ partition_key: string; index_key_json: string }>),
+        );
+      });
+    }
+    // Both pre-existing rows must be indexed -- neither silently skipped.
+    foundRows.sort((a, b) => (a.partition_key < b.partition_key ? -1 : 1));
+    expect(foundRows).toHaveLength(2);
+    expect(JSON.parse(foundRows[0].index_key_json)).toEqual(["alpha"]);
+    expect(JSON.parse(foundRows[1].index_key_json)).toEqual(["beta"]);
+
+    // Also confirmed via the actual query path, not just physical inspection.
+    const q = await post("/v1/index-query", { table: "idx_intpk_evt", indexName: "idx_intpk_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(q.status).toBe(200);
+    expect(((await q.json()) as { rows: unknown[] }).rows).toHaveLength(1);
+  });
+
   // Codex full-PR review P1 (silent index miss): an index created AFTER a
   // shard is marked draining but BEFORE its vbuckets migrate must still index
   // that shard's existing rows — the backfill scan is drain-aware (active +

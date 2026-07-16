@@ -2320,9 +2320,28 @@ export class CatalogDO extends DurableObject {
     const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
     const shardId = shardIds[row.backfill_shard_idx];
 
+    // Codex review P1 fix: this shard's FIRST page (backfill_after_pk still
+    // at its '' default) must not filter with `WHERE pk > ''` at all. That
+    // predicate is only safe once a REAL previously-seen key is bound --
+    // SQLite's affinity rules convert a numeric-looking TEXT parameter (e.g.
+    // "251") for comparison against an INTEGER-affinity column, so later
+    // pages compare correctly (proven directly: `WHERE id > '250'` against
+    // an INTEGER PRIMARY KEY column correctly returns only rows > 250). An
+    // EMPTY string parameter doesn't convert the same way: SQLite's type
+    // ordering ranks any INTEGER below any TEXT, so `id > ''` is FALSE for
+    // every existing integer value, not true -- the first page would
+    // silently scan zero rows on any table using a non-TEXT-affinity
+    // partition key column, and the shard-exhausted branch below would then
+    // advance past it as if it had no data at all, permanently skipping
+    // every pre-existing row. Omitting the predicate entirely for the
+    // sentinel case sidesteps the whole affinity question -- ORDER BY +
+    // LIMIT alone correctly return "the first page," for any column type.
+    const hasCursor = row.backfill_after_pk !== "";
     const scanRes = await this.callShard(shardId, "/execute", {
-      sql: `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePk} > ? ORDER BY ${safePk} ASC LIMIT ?`,
-      params: [row.backfill_after_pk, INDEX_BACKFILL_PAGE_SIZE],
+      sql: hasCursor
+        ? `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePk} > ? ORDER BY ${safePk} ASC LIMIT ?`
+        : `SELECT ${selectCols} FROM ${safeTable} ORDER BY ${safePk} ASC LIMIT ?`,
+      params: hasCursor ? [row.backfill_after_pk, INDEX_BACKFILL_PAGE_SIZE] : [INDEX_BACKFILL_PAGE_SIZE],
       requestId: `create-index-backfill-scan-${row.index_name}-${shardId}-${crypto.randomUUID()}`,
       isMutation: false,
     });
