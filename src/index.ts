@@ -1274,6 +1274,50 @@ async function handleAdminStatus(request: Request, env: Env): Promise<Response> 
   return adminStatusCore(env, request.headers.get("authorization") ?? undefined);
 }
 
+/** Shardscope T1: the per-vBucket -> shard map (including in-flight
+ * migration state), fanned out across every catalog shard and merged
+ * CATALOG-AWARE — vbucket IDs are catalog-local (each catalog shard
+ * independently hashes into its own [0, totalVBuckets) range), so a
+ * dashboard rendering this must never flatten two catalogs' maps into one
+ * array: vbucket 0 on catalog-0 and vbucket 0 on catalog-1 are unrelated
+ * vbuckets that happen to share a number. Mirrors adminStatusCore's
+ * fan-out/merge shape. */
+async function adminVbucketMapCore(env: Env, authorization: string | undefined): Promise<Response> {
+  // This handler only ever calls CatalogDO (never ShardDO directly), so
+  // CatalogDO's own auth check on /vbucket-map is the primary gate; this is
+  // the same defense-in-depth double-check requireAdminAuthFromHeader's doc
+  // comment describes for other /admin/* and RPC-reachable core functions.
+  const authError = requireAdminAuthFromHeader(env, authorization);
+  if (authError) return authError;
+
+  const results = await fanOutToAllCatalogs(env, "/vbucket-map", () => ({}), authorization);
+  const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to report their vbucket map.");
+  if (failed) return failed;
+
+  type VbucketMapRow = {
+    vbucket: number;
+    shardId: string;
+    migrationStatus: string;
+    targetShardId: string | null;
+    cutoverStartedAt: string | null;
+  };
+  type CatalogVbucketMap = {
+    catalogShardId: string;
+    totalVBuckets: number;
+    map: VbucketMapRow[];
+  };
+  const catalogs: CatalogVbucketMap[] = results.map((r) => {
+    const body = r.body as { totalVBuckets: number; map: VbucketMapRow[] };
+    return { catalogShardId: r.catalogShardId, totalVBuckets: body.totalVBuckets, map: body.map };
+  });
+  const totalVBuckets = catalogs.reduce((sum, c) => sum + c.totalVBuckets, 0);
+  return json({ catalogShardCount: results.length, totalVBuckets, catalogs });
+}
+
+async function handleAdminVbucketMap(request: Request, env: Env): Promise<Response> {
+  return adminVbucketMapCore(env, request.headers.get("authorization") ?? undefined);
+}
+
 async function adminListTablesCore(env: Env, authorization: string | undefined): Promise<Response> {
   // table_rules are fanned out identically to every catalog shard by
   // /admin/register-table, so catalog-0 is representative of all of them.
@@ -3685,6 +3729,11 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     return unwrapForRpc(await adminStatusCore(this.env, `Bearer ${adminToken}`));
   }
 
+  async adminVbucketMap(adminToken: string): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminVbucketMapCore(this.env, `Bearer ${adminToken}`));
+  }
+
   async adminListTables(adminToken: string): Promise<unknown> {
     assertAdminRpcAuth(this.env, adminToken);
     return unwrapForRpc(await adminListTablesCore(this.env, `Bearer ${adminToken}`));
@@ -3770,6 +3819,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/create-table": handleAdminCreateTable,
   "/admin/split-vbucket": handleAdminSplitVbucket,
   "/admin/status": handleAdminStatus,
+  "/admin/vbucket-map": handleAdminVbucketMap,
   "/admin/list-tables": handleAdminListTables,
   "/admin/drain-shard": handleAdminDrainShard,
   "/admin/shard-stats": handleAdminShardStats,

@@ -4,7 +4,7 @@ import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { ALL_TEST_SHARD_IDS, AUTH, initCluster, post, registerTenant, shardExecute, tenantForCatalogShard } from "./index.test-helpers";
+import { ALL_TEST_SHARD_IDS, AUTH, initCluster, post, registerTenant, setMigrationState, shardExecute, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -33,6 +33,71 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(body.initialized).toBe(true);
     // 2 shards per catalog x >=2 catalog shards
     expect(body.shards.total).toBeGreaterThanOrEqual(4);
+  });
+
+  it("/admin/vbucket-map returns one namespaced map per catalog shard, without collapsing same-numbered vbuckets across catalogs", async () => {
+    // handleInit floors totalVBuckets at 64 (see catalog.ts's handleInit) —
+    // pass 64 explicitly so the request value and the enforced value agree.
+    await initCluster(2, 64);
+    const res = await post("/admin/vbucket-map", {}, AUTH());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      catalogShardCount: number;
+      totalVBuckets: number;
+      catalogs: Array<{
+        catalogShardId: string;
+        totalVBuckets: number;
+        map: Array<{ vbucket: number; shardId: string; migrationStatus: string; targetShardId: string | null; cutoverStartedAt: string | null }>;
+      }>;
+    };
+    expect(body.catalogShardCount).toBeGreaterThan(1);
+    expect(body.catalogs.map((c) => c.catalogShardId)).toEqual(
+      expect.arrayContaining(["catalog-0", "catalog-1"]),
+    );
+    // Every catalog shard independently maps the full [0, totalVBuckets)
+    // range — vbucket 0 exists in EVERY catalog's own map, and each is a
+    // distinct, catalog-local vbucket, so the response must keep them under
+    // separate catalog entries rather than flattening into one shared array.
+    for (const catalog of body.catalogs) {
+      expect(catalog.totalVBuckets).toBe(64);
+      expect(catalog.map.map((m) => m.vbucket)).toEqual(Array.from({ length: 64 }, (_, i) => i));
+      for (const row of catalog.map) {
+        expect(row.migrationStatus).toBe("none");
+        expect(row.targetShardId).toBeNull();
+        expect(row.cutoverStartedAt).toBeNull();
+      }
+    }
+    expect(body.totalVBuckets).toBe(body.catalogShardCount * 64);
+  });
+
+  it("/admin/vbucket-map surfaces in-flight migration state for the affected vbucket", async () => {
+    await initCluster(2, 64);
+    const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const sourceShardId = await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec("SELECT shard_id FROM vbucket_map WHERE vbucket = 0")) as Array<{ shard_id: string }>;
+      return rows[0].shard_id;
+    });
+    const targetShardId = sourceShardId === "catalog-0-shard-0" ? "catalog-0-shard-1" : "catalog-0-shard-0";
+    await setMigrationState(0, "backfilling", targetShardId);
+    try {
+      const res = await post("/admin/vbucket-map", {}, AUTH());
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        catalogs: Array<{ catalogShardId: string; map: Array<{ vbucket: number; migrationStatus: string; targetShardId: string | null }> }>;
+      };
+      const catalog0 = body.catalogs.find((c) => c.catalogShardId === "catalog-0")!;
+      const row = catalog0.map.find((m) => m.vbucket === 0)!;
+      expect(row.migrationStatus).toBe("backfilling");
+      expect(row.targetShardId).toBe(targetShardId);
+    } finally {
+      await setMigrationState(0, "none", null);
+    }
+  });
+
+  it("/admin/vbucket-map requires the admin token (no token -> 401)", async () => {
+    await initCluster();
+    const res = await post("/admin/vbucket-map", {});
+    expect(res.status).toBe(401);
   });
 
   it("/admin/split-vbucket requires catalogShardId", async () => {
