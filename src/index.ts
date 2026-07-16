@@ -28,6 +28,16 @@ export interface Env {
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   ADMIN_TOKEN?: string;
   CATALOG_SHARD_COUNT?: string;
+  /** SAFETY: demo-only fault-injection kill switch (Shardscope chaos mode —
+   * see /admin/fault-inject, /admin/fault-clear, and ShardDO's
+   * checkFaultInjection in shard.ts). Every fault-injection code path treats
+   * anything other than the EXACT string "true" as disabled/no-op.
+   * PRODUCTION MUST NEVER SET THIS VARIABLE. It exists purely so a demo
+   * environment can make one shard briefly return 503s to show the cluster
+   * surviving a node blip — leaving it unset (the default for every real
+   * deployment) means the feature has zero fault surface: the admin
+   * endpoints 403 immediately and ShardDO's own check is a no-op. */
+  FAULT_INJECTION_ENABLED?: string;
 }
 
 const DEFAULT_CATALOG_SHARD_COUNT = 4;
@@ -1859,6 +1869,139 @@ async function adminShardStatsCore(env: Env, body: { shardId: string }, authoriz
 async function handleAdminShardStats(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { shardId: string };
   return adminShardStatsCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+// ---- Demo-only fault injection (Shardscope chaos mode) ----
+// SAFETY: see Env.FAULT_INJECTION_ENABLED's doc comment above. Every entry
+// point below — HTTP and RPC — checks this flag before doing anything else,
+// so a production deployment that never sets it has zero fault surface: the
+// endpoint 403s before auth, before routing, before ever reaching the target
+// ShardDO. ShardDO enforces the same gate again independently (see
+// handleFaultInject in shard.ts) — this is intentional defense-in-depth for
+// a fault surface in a database, not redundancy to clean up.
+
+/** Gate shared by both fault-injection endpoints — checked FIRST, ahead of
+ * admin auth, so a disabled deployment never even evaluates whether the
+ * caller is an admin for this specific pair of routes. */
+function requireFaultInjectionEnabled(env: Env): Response | null {
+  if (env.FAULT_INJECTION_ENABLED !== "true") {
+    return json(
+      { error: 'Fault injection is disabled. Set FAULT_INJECTION_ENABLED="true" to enable this demo-only endpoint — never in production.' },
+      403,
+    );
+  }
+  return null;
+}
+
+/** SAFETY (non-destructive on cold shards): resolves a shardId against the
+ * LIVE topology and returns a Response to propagate if it is NOT a currently
+ * known shard, else null. Must be called BEFORE any env.SHARD.get()/.fetch()
+ * on the id — because merely `.get()`-ing a never-seen ShardDO id and sending
+ * it a request INSTANTIATES that Durable Object, whose constructor schedules
+ * an alarm (a durable-storage write). So faulting an arbitrary/unknown
+ * shardId would MATERIALIZE a DO that never existed — a write, i.e.
+ * destructive. Guarding here means a cold/unknown id is rejected without ever
+ * touching the DO. The known set is the union of every vbucket_map row's
+ * shardId and target_shard_id across all catalog shards — exactly the ids the
+ * cluster currently routes to (or is migrating to). Returns a 503 if the
+ * topology itself can't be read (fail-closed: don't fault a shard we can't
+ * confirm exists). */
+async function rejectIfUnknownShard(
+  env: Env,
+  shardId: string,
+  authorization: string | undefined,
+): Promise<Response | null> {
+  const results = await fanOutToAllCatalogs(env, "/vbucket-map", () => ({}), authorization);
+  const failed = firstCatalogFanOutFailure(results, "Could not read the vbucket map to validate the target shard.");
+  if (failed) return failed;
+  const known = new Set<string>();
+  for (const r of results) {
+    const map = (r.body as { map?: Array<{ shardId?: string; targetShardId?: string | null }> }).map ?? [];
+    for (const row of map) {
+      if (row.shardId) known.add(row.shardId);
+      if (row.targetShardId) known.add(row.targetShardId);
+    }
+  }
+  if (!known.has(shardId)) {
+    return json(
+      {
+        error: {
+          code: "UNKNOWN_SHARD",
+          message: `Shard ${shardId} is not a currently-known shard; refusing to fault-inject an id the cluster doesn't route to.`,
+          fix: "Target a shardId that appears in /admin/vbucket-map (as a shardId or target_shard_id).",
+        },
+      },
+      404,
+    );
+  }
+  return null;
+}
+
+async function adminFaultInjectCore(
+  env: Env,
+  body: { shardId?: string; catalogShardId?: string; mode?: string; durationMs?: number },
+  authorization: string | undefined,
+): Promise<Response> {
+  const disabledError = requireFaultInjectionEnabled(env);
+  if (disabledError) return disabledError;
+  const authError = requireAdminAuthFromHeader(env, authorization);
+  if (authError) return authError;
+  if (!body.shardId) {
+    return json({ error: "Missing shardId." }, 400);
+  }
+  // SAFETY (non-destructive on cold shards): validate BEFORE routeToShard so
+  // an unknown id is never .get()/.fetch()'d into existence — see
+  // rejectIfUnknownShard. This is also what keeps the blast radius bounded to
+  // real cluster shards.
+  const unknownError = await rejectIfUnknownShard(env, body.shardId, authorization);
+  if (unknownError) return unknownError;
+  // BOUNDED BLAST RADIUS: routeToShard resolves exactly one ShardDO by
+  // shardId — catalogShardId is accepted (mirrors every other shard-targeted
+  // admin route's shape) but unused for routing; there is no fan-out here,
+  // ever, to more than the single named shard.
+  const res = await routeToShard(env, body.shardId, "/fault-inject", {
+    mode: body.mode ?? "unreachable",
+    durationMs: body.durationMs,
+  });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminFaultInject(request: Request, env: Env): Promise<Response> {
+  // Flag-check BEFORE parsing the body so a disabled deployment never even
+  // reads attacker-supplied input (the "flag checked first" guarantee is
+  // literal, not just enforced downstream in the Core).
+  const disabledError = requireFaultInjectionEnabled(env);
+  if (disabledError) return disabledError;
+  const body = (await request.json()) as { shardId?: string; catalogShardId?: string; mode?: string; durationMs?: number };
+  return adminFaultInjectCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminFaultClearCore(
+  env: Env,
+  body: { shardId?: string; catalogShardId?: string },
+  authorization: string | undefined,
+): Promise<Response> {
+  const disabledError = requireFaultInjectionEnabled(env);
+  if (disabledError) return disabledError;
+  const authError = requireAdminAuthFromHeader(env, authorization);
+  if (authError) return authError;
+  if (!body.shardId) {
+    return json({ error: "Missing shardId." }, 400);
+  }
+  // Same cold-shard guard as inject: never instantiate an unknown DO just to
+  // "clear" a fault it can't possibly have.
+  const unknownError = await rejectIfUnknownShard(env, body.shardId, authorization);
+  if (unknownError) return unknownError;
+  const res = await routeToShard(env, body.shardId, "/fault-clear", {});
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminFaultClear(request: Request, env: Env): Promise<Response> {
+  // Flag-check before parsing the body (see handleAdminFaultInject).
+  const disabledError = requireFaultInjectionEnabled(env);
+  if (disabledError) return disabledError;
+  const body = (await request.json()) as { shardId?: string; catalogShardId?: string };
+  return adminFaultClearCore(env, body, request.headers.get("authorization") ?? undefined);
 }
 
 async function sqlCore(env: Env, ctx: ExecutionContext, body: SqlRequest, authorization: string | undefined): Promise<Response> {
@@ -3811,6 +3954,23 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     assertAdminRpcAuth(this.env, adminToken);
     return unwrapForRpc(await scatterCore(this.env, body, `Bearer ${adminToken}`));
   }
+
+  /** Demo-only fault injection (Shardscope chaos mode) — see
+   * Env.FAULT_INJECTION_ENABLED's doc comment. assertAdminRpcAuth runs first
+   * (uniform with every other admin RPC method here), and
+   * adminFaultInjectCore independently re-checks BOTH FAULT_INJECTION_ENABLED
+   * and admin auth before doing anything — so this RPC path has the exact
+   * same "flag gate, then admin gate" enforcement as the HTTP path, just with
+   * assertAdminRpcAuth's uniform admin pre-check ahead of it too. */
+  async adminFaultInject(adminToken: string, body: Parameters<typeof adminFaultInjectCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminFaultInjectCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminFaultClear(adminToken: string, body: Parameters<typeof adminFaultClearCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminFaultClearCore(this.env, body, `Bearer ${adminToken}`));
+  }
 }
 
 const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext) => Promise<Response>> = {
@@ -3841,6 +4001,8 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/drain-shard-status": handleAdminDrainShardStatus,
   "/admin/topology-lock-status": handleAdminTopologyLockStatus,
   "/admin/force-release-topology-lock": handleAdminForceReleaseTopologyLock,
+  "/admin/fault-inject": handleAdminFaultInject,
+  "/admin/fault-clear": handleAdminFaultClear,
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
