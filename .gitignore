@@ -99,3 +99,14 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# ------------------------------
+# TPC-C benchmark (examples/tpc-c-benchmark)
+# ------------------------------
+# Codex review round 16 P2 fix: the nested examples/tpc-c-benchmark/.gitignore
+# only protects this pattern relative to that directory -- invoking the CLI
+# from the repo root (e.g. `node examples/tpc-c-benchmark/src/run.mjs seed`,
+# without cd-ing into the example first) writes the default tenants file
+# relative to the repo root instead, outside that nested rule's scope. This
+# root-level rule covers plaintext tenant bearer tokens regardless of which
+# directory the CLI happens to be invoked from.
