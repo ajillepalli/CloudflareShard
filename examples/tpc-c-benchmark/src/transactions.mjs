@@ -18,11 +18,39 @@
 //   - Stock-Level's server-side aggregate is replaced with table-scan +
 //     client-side counting -- no aggregation pushdown exists.
 //   - New-Order's per-order-line atomicity is split from the order header
-//     (district update + order header + new_order insert are one tx; each
-//     line's order_line insert + stock update is a SEPARATE tx) -- a direct
-//     consequence of the 8-participant cap: a New-Order with the spec's
-//     default 5-15 lines could touch 2 + 2*15 = 32 distinct rows, far past
-//     the cap, if attempted as one transaction.
+//     (district update + order insert are one tx; each line's order_line
+//     insert + stock update is a SEPARATE tx) -- a direct consequence of the
+//     8-participant cap: a New-Order with the spec's default 5-15 lines
+//     could touch 2 + 2*15 = 32 distinct rows, far past the cap, if
+//     attempted as one transaction. The new_order marker itself (what makes
+//     an order visible to Delivery at all) is deliberately inserted LAST,
+//     as its own standalone write after every line has committed -- not
+//     alongside district+orders in the header tx -- specifically so a
+//     concurrent Delivery pass can never observe an order that's still
+//     mid-flight (Codex review found this: inserting the marker up front
+//     let Delivery race New-Order's own line-processing loop, summing an
+//     incomplete order and orphaning whichever lines hadn't landed yet).
+//     A second, narrower gap was found the same way (confirmed live:
+//     seeding fresh warehouses and running under contention reliably
+//     produced a small number of these): runPool's own `Promise.all`
+//     rejects on the FIRST line to throw without waiting for other
+//     still-in-flight lines, so if one line failed (a TX_ABORTED, a
+//     detected stock conflict), the New-Order function threw and skipped
+//     the marker insert entirely -- while OTHER lines already in flight in
+//     parallel workers could still commit successfully in the background
+//     afterward, leaving a real, partial, permanently-undelivered order
+//     behind. Fixed by catching each line's own error INSIDE the pool
+//     callback instead of letting it propagate through Promise.all: every
+//     line is now always awaited to completion (success or caught failure)
+//     before the function decides whether to insert the marker or report an
+//     aggregate failure. Residual gap after that fix: if the FINAL
+//     marker-insert call itself fails (a genuine, separate possibility, not
+//     the race above), the order/lines/stock writes that already committed
+//     are still not rolled back, and the order is then never visible to
+//     Delivery -- accepted as out of proportion to close for a benchmark
+//     (would need saga-style compensating rollback, real machinery for a
+//     demo project), and rare enough at this benchmark's realistic scale
+//     not to meaningfully affect the numbers it reports.
 //   - Remote (cross-warehouse) order lines in New-Order (~1% of lines) fall
 //     back to two independent, non-atomic /v1/mutate calls instead of a
 //     2-participant tx -- a consequence of /v1/tx's one-tenantId-per-call
@@ -78,6 +106,17 @@ async function newOrder(world) {
   const o_id = districtRow.d_next_o_id;
   const entryDate = new Date().toISOString();
 
+  // Codex review P2 fix: the new_order marker (the thing that makes this
+  // order visible to Delivery at all) is deliberately NOT inserted here,
+  // alongside district+orders. If it were, a concurrent Delivery worker
+  // could pick up this order in the window between this header tx
+  // committing and the per-line transactions below finishing -- summing
+  // zero or partial order_line rows, deleting the marker, and adjusting the
+  // customer's balance by the wrong (incomplete) amount, with the still-
+  // arriving lines left permanently undelivered (no marker left for a
+  // future Delivery pass to find them by). Inserting new_order as the LAST
+  // step, only once every line has actually committed, closes that window:
+  // an order is never visible to Delivery until it's actually complete.
   await home.client.tx(
     [
       { op: "update", table: "tpcc_district", partitionKey: districtRow.d_key, values: { d_next_o_id: o_id + 1 } },
@@ -87,19 +126,47 @@ async function newOrder(world) {
         partitionKey: orderKey(w, d, o_id),
         values: { w_id: w, d_id: d, o_id, c_id, o_entry_d: entryDate, o_carrier_id: null, o_ol_cnt: lineCount },
       },
-      {
-        op: "insert",
-        table: "tpcc_new_order",
-        partitionKey: newOrderKey(w, d, o_id),
-        values: { w_id: w, d_id: d, o_id },
-      },
     ],
     crypto.randomUUID(),
   );
 
   // Process lines with a little concurrency -- independent rows in the
   // common (same-warehouse) case, so there's no reason to serialize them.
+  // Verification found a real gap in an earlier version of this: runPool's
+  // Promise.all rejects on the FIRST line to throw without waiting for
+  // other still-in-flight lines, so those other lines could still commit
+  // successfully in the background AFTER this function had already thrown
+  // past the marker-insert step below -- a partial, never-delivered order.
+  // Catching each line's own error INSIDE the pool callback (instead of
+  // letting it propagate through Promise.all) means every line is always
+  // awaited to completion, one way or the other, before this function
+  // decides whether to insert the marker or report a failure -- no line's
+  // write can land after the caller has already given up on it.
+  const lineErrors = [];
   await runPool(lines, Math.min(4, lines.length), async (line) => {
+    try {
+      await processOrderLine(line);
+    } catch (err) {
+      lineErrors.push({ ol_number: line.ol_number, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  if (lineErrors.length > 0) {
+    throw new Error(
+      `New-Order failed on ${lineErrors.length}/${lines.length} line(s): ${lineErrors.map((e) => `line ${e.ol_number}: ${e.error}`).join("; ")}`,
+    );
+  }
+
+  // Only now -- after every line has actually committed -- does this order
+  // become visible to Delivery. See the comment on the header tx above.
+  await home.client.mutate({
+    op: "insert",
+    table: "tpcc_new_order",
+    partitionKey: newOrderKey(w, d, o_id),
+    values: { w_id: w, d_id: d, o_id },
+    requestId: crypto.randomUUID(),
+  });
+
+  async function processOrderLine(line) {
     const item = world.itemByI_id.get(line.i_id);
     const supplyWarehouse = world.warehouseById.get(line.supplyWarehouseId);
 
@@ -189,7 +256,7 @@ async function newOrder(world) {
         throw new Error(`stock row ${stockRow.s_key} changed concurrently -- remote line's stock update did not apply`);
       }
     }
-  });
+  }
 }
 
 /** Payment: weight 43% of the standard TPC-C mix. */

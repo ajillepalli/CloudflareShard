@@ -228,11 +228,21 @@ export async function seed(opts) {
           d_name: existingDistrict?.d_name ?? `D${w}-${d}`,
           d_tax: dTax,
           d_ytd: existingDistrict?.d_ytd ?? 30000.0,
-          // Preserve an already-advanced counter across reseeds (see comment
-          // above) -- only a genuinely new district starts at the real
-          // TPC-C initial-load convention (o_id 1..customersPerDistrict are
-          // pre-existing orders, so the next fresh order starts right after them).
-          d_next_o_id: existingDistrict?.d_next_o_id ?? customersPerDistrict + 1,
+          // Codex review P2 fix (round 2): take the MAX of "whatever's
+          // already there" and "this run's own baseline" -- preserving the
+          // existing value outright (as a first version of this fix did)
+          // breaks the case where a reseed also passes a LARGER
+          // --customers-per-district with --seed-orders than a prior run
+          // used: this run's seed still inserts pre-existing orders up to
+          // the new customersPerDistrict, and if the old preserved
+          // d_next_o_id were smaller than that, New-Order would immediately
+          // start colliding with the just-seeded order keys. Math.max keeps
+          // both cases correct: a genuinely new district gets the normal
+          // baseline (o_id 1..customersPerDistrict are pre-existing orders,
+          // so the next fresh order starts right after them); an existing
+          // district keeps its already-advanced counter UNLESS this run's
+          // own baseline is higher, in which case that wins instead.
+          d_next_o_id: Math.max(existingDistrict?.d_next_o_id ?? 0, customersPerDistrict + 1),
         },
       });
     }
