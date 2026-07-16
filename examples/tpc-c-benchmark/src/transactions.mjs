@@ -314,13 +314,44 @@ async function newOrder(world) {
   // awaited to completion, one way or the other, before this function
   // decides whether to insert the marker or report a failure -- no line's
   // write can land after the caller has already given up on it.
+  //
+  // Codex review round 15 P2 fix: lines are now grouped by
+  // (supplyWarehouseId, i_id) FIRST, and only DIFFERENT groups run
+  // concurrently against each other -- lines WITHIN one group (the rare
+  // case the dedup loop above still let collide) run strictly
+  // sequentially. This closes a gap in round 14's LIFO-reversal fix for
+  // compensateFailedOrder: that fix assumed succeededLines.push() order
+  // (governed by each line's own promise settling) matches the TRUE
+  // server-side commit order for same-row lines -- true when a losing
+  // line's own CAS retry adds a real extra round trip, but NOT
+  // guaranteed in general, since ordinary network/response jitter can let
+  // an earlier-committing line's response arrive LATER than a
+  // later-committing line's response, reversing push order relative to
+  // commit order. Serializing same-key lines removes the ambiguity at its
+  // source instead of trying to infer true order after the fact: with only
+  // one line "in flight" for a given stock row at a time, there is no
+  // racing response to reorder, so push order is push order BY
+  // CONSTRUCTION for every group. Distinct-key groups (the overwhelming
+  // common case, and the ONLY case once --items comfortably exceeds line
+  // counts) still run fully concurrently for throughput -- this only
+  // changes behavior for the already-rare duplicate-stock-row fallback.
+  const lineGroups = new Map();
+  for (const line of lines) {
+    const key = `${line.supplyWarehouseId}-${line.i_id}`;
+    if (!lineGroups.has(key)) lineGroups.set(key, []);
+    lineGroups.get(key).push(line);
+  }
+  const groups = [...lineGroups.values()];
+
   const lineErrors = [];
   const succeededLines = [];
-  await runPool(lines, Math.min(4, lines.length), async (line) => {
-    try {
-      succeededLines.push(await processOrderLine(line));
-    } catch (err) {
-      lineErrors.push({ ol_number: line.ol_number, error: err instanceof Error ? err.message : String(err) });
+  await runPool(groups, Math.min(4, groups.length), async (group) => {
+    for (const line of group) {
+      try {
+        succeededLines.push(await processOrderLine(line));
+      } catch (err) {
+        lineErrors.push({ ol_number: line.ol_number, error: err instanceof Error ? err.message : String(err) });
+      }
     }
   });
   if (lineErrors.length > 0) {
@@ -907,14 +938,39 @@ async function delivery(world) {
         // Delivery's marker-restore-then-retry mechanism is exactly the kind
         // of "someone retries this same logical credit later" scenario the
         // file-header/Payment comments warn never to create.
-        const result = await mutateResolvingAmbiguity(home.client, {
-          op: "update",
-          table: "tpcc_customer",
-          partitionKey: custRow.c_key,
-          values: { c_balance: round2(custRow.c_balance + sumAmount), c_delivery_cnt: custRow.c_delivery_cnt + 1 },
-          where: { c_balance: custRow.c_balance, c_delivery_cnt: custRow.c_delivery_cnt },
-          requestId: crypto.randomUUID(),
-        });
+        const intendedBalance = round2(custRow.c_balance + sumAmount);
+        const intendedDeliveryCnt = custRow.c_delivery_cnt + 1;
+        let result;
+        try {
+          result = await mutateResolvingAmbiguity(home.client, {
+            op: "update",
+            table: "tpcc_customer",
+            partitionKey: custRow.c_key,
+            values: { c_balance: intendedBalance, c_delivery_cnt: intendedDeliveryCnt },
+            where: { c_balance: custRow.c_balance, c_delivery_cnt: custRow.c_delivery_cnt },
+            requestId: crypto.randomUUID(),
+          });
+        } catch (err) {
+          // Codex review round 15 P2 fix: mutateResolvingAmbiguity itself
+          // can still throw if EVERY one of its own bounded attempts hits
+          // an ambiguous (non-ApiError) failure -- a rare, sustained
+          // network problem, but escalating straight to the outer catch's
+          // marker restoration would reopen the exact double-credit risk
+          // the round-13 fix exists to close, if this credit actually DID
+          // apply on some attempt whose response was lost every time.
+          // Resolve it for good with one final read: this order's marker
+          // was already claimed via its own checked delete before this
+          // function ever got here, so no OTHER Delivery worker can be
+          // concurrently processing THIS SAME order -- an exact match on
+          // BOTH c_balance AND c_delivery_cnt together can only mean this
+          // specific credit applied, not a coincidental unrelated write.
+          const verifyRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id: orderRow.c_id });
+          const verifyRow = (verifyRes.rows || [])[0];
+          if (verifyRow && verifyRow.c_balance === intendedBalance && verifyRow.c_delivery_cnt === intendedDeliveryCnt) {
+            break; // confirmed applied -- treat as success, do not restore the marker
+          }
+          throw err; // genuinely unresolved -- safe to let the marker be restored
+        }
         if (result.rowsAffected > 0) break;
         if (attempt >= MUTATION_RETRY_ATTEMPTS) {
           throw new Error(`customer ${orderRow.c_id} delivery credit did not apply after ${MUTATION_RETRY_ATTEMPTS} attempts -- persistent contention`);
