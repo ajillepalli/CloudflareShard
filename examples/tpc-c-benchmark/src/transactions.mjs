@@ -399,7 +399,28 @@ async function newOrder(world) {
    * the o_id sequence is expected and harmless, the same way a rolled-back
    * insert leaves a gap in a real database's auto-increment sequence. */
   async function compensateFailedOrder(succeeded) {
-    for (const line of succeeded) {
+    // Codex review round 14 P2 fix: reverses in LIFO order (most-recently-
+    // succeeded line first), not the original forward/insertion order. This
+    // matters specifically when --items is smaller than a New-Order's line
+    // count (or the within-one-order dedup loop above still collides after
+    // its bounded retries): two lines in the SAME order can then reference
+    // the SAME (supplyWarehouseId, i_id) stock row, one applying its
+    // decrement on top of the other's. Each line's reversal is its own
+    // compare-and-swap matching EXACTLY the values that line itself applied
+    // (originalStock/appliedStock) -- so reversing a CHAIN of two dependent
+    // updates in forward order tries the EARLIER line's reversal first,
+    // whose `where` no longer matches (the later line already changed the
+    // row again), safely no-ops, and is never retried -- permanently
+    // stranding that decrement even though the whole order (including this
+    // line) is being compensated. succeededLines.push() happens as each
+    // line's own retry loop resolves, so for two lines racing the same row,
+    // push order already reflects the TRUE server-side application order
+    // (whichever won the CAS first is pushed first; the other necessarily
+    // read and built on top of it). Reversing LIFO therefore always
+    // unwinds a same-row chain in the exact reverse of how it was built,
+    // letting every reversal's `where` match the state left by the
+    // reversal just before it -- both fully undone instead of one stranded.
+    for (const line of [...succeeded].reverse()) {
       try {
         // order_line always belongs to the ORDERING warehouse's tenant;
         // stock belongs to the SUPPLY warehouse's tenant -- the same two
