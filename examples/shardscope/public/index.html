@@ -190,6 +190,44 @@
              refreshReshardPickers() in app.js. No second data source. -->
         <div class="reshard-panel" data-hook="reshard-panel" hidden>
 
+          <!-- "The old way" contrast beat (T10) — a fair, collapsed-by-default
+               explainer for why zero-downtime resharding matters. Copy-only:
+               no new data source, no /api calls. Collapsed by default so it's
+               discoverable without ever pushing the operator controls below
+               out of view unless the operator opens it (see app.js's
+               toggleOldwayPanel()). -->
+          <div class="oldway-panel" data-hook="oldway-panel">
+            <button class="oldway-toggle" type="button" data-hook="oldway-toggle" aria-expanded="false" aria-controls="oldway-body">
+              <span class="oldway-toggle-text">
+                <span class="oldway-toggle-label">Why this matters</span>
+                <span class="oldway-toggle-sub">the old way, vs. what you just watched</span>
+              </span>
+              <span class="oldway-chevron mono" data-hook="oldway-chevron" aria-hidden="true">&#9662;</span>
+            </button>
+            <div class="oldway-body" id="oldway-body" data-hook="oldway-body" hidden>
+              <div class="oldway-col oldway-col-old">
+                <div class="oldway-col-label">The old way</div>
+                <ul class="oldway-list">
+                  <li>Schedule a maintenance window</li>
+                  <li>App goes read-only, or writes start getting rejected</li>
+                  <li>Move the data, cut over, and hope nothing breaks</li>
+                </ul>
+                <span class="oldway-chip oldway-chip-danger">downtime: minutes to hours</span>
+                <div class="oldway-fine">Sophisticated systems (Vitess/PlanetScale-class) <em>can</em> reshard online — it just takes streaming replication, careful backfill, and a delicate cutover run by someone who's done it before. Real engineering, not a button.</div>
+              </div>
+              <div class="oldway-divider" aria-hidden="true"></div>
+              <div class="oldway-col oldway-col-new">
+                <div class="oldway-col-label">Shardscope</div>
+                <ul class="oldway-list">
+                  <li>One operator action — Split, Migrate, or Drain</li>
+                  <li>Live, under load — writes keep landing the whole time</li>
+                  <li>A correctness meter proves it, instead of just claiming it</li>
+                </ul>
+                <span class="oldway-chip oldway-chip-safe mono">lost 0 &middot; checksum OK</span>
+              </div>
+            </div>
+          </div>
+
           <!-- current-operation card: shown only while an op this tab started
                is in flight (polled via GET /api/reshard/migrate-status or
                /drain-status — see app.js's pollActiveOp()). -->

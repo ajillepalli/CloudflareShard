@@ -79,6 +79,11 @@ const el = {
   railReshard: hook("rail-reshard"),
   consoleTitle: hook("console-title"),
   reshardPanel: hook("reshard-panel"),
+
+  // ---- "The old way" contrast beat (T10) ----
+  oldwayToggle: hook("oldway-toggle"),
+  oldwayBody: hook("oldway-body"),
+  oldwayChevron: hook("oldway-chevron"),
   opCard: hook("op-card"),
   opCardName: hook("op-card-name"),
   opCardDetail: hook("op-card-detail"),
@@ -784,6 +789,20 @@ function reshardFetch(path, options) {
   });
 }
 
+// ---- "the old way" contrast beat (T10) ---------------------------------------
+
+/** Collapsed by default (see index.html's oldway-body[hidden]) — purely a
+ * copy panel, no data source, so a plain in-memory flag is all this needs;
+ * nothing else in the app reads or depends on this state. */
+let oldwayExpanded = false;
+
+function toggleOldwayPanel() {
+  oldwayExpanded = !oldwayExpanded;
+  el.oldwayBody.hidden = !oldwayExpanded;
+  el.oldwayToggle.setAttribute("aria-expanded", String(oldwayExpanded));
+  el.oldwayChevron.textContent = oldwayExpanded ? "▴" : "▾";
+}
+
 // ---- room switching ---------------------------------------------------------
 
 function setActiveRoom(room) {
@@ -1466,6 +1485,7 @@ function init() {
   // ---- Reshard room (T8) wiring ----
   onActivate(el.railTopology, () => setActiveRoom("topology"));
   onActivate(el.railReshard, () => setActiveRoom("reshard"));
+  el.oldwayToggle.addEventListener("click", toggleOldwayPanel);
   el.opTabSplit.addEventListener("click", () => setActiveOpTab("split"));
   el.opTabMigrate.addEventListener("click", () => setActiveOpTab("migrate"));
   el.opTabDrain.addEventListener("click", () => setActiveOpTab("drain"));

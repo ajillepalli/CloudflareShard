@@ -749,6 +749,110 @@ html, body {
   gap: 16px;
 }
 
+/* "The old way" contrast beat (T10) — collapsed by default. Reuses this
+   room's existing card/chip/list grammar (op-card's border+radius, danger-btn's
+   rotated-square bullet, reshard-error's restrained danger-on-well chip)
+   rather than inventing a parallel style. --safe stays reserved for the
+   literal lost/checksum invariant, same as the topbar scoreboard. */
+.oldway-panel {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.oldway-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: none;
+  background: var(--bg-well);
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  cursor: pointer;
+  text-align: left;
+  transition: background .2s ease, color .2s ease;
+}
+.oldway-toggle:hover { color: var(--text-primary); background: rgba(230, 234, 242, .04); }
+.oldway-toggle-text { display: flex; flex-direction: column; gap: 2px; }
+.oldway-toggle-label { font-size: 11.5px; font-weight: 600; color: var(--text-primary); }
+.oldway-toggle-sub { font-size: 10px; color: var(--text-dim); }
+.oldway-chevron { flex: 0 0 auto; font-size: 10px; color: var(--text-dim); }
+
+.oldway-body {
+  padding: 12px 13px 13px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.oldway-col-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  margin-bottom: 7px;
+}
+.oldway-col-old .oldway-col-label { color: var(--text-dim); }
+.oldway-col-new .oldway-col-label { color: var(--safe); }
+
+.oldway-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.oldway-list li { display: flex; align-items: flex-start; gap: 8px; }
+.oldway-list li::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  margin-top: 5px;
+  border-radius: 1px;
+  transform: rotate(45deg);
+  background: var(--text-dim);
+}
+.oldway-col-new .oldway-list li::before { background: var(--safe); }
+
+.oldway-chip {
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  padding: 4px 9px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.oldway-chip-danger {
+  color: var(--danger-bright);
+  background: rgba(240, 74, 74, .07);
+  border: 1px solid rgba(240, 74, 74, .22);
+}
+.oldway-chip-safe {
+  color: var(--safe);
+  background: rgba(53, 227, 176, .07);
+  border: 1px solid rgba(53, 227, 176, .22);
+  font-variant-numeric: tabular-nums;
+}
+
+.oldway-fine {
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.oldway-fine em { color: var(--text-muted); font-style: normal; }
+
+.oldway-divider { height: 1px; background: var(--border); margin: 2px 0; }
+
 /* current-operation card */
 .op-card {
   border: 1px solid var(--border);
