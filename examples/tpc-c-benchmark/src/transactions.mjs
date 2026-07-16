@@ -190,9 +190,35 @@ async function newOrder(world) {
   // future Delivery pass to find them by). Inserting new_order as the LAST
   // step, only once every line has actually committed, closes that window:
   // an order is never visible to Delivery until it's actually complete.
+  //
+  // Codex review round 10 P2 fix: the district update below now carries a
+  // `where: { d_next_o_id: o_id }` guard against d_next_o_id regressing.
+  // Without it, a request that read d_next_o_id=o_id, then stalled (e.g.
+  // behind a slow line/compensation elsewhere), could still commit this
+  // header tx AFTER a different, faster order had already advanced the
+  // counter past o_id -- blindly setting d_next_o_id back DOWN to o_id + 1
+  // and handing that same, now-stale o_id out again to a future New-Order
+  // read, colliding with an order that already exists. The order INSERT
+  // alongside it stays unconditional: per this file's established /v1/tx
+  // semantics (see the file header and Payment's own comment above), a
+  // where-mismatched participant simply has no effect while the rest of the
+  // SAME tx still commits -- so a guard miss here just skips the counter
+  // regression, while the insert independently succeeds (reusing a key a
+  // prior compensation already freed -- harmless) or fails as a duplicate
+  // (self-resolving: recorded as an ordinary failed New-Order attempt, the
+  // same as any other TX_ABORTED). No retry loop is needed here (unlike
+  // Payment/Delivery's counters): there's no legitimate reason to retry a
+  // guard miss -- a fresh New-Order attempt just reads whatever d_next_o_id
+  // is current next time around.
   await home.client.tx(
     [
-      { op: "update", table: "tpcc_district", partitionKey: districtRow.d_key, values: { d_next_o_id: o_id + 1 } },
+      {
+        op: "update",
+        table: "tpcc_district",
+        partitionKey: districtRow.d_key,
+        values: { d_next_o_id: o_id + 1 },
+        where: { d_next_o_id: o_id },
+      },
       {
         op: "insert",
         table: "tpcc_orders",
@@ -468,6 +494,29 @@ async function payment(world) {
   const c_id = world.randomCustomerId();
   const amount = randomAmount(1.0, 5000.0);
 
+  // Codex review round 10 P2 fix: real TPC-C's Payment draws a REMOTE
+  // customer (a different warehouse than the terminal/home processing the
+  // payment) ~15% of the time whenever more than one warehouse exists --
+  // an earlier version always resolved the customer against `home`,
+  // silently dropping this path (and the cross-warehouse load it's meant to
+  // exercise) entirely. warehouse/district YTD always update on the
+  // TERMINAL's own warehouse (home) regardless -- only the customer
+  // lookup/update below resolves against customerHome instead. This is
+  // straightforward specifically because Payment already does each counter
+  // as its own single-tenant /v1/mutate call (see this function's own
+  // comment above) rather than one bundled /v1/tx: /v1/tx's same-tenant
+  // requirement would have made combining a remote customer with the
+  // other counters in one transaction impossible anyway.
+  let customerHome = home;
+  let customerDistrictId = d;
+  const remote = world.warehouses.length > 1 && Math.random() < 0.15;
+  if (remote) {
+    do {
+      customerHome = world.warehouses[randInt(0, world.warehouses.length - 1)];
+    } while (customerHome.warehouseId === w);
+    customerDistrictId = world.randomDistrictId();
+  }
+
   let whRow, distRow;
 
   // Each of these tables has exactly one relevant row per tenant call here
@@ -511,11 +560,12 @@ async function payment(world) {
     }
   }
 
+  let custRow;
   for (let attempt = 1; ; attempt++) {
-    const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id });
-    const custRow = (custRes.rows || [])[0];
-    if (!custRow) throw new Error(`customer ${c_id} in district ${d} of warehouse ${w} not found`);
-    const result = await home.client.mutate({
+    const custRes = await customerHome.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: customerDistrictId, c_id });
+    custRow = (custRes.rows || [])[0];
+    if (!custRow) throw new Error(`customer ${c_id} in district ${customerDistrictId} of warehouse ${customerHome.warehouseId} not found`);
+    const result = await customerHome.client.mutate({
       op: "update",
       table: "tpcc_customer",
       partitionKey: custRow.c_key,
@@ -536,6 +586,11 @@ async function payment(world) {
   // Unconditional side effect -- only recorded once the three updates above
   // are all confirmed applied, so a retried/abandoned Payment never leaves
   // a phantom history row behind for an update that didn't actually happen.
+  // w_id/d_id here are always the TERMINAL's (home's) own warehouse/district
+  // -- this reduced schema has no separate customer-warehouse/district
+  // columns, so a remote payment's customer location is noted in h_data
+  // instead, the same minimal-schema trade-off historyKey()/tpcc_history
+  // already make elsewhere.
   await home.client.mutate({
     op: "insert",
     table: "tpcc_history",
@@ -546,7 +601,7 @@ async function payment(world) {
       c_id,
       h_amount: amount,
       h_date: new Date().toISOString(),
-      h_data: `${whRow.w_name ?? ""} ${distRow.d_name ?? ""}`.trim(),
+      h_data: `${whRow.w_name ?? ""} ${distRow.d_name ?? ""}`.trim() + (remote ? ` (remote customer: warehouse ${customerHome.warehouseId} district ${customerDistrictId})` : ""),
     },
     requestId: crypto.randomUUID(),
   });
@@ -625,12 +680,38 @@ async function delivery(world) {
     // response doesn't report per-mutation rowsAffected -- a stale-read
     // second worker's delete would silently no-op there while its customer
     // credit still committed, double-crediting the customer for one order.
-    const claimResult = await home.client.mutate({
-      op: "delete",
-      table: "tpcc_new_order",
-      partitionKey: oldest.no_key,
-      requestId: crypto.randomUUID(),
-    });
+    // Codex review round 10 P2 fix: if this call itself THROWS (a transient
+    // network/topology error, not a clean rowsAffected:0 response), we can't
+    // tell whether the delete actually committed before the error -- unlike
+    // the marker-restore try/catch below, this failure happens BEFORE that
+    // block even starts, so it would otherwise skip straight past every
+    // safety net and leave the order permanently unclaimable if the delete
+    // in fact applied. Best-effort reinsert the marker on any such ambiguous
+    // failure: if the delete never actually applied, the row is still there
+    // and this insert simply fails as a duplicate (harmless, swallowed); if
+    // it did apply, this restores it so a later Delivery pass can retry.
+    // Either way, the original error is rethrown -- this attempt is still a
+    // genuine failure, not a silent skip.
+    let claimResult;
+    try {
+      claimResult = await home.client.mutate({
+        op: "delete",
+        table: "tpcc_new_order",
+        partitionKey: oldest.no_key,
+        requestId: crypto.randomUUID(),
+      });
+    } catch (err) {
+      await home.client
+        .mutate({
+          op: "insert",
+          table: "tpcc_new_order",
+          partitionKey: oldest.no_key,
+          values: { w_id: w, d_id: d, o_id },
+          requestId: crypto.randomUUID(),
+        })
+        .catch(() => {});
+      throw err;
+    }
     if (claimResult.rowsAffected === 0) continue; // already claimed by a concurrent Delivery worker
 
     // Codex review P2 fix: the marker is gone the moment the claim above
