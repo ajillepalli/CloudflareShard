@@ -594,17 +594,48 @@ describe("Worker /v1/index-query read-time re-routing (Milestone 3, Chunk 2)", (
     // Codex live-deployment finding: backfill is no longer synchronous, so
     // /admin/create-index itself always returns 200 (registration succeeds,
     // backfill merely STARTS) — the PROVENANCE_MISSING_FOR_INDEX condition
-    // now surfaces only inside catalog-0's alarm loop, which logs it and
-    // retries the SAME unresolved row forever (see advanceIndexBackfill's
-    // doc comment) rather than ever completing. The observable behavior is
-    // that the index never reaches 'ready', not a synchronous error
-    // response — driveIndexBackfillToCompletion throwing after exhausting
-    // its tick budget is exactly that non-completion, asserted directly.
+    // now surfaces only inside catalog-0's alarm loop. Round 2 (Codex P1
+    // fix): this specific condition is a PermanentIndexBackfillError, not an
+    // ordinary transient one -- retrying forever would hold this index's
+    // topology lock indefinitely, wedging every other topology operation
+    // until an operator noticed and force-released it by hand. The alarm
+    // gives up after ONE tick instead: marks the index 'failed' (still
+    // non-'ready', so /v1/index-query keeps rejecting it) and releases the
+    // lock immediately, so a genuinely unrelated topology op is NOT blocked.
     const res = await post("/admin/create-index", { indexName: "idx_c2_noprov_by_v", table: "idx_c2_noprov_evt", columns: ["v"] }, AUTH());
     expect(res.status).toBe(200);
-    await expect(driveIndexBackfillToCompletion("idx_c2_noprov_by_v", 5)).rejects.toThrow();
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
     const statusRes = await post("/admin/create-index-status", { indexName: "idx_c2_noprov_by_v" }, AUTH());
     const statusBody = (await statusRes.json()) as { status: string };
-    expect(statusBody.status).toBe("building");
+    expect(statusBody.status).toBe("failed");
+
+    // The lock was actually released -- an unrelated topology op succeeds
+    // immediately instead of 409 TOPOLOGY_OPERATION_IN_PROGRESS.
+    await createIndexTestTable("idx_c2_noprov_unrelated_evt");
+    const unrelated = await post("/admin/create-index", { indexName: "idx_c2_noprov_unrelated_by_v", table: "idx_c2_noprov_unrelated_evt", columns: ["v"] }, AUTH());
+    expect(unrelated.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_c2_noprov_unrelated_by_v");
+
+    // Once the operator actually fixes the provenance gap (deterministically,
+    // via /admin/set-row-owner naming the exact tenant, rather than
+    // /admin/backfill-provenance's mechanical discovery, which could find
+    // this orphan row genuinely ambiguous between multiple candidate
+    // tenants and leave it unresolved -- not what this test is about),
+    // retrying /admin/create-index resumes and completes normally.
+    const owningTenantId = tenantForCatalogShard(0, 4);
+    const setOwnerRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-0", shardId: "catalog-0-shard-0", table: "idx_c2_noprov_evt", partitionKey: "row-no-prov", tenantId: owningTenantId },
+      AUTH(),
+    );
+    expect(setOwnerRes.status).toBe(200);
+    const retry = await post("/admin/create-index", { indexName: "idx_c2_noprov_by_v", table: "idx_c2_noprov_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_c2_noprov_by_v");
+    const finalStatusRes = await post("/admin/create-index-status", { indexName: "idx_c2_noprov_by_v" }, AUTH());
+    expect(((await finalStatusRes.json()) as { status: string }).status).toBe("ready");
   });
 });

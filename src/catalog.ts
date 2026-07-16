@@ -71,6 +71,33 @@ const CUTOVER_PREPARED_WAIT_MAX_MS = 30000;
 // subrequests, comfortably under Cloudflare's per-invocation cap with
 // headroom for INDEX_RING_FENCED retries on a handful of rows.
 const INDEX_BACKFILL_PAGE_SIZE = 250;
+// Codex review P2 fix: re-heartbeat the topology lock partway through a full
+// page's write loop, not just once before the tick starts. A full 250-row
+// page's writes run serially (each one its own subrequest, some possibly
+// retried on INDEX_RING_FENCED) -- if that genuinely takes longer than
+// TOPOLOGY_LOCK_TTL_MS (30s), the lease could expire and another topology
+// operation acquire it while this tick is still writing entries, reopening
+// the exact race the lock exists to prevent. Mirrors the retired synchronous
+// backfill's BACKFILL_HEARTBEAT_ROW_INTERVAL, just scoped to one tick's page
+// instead of a whole shard's unbounded scan.
+const INDEX_BACKFILL_HEARTBEAT_ROW_INTERVAL = 50;
+
+/** Codex review P1 fix: distinguishes a backfill failure that CANNOT resolve
+ * itself no matter how many times the alarm retries (e.g. a row with no
+ * __cf_row_owners provenance entry -- only an explicit
+ * /admin/backfill-provenance run, a genuine operator action, ever fixes
+ * that) from an ordinary transient one (a network blip, contention, a
+ * momentarily-fenced ring position) that's safe to retry forever with
+ * backoff. Treating BOTH the same way -- which the alarm loop's shared
+ * per-item catch, copied from migration's, originally did -- meant a
+ * permanent failure left the topology lock held indefinitely: every later
+ * tick would heartbeat the SAME lock, throw the SAME error, and never
+ * release it, wedging every other create-index/drop-index/drain-shard/
+ * split-vbucket/migrate-vbucket call behind TOPOLOGY_OPERATION_IN_PROGRESS
+ * until an operator noticed and force-released it by hand -- strictly worse
+ * than the retired synchronous path, which surfaced this exact condition as
+ * an immediate, visible 409 and released its lock right away. */
+class PermanentIndexBackfillError extends Error {}
 
 type MigrationRow = {
   vbucket: number;
@@ -1015,8 +1042,17 @@ export class CatalogDO extends DurableObject {
     if (current?.status === "ready") {
       return json({ ok: true, indexName: body.indexName, status: "ready", handedOff: false });
     }
+    // Codex review P1 fix: a 'failed' index (backfill hit a PermanentIndex-
+    // BackfillError -- e.g. a provenance gap -- and gave up, see alarm()'s
+    // catch) is a genuine RETRY target once the operator fixes the
+    // underlying issue, not a dead end. Resetting status back to 'building'
+    // here (alongside the SAME 'building' case a first-time start already
+    // handles) re-arms the alarm using whatever backfill_shard_idx/
+    // backfill_after_pk cursor the earlier failed attempt left behind
+    // (deliberately preserved, not cleared, by that catch branch) -- this
+    // retry resumes rather than re-scanning from the very first shard.
     this.sql.exec(
-      "UPDATE index_rules SET backfill_shard_ids_json = ?, topology_lock_operation_id = ? WHERE index_name = ? AND status = 'building'",
+      "UPDATE index_rules SET status = 'building', backfill_shard_ids_json = ?, topology_lock_operation_id = ? WHERE index_name = ? AND status IN ('building', 'failed')",
       JSON.stringify(body.backfillShardIds),
       body.operationId ?? null,
       body.indexName,
@@ -2379,13 +2415,21 @@ export class CatalogDO extends DurableObject {
 
     const placementRing = JSON.parse(row.placement_ring_json) as string[];
     let rowsWritten = 0;
+    let rowsSinceHeartbeat = 0;
     for (const pk of pageKeys) {
       const freshRow = freshByPk.get(pk);
       if (!freshRow) continue; // deleted since the scan -- skip rather than index stale data
       if (!freshRow.__cf_tenant_id) {
-        throw new Error(
+        throw new PermanentIndexBackfillError(
           `row ${pk} on shard ${shardId}, table ${row.table_name} has no row-provenance entry (__cf_row_owners) -- run /admin/backfill-provenance for this shard, then retry`,
         );
+      }
+      rowsSinceHeartbeat += 1;
+      if (rowsSinceHeartbeat >= INDEX_BACKFILL_HEARTBEAT_ROW_INTERVAL) {
+        rowsSinceHeartbeat = 0;
+        if (!(await this.heartbeatTopologyLockOrPark(row.topology_lock_operation_id))) {
+          throw new Error(`topology lock lost partway through a backfill page for index ${row.index_name}`);
+        }
       }
       const tenantId = freshRow.__cf_tenant_id;
       const indexKeyJson = JSON.stringify(columns.map((c) => freshRow[c] ?? null));
@@ -3151,6 +3195,34 @@ export class CatalogDO extends DurableObject {
           const stillActive = await this.advanceIndexBackfill(b);
           anyActive = anyActive || stillActive;
         } catch (error) {
+          if (error instanceof PermanentIndexBackfillError) {
+            // Codex review P1 fix: this specific error can NEVER resolve by
+            // simply retrying -- only an explicit operator action
+            // (/admin/backfill-provenance) can fix it. Retrying forever
+            // (the ordinary-error branch below) would hold this index's
+            // topology lock indefinitely, wedging every OTHER topology
+            // operation until someone happened to force-release it by
+            // hand. Give up instead: mark 'failed' (still non-'ready', so
+            // /v1/index-query keeps rejecting reads against it -- see
+            // handleLookupIndex's `status !== "ready"` gate), release the
+            // lock, and stop the alarm from matching this row again
+            // (backfill_shard_ids_json cleared) -- but deliberately
+            // PRESERVE backfill_shard_idx/backfill_after_pk (the cursor),
+            // so a retried /admin/create-index after the operator actually
+            // fixes provenance resumes from where this left off instead of
+            // re-scanning from the start (see handleStartIndexBackfill's
+            // 'failed'-retry branch).
+            log("catalog.index_backfill_permanently_failed", {
+              indexName: b.index_name,
+              message: error.message,
+            });
+            this.sql.exec(
+              "UPDATE index_rules SET status = 'failed', backfill_shard_ids_json = '[]', topology_lock_operation_id = NULL WHERE index_name = ?",
+              b.index_name,
+            );
+            await this.releaseTopologyLockRemote(b.topology_lock_operation_id);
+            continue;
+          }
           // Leave the cursor where it is and retry next tick -- every step
           // is idempotent (INSERT OR REPLACE index-entry writes, a
           // re-resolvable INDEX_RING_FENCED retry, a resumable scan
