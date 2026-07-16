@@ -54,6 +54,86 @@ export interface ShardApiBinding {
    * design exists to never pass `rotate: true` for a tenant it didn't
    * itself just create. */
   adminRegisterTenant(adminToken: string, body: { tenantId: string; rotate?: boolean }): Promise<unknown>;
+
+  // ---- Reshard console (T8) — topology-mutating admin controls ------------
+  // Every method below is a topology-op RPC that ALREADY EXISTS on
+  // CloudflareShardRpc in the main repo's src/index.ts (see that class's
+  // "Admin/topology methods" section) — declared here only so this Worker's
+  // TypeScript build knows the shape of the SHARD_API service binding call.
+  // Like every method above, all validation/auth happens on the OTHER side
+  // of this binding (assertAdminRpcAuth checks adminToken there); a rejected
+  // promise here means the underlying RPC's unwrapForRpc turned a non-2xx
+  // HTTP response into a thrown Error (see CloudflareShardRpc's own
+  // unwrapForRpc helper) — src/reshard.ts's callers are responsible for
+  // catching that and turning it into a calm inline error for the browser.
+  //
+  // CATALOG-AWARE: vbucket ids are local to a single catalog shard's own
+  // [0, totalVBuckets) range (same caveat as adminVbucketMap above) — every
+  // one of these calls that takes a vbucket also takes catalogShardId to
+  // disambiguate it.
+
+  /** Starts a vbucket split: creates a fresh target shard (or migrates onto
+   * `newShardId` if given) and begins a real data migration off the vbucket's
+   * current shard. See adminSplitVbucketCore (main repo's src/index.ts,
+   * ~line 1265) and CatalogDO.handleSplitVbucket (src/catalog.ts) for the
+   * exact payload/response shape. Success body:
+   * `{ ok: true, vbucket, fromShard, toShard, metadataVersion, migrationStarted: true }`. */
+  adminSplitVbucket(adminToken: string, payload: { catalogShardId?: string; vbucket: number; newShardId?: string }): Promise<unknown>;
+
+  /** Starts a vbucket migration onto an explicit `targetShardId` (or a fresh
+   * shard if omitted — same underlying primitive as adminSplitVbucket). See
+   * adminMigrateVbucketCore (~line 1302) and CatalogDO.handleMigrateVbucket.
+   * Success body: `{ ok: true, vbucket, fromShard, toShard, status: "backfilling" }`. */
+  adminMigrateVbucket(adminToken: string, payload: { catalogShardId?: string; vbucket?: number; targetShardId?: string }): Promise<unknown>;
+
+  /** Progress of an in-flight (or just-finished) migrate/split for one
+   * vbucket. See CatalogDO.handleMigrateVbucketStatus (src/catalog.ts).
+   * Response body: `{ vbucket, status, fromShard, toShard, rowsCopied,
+   * mirrorQueueDepth, startedAt, blockedTxIds? }` — `status` is one of
+   * "none" | "backfilling" | "mirroring" | "cutover" |
+   * "cutover-blocked-on-prepared-intents" | "aborting" (see the migration
+   * state machine in src/catalog.ts); "none" after having been non-"none" is
+   * terminal (either committed via cutover or cleaned up via abort). */
+  adminMigrateVbucketStatus(adminToken: string, payload: { catalogShardId?: string; vbucket?: number }): Promise<unknown>;
+
+  /** Aborts an in-flight migrate/split for one vbucket — safe at any point
+   * before the ownership flip (the source never stopped being authoritative).
+   * See CatalogDO.handleMigrateVbucketAbort. Success body:
+   * `{ ok: true, vbucket, status: "aborted" }`; 409 MIGRATION_ALREADY_COMMITTED
+   * if there's nothing active to abort. */
+  adminMigrateVbucketAbort(adminToken: string, payload: { catalogShardId?: string; vbucket?: number }): Promise<unknown>;
+
+  /** Starts draining a shard (evacuates every vbucket it owns + any index
+   * ring it's pinned into, within the given catalog). See adminDrainShardCore
+   * (~line 1833) and CatalogDO.handleDrainShard. Success body:
+   * `{ ok: true, shardId, metadataVersion, evacuationStarted: true }`; can
+   * 409 (SHARD_HAS_IN_FLIGHT_TRANSACTIONS, SHARD_HAS_PENDING_INDEX_JOBS,
+   * RING_EVACUATION_NO_CANDIDATE) before anything durable is marked. */
+  adminDrainShard(adminToken: string, payload: { shardId: string; catalogShardId?: string }): Promise<unknown>;
+
+  /** Progress of an in-flight (or just-finished) shard drain. See
+   * CatalogDO.handleDrainShardStatus. Response body: `{ shardId,
+   * vbucketsRemaining, ringsRemaining, status, stallReason }` — `status` is
+   * one of "active" | "migrating-vbuckets" | "evacuating-rings" |
+   * "stalled-provenance" | "stalled" | "complete". */
+  adminDrainShardStatus(adminToken: string, payload: { catalogShardId?: string; shardId?: string }): Promise<unknown>;
+
+  /** Current holder (if any) of the cluster-wide topology-operation lock —
+   * every split/migrate/drain above acquires this lock for its whole
+   * multi-tick duration, so at most one topology op runs cluster-wide at a
+   * time. See adminTopologyLockStatusCore (~line 2945). No payload — the
+   * lock lives on one canonical physical DO ("catalog-0"), not per catalog.
+   * Response body: `{ held: false }` or `{ held: true, operationId,
+   * operationType, acquiredAt, heartbeatAt, expiresAt, expired }`. */
+  adminTopologyLockStatus(adminToken: string): Promise<unknown>;
+
+  /** Operator escape hatch: force-clears the topology lock IFF `operationId`
+   * currently matches its holder (idempotent no-op otherwise) — for a
+   * crashed operation that never released it. See
+   * adminForceReleaseTopologyLockCore (~line 2962). Read
+   * adminTopologyLockStatus first to find the current operationId; this call
+   * 400s without one. Response body: `{ ok: true, released: boolean }`. */
+  adminForceReleaseTopologyLock(adminToken: string, payload: { operationId?: string }): Promise<unknown>;
 }
 
 export interface Env {

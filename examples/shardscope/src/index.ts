@@ -47,6 +47,24 @@ import { TopologyAggregator } from "./aggregator";
 import { LoadDriver } from "./load/load-driver";
 import { TenantTokenStore } from "./load/tenant-token-store";
 import { isGateAuthorized, handleLogin, handleLogout } from "./gate";
+import {
+  ReshardValidationError,
+  parseSplitVbucketInput,
+  splitVbucket,
+  parseMigrateVbucketInput,
+  migrateVbucket,
+  parseMigrateVbucketStatusQuery,
+  migrateVbucketStatus,
+  parseMigrateVbucketAbortInput,
+  migrateVbucketAbort,
+  parseDrainShardInput,
+  drainShard,
+  parseDrainShardStatusQuery,
+  drainShardStatus,
+  topologyLockStatus,
+  parseForceReleaseTopologyLockInput,
+  forceReleaseTopologyLock,
+} from "./reshard";
 import type { Env } from "./env";
 
 export { TopologyAggregator, LoadDriver, TenantTokenStore };
@@ -132,6 +150,55 @@ function forwardToLoadDriver(request: Request, env: Env): Promise<Response> {
   return stub.fetch(request);
 }
 
+/** Parses a Reshard console POST body, turning invalid JSON into the same
+ * ReshardValidationError -> 400 path runReshardOp gives every other bad
+ * request from the browser (see reshard.ts's header comment). */
+async function readReshardJsonBody(request: Request): Promise<unknown> {
+  try {
+    return await request.json();
+  } catch {
+    throw new ReshardValidationError("Invalid JSON body.");
+  }
+}
+
+/** Runs one Reshard console operation (src/reshard.ts) and turns any failure
+ * into a calm JSON error response instead of a 500 or an unhandled
+ * rejection — this is the "handle errors, calm inline messages" contract
+ * the Reshard console UI depends on. Two failure classes are handled
+ * distinctly:
+ *   - ReshardValidationError (a malformed request FROM the browser, caught
+ *     by reshard.ts's parse*() functions before ever touching SHARD_API) ->
+ *     400 with that message.
+ *   - Everything else is assumed to be env.SHARD_API's RPC call rejecting.
+ *     CloudflareShardRpc's own unwrapForRpc (main repo's src/index.ts) turns
+ *     any non-2xx HTTP response from the catalog into a thrown Error whose
+ *     message is `CloudflareShard RPC error <status>: <JSON body>` — that
+ *     JSON body is exactly the structured `{ error: {...} }` shape the
+ *     catalog itself returned (e.g. 409 MIGRATION_IN_PROGRESS when another
+ *     op already holds the topology lock), so it's unpacked and forwarded
+ *     with its original status rather than collapsed into a generic 500. */
+async function runReshardOp(fn: () => Promise<unknown>): Promise<Response> {
+  try {
+    const result = await fn();
+    return json(result);
+  } catch (err) {
+    if (err instanceof ReshardValidationError) {
+      return json({ error: err.message }, 400);
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    const match = /^CloudflareShard RPC error (\d+): ([\s\S]*)$/.exec(message);
+    if (match) {
+      const status = Number(match[1]) >= 400 && Number(match[1]) < 600 ? Number(match[1]) : 502;
+      try {
+        return json(JSON.parse(match[2]), status);
+      } catch {
+        return json({ error: match[2] }, status);
+      }
+    }
+    return json({ error: message }, 502);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -189,6 +256,45 @@ export default {
       (request.method === "GET" && url.pathname === "/api/load/status")
     ) {
       return forwardToLoadDriver(request, env);
+    }
+
+    // /api/reshard/*: the Reshard room's manual operator controls (T8) —
+    // split / migrate / drain, their status/abort forwarders, and the
+    // cluster-wide topology-lock status + force-release escape hatch (see
+    // src/reshard.ts). GATING CONFIRMATION: every path under here is a
+    // /api/* route, so it already went through the `isGateAuthorized` check
+    // at the top of this function (this code is unreachable otherwise) —
+    // these ARE gated, same as /api/load/*. They additionally thread
+    // ADMIN_TOKEN through to SHARD_API inside src/reshard.ts (never here,
+    // never in the browser), completing the TODO in this file's header
+    // comment: "each such route must ALSO thread ADMIN_TOKEN through to the
+    // underlying SHARD_API call in addition to the SHARDSCOPE_GATE_TOKEN
+    // check every /api/* route already gets."
+    if (url.pathname.startsWith("/api/reshard/")) {
+      if (request.method === "POST" && url.pathname === "/api/reshard/split") {
+        return runReshardOp(async () => splitVbucket(env, parseSplitVbucketInput(await readReshardJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/reshard/migrate") {
+        return runReshardOp(async () => migrateVbucket(env, parseMigrateVbucketInput(await readReshardJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/reshard/drain") {
+        return runReshardOp(async () => drainShard(env, parseDrainShardInput(await readReshardJsonBody(request))));
+      }
+      if (request.method === "GET" && url.pathname === "/api/reshard/migrate-status") {
+        return runReshardOp(() => migrateVbucketStatus(env, parseMigrateVbucketStatusQuery(url.searchParams)));
+      }
+      if (request.method === "GET" && url.pathname === "/api/reshard/drain-status") {
+        return runReshardOp(() => drainShardStatus(env, parseDrainShardStatusQuery(url.searchParams)));
+      }
+      if (request.method === "GET" && url.pathname === "/api/reshard/lock-status") {
+        return runReshardOp(() => topologyLockStatus(env));
+      }
+      if (request.method === "POST" && url.pathname === "/api/reshard/migrate-abort") {
+        return runReshardOp(async () => migrateVbucketAbort(env, parseMigrateVbucketAbortInput(await readReshardJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/reshard/force-release-lock") {
+        return runReshardOp(async () => forceReleaseTopologyLock(env, parseForceReleaseTopologyLockInput(await readReshardJsonBody(request))));
+      }
     }
 
     return json({ error: `Unknown route: ${url.pathname}` }, 404);

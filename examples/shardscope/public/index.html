@@ -54,14 +54,16 @@
   <div class="main">
 
     <!-- ============ LEFT RAIL ============ -->
+    <!-- Room switching (App/Play are not built yet — inert placeholders, per
+         DESIGN.md's four-room shell; only Topology + Reshard are wired). -->
     <nav class="rail">
-      <div class="rail-item">
+      <div class="rail-item disabled" title="Not built yet">
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           <rect x="4" y="4" width="12" height="12" rx="2.5" stroke="currentColor" stroke-width="1.3"/>
         </svg>
         <span class="rlabel">App</span>
       </div>
-      <div class="rail-item active">
+      <div class="rail-item active" data-hook="rail-topology" data-room="topology" role="button" tabindex="0">
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           <circle cx="10" cy="5" r="2" fill="currentColor"/>
           <circle cx="15" cy="14" r="2" fill="currentColor"/>
@@ -71,13 +73,13 @@
         </svg>
         <span class="rlabel">Topology</span>
       </div>
-      <div class="rail-item">
+      <div class="rail-item" data-hook="rail-reshard" data-room="reshard" role="button" tabindex="0">
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           <path d="M4 10 H16 M11 5 L16 10 L11 15" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
         <span class="rlabel">Reshard</span>
       </div>
-      <div class="rail-item">
+      <div class="rail-item disabled" title="Not built yet">
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           <path d="M7 5 L15 10 L7 15 Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>
         </svg>
@@ -160,10 +162,10 @@
       </div>
     </div>
 
-    <!-- ============ RIGHT PANEL: LIVE FEED ============ -->
+    <!-- ============ RIGHT PANEL: LIVE FEED / RESHARD CONSOLE ============ -->
     <aside class="console">
       <div class="console-header">
-        <span class="title">Live Feed</span>
+        <span class="title" data-hook="console-title">Live Feed</span>
         <div class="console-header-right">
           <span class="live-chip" data-hook="live-chip"><span class="d"></span><span data-hook="live-chip-label">connecting</span></span>
           <button class="logout-btn" data-hook="logout-btn" type="button" title="Disconnect and clear the gate session" hidden>Disconnect</button>
@@ -171,6 +173,102 @@
       </div>
 
       <div class="console-body">
+
+        <!-- ============ RESHARD ROOM: manual operator controls (T8) ============
+             Hidden on the Topology room. Target pickers are populated FROM the
+             live snapshot app.js already holds (lastRenderedSnapshot) — see
+             refreshReshardPickers() in app.js. No second data source. -->
+        <div class="reshard-panel" data-hook="reshard-panel" hidden>
+
+          <!-- current-operation card: shown only while an op this tab started
+               is in flight (polled via GET /api/reshard/migrate-status or
+               /drain-status — see app.js's pollActiveOp()). -->
+          <div class="op-card" data-hook="op-card" hidden>
+            <div class="op-top">
+              <span class="op-name" data-hook="op-card-name">—</span>
+              <button class="op-abort-btn" data-hook="op-abort-btn" type="button" hidden>Abort</button>
+            </div>
+            <div class="progress-track"><div class="progress-fill indeterminate" data-hook="op-card-fill"></div></div>
+            <div class="op-detail mono" data-hook="op-card-detail"></div>
+          </div>
+
+          <!-- topology-operation lock — which op (if any) currently holds the
+               cluster-wide lock every split/migrate/drain acquires. Polled
+               alongside the current-op card while this room is active. -->
+          <div class="lock-card" data-hook="lock-card">
+            <div class="lock-top">
+              <span class="micro">Topology Lock</span>
+              <span class="lock-state mono" data-hook="lock-state">—</span>
+            </div>
+            <div class="lock-detail mono" data-hook="lock-detail"></div>
+            <button class="lock-release-btn" data-hook="lock-release-btn" type="button" hidden>Force-release lock</button>
+            <div class="reshard-error" data-hook="lock-error" hidden></div>
+          </div>
+
+          <!-- op tabs: Split / Migrate / Drain -->
+          <div class="btn-row" data-hook="op-tabs">
+            <button class="btn selected" type="button" data-hook="op-tab-split" data-op="split">Split</button>
+            <button class="btn" type="button" data-hook="op-tab-migrate" data-op="migrate">Migrate</button>
+            <button class="btn" type="button" data-hook="op-tab-drain" data-op="drain">Drain</button>
+          </div>
+
+          <!-- Split form: creates a fresh target shard (or newShardId, if
+               given) and starts a real migration off the vbucket's current
+               shard. catalogShardId is required — vbucket ids are
+               catalog-local (see src/reshard.ts's header comment). -->
+          <form class="op-form" data-hook="op-form-split" autocomplete="off">
+            <label class="field-label micro" for="split-catalog">Catalog shard</label>
+            <select class="field-select mono" id="split-catalog" data-hook="split-catalog"></select>
+            <label class="field-label micro" for="split-vbucket">vBucket</label>
+            <select class="field-select mono" id="split-vbucket" data-hook="split-vbucket"></select>
+            <label class="field-label micro" for="split-new-shard">New shard id (optional — auto if blank)</label>
+            <input class="field-input mono" id="split-new-shard" type="text" data-hook="split-new-shard" placeholder="auto" spellcheck="false" />
+            <button class="field-submit" type="submit" data-hook="split-submit">Split vBucket</button>
+          </form>
+
+          <!-- Migrate form: moves a vbucket onto an explicit target shard (or
+               a fresh one, same as Split, if left on "auto"). -->
+          <form class="op-form" data-hook="op-form-migrate" hidden autocomplete="off">
+            <label class="field-label micro" for="migrate-catalog">Catalog shard</label>
+            <select class="field-select mono" id="migrate-catalog" data-hook="migrate-catalog"></select>
+            <label class="field-label micro" for="migrate-vbucket">vBucket</label>
+            <select class="field-select mono" id="migrate-vbucket" data-hook="migrate-vbucket"></select>
+            <label class="field-label micro" for="migrate-target">Target shard</label>
+            <select class="field-select mono" id="migrate-target" data-hook="migrate-target"></select>
+            <button class="field-submit" type="submit" data-hook="migrate-submit">Migrate vBucket</button>
+          </form>
+
+          <!-- Drain form: evacuates every vbucket (+ pinned index ring)
+               `drain-shard-select` currently owns, within the selected
+               catalog. -->
+          <form class="op-form" data-hook="op-form-drain" hidden autocomplete="off">
+            <label class="field-label micro" for="drain-catalog">Catalog shard</label>
+            <select class="field-select mono" id="drain-catalog" data-hook="drain-catalog"></select>
+            <label class="field-label micro" for="drain-shard-select">Shard to drain</label>
+            <select class="field-select mono" id="drain-shard-select" data-hook="drain-shard-select"></select>
+            <button class="field-submit" type="submit" data-hook="drain-submit">Drain Shard</button>
+          </form>
+
+          <div class="reshard-error" data-hook="reshard-error" hidden></div>
+
+          <!-- Chaos "Break It" panel — T9, gated on the correctness meter
+               (T4). Deliberately no functional attack buttons here yet. -->
+          <div class="section-divider">
+            <span class="label">Chaos — Break It</span>
+            <span class="line"></span>
+          </div>
+          <div class="chaos-placeholder">
+            <div class="chaos-note">Lands in T9, once the correctness meter (T4 — writes/lost/checksum) is live. Attack buttons are intentionally not wired yet.</div>
+            <div class="danger-stack">
+              <div class="danger-btn disabled"><span class="bullet"></span>Kill shard mid-migration</div>
+              <div class="danger-btn disabled"><span class="bullet"></span>Drain hot node</div>
+              <div class="danger-btn disabled"><span class="bullet"></span>Double-submit</div>
+              <div class="danger-btn disabled"><span class="bullet"></span>Blip shard</div>
+              <div class="danger-btn disabled"><span class="bullet"></span>Replay mismatch</div>
+            </div>
+          </div>
+        </div>
+
         <div class="log-wrap">
           <div class="log-head">
             <span class="micro">Event Log</span>

@@ -61,6 +61,35 @@ const el = {
   loginSubmit: hook("login-submit"),
   loginError: hook("login-error"),
   logoutBtn: hook("logout-btn"),
+
+  // ---- Reshard room (T8) ----
+  railTopology: hook("rail-topology"),
+  railReshard: hook("rail-reshard"),
+  consoleTitle: hook("console-title"),
+  reshardPanel: hook("reshard-panel"),
+  opCard: hook("op-card"),
+  opCardName: hook("op-card-name"),
+  opCardDetail: hook("op-card-detail"),
+  opAbortBtn: hook("op-abort-btn"),
+  lockState: hook("lock-state"),
+  lockDetail: hook("lock-detail"),
+  lockReleaseBtn: hook("lock-release-btn"),
+  lockError: hook("lock-error"),
+  opTabSplit: hook("op-tab-split"),
+  opTabMigrate: hook("op-tab-migrate"),
+  opTabDrain: hook("op-tab-drain"),
+  opFormSplit: hook("op-form-split"),
+  opFormMigrate: hook("op-form-migrate"),
+  opFormDrain: hook("op-form-drain"),
+  splitCatalogSelect: hook("split-catalog"),
+  splitVbucketSelect: hook("split-vbucket"),
+  splitNewShardInput: hook("split-new-shard"),
+  migrateCatalogSelect: hook("migrate-catalog"),
+  migrateVbucketSelect: hook("migrate-vbucket"),
+  migrateTargetSelect: hook("migrate-target"),
+  drainCatalogSelect: hook("drain-catalog"),
+  drainShardSelect: hook("drain-shard-select"),
+  reshardError: hook("reshard-error"),
 };
 
 // ============================================================================
@@ -352,6 +381,11 @@ function render(snapshot) {
   try {
     renderInner(snapshot);
     lastRenderedSnapshot = snapshot;
+    // Reshard room's target pickers read straight off lastRenderedSnapshot —
+    // keep them in step with every tick (?demo=1 and the sample fallback
+    // included; there is no second data source for the Reshard room, see
+    // this file's "Reshard room" section below).
+    refreshReshardPickers();
   } catch (err) {
     // Never let a render bug blank the canvas — keep whatever was already
     // painted and surface the failure quietly.
@@ -581,6 +615,425 @@ function renderInner(snapshot) {
 }
 
 // ============================================================================
+// Reshard room (T8): manual operator controls — split / migrate / drain,
+// their status/abort, and the topology-operation-lock status + force-release
+// escape hatch. Calls go to /api/reshard/* (see ../src/reshard.ts + the
+// routing block in ../src/index.ts) — same-origin, gated by the same
+// SHARDSCOPE_GATE_TOKEN session cookie every other /api/* call here uses.
+//
+// Target pickers are populated ENTIRELY from `lastRenderedSnapshot` (set by
+// render() above, every tick) — there is no second fetch for topology data.
+// vBucket ids are catalog-local (see src/reshard.ts's header comment), so
+// every picker here is scoped to a chosen catalogShardId first.
+// ============================================================================
+
+let activeRoom = "topology";
+let activeOpTab = "split";
+/** The op this browser tab most recently started (if any) — polled via
+ * GET /api/reshard/migrate-status or /drain-status until it reaches a
+ * terminal state, or aborted. Null when nothing is in flight. Note this is
+ * purely LOCAL bookkeeping for "what should this tab poll the status of";
+ * the topology-lock status (below) is the actual cluster-wide source of
+ * truth for whether *some* op is running. */
+let activeOp = null; // { kind: 'migrate' | 'drain', catalogShardId, vbucket?, shardId? }
+let reshardPollTimer = null;
+const RESHARD_POLL_INTERVAL_MS = 1500;
+let lockReleaseConfirmTimer = null;
+let lastLockOperationId = null;
+
+function setReshardError(msg, level) {
+  if (!el.reshardError) return;
+  if (!msg) {
+    el.reshardError.hidden = true;
+    el.reshardError.textContent = "";
+    return;
+  }
+  el.reshardError.hidden = false;
+  el.reshardError.className = "reshard-error" + (level ? " " + level : "");
+  el.reshardError.textContent = msg;
+}
+
+function setLockError(msg) {
+  if (!el.lockError) return;
+  if (!msg) {
+    el.lockError.hidden = true;
+    el.lockError.textContent = "";
+    return;
+  }
+  el.lockError.hidden = false;
+  el.lockError.textContent = msg;
+}
+
+/** fetch() wrapper for every /api/reshard/* call: same-origin credentials +
+ * a single 401 handling path (the gate session expired mid-visit — fall back
+ * to the login panel exactly like the SSE stream's own gate does). Resolves
+ * with the parsed JSON body on 2xx; rejects with an Error carrying the
+ * server's message on everything else. */
+function reshardFetch(path, options) {
+  return fetch(path, Object.assign({ credentials: "same-origin" }, options)).then((res) => {
+    if (res.status === 401) {
+      handleLogout();
+      throw new Error("session expired — please log in again");
+    }
+    return res.json().catch(() => ({})).then((body) => {
+      if (!res.ok) {
+        const errField = body && body.error;
+        const message = (errField && (errField.message || errField)) || `request failed (${res.status})`;
+        throw new Error(typeof message === "string" ? message : JSON.stringify(message));
+      }
+      return body;
+    });
+  });
+}
+
+// ---- room switching ---------------------------------------------------------
+
+function setActiveRoom(room) {
+  if (room === activeRoom) return;
+  activeRoom = room;
+  el.railTopology.classList.toggle("active", room === "topology");
+  el.railReshard.classList.toggle("active", room === "reshard");
+  el.reshardPanel.hidden = room !== "reshard";
+  el.consoleTitle.textContent = room === "reshard" ? "Reshard Console" : "Live Feed";
+
+  if (room === "reshard") {
+    refreshReshardPickers();
+    pollLockStatus();
+    startReshardPolling();
+  } else {
+    stopReshardPolling();
+  }
+}
+
+function startReshardPolling() {
+  stopReshardPolling();
+  reshardPollTimer = setInterval(() => {
+    pollLockStatus();
+    if (activeOp) pollActiveOp();
+  }, RESHARD_POLL_INTERVAL_MS);
+}
+
+function stopReshardPolling() {
+  if (reshardPollTimer) {
+    clearInterval(reshardPollTimer);
+    reshardPollTimer = null;
+  }
+}
+
+// ---- target pickers, sourced from lastRenderedSnapshot ----------------------
+
+/** Rebuilds a <select>'s options from `items` ({value,label}[]), preserving
+ * the previous selection when it's still present in the new list — so a
+ * routine 900ms snapshot tick doesn't yank the operator's in-progress
+ * selection out from under them. */
+function populateSelect(select, items, placeholder) {
+  if (!select) return;
+  const prevValue = select.value;
+  select.innerHTML = "";
+  if (placeholder !== undefined) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = placeholder;
+    select.appendChild(opt);
+  }
+  for (const item of items) {
+    const opt = document.createElement("option");
+    opt.value = item.value;
+    opt.textContent = item.label;
+    select.appendChild(opt);
+  }
+  const stillPresent = [...select.options].some((o) => o.value === prevValue);
+  select.value = stillPresent ? prevValue : select.options.length ? select.options[0].value : "";
+}
+
+function catalogsFromSnapshot() {
+  const snap = lastRenderedSnapshot;
+  return Array.isArray(snap && snap.catalogs) ? snap.catalogs : [];
+}
+
+/** vbucket rows for one catalog, straight off the live snapshot — no second
+ * data source (DESIGN.md: one living topology canvas, not a parallel view). */
+function vbucketsForCatalog(catalogShardId) {
+  const catalog = catalogsFromSnapshot().find((c) => c.catalogShardId === catalogShardId);
+  if (!catalog || !Array.isArray(catalog.vbuckets)) return [];
+  return [...catalog.vbuckets].sort((a, b) => a.vbucket - b.vbucket);
+}
+
+/** shardIds a catalog currently owns (as a current owner OR a migration
+ * target) — the catalog-local shard universe, derived the same way this
+ * file's own renderInner() computes the topology canvas's shard-id union. */
+function shardIdsForCatalog(catalogShardId) {
+  const ids = new Set();
+  for (const row of vbucketsForCatalog(catalogShardId)) {
+    if (row.shardId) ids.add(row.shardId);
+    if (row.targetShardId) ids.add(row.targetShardId);
+  }
+  return [...ids].sort();
+}
+
+function refreshReshardPickers() {
+  if (!el.reshardPanel) return; // guard: called from render() before init() wires DOM hooks is impossible, but stay defensive
+  const catalogItems = catalogsFromSnapshot().map((c) => ({ value: c.catalogShardId, label: c.catalogShardId }));
+
+  populateSelect(el.splitCatalogSelect, catalogItems);
+  populateSelect(el.migrateCatalogSelect, catalogItems);
+  populateSelect(el.drainCatalogSelect, catalogItems);
+
+  refreshVbucketPicker(el.splitCatalogSelect, el.splitVbucketSelect);
+  refreshVbucketPicker(el.migrateCatalogSelect, el.migrateVbucketSelect, el.migrateTargetSelect);
+  refreshShardPicker(el.drainCatalogSelect, el.drainShardSelect);
+}
+
+function refreshVbucketPicker(catalogSelect, vbucketSelect, targetSelect) {
+  const catalogShardId = catalogSelect.value;
+  const rows = catalogShardId ? vbucketsForCatalog(catalogShardId) : [];
+  populateSelect(
+    vbucketSelect,
+    rows.map((r) => ({
+      value: String(r.vbucket),
+      label: `vbucket ${r.vbucket} (on ${r.shardId})${r.migrationStatus && r.migrationStatus !== "none" ? " · migrating" : ""}`,
+    })),
+  );
+  if (targetSelect) {
+    const shardIds = catalogShardId ? shardIdsForCatalog(catalogShardId) : [];
+    const currentOwner = rows.find((r) => String(r.vbucket) === vbucketSelect.value);
+    const items = shardIds.filter((id) => !currentOwner || id !== currentOwner.shardId).map((id) => ({ value: id, label: id }));
+    populateSelect(targetSelect, items, "auto (new shard)");
+  }
+}
+
+function refreshShardPicker(catalogSelect, shardSelect) {
+  const catalogShardId = catalogSelect.value;
+  const shardIds = catalogShardId ? shardIdsForCatalog(catalogShardId) : [];
+  populateSelect(shardSelect, shardIds.map((id) => ({ value: id, label: id })));
+}
+
+// ---- op tabs (Split / Migrate / Drain) --------------------------------------
+
+function setActiveOpTab(tab) {
+  activeOpTab = tab;
+  el.opTabSplit.classList.toggle("selected", tab === "split");
+  el.opTabMigrate.classList.toggle("selected", tab === "migrate");
+  el.opTabDrain.classList.toggle("selected", tab === "drain");
+  el.opFormSplit.hidden = tab !== "split";
+  el.opFormMigrate.hidden = tab !== "migrate";
+  el.opFormDrain.hidden = tab !== "drain";
+  setReshardError(null);
+}
+
+function setFormBusy(form, busy) {
+  [...form.elements].forEach((elm) => {
+    elm.disabled = busy;
+  });
+}
+
+// ---- form submit handlers ----------------------------------------------------
+
+function handleSplitSubmit(evt) {
+  evt.preventDefault();
+  const catalogShardId = el.splitCatalogSelect.value;
+  const vbucket = Number(el.splitVbucketSelect.value);
+  const newShardId = el.splitNewShardInput.value.trim() || undefined;
+  if (!catalogShardId || !Number.isInteger(vbucket)) {
+    setReshardError("select a catalog shard and vbucket first");
+    return;
+  }
+  setReshardError(null);
+  setFormBusy(el.opFormSplit, true);
+  reshardFetch("/api/reshard/split", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ catalogShardId, vbucket, newShardId }),
+  })
+    .then((body) => {
+      logLine(`split started · vbucket ${vbucket} (${catalogShardId}) → ${(body && body.toShard) || "(new shard)"}`, "mig");
+      activeOp = { kind: "migrate", catalogShardId, vbucket };
+      pollActiveOp();
+    })
+    .catch((err) => setReshardError((err && err.message) || "split failed"))
+    .finally(() => setFormBusy(el.opFormSplit, false));
+}
+
+function handleMigrateSubmit(evt) {
+  evt.preventDefault();
+  const catalogShardId = el.migrateCatalogSelect.value;
+  const vbucket = Number(el.migrateVbucketSelect.value);
+  const targetShardId = el.migrateTargetSelect.value || undefined;
+  if (!catalogShardId || !Number.isInteger(vbucket)) {
+    setReshardError("select a catalog shard and vbucket first");
+    return;
+  }
+  setReshardError(null);
+  setFormBusy(el.opFormMigrate, true);
+  reshardFetch("/api/reshard/migrate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ catalogShardId, vbucket, targetShardId }),
+  })
+    .then((body) => {
+      logLine(`migrate started · vbucket ${vbucket} (${catalogShardId}) → ${(body && body.toShard) || "(new shard)"}`, "mig");
+      activeOp = { kind: "migrate", catalogShardId, vbucket };
+      pollActiveOp();
+    })
+    .catch((err) => setReshardError((err && err.message) || "migrate failed"))
+    .finally(() => setFormBusy(el.opFormMigrate, false));
+}
+
+function handleDrainSubmit(evt) {
+  evt.preventDefault();
+  const catalogShardId = el.drainCatalogSelect.value;
+  const shardId = el.drainShardSelect.value;
+  if (!catalogShardId || !shardId) {
+    setReshardError("select a catalog shard and a shard to drain first");
+    return;
+  }
+  setReshardError(null);
+  setFormBusy(el.opFormDrain, true);
+  reshardFetch("/api/reshard/drain", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ catalogShardId, shardId }),
+  })
+    .then(() => {
+      logLine(`drain started · ${shardId} (${catalogShardId})`, "mig");
+      activeOp = { kind: "drain", catalogShardId, shardId };
+      pollActiveOp();
+    })
+    .catch((err) => setReshardError((err && err.message) || "drain failed"))
+    .finally(() => setFormBusy(el.opFormDrain, false));
+}
+
+function handleAbortClick() {
+  if (!activeOp || activeOp.kind !== "migrate") return;
+  const op = activeOp;
+  el.opAbortBtn.disabled = true;
+  reshardFetch("/api/reshard/migrate-abort", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ catalogShardId: op.catalogShardId, vbucket: op.vbucket }),
+  })
+    .then(() => {
+      logLine(`migrate aborted · vbucket ${op.vbucket} (${op.catalogShardId})`, "warn");
+      if (activeOp === op) activeOp = null;
+      renderOpCard(null);
+    })
+    .catch((err) => setReshardError((err && err.message) || "abort failed"))
+    .finally(() => {
+      el.opAbortBtn.disabled = false;
+    });
+}
+
+// ---- current-op polling + render ---------------------------------------------
+
+function pollActiveOp() {
+  if (!activeOp) return;
+  const op = activeOp;
+  const req =
+    op.kind === "migrate"
+      ? reshardFetch(`/api/reshard/migrate-status?catalogShardId=${encodeURIComponent(op.catalogShardId)}&vbucket=${op.vbucket}`)
+      : reshardFetch(`/api/reshard/drain-status?catalogShardId=${encodeURIComponent(op.catalogShardId)}&shardId=${encodeURIComponent(op.shardId)}`);
+
+  req
+    .then((status) => {
+      if (activeOp !== op) return; // superseded by a newer op while this call was in flight
+      renderOpCard(op, status);
+      const terminal = op.kind === "migrate" ? status.status === "none" : status.status === "complete";
+      if (terminal) {
+        logLine(
+          op.kind === "migrate"
+            ? `migrate complete · vbucket ${op.vbucket} (${op.catalogShardId})`
+            : `drain complete · ${op.shardId} (${op.catalogShardId})`,
+          "safe",
+        );
+        activeOp = null;
+      }
+    })
+    .catch((err) => {
+      if (activeOp !== op) return;
+      setReshardError(`status check failed: ${(err && err.message) || err}`, "warn");
+    });
+}
+
+function renderOpCard(op, status) {
+  if (!op) {
+    el.opCard.hidden = true;
+    return;
+  }
+  el.opCard.hidden = false;
+  el.opAbortBtn.hidden = op.kind !== "migrate";
+  if (op.kind === "migrate") {
+    el.opCardName.textContent = `migrate-vbucket · ${(status && status.status) || "starting"}`;
+    const parts = [`vbucket <b>${escapeHtml(String(op.vbucket))}</b>`, `<span class="arrow">&rarr;</span>`, `<b>${escapeHtml((status && status.toShard) || "?")}</b>`];
+    if (status && typeof status.rowsCopied === "number") parts.push(`<span class="stat">· ${fmtInt(status.rowsCopied)} rows copied</span>`);
+    if (status && status.mirrorQueueDepth) parts.push(`<span class="stat">· ${fmtInt(status.mirrorQueueDepth)} mirror queued</span>`);
+    el.opCardDetail.innerHTML = parts.join(" ");
+  } else {
+    el.opCardName.textContent = `drain-shard · ${(status && status.status) || "starting"}`;
+    const parts = [`<b>${escapeHtml(op.shardId)}</b>`];
+    if (status && typeof status.vbucketsRemaining === "number") parts.push(`<span class="stat">· ${fmtInt(status.vbucketsRemaining)} vbucket(s) left</span>`);
+    if (status && typeof status.ringsRemaining === "number") parts.push(`<span class="stat">· ${fmtInt(status.ringsRemaining)} ring(s) left</span>`);
+    if (status && status.stallReason) parts.push(`<span class="stat">· stalled: ${escapeHtml(status.stallReason)}</span>`);
+    el.opCardDetail.innerHTML = parts.join(" ");
+  }
+}
+
+// ---- topology-operation lock status + force-release -------------------------
+
+function pollLockStatus() {
+  reshardFetch("/api/reshard/lock-status")
+    .then((status) => {
+      setLockError(null);
+      lastLockOperationId = status.held ? status.operationId : null;
+      el.lockState.textContent = !status.held ? "free" : status.expired ? "held (expired)" : "held";
+      el.lockState.className = "lock-state mono " + (!status.held ? "free" : status.expired ? "expired" : "held");
+      el.lockReleaseBtn.hidden = !status.held;
+      if (status.held) {
+        el.lockDetail.textContent = `${status.operationType} · op ${status.operationId} · acquired ${new Date(status.acquiredAt).toLocaleTimeString()}`;
+      } else {
+        el.lockDetail.textContent = "no topology operation is running cluster-wide";
+      }
+    })
+    .catch((err) => setLockError(`lock status unavailable: ${(err && err.message) || err}`));
+}
+
+/** Guarded two-step confirm (a native confirm() dialog doesn't fit this
+ * control room's aesthetic, but a force-release is a real operator escape
+ * hatch that shouldn't fire on a single misclick) — first click arms it for
+ * 4s, second click within that window actually calls the RPC. */
+function handleForceReleaseClick() {
+  if (!lastLockOperationId) return;
+  if (!el.lockReleaseBtn.classList.contains("confirming")) {
+    el.lockReleaseBtn.classList.add("confirming");
+    el.lockReleaseBtn.textContent = "Confirm force-release?";
+    clearTimeout(lockReleaseConfirmTimer);
+    lockReleaseConfirmTimer = setTimeout(resetLockReleaseButton, 4000);
+    return;
+  }
+  clearTimeout(lockReleaseConfirmTimer);
+  const operationId = lastLockOperationId;
+  el.lockReleaseBtn.disabled = true;
+  reshardFetch("/api/reshard/force-release-lock", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ operationId }),
+  })
+    .then((body) => {
+      logLine(`topology lock force-released · op ${operationId} (released: ${body && body.released})`, "warn");
+      pollLockStatus();
+    })
+    .catch((err) => setLockError((err && err.message) || "force-release failed"))
+    .finally(() => {
+      el.lockReleaseBtn.disabled = false;
+      resetLockReleaseButton();
+    });
+}
+
+function resetLockReleaseButton() {
+  el.lockReleaseBtn.classList.remove("confirming");
+  el.lockReleaseBtn.textContent = "Force-release lock";
+}
+
+// ============================================================================
 // Auth gate (src/gate.ts): /api/* requires SHARDSCOPE_GATE_TOKEN, presented
 // as a `shardscope_gate` HttpOnly cookie set by POST /login. EventSource
 // can't read response status codes or set an Authorization header, so we
@@ -679,6 +1132,12 @@ function handleLogout() {
   el.nodesLayer.innerHTML = "";
   el.arcLayer.querySelectorAll("path.migration-path").forEach((p) => p.remove());
   el.canvasSub.textContent = "";
+  // The session that gated every /api/reshard/* call is gone — stop polling
+  // it and drop any in-flight op's local bookkeeping (the op itself keeps
+  // running server-side; this only clears what THIS tab was watching).
+  stopReshardPolling();
+  activeOp = null;
+  if (el.opCard) el.opCard.hidden = true;
   logLine("logged out", "warn");
   showLoginPanel();
 }
@@ -797,9 +1256,41 @@ function connectLive() {
   });
 }
 
+/** Click + Enter/Space (role="button" rail items aren't native <button>s). */
+function onActivate(elm, fn) {
+  if (!elm) return;
+  elm.addEventListener("click", fn);
+  elm.addEventListener("keydown", (evt) => {
+    if (evt.key === "Enter" || evt.key === " ") {
+      evt.preventDefault();
+      fn();
+    }
+  });
+}
+
 function init() {
   el.loginForm.addEventListener("submit", handleLoginSubmit);
   el.logoutBtn.addEventListener("click", handleLogout);
+
+  // ---- Reshard room (T8) wiring ----
+  onActivate(el.railTopology, () => setActiveRoom("topology"));
+  onActivate(el.railReshard, () => setActiveRoom("reshard"));
+  el.opTabSplit.addEventListener("click", () => setActiveOpTab("split"));
+  el.opTabMigrate.addEventListener("click", () => setActiveOpTab("migrate"));
+  el.opTabDrain.addEventListener("click", () => setActiveOpTab("drain"));
+  el.opFormSplit.addEventListener("submit", handleSplitSubmit);
+  el.opFormMigrate.addEventListener("submit", handleMigrateSubmit);
+  el.opFormDrain.addEventListener("submit", handleDrainSubmit);
+  el.opAbortBtn.addEventListener("click", handleAbortClick);
+  el.lockReleaseBtn.addEventListener("click", handleForceReleaseClick);
+  el.splitCatalogSelect.addEventListener("change", () => refreshVbucketPicker(el.splitCatalogSelect, el.splitVbucketSelect));
+  el.migrateCatalogSelect.addEventListener("change", () =>
+    refreshVbucketPicker(el.migrateCatalogSelect, el.migrateVbucketSelect, el.migrateTargetSelect),
+  );
+  el.migrateVbucketSelect.addEventListener("change", () =>
+    refreshVbucketPicker(el.migrateCatalogSelect, el.migrateVbucketSelect, el.migrateTargetSelect),
+  );
+  el.drainCatalogSelect.addEventListener("change", () => refreshShardPicker(el.drainCatalogSelect, el.drainShardSelect));
 
   const params = new URLSearchParams(location.search);
   if (params.get("demo") === "1") {
