@@ -4,7 +4,7 @@ import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
 import { CoordinatorDO } from "./coordinator";
 import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
-import { checkAdminAuth } from "./auth";
+import { checkAdminAuth, isValidBearerToken } from "./auth";
 import { log } from "./log";
 import { extractCreateTableName, isDangerous, isDangerousSchema, isInternalTableName, isMutation, mutationTargetIsInternal, normalizeTableName } from "./sql-safety";
 import {
@@ -75,6 +75,20 @@ function assertParamsArray(params: unknown): params is unknown[] {
 function requireAdminAuth(env: Env, request: Request): Response | null {
   const authError = checkAdminAuth(env.ADMIN_TOKEN, request);
   return authError ? json({ error: authError.error }, authError.status) : null;
+}
+
+/** Same gate as requireAdminAuth, but for core functions that only have the
+ * raw `authorization` header string (not a Request) — e.g. an RPC caller.
+ * Mirrors checkAdminAuth's logic exactly (see auth.ts) without needing a
+ * Request object to read the header off of. */
+function requireAdminAuthFromHeader(env: Env, authorization: string | undefined): Response | null {
+  if (!env.ADMIN_TOKEN) {
+    return json({ error: "ADMIN_TOKEN is not configured." }, 500);
+  }
+  if (!isValidBearerToken(authorization ?? null, env.ADMIN_TOKEN)) {
+    return json({ error: "Unauthorized." }, 401);
+  }
+  return null;
 }
 
 function catalogShardCount(env: Env): number {
@@ -194,9 +208,7 @@ async function routeToShard(env: Env, shardId: string, path: string, payload: un
   });
 }
 
-async function handleAdminInit(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as Record<string, unknown>;
-  const authorization = request.headers.get("authorization") ?? undefined;
+async function adminInitCore(env: Env, payload: Record<string, unknown>, authorization: string | undefined): Promise<Response> {
   const results = await fanOutToAllCatalogs(
     env,
     "/init",
@@ -212,8 +224,14 @@ async function handleAdminInit(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleAdminRegisterTable(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as Record<string, unknown> & {
+async function handleAdminInit(request: Request, env: Env): Promise<Response> {
+  const payload = (await request.json()) as Record<string, unknown>;
+  return adminInitCore(env, payload, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminRegisterTableCore(
+  env: Env,
+  payload: Record<string, unknown> & {
     table?: string;
     // PR review round 11: widened to `string | null` — this route now sends
     // an explicit `null` down to CatalogDO to signal "clear schema_sql",
@@ -221,7 +239,9 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
     // below (just before the fan-out) for the full contract.
     schemaSql?: string | null;
     partitionKeyColumn?: string;
-  };
+  },
+  authorization: string | undefined,
+): Promise<Response> {
   // Pre-landing review fix: every sibling route (handleAdminSetPartitionKeyColumn,
   // handleAdminCreateIndex) validates its identifiers against IDENTIFIER_RE before
   // using them; this route was missing that check even though payload.table flows
@@ -369,11 +389,19 @@ async function handleAdminRegisterTable(request: Request, env: Env): Promise<Res
     }
   }
 
-  const authorization = request.headers.get("authorization") ?? undefined;
   const results = await fanOutToAllCatalogs(env, "/register-table", () => ({ ...payload, partitionKeyUnique }), authorization);
   const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to register the table.");
   if (failed) return failed;
   return json({ ok: true, catalogShardCount: results.length });
+}
+
+async function handleAdminRegisterTable(request: Request, env: Env): Promise<Response> {
+  const payload = (await request.json()) as Record<string, unknown> & {
+    table?: string;
+    schemaSql?: string | null;
+    partitionKeyColumn?: string;
+  };
+  return adminRegisterTableCore(env, payload, request.headers.get("authorization") ?? undefined);
 }
 
 /** Codex PR review round 3 fix: asks the shard itself (via
@@ -608,13 +636,16 @@ async function checkPartitionKeyUniqueAcrossShards(
   return results.every((result) => result === true);
 }
 
-async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as {
+async function adminCreateTableCore(
+  env: Env,
+  body: {
     table?: string;
     schema?: string;
     partitioning?: string;
     partitionKeyColumn?: string;
-  };
+  },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!body.table || !body.schema) {
     return json({ error: "Missing table or schema." }, 400);
   }
@@ -791,7 +822,7 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
       schemaSql: body.schema,
       partitionKeyUnique,
     }),
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register table.");
   if (registerFailed) return registerFailed;
@@ -799,8 +830,21 @@ async function handleAdminCreateTable(request: Request, env: Env): Promise<Respo
   return json({ ok: true, table: body.table, shardsApplied: shardResults.length });
 }
 
-async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+async function handleAdminCreateTable(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as {
+    table?: string;
+    schema?: string;
+    partitioning?: string;
+    partitionKeyColumn?: string;
+  };
+  return adminCreateTableCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminSetPartitionKeyColumnCore(
+  env: Env,
+  body: { table?: string; partitionKeyColumn?: string },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!body.table || !body.partitionKeyColumn) {
     return json(
       { error: { code: "MISSING_FIELDS", message: "Missing table or partitionKeyColumn.", fix: "Provide both table and partitionKeyColumn." } },
@@ -860,11 +904,16 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
     env,
     "/set-partition-key-column",
     () => ({ ...body, partitionKeyUnique }),
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   const failed = firstCatalogFanOutFailure(results, "Failed to update partitionKeyColumn on one or more catalog shards.");
   if (failed) return failed;
   return json({ ok: true, table: body.table, partitionKeyColumn: body.partitionKeyColumn });
+}
+
+async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { table?: string; partitionKeyColumn?: string };
+  return adminSetPartitionKeyColumnCore(env, body, request.headers.get("authorization") ?? undefined);
 }
 
 /** Milestone 2, Chunk 1. Registers a secondary index and backfills it against
@@ -875,7 +924,11 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
  * shard. Single-pass, not chunked: acceptable for this milestone's stated
  * pre-product scale (see design doc Premise 1); a very large table could hit
  * a Worker CPU-time limit, a known simplification, not a silent bug. */
-async function handleAdminCreateIndex(request: Request, env: Env): Promise<Response> {
+async function adminCreateIndexCore(
+  env: Env,
+  body: { indexName?: string; table?: string; columns?: string[] },
+  authorization: string | undefined,
+): Promise<Response> {
   // Topology lock (Stage 2): create-index mutates every catalog's index_rules
   // and races drain ring-evacuation; serialize it against all other topology
   // ops. Held for the whole (synchronous) registration + backfill, released in
@@ -883,14 +936,23 @@ async function handleAdminCreateIndex(request: Request, env: Env): Promise<Respo
   const lock = await acquireTopologyLock(env, "create-index");
   if (lock instanceof Response) return lock;
   try {
-    return await handleAdminCreateIndexLocked(request, env, lock.operationId);
+    return await adminCreateIndexLockedCore(env, body, authorization, lock.operationId);
   } finally {
     await releaseTopologyLock(env, lock.operationId);
   }
 }
 
-async function handleAdminCreateIndexLocked(request: Request, env: Env, operationId: string): Promise<Response> {
+async function handleAdminCreateIndex(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { indexName?: string; table?: string; columns?: string[] };
+  return adminCreateIndexCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminCreateIndexLockedCore(
+  env: Env,
+  body: { indexName?: string; table?: string; columns?: string[] },
+  authorization: string | undefined,
+  operationId: string,
+): Promise<Response> {
   if (!body.indexName || !body.table || !body.columns || body.columns.length === 0) {
     return json(
       { error: { code: "MISSING_FIELDS", message: "Missing indexName, table, or columns.", fix: "Provide indexName, table, and a non-empty columns array." } },
@@ -908,7 +970,7 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env, operatio
 
   // table_rules is fanned out identically to every catalog shard, so
   // catalog-0's view is representative (same pattern as handleAdminListTables).
-  const tablesRes = await routeToCatalog(env, "catalog-0", "/list-tables", {}, request.headers.get("authorization") ?? undefined);
+  const tablesRes = await routeToCatalog(env, "catalog-0", "/list-tables", {}, authorization);
   if (!tablesRes.ok) {
     return new Response(tablesRes.body, { status: tablesRes.status, headers: tablesRes.headers });
   }
@@ -1035,7 +1097,7 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env, operatio
     env,
     "/create-index",
     () => ({ indexName, table, columns, placementRing: verifiedRingShardIds }),
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
   if (registerFailed) return registerFailed;
@@ -1192,7 +1254,7 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env, operatio
     env,
     "/mark-index-ready",
     () => ({ indexName }),
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   const readyFailed = firstCatalogFanOutFailure(readyResults, "Failed to mark index ready.");
   if (readyFailed) return readyFailed;
@@ -1200,8 +1262,7 @@ async function handleAdminCreateIndexLocked(request: Request, env: Env, operatio
   return json({ ok: true, indexName, table, columns });
 }
 
-async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as { catalogShardId?: string };
+async function adminSplitVbucketCore(env: Env, payload: { catalogShardId?: string }, authorization: string | undefined): Promise<Response> {
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
   }
@@ -1220,8 +1281,30 @@ async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Resp
       payload.catalogShardId,
       "/split-vbucket",
       { ...payload, operationId: lock.operationId },
-      request.headers.get("authorization") ?? undefined,
+      authorization,
     );
+    handedOff = res.ok;
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } finally {
+    if (!handedOff) await releaseTopologyLock(env, lock.operationId);
+  }
+}
+
+async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Response> {
+  const payload = (await request.json()) as { catalogShardId?: string };
+  return adminSplitVbucketCore(env, payload, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminMigrateVbucketCore(env: Env, payload: { catalogShardId?: string }, authorization: string | undefined): Promise<Response> {
+  if (!payload.catalogShardId) {
+    return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
+  }
+  // Same hand-off pattern as split-vbucket above.
+  const lock = await acquireTopologyLock(env, "migrate-vbucket");
+  if (lock instanceof Response) return lock;
+  let handedOff = false;
+  try {
+    const res = await routeToCatalog(env, payload.catalogShardId, "/migrate-vbucket", { ...payload, operationId: lock.operationId }, authorization);
     handedOff = res.ok;
     return new Response(res.body, { status: res.status, headers: res.headers });
   } finally {
@@ -1231,34 +1314,28 @@ async function handleAdminSplitVbucket(request: Request, env: Env): Promise<Resp
 
 async function handleAdminMigrateVbucket(request: Request, env: Env): Promise<Response> {
   const payload = (await request.json()) as { catalogShardId?: string };
-  if (!payload.catalogShardId) {
-    return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
-  }
-  // Same hand-off pattern as split-vbucket above.
-  const lock = await acquireTopologyLock(env, "migrate-vbucket");
-  if (lock instanceof Response) return lock;
-  let handedOff = false;
-  try {
-    const res = await routeToCatalog(env, payload.catalogShardId, "/migrate-vbucket", { ...payload, operationId: lock.operationId }, request.headers.get("authorization") ?? undefined);
-    handedOff = res.ok;
-    return new Response(res.body, { status: res.status, headers: res.headers });
-  } finally {
-    if (!handedOff) await releaseTopologyLock(env, lock.operationId);
-  }
+  return adminMigrateVbucketCore(env, payload, request.headers.get("authorization") ?? undefined);
 }
 
 /** Milestone 3, Chunk 4: thin forwarders to the owning catalog shard's
  * migration endpoints — the catalog owns the state machine and drives the
  * shard-level export/import/fence orchestration from its own alarm. Read-only
  * status / abort forwarders do NOT take the topology lock. */
-function makeCatalogMigrationForwarder(path: string): (request: Request, env: Env) => Promise<Response> {
-  return async (request, env) => {
-    const payload = (await request.json()) as { catalogShardId?: string };
+function makeCatalogMigrationForwarderCore(path: string): (env: Env, body: { catalogShardId?: string }, authorization: string | undefined) => Promise<Response> {
+  return async (env, payload, authorization) => {
     if (!payload.catalogShardId) {
       return json({ error: "Missing catalogShardId. vBucket numbering is local to a catalog shard." }, 400);
     }
-    const res = await routeToCatalog(env, payload.catalogShardId, path, payload, request.headers.get("authorization") ?? undefined);
+    const res = await routeToCatalog(env, payload.catalogShardId, path, payload, authorization);
     return new Response(res.body, { status: res.status, headers: res.headers });
+  };
+}
+
+function makeCatalogMigrationForwarder(path: string): (request: Request, env: Env) => Promise<Response> {
+  const core = makeCatalogMigrationForwarderCore(path);
+  return async (request, env) => {
+    const payload = (await request.json()) as { catalogShardId?: string };
+    return core(env, payload, request.headers.get("authorization") ?? undefined);
   };
 }
 
@@ -1267,8 +1344,11 @@ const handleAdminMigrateVbucketAbort = makeCatalogMigrationForwarder("/migrate-v
 // Milestone 3, Chunk 5: progress of a shard drain's two evacuation loops.
 const handleAdminDrainShardStatus = makeCatalogMigrationForwarder("/drain-shard-status");
 
-async function handleAdminStatus(request: Request, env: Env): Promise<Response> {
-  const authorization = request.headers.get("authorization") ?? undefined;
+const adminMigrateVbucketStatusCore = makeCatalogMigrationForwarderCore("/migrate-vbucket-status");
+const adminMigrateVbucketAbortCore = makeCatalogMigrationForwarderCore("/migrate-vbucket-abort");
+const adminDrainShardStatusCore = makeCatalogMigrationForwarderCore("/drain-shard-status");
+
+async function adminStatusCore(env: Env, authorization: string | undefined): Promise<Response> {
   const results = await fanOutToAllCatalogs(env, "/status", () => ({}), authorization);
   const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to report status.");
   if (failed) return failed;
@@ -1297,7 +1377,11 @@ async function handleAdminStatus(request: Request, env: Env): Promise<Response> 
   return json({ initialized, catalogShardCount: results.length, shards: totals, catalogs });
 }
 
-async function handleAdminListTables(request: Request, env: Env): Promise<Response> {
+async function handleAdminStatus(request: Request, env: Env): Promise<Response> {
+  return adminStatusCore(env, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminListTablesCore(env: Env, authorization: string | undefined): Promise<Response> {
   // table_rules are fanned out identically to every catalog shard by
   // /admin/register-table, so catalog-0 is representative of all of them.
   const res = await routeToCatalog(
@@ -1305,12 +1389,16 @@ async function handleAdminListTables(request: Request, env: Env): Promise<Respon
     "catalog-0",
     "/list-tables",
     {},
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
-async function handleAdminListIndexes(request: Request, env: Env): Promise<Response> {
+async function handleAdminListTables(request: Request, env: Env): Promise<Response> {
+  return adminListTablesCore(env, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminListIndexesCore(env: Env, authorization: string | undefined): Promise<Response> {
   // index_rules are fanned out identically to every catalog shard by
   // /admin/create-index, so catalog-0 is representative of all of them.
   const res = await routeToCatalog(
@@ -1318,9 +1406,13 @@ async function handleAdminListIndexes(request: Request, env: Env): Promise<Respo
     "catalog-0",
     "/list-indexes",
     {},
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminListIndexes(request: Request, env: Env): Promise<Response> {
+  return adminListIndexesCore(env, request.headers.get("authorization") ?? undefined);
 }
 
 /** Milestone 2, Chunk 6. Unregisters the index in CatalogDO first (fanned to
@@ -1328,20 +1420,24 @@ async function handleAdminListIndexes(request: Request, env: Env): Promise<Respo
  * it immediately, then best-effort deletes its physical __cf_indexes rows
  * across every shard — the index could be on any shard given hash-based
  * placement, so this fans out rather than targeting one. */
-async function handleAdminDropIndex(request: Request, env: Env): Promise<Response> {
+async function adminDropIndexCore(env: Env, body: { indexName?: string }, authorization: string | undefined): Promise<Response> {
   // Topology lock (Stage 2): drop-index mutates every catalog's index_rules and
   // deletes physical entries; serialize it against all other topology ops.
   const lock = await acquireTopologyLock(env, "drop-index");
   if (lock instanceof Response) return lock;
   try {
-    return await handleAdminDropIndexLocked(request, env);
+    return await adminDropIndexLockedCore(env, body, authorization);
   } finally {
     await releaseTopologyLock(env, lock.operationId);
   }
 }
 
-async function handleAdminDropIndexLocked(request: Request, env: Env): Promise<Response> {
+async function handleAdminDropIndex(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { indexName?: string };
+  return adminDropIndexCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminDropIndexLockedCore(env: Env, body: { indexName?: string }, authorization: string | undefined): Promise<Response> {
   if (!body.indexName) {
     return json({ error: "Missing indexName" }, 400);
   }
@@ -1352,7 +1448,7 @@ async function handleAdminDropIndexLocked(request: Request, env: Env): Promise<R
   // one later evacuated by Chunk 5's drain), so cleanup below targets the
   // UNION of the pinned ring and the current live set rather than only
   // whichever set happens to include every shard the index ever touched.
-  const existingListRes = await routeToCatalog(env, "catalog-0", "/list-indexes", {}, request.headers.get("authorization") ?? undefined);
+  const existingListRes = await routeToCatalog(env, "catalog-0", "/list-indexes", {}, authorization);
   const existingList = existingListRes.ok
     ? ((await existingListRes.json()) as { indexes: Array<{ indexName: string; placementRing?: string[] }> })
     : { indexes: [] };
@@ -1362,7 +1458,7 @@ async function handleAdminDropIndexLocked(request: Request, env: Env): Promise<R
     env,
     "/drop-index",
     () => ({ indexName: body.indexName }),
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   const unregisterFailed = firstCatalogFanOutFailure(unregisterResults, "Failed to unregister index.");
   if (unregisterFailed) return unregisterFailed;
@@ -1437,9 +1533,7 @@ type OrphanedRow = { catalogShardId: string; shardId: string; table: string; par
  * across separate requests) — the same "acceptable at this milestone's
  * pre-product scale, a known simplification, not a silent bug" tradeoff
  * /admin/create-index's backfill already makes. */
-async function handleAdminBackfillProvenance(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { catalogShardId?: string };
-  const authorization = request.headers.get("authorization") ?? undefined;
+async function adminBackfillProvenanceCore(env: Env, body: { catalogShardId?: string }, authorization: string | undefined): Promise<Response> {
   const catalogShardIds = body.catalogShardId ? [body.catalogShardId] : allCatalogShardIds(env);
 
   let attributed = 0;
@@ -1602,6 +1696,11 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
   return json({ attributed, ambiguous, orphaned });
 }
 
+async function handleAdminBackfillProvenance(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { catalogShardId?: string };
+  return adminBackfillProvenanceCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
 /** Milestone 3, Chunk 1 (POST /admin/set-row-owner). Manual resolution for a
  * row /admin/backfill-provenance reported ambiguous (or any row an operator
  * otherwise knows the true owner of). Rejects 409 if the claimed tenant's
@@ -1609,21 +1708,23 @@ async function handleAdminBackfillProvenance(request: Request, env: Env): Promis
  * record an owner assignment that /admin/migrate-vbucket's provenance-gate
  * (Chunk 4) would itself never have produced, rather than trusting the
  * caller unconditionally. */
-async function handleAdminSetRowOwner(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as {
+async function adminSetRowOwnerCore(
+  env: Env,
+  body: {
     catalogShardId?: string;
     shardId?: string;
     table?: string;
     partitionKey?: string;
     tenantId?: string;
-  };
+  },
+  authorization: string | undefined,
+): Promise<Response> {
   if (!body.catalogShardId || !body.shardId || !body.table || !body.partitionKey || !body.tenantId) {
     return json(
       { error: { code: "MISSING_FIELDS", message: "Missing catalogShardId, shardId, table, partitionKey, or tenantId." } },
       400,
     );
   }
-  const authorization = request.headers.get("authorization") ?? undefined;
 
   const vbMapRes = await routeToCatalog(env, body.catalogShardId, "/vbucket-map", {}, authorization);
   if (!vbMapRes.ok) return new Response(vbMapRes.body, { status: vbMapRes.status, headers: vbMapRes.headers });
@@ -1652,8 +1753,18 @@ async function handleAdminSetRowOwner(request: Request, env: Env): Promise<Respo
   return json({ ok: true });
 }
 
-async function handleAdminDrainShard(request: Request, env: Env): Promise<Response> {
-  const payload = (await request.json()) as { shardId: string; catalogShardId?: string };
+async function handleAdminSetRowOwner(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as {
+    catalogShardId?: string;
+    shardId?: string;
+    table?: string;
+    partitionKey?: string;
+    tenantId?: string;
+  };
+  return adminSetRowOwnerCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminDrainShardCore(env: Env, payload: { shardId: string; catalogShardId?: string }, authorization: string | undefined): Promise<Response> {
   if (!payload.catalogShardId) {
     return json({ error: "Missing catalogShardId. Shard ownership is scoped to a catalog shard." }, 400);
   }
@@ -1712,7 +1823,6 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
   // NOT acquire a NEW lock — that drain already holds its own lock, and a
   // fresh acquire attempt would 409 against it. Check current status first to
   // tell the two apart.
-  const authorization = request.headers.get("authorization") ?? undefined;
   const statusRes = await routeToCatalog(env, payload.catalogShardId, "/drain-shard-status", { shardId: payload.shardId }, authorization);
   let alreadyDraining = false;
   if (statusRes.ok) {
@@ -1742,8 +1852,12 @@ async function handleAdminDrainShard(request: Request, env: Env): Promise<Respon
   }
 }
 
-async function handleAdminAuditLog(request: Request, env: Env): Promise<Response> {
-  const authorization = request.headers.get("authorization") ?? undefined;
+async function handleAdminDrainShard(request: Request, env: Env): Promise<Response> {
+  const payload = (await request.json()) as { shardId: string; catalogShardId?: string };
+  return adminDrainShardCore(env, payload, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminAuditLogCore(env: Env, authorization: string | undefined): Promise<Response> {
   const results = await fanOutToAllCatalogs(env, "/audit-log", () => ({}), authorization);
   const failed = firstCatalogFanOutFailure(results, "One or more catalog shards failed to report the audit log.");
   if (failed) return failed;
@@ -1759,8 +1873,11 @@ async function handleAdminAuditLog(request: Request, env: Env): Promise<Response
   return json({ entries });
 }
 
-async function handleAdminRegisterTenant(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { tenantId?: string; rotate?: boolean };
+async function handleAdminAuditLog(request: Request, env: Env): Promise<Response> {
+  return adminAuditLogCore(env, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminRegisterTenantCore(env: Env, body: { tenantId?: string; rotate?: boolean }, authorization: string | undefined): Promise<Response> {
   if (!body.tenantId) {
     return json(
       { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
@@ -1768,25 +1885,33 @@ async function handleAdminRegisterTenant(request: Request, env: Env): Promise<Re
     );
   }
   const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
-  const res = await routeToCatalog(env, catalogShardId, "/register-tenant", body, request.headers.get("authorization") ?? undefined);
+  const res = await routeToCatalog(env, catalogShardId, "/register-tenant", body, authorization);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminRegisterTenant(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { tenantId?: string; rotate?: boolean };
+  return adminRegisterTenantCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function adminRevokeTenantCore(env: Env, body: { tenantId?: string }, authorization: string | undefined): Promise<Response> {
+  if (!body.tenantId) {
+    return json(
+      { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
+      400,
+    );
+  }
+  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
+  const res = await routeToCatalog(env, catalogShardId, "/revoke-tenant", body, authorization);
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
 async function handleAdminRevokeTenant(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { tenantId?: string };
-  if (!body.tenantId) {
-    return json(
-      { error: { code: "MISSING_TENANT_ID", message: "Missing tenantId.", fix: "Provide a tenantId in the request body." } },
-      400,
-    );
-  }
-  const catalogShardId = catalogShardIdForTenant(env, body.tenantId);
-  const res = await routeToCatalog(env, catalogShardId, "/revoke-tenant", body, request.headers.get("authorization") ?? undefined);
-  return new Response(res.body, { status: res.status, headers: res.headers });
+  return adminRevokeTenantCore(env, body, request.headers.get("authorization") ?? undefined);
 }
 
-async function handleAdminShardStats(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { shardId: string };
+async function adminShardStatsCore(env: Env, body: { shardId: string }, authorization: string | undefined): Promise<Response> {
   if (!body.shardId) {
     return json({ error: "Missing shardId" }, 400);
   }
@@ -1794,7 +1919,12 @@ async function handleAdminShardStats(request: Request, env: Env): Promise<Respon
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
-async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleAdminShardStats(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { shardId: string };
+  return adminShardStatsCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
+async function sqlCore(env: Env, ctx: ExecutionContext, body: SqlRequest, authorization: string | undefined): Promise<Response> {
   // ARCHITECTURE CHANGE: /v1/sql is now ADMIN-ONLY (operator/debugging), like
   // /v1/scatter. The per-tenant SQL guard was structurally unwinnable — the
   // denylist/allowlist leaked six times — and a raw partition-scoped SELECT
@@ -1804,10 +1934,9 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
   // tenants write via /v1/mutate + /v1/tx and read via /v1/index-query.
   // body.tenantId is still required (routing/hashing) but is NOT authenticated
   // against the caller — the caller is the operator (ADMIN_TOKEN).
-  const adminAuthError = requireAdminAuth(env, request);
+  const adminAuthError = requireAdminAuthFromHeader(env, authorization);
   if (adminAuthError) return adminAuthError;
 
-  const body = (await request.json()) as SqlRequest;
   if (!body.sql || !body.table || !body.tenantId) {
     return json({ error: "Missing required fields: sql, table, tenantId." }, 400);
   }
@@ -1865,7 +1994,7 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
       tenantId: body.tenantId,
       partitionKey: body.partitionKey,
     },
-    request.headers.get("authorization") ?? undefined,
+    authorization,
   );
   const routeLookupMs = Date.now() - routeStart;
 
@@ -1951,6 +2080,21 @@ async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): P
     observability: { routeLookupMs, shardExecuteMs, metadataVersion: route.metadataVersion },
     result: shardPayload,
   });
+}
+
+async function handleV1Sql(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  // Check auth BEFORE parsing the body — matches this route's original
+  // ordering (an unauthenticated caller gets 401 regardless of whether its
+  // body is even valid JSON, rather than a malformed body short-circuiting
+  // straight to a 500 before auth ever runs). sqlCore re-checks internally
+  // too (needed for an RPC caller, which skips this wrapper entirely) —
+  // deliberately redundant, same defense-in-depth idiom this codebase
+  // already uses for /admin/* (see requireAdminAuth's doc comment).
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const preAuthError = requireAdminAuthFromHeader(env, authorization);
+  if (preAuthError) return preAuthError;
+  const body = (await request.json()) as SqlRequest;
+  return sqlCore(env, ctx, body, authorization);
 }
 
 /** `ring` is the index's pinned placement_ring_json (captured once at
@@ -2439,8 +2583,7 @@ async function handleV1Mutate(request: Request, env: Env, ctx: ExecutionContext)
  * bounds the blast radius of what the CALLER asked to touch, and index
  * maintenance is bookkeeping this system adds on the caller's behalf, not
  * additional caller-requested scope. */
-async function handleV1Tx(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as StructuredOperation;
+async function txCore(env: Env, body: StructuredOperation, authorization: string | undefined): Promise<Response> {
   if (!body.mutations || body.mutations.length === 0) {
     return json({ error: { code: "MISSING_MUTATIONS", message: "mutations must be a non-empty array." } }, 400);
   }
@@ -2482,7 +2625,6 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
   };
   const compiledByShardId = new Map<string, TxIntent[]>();
   const currentCount = catalogShardCount(env);
-  const authorization = request.headers.get("authorization") ?? undefined;
 
   function addIntent(shardId: string, intent: TxIntent): void {
     const existing = compiledByShardId.get(shardId);
@@ -2688,8 +2830,17 @@ async function handleV1Tx(request: Request, env: Env): Promise<Response> {
   });
 }
 
+async function handleV1Tx(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as StructuredOperation;
+  return txCore(env, body, request.headers.get("authorization") ?? undefined);
+}
+
 async function handleAdminTxStatus(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { txId?: string };
+  return adminTxStatusCore(env, body);
+}
+
+async function adminTxStatusCore(env: Env, body: { txId?: string }): Promise<Response> {
   if (!body.txId) {
     return json({ error: "Missing txId" }, 400);
   }
@@ -2705,6 +2856,10 @@ async function handleAdminTxStatus(request: Request, env: Env): Promise<Response
 
 async function handleAdminTxForceAbort(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { txId?: string };
+  return adminTxForceAbortCore(env, body);
+}
+
+async function adminTxForceAbortCore(env: Env, body: { txId?: string }): Promise<Response> {
   if (!body.txId) {
     return json({ error: "Missing txId" }, 400);
   }
@@ -2721,9 +2876,13 @@ async function handleAdminTxForceAbort(request: Request, env: Env): Promise<Resp
 /** Stage 4 (approved topology-lock design): admin inspection of the current
  * cluster-wide topology lock — a thin forwarder to catalog-0's own
  * /topology-lock-status (the lock's single canonical home). */
-async function handleAdminTopologyLockStatus(request: Request, env: Env): Promise<Response> {
-  const res = await routeToCatalog(env, "catalog-0", "/topology-lock-status", {}, request.headers.get("authorization") ?? undefined);
+async function adminTopologyLockStatusCore(env: Env, authorization: string | undefined): Promise<Response> {
+  const res = await routeToCatalog(env, "catalog-0", "/topology-lock-status", {}, authorization);
   return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminTopologyLockStatus(request: Request, env: Env): Promise<Response> {
+  return adminTopologyLockStatusCore(env, request.headers.get("authorization") ?? undefined);
 }
 
 /** Stage 4: the operator escape hatch for a stuck topology lock (a crashed
@@ -2734,13 +2893,17 @@ async function handleAdminTopologyLockStatus(request: Request, env: Env): Promis
  * operationId currently matches (idempotent no-op otherwise — an operator who
  * doesn't know the exact operationId should read /admin/topology-lock-status
  * first). */
-async function handleAdminForceReleaseTopologyLock(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { operationId?: string };
+async function adminForceReleaseTopologyLockCore(env: Env, body: { operationId?: string }, authorization: string | undefined): Promise<Response> {
   if (!body.operationId) {
     return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId.", fix: "Read /admin/topology-lock-status to find the current holder's operationId." } }, 400);
   }
-  const res = await routeToCatalog(env, "catalog-0", "/release-topology-lock", { operationId: body.operationId }, request.headers.get("authorization") ?? undefined);
+  const res = await routeToCatalog(env, "catalog-0", "/release-topology-lock", { operationId: body.operationId }, authorization);
   return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminForceReleaseTopologyLock(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { operationId?: string };
+  return adminForceReleaseTopologyLockCore(env, body, request.headers.get("authorization") ?? undefined);
 }
 
 const MAX_INDEX_QUERY_LIMIT = 100;
@@ -3433,17 +3596,15 @@ async function handleV1TableScan(request: Request, env: Env): Promise<Response> 
   return tableScanCore(env, body, request.headers.get("authorization") ?? undefined);
 }
 
-async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
+async function scatterCore(env: Env, body: { sql: string; params?: unknown[]; limit?: number }, authorization: string | undefined): Promise<Response> {
   // /v1/scatter reads across every tenant indiscriminately — that's inherently
   // an admin/operator operation, not a data-plane one, so it requires
   // ADMIN_TOKEN rather than a tenant token. The Worker's structural /admin/*
   // gate doesn't cover this path (it's under /v1/, not /admin/), so this
   // check is explicit rather than "for free" — the same class of bug that
   // previously left /admin/shard-stats unauthenticated.
-  const scatterAuthError = requireAdminAuth(env, request);
+  const scatterAuthError = requireAdminAuthFromHeader(env, authorization);
   if (scatterAuthError) return scatterAuthError;
-
-  const body = (await request.json()) as { sql: string; params?: unknown[]; limit?: number };
 
   if (!body.sql) {
     return json({ error: "Missing sql" }, 400);
@@ -3513,6 +3674,15 @@ async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   });
 }
 
+async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
+  // Same auth-before-parse ordering fix as handleV1Sql above, for the same reason.
+  const authorization = request.headers.get("authorization") ?? undefined;
+  const preAuthError = requireAdminAuthFromHeader(env, authorization);
+  if (preAuthError) return preAuthError;
+  const body = (await request.json()) as { sql: string; params?: unknown[]; limit?: number };
+  return scatterCore(env, body, authorization);
+}
+
 /** mutateCore/tableScanCore/indexQueryCore return a Response (built via the
  * same json()/passthrough helpers the HTTP routes use, so HTTP and RPC can
  * never disagree on status/error shape) — an RPC method isn't allowed to
@@ -3547,6 +3717,24 @@ export type TableScanRpcResult = {
  * the service binding wired in is not, on its own, sufficient authorization.
  * Admin/topology operations are deliberately not exposed here — see the
  * follow-up issue that covers them. */
+/** Every admin/topology RPC method below must check this itself. The HTTP
+ * side gets ADMIN_TOKEN enforcement "for free" from the top-level fetch()
+ * handler's structural `pathname.startsWith("/admin/")` gate (see its call
+ * site) — but RPC calls have no path/URL for that gate to match against, so
+ * each admin RPC method independently enforces the exact same check the
+ * structural gate would have. Throws (RPC's idiomatic failure mode) rather
+ * than returning an error Response. Some cores (sqlCore, scatterCore) also
+ * check internally, since their HTTP routes needed an explicit check too
+ * (they live under /v1/, not /admin/) — calling this first anyway for them
+ * is redundant but harmless, and keeps every admin RPC method uniform:
+ * no method here relies on remembering whether its own core self-checks. */
+function assertAdminRpcAuth(env: Env, adminToken: string): void {
+  const authError = requireAdminAuthFromHeader(env, `Bearer ${adminToken}`);
+  if (authError) {
+    throw new Error(`CloudflareShard RPC error ${authError.status}: unauthorized (invalid or missing ADMIN_TOKEN)`);
+  }
+}
+
 export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
   async mutate(tenantToken: string, body: StructuredMutation & { requestId?: string }): Promise<MutateRpcResult> {
     return unwrapForRpc<MutateRpcResult>(await mutateCore(this.env, this.ctx, body, `Bearer ${tenantToken}`));
@@ -3564,6 +3752,159 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     body: { table: string; indexName: string; tenantId: string; values: Record<string, unknown>; limit?: number },
   ): Promise<IndexQueryRpcResult> {
     return unwrapForRpc<IndexQueryRpcResult>(await indexQueryCore(this.env, body, `Bearer ${tenantToken}`));
+  }
+
+  /** Cross-shard atomic write via CoordinatorDO's 2PC — a tenant data-path
+   * operation like mutate/tableScan/indexQuery above (takes a tenant token,
+   * not an admin token), just not part of issue #14's original scope. */
+  async tx(tenantToken: string, body: StructuredOperation): Promise<unknown> {
+    return unwrapForRpc(await txCore(this.env, body, `Bearer ${tenantToken}`));
+  }
+
+  // ---- Admin/topology methods (issue #15) ----
+  // Every method below requires adminToken as an explicit argument, checked
+  // via assertAdminRpcAuth before anything else runs — see that function's
+  // doc comment for why this can't rely on the HTTP side's structural gate.
+  // Return types are intentionally `Promise<unknown>`: the resolved value is
+  // the exact same JSON shape the equivalent HTTP endpoint documents in
+  // README.md/docs/SPEC.md.
+
+  async adminInit(adminToken: string, payload: Parameters<typeof adminInitCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminInitCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminRegisterTable(adminToken: string, payload: Parameters<typeof adminRegisterTableCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminRegisterTableCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminCreateTable(adminToken: string, body: Parameters<typeof adminCreateTableCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminCreateTableCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminSetPartitionKeyColumn(adminToken: string, body: Parameters<typeof adminSetPartitionKeyColumnCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminSetPartitionKeyColumnCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminCreateIndex(adminToken: string, body: Parameters<typeof adminCreateIndexCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminCreateIndexCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminDropIndex(adminToken: string, body: Parameters<typeof adminDropIndexCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminDropIndexCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminListIndexes(adminToken: string): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminListIndexesCore(this.env, `Bearer ${adminToken}`));
+  }
+
+  async adminSplitVbucket(adminToken: string, payload: Parameters<typeof adminSplitVbucketCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminSplitVbucketCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminMigrateVbucket(adminToken: string, payload: Parameters<typeof adminMigrateVbucketCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminMigrateVbucketCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminMigrateVbucketStatus(adminToken: string, payload: Parameters<typeof adminMigrateVbucketStatusCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminMigrateVbucketStatusCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminMigrateVbucketAbort(adminToken: string, payload: Parameters<typeof adminMigrateVbucketAbortCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminMigrateVbucketAbortCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminStatus(adminToken: string): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminStatusCore(this.env, `Bearer ${adminToken}`));
+  }
+
+  async adminListTables(adminToken: string): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminListTablesCore(this.env, `Bearer ${adminToken}`));
+  }
+
+  async adminDrainShard(adminToken: string, payload: Parameters<typeof adminDrainShardCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminDrainShardCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminDrainShardStatus(adminToken: string, payload: Parameters<typeof adminDrainShardStatusCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminDrainShardStatusCore(this.env, payload, `Bearer ${adminToken}`));
+  }
+
+  async adminShardStats(adminToken: string, body: Parameters<typeof adminShardStatsCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminShardStatsCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminAuditLog(adminToken: string): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminAuditLogCore(this.env, `Bearer ${adminToken}`));
+  }
+
+  async adminRegisterTenant(adminToken: string, body: Parameters<typeof adminRegisterTenantCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminRegisterTenantCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminRevokeTenant(adminToken: string, body: Parameters<typeof adminRevokeTenantCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminRevokeTenantCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminBackfillProvenance(adminToken: string, body: Parameters<typeof adminBackfillProvenanceCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminBackfillProvenanceCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminSetRowOwner(adminToken: string, body: Parameters<typeof adminSetRowOwnerCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminSetRowOwnerCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  async adminTxStatus(adminToken: string, body: Parameters<typeof adminTxStatusCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminTxStatusCore(this.env, body));
+  }
+
+  async adminTxForceAbort(adminToken: string, body: Parameters<typeof adminTxForceAbortCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminTxForceAbortCore(this.env, body));
+  }
+
+  async adminTopologyLockStatus(adminToken: string): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminTopologyLockStatusCore(this.env, `Bearer ${adminToken}`));
+  }
+
+  async adminForceReleaseTopologyLock(adminToken: string, body: Parameters<typeof adminForceReleaseTopologyLockCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await adminForceReleaseTopologyLockCore(this.env, body, `Bearer ${adminToken}`));
+  }
+
+  /** Operator-only raw SQL — see sqlCore's doc comment for why this is
+   * admin-gated rather than tenant-gated. */
+  async sql(adminToken: string, body: Parameters<typeof sqlCore>[2]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await sqlCore(this.env, this.ctx, body, `Bearer ${adminToken}`));
+  }
+
+  /** Cross-tenant fan-out read — admin-gated for the same reason sql() is. */
+  async scatter(adminToken: string, body: Parameters<typeof scatterCore>[1]): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await scatterCore(this.env, body, `Bearer ${adminToken}`));
   }
 }
 

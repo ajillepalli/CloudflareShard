@@ -138,6 +138,16 @@ async function main() {
     assert(result.indexQueryResult.rows.length >= 1, "expected at least one row back from indexQuery");
   });
 
+  await check("RPC adminListTables() (admin op), over the real service binding", async () => {
+    const result = await consumerCall("/demo/admin-list-tables", { adminToken });
+    assert(result.adminListTablesResult != null, "expected a non-null adminListTablesResult");
+  });
+
+  await check("RPC adminTopologyLockStatus() (topology op), over the real service binding", async () => {
+    const result = await consumerCall("/demo/admin-topology-lock-status", { adminToken });
+    assert(result.adminTopologyLockStatusResult != null, "expected a non-null adminTopologyLockStatusResult");
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed.`);
   if (failed.length > 0) process.exit(1);
