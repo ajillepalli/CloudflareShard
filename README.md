@@ -502,9 +502,11 @@ same reason.
 Every route above is also reachable without HTTP by a Worker running in the
 same Cloudflare account, via a [service binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/rpc/)
 to `CloudflareShardRpc` — a named `WorkerEntrypoint` export in `src/index.ts`
-exposing `mutate()`, `tableScan()`, and `indexQuery()` (the tenant data path;
-admin/topology operations aren't exposed this way yet — see the tracked
-follow-up issue). A consumer Worker declares this in its own `wrangler.toml`:
+exposing a method per route: the tenant data path (`mutate()`, `tableScan()`,
+`indexQuery()`, `tx()`) plus every admin/topology operation (`adminInit()`,
+`adminCreateTable()`, `adminDrainShard()`, `adminBackfillProvenance()`, `sql()`,
+`scatter()`, and the rest — one method per `/admin/*` route). A consumer
+Worker declares this in its own `wrangler.toml`:
 
 ```toml
 [[services]]
@@ -523,14 +525,25 @@ const result = await env.SHARD_API.mutate(tenantToken, {
 ```
 
 The security boundary shifts from "possessing a bearer token per request" to
-"this binding is wired into the caller's own config" — but the tenant token
-is still required and still checked: it's passed as an explicit argument and
-validated internally via the same `CatalogDO.checkTenantAuth` path the HTTP
-routes use. Holding the binding alone is not sufficient authorization.
+"this binding is wired into the caller's own config" — but the token is still
+required and still checked, for both kinds of method:
+
+- Tenant methods (`mutate`, `tableScan`, `indexQuery`, `tx`) take the tenant
+  token as an explicit first argument, validated internally via the same
+  `CatalogDO.checkTenantAuth` path the HTTP routes use.
+- Admin/topology methods (everything else) take `ADMIN_TOKEN` as an explicit
+  first argument instead, checked internally the same way the HTTP side's
+  structural `/admin/*` gate would — RPC calls have no URL path for that gate
+  to match against, so each admin method enforces it itself.
+
+Holding the service binding alone is not sufficient authorization for either
+kind of method — a Worker still needs the actual token, passed explicitly on
+every call, exactly as an HTTP caller needs it in an `Authorization` header.
 
 A full working example — a second Worker, wired via service binding, with a
 real integration test proving the round trip over the actual binding (not an
-in-process mock) — lives in [`examples/rpc-consumer/`](examples/rpc-consumer/).
+in-process mock), covering both a tenant-data-path call and an admin/topology
+call — lives in [`examples/rpc-consumer/`](examples/rpc-consumer/).
 
 ## Known limitations
 
