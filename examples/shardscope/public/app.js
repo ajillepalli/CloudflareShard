@@ -80,6 +80,18 @@ const el = {
   consoleTitle: hook("console-title"),
   reshardPanel: hook("reshard-panel"),
 
+  // ---- Edge room (T11) ----
+  railEdge: hook("rail-edge"),
+  canvasWrap: hook("canvas-wrap"),
+  edgeWrap: hook("edge-wrap"),
+  edgeLiveDot: hook("edge-live-dot"),
+  edgeStatus: hook("edge-status"),
+  edgeHeroValue: hook("edge-hero-value"),
+  edgeHeroServed: hook("edge-hero-served"),
+  edgeHeroCaption: hook("edge-hero-caption"),
+  edgeRemeasureBtn: hook("edge-remeasure-btn"),
+  edgeMapSvg: hook("edge-map-svg"),
+
   // ---- "The old way" contrast beat (T10) ----
   oldwayToggle: hook("oldway-toggle"),
   oldwayBody: hook("oldway-body"),
@@ -807,11 +819,22 @@ function toggleOldwayPanel() {
 
 function setActiveRoom(room) {
   if (room === activeRoom) return;
+  // The gate's login panel (login-panel) lives inside canvas-wrap and only
+  // ever overlays the Topology room. The Edge room (T11) hides canvas-wrap
+  // entirely while active (see below) — refuse to leave Topology while the
+  // login panel is up, so a rail click can't silently hide the login prompt
+  // behind an un-gated-looking Edge/Reshard room. (Reshard never hides
+  // canvas-wrap, so it was never exposed to this; Edge is.)
+  if (el.loginPanel && !el.loginPanel.hidden && room !== "topology") return;
+
   activeRoom = room;
   el.railTopology.classList.toggle("active", room === "topology");
   el.railReshard.classList.toggle("active", room === "reshard");
+  if (el.railEdge) el.railEdge.classList.toggle("active", room === "edge");
   el.reshardPanel.hidden = room !== "reshard";
-  el.consoleTitle.textContent = room === "reshard" ? "Reshard Console" : "Live Feed";
+  if (el.canvasWrap) el.canvasWrap.hidden = room === "edge";
+  if (el.edgeWrap) el.edgeWrap.hidden = room !== "edge";
+  el.consoleTitle.textContent = room === "reshard" ? "Reshard Console" : room === "edge" ? "Edge" : "Live Feed";
 
   if (room === "reshard") {
     refreshReshardPickers();
@@ -820,6 +843,31 @@ function setActiveRoom(room) {
   } else {
     stopReshardPolling();
   }
+
+  if (room === "edge") {
+    startEdgeRoom();
+  } else {
+    stopEdgeRoom();
+  }
+}
+
+/** Forces the room back to Topology, bypassing setActiveRoom's normal
+ * early-return + login-panel guard above — used by handleLogout() so a
+ * session expiring while the Reshard/Edge room is open doesn't strand the
+ * login panel hidden behind a hidden canvas-wrap (this is the "session just
+ * expired" half of the same problem setActiveRoom's guard prevents going
+ * forward). */
+function forceTopologyRoomForLogin() {
+  activeRoom = "topology";
+  el.railTopology.classList.add("active");
+  el.railReshard.classList.remove("active");
+  if (el.railEdge) el.railEdge.classList.remove("active");
+  el.reshardPanel.hidden = true;
+  if (el.canvasWrap) el.canvasWrap.hidden = false;
+  if (el.edgeWrap) el.edgeWrap.hidden = true;
+  el.consoleTitle.textContent = "Live Feed";
+  stopReshardPolling();
+  stopEdgeRoom();
 }
 
 function startReshardPolling() {
@@ -1244,6 +1292,242 @@ function handleChaosAttackClick(evt) {
 }
 
 // ============================================================================
+// Edge room (Phase 3, T11): the viewer's REAL measured round-trip time to
+// the nearest Cloudflare edge, via GET /api/edge (see ../src/edge.ts).
+//
+// HONESTY CONTRACT (read before touching this section): the ONLY "live"
+// figure in this room is the hero value rendered by renderEdgeResult() below
+// — a real browser round trip, averaged over a few real fetches of
+// /api/edge, together with the REAL Cloudflare colo/city/country/region
+// request.cf reports for this request (see ../src/edge.ts's buildEdgeInfo).
+// Shardscope has no live multi-region probe network today, so
+// ILLUSTRATIVE_REGIONS below are reference points ONLY — hand-picked
+// lat/long used purely to place dots on the map, tagged "illustrative"
+// everywhere they render, and NEVER given a latency number (a number there
+// would have to be fabricated: nothing in this demo actually measures from
+// those cities). When this Worker isn't running behind a real Cloudflare
+// edge at all (request.cf undefined — local dev/miniflare), or ?demo=1 mode
+// is active, or the measurement can't complete, this section renders an
+// explicit honest state instead — never a fabricated number.
+//
+// TODO(shardscope): once this demo has a genuine global deployment with real
+// multi-region probes, wire real measured numbers into (a subset of)
+// ILLUSTRATIVE_REGIONS and drop the "illustrative" tagging for whichever
+// regions become real measurements.
+// ============================================================================
+
+// Total /api/edge fetches per measurement; the first is discarded as a
+// connection/TLS-setup warmup so it doesn't skew the average toward a worse
+// number than steady-state round trips actually are.
+const EDGE_SAMPLE_ROUNDS = 6;
+const EDGE_MAP_WIDTH = 600;
+const EDGE_MAP_HEIGHT = 300;
+
+// Hand-picked reference cities spanning the globe, purely so the map reads
+// as a world map rather than a single dot — see the honesty contract above.
+// Approximate city-center lat/long only, used for dot placement and nothing
+// else; NOT measured, NOT a latency claim.
+const ILLUSTRATIVE_REGIONS = [
+  { label: "Ashburn, US", lat: 39.04, lon: -77.49 },
+  { label: "São Paulo, BR", lat: -23.55, lon: -46.63 },
+  { label: "Frankfurt, DE", lat: 50.11, lon: 8.68 },
+  { label: "Tokyo, JP", lat: 35.68, lon: 139.65 },
+  { label: "Sydney, AU", lat: -33.87, lon: 151.21 },
+  { label: "Johannesburg, ZA", lat: -26.2, lon: 28.05 },
+];
+
+let edgeMeasuring = false;
+
+function projectLatLon(lat, lon) {
+  const x = ((lon + 180) / 360) * EDGE_MAP_WIDTH;
+  const y = ((90 - lat) / 180) * EDGE_MAP_HEIGHT;
+  return { x, y };
+}
+
+function setEdgeStatus(text) {
+  if (el.edgeStatus) el.edgeStatus.textContent = text;
+}
+
+/** Mirrors the Topology canvas's own dot-live state classes (see
+ * setLiveState) — "live" (green pulse), "warn" (amber, no pulse), or
+ * neither (idle/off). */
+function setEdgeLive(state) {
+  if (!el.edgeLiveDot) return;
+  el.edgeLiveDot.className = "dot-live" + (state === "live" ? " live" : state === "warn" ? " stale" : "");
+}
+
+/** Renders the map: illustrative reference dots always; a real "you" dot
+ * ONLY when we have real lat/long from request.cf for this measurement
+ * (never estimated, never a default/guessed position). */
+function renderEdgeMap(youPoint) {
+  if (!el.edgeMapSvg) return;
+  const parts = [];
+  for (const region of ILLUSTRATIVE_REGIONS) {
+    const { x, y } = projectLatLon(region.lat, region.lon);
+    parts.push(
+      `<circle class="edge-dot-illustrative" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4"><title>${escapeHtml(region.label)} — illustrative reference point, not measured</title></circle>`,
+    );
+  }
+  if (youPoint) {
+    const { x, y } = projectLatLon(youPoint.lat, youPoint.lon);
+    parts.push(
+      `<circle class="edge-dot-you-ring" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="9"></circle>` +
+        `<circle class="edge-dot-you" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5"><title>You — real, measured</title></circle>` +
+        `<text class="edge-map-label you-label" x="${x.toFixed(1)}" y="${(y - 12).toFixed(1)}" text-anchor="middle">YOU</text>`,
+    );
+  }
+  el.edgeMapSvg.innerHTML = parts.join("");
+}
+
+/** ?demo=1 and the honest "worker unreachable"/local-dev states all funnel
+ * through here: illustrative reference map only, no fabricated "you" number
+ * — Shardscope never invents a viewer latency it didn't actually measure. */
+function renderEdgeUnmeasured(reason, caption) {
+  setEdgeStatus("Edge — " + reason);
+  setEdgeLive("warn");
+  if (el.edgeHeroValue) {
+    el.edgeHeroValue.textContent = "—";
+    el.edgeHeroValue.classList.add("local");
+  }
+  if (el.edgeHeroServed) el.edgeHeroServed.textContent = reason;
+  if (el.edgeHeroCaption) el.edgeHeroCaption.textContent = caption;
+  renderEdgeMap(null);
+}
+
+function renderEdgeMeasuring() {
+  setEdgeStatus("Edge — measuring");
+  setEdgeLive("warn");
+  if (el.edgeHeroValue) {
+    el.edgeHeroValue.textContent = "measuring…";
+    el.edgeHeroValue.classList.add("local");
+  }
+  if (el.edgeHeroServed) el.edgeHeroServed.textContent = `sampling ${EDGE_SAMPLE_ROUNDS - 1} real round trips…`;
+  if (el.edgeHeroCaption) el.edgeHeroCaption.textContent = "";
+  if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.hidden = true;
+  renderEdgeMap(null);
+}
+
+function renderEdgeLocal() {
+  renderEdgeUnmeasured(
+    "running locally — no Cloudflare edge data",
+    "This Worker isn't running behind a real Cloudflare edge right now (no request.cf), so there's no real colo or latency to report. The reference dots below are illustrative only.",
+  );
+  if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.hidden = false;
+}
+
+function renderEdgeError(message) {
+  renderEdgeUnmeasured(
+    "unreachable",
+    "The reference dots below are illustrative only — nothing here is fabricated in place of a failed measurement.",
+  );
+  if (el.edgeHeroServed) el.edgeHeroServed.textContent = `couldn't measure — ${message}`;
+  if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.hidden = false;
+}
+
+function renderEdgeResult(avgMs, sampleCount, edgeInfo) {
+  setEdgeStatus("Edge — live");
+  setEdgeLive("live");
+  if (el.edgeHeroValue) {
+    el.edgeHeroValue.textContent = `${Math.round(avgMs)} ms`;
+    el.edgeHeroValue.classList.remove("local");
+  }
+  const locBits = [edgeInfo.city, edgeInfo.country].filter(Boolean).join(", ");
+  if (el.edgeHeroServed) el.edgeHeroServed.textContent = `served from ${edgeInfo.colo}${locBits ? " · " + locBits : ""}`;
+  if (el.edgeHeroCaption) {
+    el.edgeHeroCaption.textContent =
+      `Real, measured: your browser's average round trip to this Worker over ${sampleCount} samples (a first warmup request is discarded). ` +
+      `The colo (${edgeInfo.colo}) and geo above come straight from Cloudflare's own request.cf for this request — nothing estimated. ` +
+      `The reference dots on the map are illustrative only — there's no live probe network behind this demo yet.`;
+  }
+  if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.hidden = false;
+  const lat = edgeInfo.latitude != null ? parseFloat(edgeInfo.latitude) : NaN;
+  const lon = edgeInfo.longitude != null ? parseFloat(edgeInfo.longitude) : NaN;
+  renderEdgeMap(Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null);
+}
+
+/** fetch()-and-time a single GET /api/edge round trip. Rejects (never
+ * fabricates a result) on a non-2xx status; a 401 is tagged `.unauthorized`
+ * so the caller can route it into the same gate-expired flow every other
+ * /api/* caller in this file uses. */
+async function fetchEdgeOnce() {
+  const t0 = performance.now();
+  const res = await fetch("/api/edge", { credentials: "same-origin", cache: "no-store" });
+  const t1 = performance.now();
+  if (res.status === 401) {
+    const err = new Error("unauthorized");
+    err.unauthorized = true;
+    throw err;
+  }
+  if (!res.ok) throw new Error(`request failed (${res.status})`);
+  const body = await res.json();
+  return { rtt: t1 - t0, body };
+}
+
+/** Runs one full measurement: EDGE_SAMPLE_ROUNDS fetches, first discarded as
+ * warmup, remaining averaged. Every branch below renders an honest state —
+ * live result, explicit "local" (no edge), or explicit error — never a
+ * fabricated number. */
+async function runEdgeMeasurement() {
+  if (edgeMeasuring) return;
+  edgeMeasuring = true;
+  if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.disabled = true;
+  renderEdgeMeasuring();
+  try {
+    const samples = [];
+    let lastBody = null;
+    for (let i = 0; i < EDGE_SAMPLE_ROUNDS; i++) {
+      const { rtt, body } = await fetchEdgeOnce();
+      lastBody = body;
+      if (i > 0) samples.push(rtt); // discard sample 0 (connection warmup)
+    }
+    if (!lastBody) throw new Error("no response");
+    if (lastBody.local || !lastBody.edge) {
+      renderEdgeLocal();
+      logLine("edge probe: running locally — no Cloudflare edge data", "warn");
+    } else {
+      const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+      renderEdgeResult(avg, samples.length, lastBody.edge);
+      logLine(`edge probe: ${Math.round(avg)} ms avg round trip to ${lastBody.edge.colo} (${samples.length} samples)`, "safe");
+    }
+  } catch (err) {
+    if (err && err.unauthorized) {
+      logLine("edge probe: session expired — please log in again", "warn");
+      handleLogout();
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    renderEdgeError(message);
+    logLine(`edge probe failed: ${message}`, "warn");
+  } finally {
+    edgeMeasuring = false;
+    if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.disabled = false;
+  }
+}
+
+/** Called by setActiveRoom() on entering the Edge room. ?demo=1 never opens
+ * a live connection of any kind (see this room's honesty contract above) —
+ * it renders the illustrative-only map immediately with no /api/* call. */
+function startEdgeRoom() {
+  if (mode === "demo") {
+    renderEdgeUnmeasured(
+      "demo mode — no live measurement",
+      "No live measurement is taken in demo mode. The dots below are illustrative reference points only — Shardscope has no live multi-region probe network today, so nothing outside your own browser is ever measured.",
+    );
+    logLine("edge room: demo mode — rendering illustrative reference map only, no live probe", "mig");
+    return;
+  }
+  runEdgeMeasurement();
+}
+
+/** Called by setActiveRoom() on leaving the Edge room. There is currently no
+ * interval/timer to tear down here — runEdgeMeasurement is a short, self-
+ * terminating fetch loop, left to finish naturally if a room switch happens
+ * mid-measurement. Kept as its own function (rather than inlined at the
+ * setActiveRoom call site) so a future periodic-refresh timer has a single,
+ * obvious place to be added and cleared. */
+function stopEdgeRoom() {}
+
+// ============================================================================
 // Auth gate (src/gate.ts): /api/* requires SHARDSCOPE_GATE_TOKEN, presented
 // as a `shardscope_gate` HttpOnly cookie set by POST /login. EventSource
 // can't read response status codes or set an Authorization header, so we
@@ -1348,6 +1632,10 @@ function handleLogout() {
   stopReshardPolling();
   activeOp = null;
   if (el.opCard) el.opCard.hidden = true;
+  // Bring canvas-wrap (and the login panel it hosts) back into view
+  // regardless of which room was open when the session expired — see
+  // forceTopologyRoomForLogin's own comment for why this matters for Edge.
+  forceTopologyRoomForLogin();
   logLine("logged out", "warn");
   showLoginPanel();
 }
@@ -1485,6 +1773,8 @@ function init() {
   // ---- Reshard room (T8) wiring ----
   onActivate(el.railTopology, () => setActiveRoom("topology"));
   onActivate(el.railReshard, () => setActiveRoom("reshard"));
+  onActivate(el.railEdge, () => setActiveRoom("edge"));
+  if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.addEventListener("click", runEdgeMeasurement);
   el.oldwayToggle.addEventListener("click", toggleOldwayPanel);
   el.opTabSplit.addEventListener("click", () => setActiveOpTab("split"));
   el.opTabMigrate.addEventListener("click", () => setActiveOpTab("migrate"));

@@ -1194,6 +1194,146 @@ html, body {
   letter-spacing: .07em;
   text-transform: uppercase;
 }
+/* ============ EDGE ROOM (T11) ============
+ * The viewer's REAL measured round-trip time to the nearest Cloudflare
+ * edge (see ../src/edge.ts + app.js's Edge room section for the honesty
+ * contract this styling exists to support). --migrate (not --safe) carries
+ * the "you, real" accent throughout this room — --safe is reserved
+ * exclusively for the lost/checksum invariant per DESIGN.md ("nothing else
+ * may use this color"); --migrate already reads as "real, routine, calm
+ * flow" elsewhere in this app, which is exactly the right register for a
+ * real measured number. Illustrative reference points are always rendered
+ * in --text-dim, visually unmistakable from the real one. */
+.edge-wrap {
+  flex: 1 1 auto;
+  position: relative;
+  background:
+    radial-gradient(ellipse 900px 620px at 62% 40%, rgba(55, 199, 255, .05), transparent 60%),
+    var(--bg-well);
+  overflow-y: auto;
+  min-width: 0;
+  padding: 64px 40px 40px;
+}
+.edge-body {
+  max-width: 920px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.edge-hero {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  padding: 24px 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.edge-hero-top { color: var(--text-dim); }
+.edge-hero-value {
+  font-size: 42px;
+  font-weight: 600;
+  color: var(--migrate-bright);
+  line-height: 1.15;
+  text-shadow: 0 0 18px rgba(55, 199, 255, .25);
+}
+/* "local"/unmeasured states — deliberately NOT the bright measured styling
+   above; a smaller, dim, non-glowing treatment so "—" / "measuring…" never
+   reads as a real number at a glance. */
+.edge-hero-value.local {
+  color: var(--text-muted);
+  font-size: 19px;
+  font-weight: 500;
+  text-shadow: none;
+}
+.edge-hero-served {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.edge-hero-caption {
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  max-width: 580px;
+}
+.edge-remeasure-btn {
+  margin-top: 10px;
+  padding: 6px 12px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  cursor: pointer;
+  transition: border-color .2s ease, color .2s ease;
+}
+.edge-remeasure-btn:hover { color: var(--text-primary); border-color: var(--migrate); }
+.edge-remeasure-btn:disabled { opacity: .5; cursor: default; }
+
+.edge-map-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  padding: 18px 20px 20px;
+}
+.edge-map-head { margin-bottom: 12px; }
+.edge-map-canvas {
+  position: relative;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-well);
+  aspect-ratio: 2 / 1;
+}
+.edge-map-canvas .canvas-grid { opacity: .4; }
+.edge-map-svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+.edge-dot-illustrative { fill: var(--text-dim); opacity: .6; }
+.edge-dot-you {
+  fill: var(--migrate);
+  filter: drop-shadow(0 0 6px rgba(55, 199, 255, .8));
+}
+.edge-dot-you-ring {
+  fill: none;
+  stroke: var(--migrate);
+  stroke-width: 1.2;
+  opacity: .55;
+  animation: livePulse 2.4s ease-in-out infinite;
+}
+.edge-map-label {
+  font-family: var(--font-sans);
+  font-size: 8.5px;
+  fill: var(--text-dim);
+  letter-spacing: .02em;
+}
+.edge-map-label.you-label {
+  fill: var(--migrate-bright);
+  font-weight: 700;
+}
+
+.edge-map-legend {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 12px;
+}
+.edge-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.edge-legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.edge-legend-dot-you { background: var(--migrate); box-shadow: 0 0 6px rgba(55, 199, 255, .7); }
+.edge-legend-dot-illustrative { background: var(--text-dim); opacity: .7; }
+
 .chaos-result-note {
   margin-top: 2px;
   padding-top: 6px;

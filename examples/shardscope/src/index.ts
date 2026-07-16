@@ -47,6 +47,7 @@ import { TopologyAggregator } from "./aggregator";
 import { LoadDriver } from "./load/load-driver";
 import { TenantTokenStore } from "./load/tenant-token-store";
 import { isGateAuthorized, handleLogin, handleLogout } from "./gate";
+import { buildEdgeInfo } from "./edge";
 import {
   ReshardValidationError,
   parseSplitVbucketInput,
@@ -259,7 +260,11 @@ async function runChaosOp(fn: () => Promise<unknown>): Promise<Response> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  // Request<unknown, IncomingRequestCfProperties>: narrows request.cf from
+  // the bare Request default (CfProperties<unknown>, a union that also
+  // includes the OUTGOING-fetch-only RequestInitCfProperties shape) down to
+  // the real INCOMING shape GET /api/edge relies on (see src/edge.ts).
+  async fetch(request: Request<unknown, IncomingRequestCfProperties>, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
@@ -303,6 +308,17 @@ export default {
       const id = env.AGGREGATOR.idFromName("singleton");
       const stub = env.AGGREGATOR.get(id);
       return stub.fetch(request);
+    }
+
+    // GET /api/edge: the Edge room's (T11) real edge/geo readout for THIS
+    // request — see src/edge.ts's header comment for the full honesty
+    // contract this route exists to uphold. request.cf is real Cloudflare
+    // data or undefined (local dev/miniflare); buildEdgeInfo is a pure,
+    // directly-unit-tested function (src/edge.test.ts) that turns either
+    // shape into an honest response — this line is deliberately the only
+    // thing connecting it to a real Request.
+    if (request.method === "GET" && url.pathname === "/api/edge") {
+      return json(buildEdgeInfo(request.cf, Date.now()));
     }
 
     // /api/load/*: forwards to the LoadDriver singleton DO (see
