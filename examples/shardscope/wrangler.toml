@@ -1,0 +1,48 @@
+name = "cloudflare-shard-shardscope"
+main = "src/index.ts"
+compatibility_date = "2026-07-14"
+
+# Service binding to CloudflareShard's RPC entrypoint (see issue #14). This is
+# what "no HTTP, no bearer-token header to construct" actually looks like: the
+# security boundary is this binding existing in this Worker's own config, not
+# a request-level credential — the admin token (and, later, per-tenant
+# tokens) is still passed as a method argument and checked internally by
+# CloudflareShardRpc, exactly as an HTTP caller's Authorization header would
+# be. See examples/rpc-consumer/wrangler.toml for the original pattern this
+# is copied from.
+#
+# Locally (`wrangler dev`), this resolves via Wrangler's local dev registry as
+# long as the main cloudflare-shard-mvp Worker is also running `wrangler dev`
+# on the same machine — no extra config needed for that. Deployed, both
+# Workers just need to exist in the same Cloudflare account under these names.
+[[services]]
+binding = "SHARD_API"
+service = "cloudflare-shard-mvp"
+entrypoint = "CloudflareShardRpc"
+
+# TopologyAggregator: a singleton Durable Object (see src/aggregator.ts) that
+# owns the single shared poll of the admin API on an alarm() tick and fans a
+# merged topology snapshot out to every open SSE subscriber. One DO instance
+# ("singleton", via idFromName) for the whole Worker — this is deliberate: we
+# want exactly one poller regardless of how many browser tabs are watching,
+# not one poll per connected client.
+[[durable_objects.bindings]]
+name = "AGGREGATOR"
+class_name = "TopologyAggregator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TopologyAggregator"]
+
+# --- Future: static SPA assets ---------------------------------------------
+# Phase 1 (this file) serves a stub HTML placeholder straight from
+# src/index.ts. Once the real dashboard SPA lands (see DESIGN.md), it should
+# be served as static assets rather than inlined in the Worker, e.g.:
+#
+# [assets]
+# directory = "./public"
+# binding = "ASSETS"
+# not_found_handling = "single-page-application"
+#
+# with src/index.ts falling back to env.ASSETS.fetch(request) for any
+# non-/api/* GET route. Left commented out until that build exists.
