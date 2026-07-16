@@ -102,6 +102,17 @@ const el = {
   drainCatalogSelect: hook("drain-catalog"),
   drainShardSelect: hook("drain-shard-select"),
   reshardError: hook("reshard-error"),
+
+  // ---- Chaos "Break It" panel (T9) ----
+  chaosAttackStack: hook("chaos-attack-stack"),
+  chaosResult: hook("chaos-result"),
+  chaosResultVerdict: hook("chaos-result-verdict"),
+  chaosResultAttack: hook("chaos-result-attack"),
+  chaosResultDid: hook("chaos-result-did"),
+  chaosResultExpected: hook("chaos-result-expected"),
+  chaosResultObserved: hook("chaos-result-observed"),
+  chaosResultNote: hook("chaos-result-note"),
+  chaosError: hook("chaos-error"),
 };
 
 // ============================================================================
@@ -1121,6 +1132,96 @@ function resetLockReleaseButton() {
 }
 
 // ============================================================================
+// Chaos "Break It" panel (T9): fires POST /api/chaos/<attack> for every
+// real, enabled attack button (see ../src/chaos.ts's header comment for the
+// full thesis — every enabled button does the REAL destructive thing against
+// the live cluster; nothing here is simulated). Reuses reshardFetch (above)
+// verbatim: same same-origin credentials, same 401 -> re-login handling, same
+// error-message unwrapping every other /api/* call in this room already
+// gets — chaos attacks are gated identically, not specially.
+//
+// The one honestly-disabled attack ("Blip shard offline") is a plain <div>
+// in index.html, not a <button data-attack>, so it is structurally excluded
+// from `stackButtons`/the click wiring below — there is no code path here
+// that could ever fire a request for it, not just a `disabled` attribute
+// hiding a working handler.
+//
+// The T4 invariant scoreboard (topbar, renderScoreboard above) is NOT
+// duplicated here — it's already always visible in the top strip regardless
+// of which room is open, which is the whole point (DESIGN.md: "fire an
+// attack, watch lost stay 0"). This section only renders the ATTACK's own
+// structured outcome (src/chaos.ts's ChaosOutcome: did/expected/observed/
+// survived/note) — the receipt for what was just fired, not a second meter.
+// ============================================================================
+
+function setChaosError(msg) {
+  if (!el.chaosError) return;
+  if (!msg) {
+    el.chaosError.hidden = true;
+    el.chaosError.textContent = "";
+    return;
+  }
+  el.chaosError.hidden = false;
+  el.chaosError.textContent = msg;
+}
+
+/** Renders a src/chaos.ts ChaosOutcome verbatim — did/expected/observed/note
+ * are shown exactly as the server judged them, never re-narrated client-side
+ * (the whole credibility of this panel rests on the server's real judgment,
+ * not a client-side retelling of it). */
+function renderChaosOutcome(outcome) {
+  if (!el.chaosResult || !outcome) return;
+  el.chaosResult.hidden = false;
+  const survived = !!outcome.survived;
+  el.chaosResultVerdict.textContent = survived ? "✓ survived" : "✗ broke";
+  el.chaosResultVerdict.className = "chaos-result-verdict mono " + (survived ? "survived" : "broke");
+  el.chaosResultAttack.textContent = outcome.attack || "";
+  el.chaosResultDid.textContent = outcome.did || "";
+  el.chaosResultExpected.textContent = outcome.expected || "";
+  el.chaosResultObserved.textContent = outcome.observed || "";
+  el.chaosResultNote.textContent = outcome.note || "";
+}
+
+function handleChaosAttackClick(evt) {
+  const btn = evt.currentTarget;
+  const attack = btn.dataset.attack;
+  if (!attack || btn.disabled) return;
+
+  setChaosError(null);
+  const stackButtons = el.chaosAttackStack ? [...el.chaosAttackStack.querySelectorAll("button[data-attack]")] : [btn];
+  stackButtons.forEach((b) => {
+    b.disabled = true;
+  });
+  logLine(`firing chaos attack: ${attack}…`, "danger");
+
+  reshardFetch(`/api/chaos/${attack}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  })
+    .then((outcome) => {
+      renderChaosOutcome(outcome);
+      const verdict = outcome && outcome.survived ? "survived ✓" : "BROKE ✗";
+      logLine(`${attack}: ${verdict} — ${(outcome && outcome.note) || ""}`, outcome && outcome.survived ? "safe" : "danger");
+    })
+    .catch((err) => {
+      // Covers both "the attack couldn't even fire" (a ChaosPreconditionError
+      // 400 — e.g. no skew load running to derive a hot shard from) and a
+      // topology-lock-busy 409 from a reused ../src/reshard.ts wrapper
+      // (drain/split/migrate/abort attacks all route through it) — both
+      // already unwrap to a plain, calm message via reshardFetch above, same
+      // as every Reshard console form's own error handling.
+      setChaosError((err && err.message) || `${attack} failed`);
+      logLine(`${attack}: could not fire — ${(err && err.message) || err}`, "warn");
+    })
+    .finally(() => {
+      stackButtons.forEach((b) => {
+        b.disabled = false;
+      });
+    });
+}
+
+// ============================================================================
 // Auth gate (src/gate.ts): /api/* requires SHARDSCOPE_GATE_TOKEN, presented
 // as a `shardscope_gate` HttpOnly cookie set by POST /login. EventSource
 // can't read response status codes or set an Authorization header, so we
@@ -1378,6 +1479,14 @@ function init() {
     refreshVbucketPicker(el.migrateCatalogSelect, el.migrateVbucketSelect, el.migrateTargetSelect),
   );
   el.drainCatalogSelect.addEventListener("change", () => refreshShardPicker(el.drainCatalogSelect, el.drainShardSelect));
+
+  // ---- Chaos "Break It" panel (T9) wiring ----
+  // Only real <button data-attack> controls get a handler — the disabled
+  // "Blip shard offline" placeholder in index.html is a plain <div> with no
+  // data-attack, so querySelectorAll("button[data-attack]") never matches it.
+  if (el.chaosAttackStack) {
+    el.chaosAttackStack.querySelectorAll("button[data-attack]").forEach((btn) => btn.addEventListener("click", handleChaosAttackClick));
+  }
 
   const params = new URLSearchParams(location.search);
   if (params.get("demo") === "1") {

@@ -261,21 +261,64 @@
 
           <div class="reshard-error" data-hook="reshard-error" hidden></div>
 
-          <!-- Chaos "Break It" panel — T9, gated on the correctness meter
-               (T4). Deliberately no functional attack buttons here yet. -->
+          <!-- Chaos "Break It" panel — T9. Every enabled button fires a REAL
+               attack (POST /api/chaos/<attack> — see ../src/chaos.ts) against
+               the live cluster over the same surfaces the rest of this app
+               already uses (the gateway's /v1/mutate for double-submit /
+               mismatched-replay; ../src/reshard.ts's admin RPC wrappers,
+               reused verbatim, for the topology attacks). The ONE attack that
+               cannot be made genuinely destructive without a core change
+               (making a shard's Durable Object unreachable mid-cutover) is a
+               disabled, honestly-labeled control, never a faked button — see
+               its title attribute below and src/chaos.ts's header comment.
+               The T4 scoreboard in the top strip stays visible the whole
+               time this room is open — that's the point: fire an attack,
+               watch `lost` stay 0. -->
           <div class="section-divider">
             <span class="label">Chaos — Break It</span>
             <span class="line"></span>
           </div>
-          <div class="chaos-placeholder">
-            <div class="chaos-note">Lands in T9, once the correctness meter (T4 — writes/lost/checksum) is live. Attack buttons are intentionally not wired yet.</div>
-            <div class="danger-stack">
-              <div class="danger-btn disabled"><span class="bullet"></span>Kill shard mid-migration</div>
-              <div class="danger-btn disabled"><span class="bullet"></span>Drain hot node</div>
-              <div class="danger-btn disabled"><span class="bullet"></span>Double-submit</div>
-              <div class="danger-btn disabled"><span class="bullet"></span>Blip shard</div>
-              <div class="danger-btn disabled"><span class="bullet"></span>Replay mismatch</div>
+          <div class="chaos-panel-body">
+            <div class="chaos-note">Every enabled button fires a real attack against the live cluster (same gateway + same reshard RPCs the rest of this console uses). Watch the scoreboard above — <span class="mono">lost</span> should stay 0.</div>
+            <div class="danger-stack" data-hook="chaos-attack-stack">
+              <button class="danger-btn" type="button" data-hook="chaos-btn-double-submit" data-attack="double-submit">
+                <span class="bullet"></span>Double-submit
+              </button>
+              <button class="danger-btn" type="button" data-hook="chaos-btn-mismatched-replay" data-attack="mismatched-replay">
+                <span class="bullet"></span>Mismatched replay
+              </button>
+              <button class="danger-btn" type="button" data-hook="chaos-btn-drain-hot-node" data-attack="drain-hot-node">
+                <span class="bullet"></span>Drain hot node
+              </button>
+              <button class="danger-btn" type="button" data-hook="chaos-btn-split-hot-vbucket" data-attack="split-hot-vbucket">
+                <span class="bullet"></span>Split hot vBucket
+              </button>
+              <button class="danger-btn" type="button" data-hook="chaos-btn-migrate-hot-vbucket" data-attack="migrate-hot-vbucket">
+                <span class="bullet"></span>Migrate hot vBucket
+              </button>
+              <button class="danger-btn" type="button" data-hook="chaos-btn-abort-migration" data-attack="abort-migration">
+                <span class="bullet"></span>Abort migration
+              </button>
+              <div
+                class="danger-btn disabled"
+                data-hook="chaos-btn-not-wired"
+                tabindex="0"
+                title="Genuinely making a shard's Durable Object unreachable mid-cutover needs a core fault-injection primitive that cloudflare-shard-mvp doesn't have. Rather than fake this button's effect, it's honestly disabled — see src/chaos.ts's header comment."
+              >
+                <span class="bullet"></span>Blip shard offline — needs core fault-injection (not wired)
+              </div>
             </div>
+            <div class="chaos-result" data-hook="chaos-result" hidden>
+              <div class="chaos-result-top">
+                <span class="chaos-result-verdict mono" data-hook="chaos-result-verdict">—</span>
+                <span class="chaos-result-attack" data-hook="chaos-result-attack"></span>
+              </div>
+              <div class="chaos-result-row"><span class="chaos-result-key">did</span><span data-hook="chaos-result-did"></span></div>
+              <div class="chaos-result-row"><span class="chaos-result-key">expected</span><span data-hook="chaos-result-expected"></span></div>
+              <div class="chaos-result-row mono" data-hook="chaos-result-observed-row"><span class="chaos-result-key">observed</span><span data-hook="chaos-result-observed"></span></div>
+              <div class="chaos-result-note" data-hook="chaos-result-note"></div>
+            </div>
+            <div class="reshard-error" data-hook="chaos-error" hidden></div>
           </div>
         </div>
 

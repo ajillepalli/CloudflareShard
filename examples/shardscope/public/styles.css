@@ -737,6 +737,10 @@ html, body {
 .log-line.safe { color: var(--safe); }
 .log-line.mig { color: var(--migrate-bright); }
 .log-line.warn { color: var(--heat-amber); }
+/* Chaos panel (T9) attack events — --danger, distinct from a routine
+   reshard's --migrate log lines: a fired attack is an EVENT, not a state
+   (DESIGN.md: "Danger red = an attack is landing"). */
+.log-line.danger { color: var(--danger-bright); }
 
 /* ============ RESHARD ROOM: manual operator console (T8) ============ */
 .reshard-panel {
@@ -955,7 +959,13 @@ html, body {
   border-color: rgba(224, 179, 65, .3);
 }
 
-/* chaos placeholder */
+/* ============ CHAOS "BREAK IT" PANEL (T9) ============
+   Every enabled .danger-btn fires a REAL attack (see ../src/chaos.ts +
+   app.js's chaos section) — --danger is reserved for exactly this: attack
+   EVENTS, never a health/state color (DESIGN.md's "red never means health"
+   rule). The one honestly-disabled button (blip-shard-offline) keeps the
+   older, dimmer "placeholder" treatment so it visually reads as inert next
+   to its live siblings. */
 .section-divider {
   display: flex;
   align-items: center;
@@ -975,7 +985,7 @@ html, body {
   color: var(--danger);
   white-space: nowrap;
 }
-.chaos-placeholder {
+.chaos-panel-body {
   display: flex;
   flex-direction: column;
   gap: 9px;
@@ -990,21 +1000,101 @@ html, body {
   display: flex;
   align-items: center;
   gap: 9px;
+  width: 100%;
   padding: 9px 11px;
   border-radius: 5px;
-  border: 1px solid rgba(240, 74, 74, .18);
-  background: rgba(240, 74, 74, .02);
-  color: var(--text-dim);
+  border: 1px solid rgba(240, 74, 74, .3);
+  background: rgba(240, 74, 74, .05);
+  color: var(--danger-bright);
   font-family: var(--font-sans);
   font-size: 11.5px;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: .01em;
+  text-align: left;
+  cursor: pointer;
+  transition: background .2s ease, border-color .2s ease, opacity .2s ease;
 }
-.danger-btn.disabled { opacity: .55; cursor: default; }
+.danger-btn:hover:not(:disabled):not(.disabled) {
+  background: rgba(240, 74, 74, .14);
+  border-color: rgba(240, 74, 74, .55);
+}
+.danger-btn:disabled:not(.disabled) { opacity: .5; cursor: default; }
+/* the one genuinely-unwired attack — dim placeholder treatment, distinct
+   from a live button that's merely mid-request. */
+.danger-btn.disabled {
+  opacity: .55;
+  cursor: default;
+  color: var(--text-dim);
+  font-weight: 500;
+  border-color: rgba(240, 74, 74, .18);
+  background: rgba(240, 74, 74, .02);
+}
 .danger-btn .bullet {
   width: 5px;
   height: 5px;
   border-radius: 1px;
-  background: var(--text-dim);
+  background: currentColor;
   flex: 0 0 auto;
   transform: rotate(45deg);
+}
+
+/* structured outcome card — { attack, did, expected, observed, survived,
+   note } from src/chaos.ts's ChaosOutcome, rendered verbatim (never
+   re-narrated) so the operator sees exactly what the server judged. */
+.chaos-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 11px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg-well);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.chaos-result-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.chaos-result-verdict {
+  font-weight: 700;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.chaos-result-verdict.survived { color: var(--safe); }
+.chaos-result-verdict.broke { color: var(--danger-bright); }
+.chaos-result-attack {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.chaos-result-row {
+  display: flex;
+  gap: 8px;
+  color: var(--text-primary);
+}
+.chaos-result-row.mono {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+.chaos-result-key {
+  flex: 0 0 58px;
+  padding-top: 1px;
+  color: var(--text-dim);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+.chaos-result-note {
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border-soft);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.6;
 }

@@ -65,6 +65,22 @@ import {
   parseForceReleaseTopologyLockInput,
   forceReleaseTopologyLock,
 } from "./reshard";
+import {
+  CHAOS_NOT_WIRED_ATTACK,
+  ChaosPreconditionError,
+  parseDoubleSubmitInput,
+  runDoubleSubmitAttack,
+  parseMismatchedReplayInput,
+  runMismatchedReplayAttack,
+  parseDrainHotNodeInput,
+  runDrainHotNodeAttack,
+  parseSplitHotVbucketInput,
+  runSplitHotVbucketAttack,
+  parseMigrateHotVbucketInput,
+  runMigrateHotVbucketAttack,
+  parseAbortMigrationInput,
+  runAbortMigrationAttack,
+} from "./chaos";
 import type { Env } from "./env";
 
 export { TopologyAggregator, LoadDriver, TenantTokenStore };
@@ -161,6 +177,23 @@ async function readReshardJsonBody(request: Request): Promise<unknown> {
   }
 }
 
+/** Parses a Chaos panel POST body — deliberately MORE tolerant than
+ * readReshardJsonBody above: every chaos attack input is optional with a
+ * sane default (see src/chaos.ts's parse*() functions), so a one-click
+ * attack button firing an EMPTY body (or no body at all) is the expected
+ * common case, not a client error. Malformed/absent JSON just falls back to
+ * `{}`, letting each attack's own defaults apply, rather than 400ing a
+ * perfectly normal "fire this attack" click. */
+async function readChaosJsonBody(request: Request): Promise<unknown> {
+  const text = await request.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
 /** Runs one Reshard console operation (src/reshard.ts) and turns any failure
  * into a calm JSON error response instead of a 500 or an unhandled
  * rejection — this is the "handle errors, calm inline messages" contract
@@ -177,13 +210,20 @@ async function readReshardJsonBody(request: Request): Promise<unknown> {
  *     catalog itself returned (e.g. 409 MIGRATION_IN_PROGRESS when another
  *     op already holds the topology lock), so it's unpacked and forwarded
  *     with its original status rather than collapsed into a generic 500. */
-async function runReshardOp(fn: () => Promise<unknown>): Promise<Response> {
+/** Shared by runReshardOp and runChaosOp below: runs `fn`, mapping any thrown
+ * error into a calm JSON Response instead of a 500 or an unhandled
+ * rejection. `isRequestError` decides which error CLASSES mean "malformed or
+ * currently-unsatisfiable request FROM the browser" (-> 400) as opposed to
+ * "the cluster/RPC layer itself rejected this" (the CloudflareShard RPC error
+ * <status>: <body> pattern, unpacked and forwarded below with its original
+ * status) or an unrecognized failure (-> 502). */
+async function runOperatorOp(fn: () => Promise<unknown>, isRequestError: (err: unknown) => boolean): Promise<Response> {
   try {
     const result = await fn();
     return json(result);
   } catch (err) {
-    if (err instanceof ReshardValidationError) {
-      return json({ error: err.message }, 400);
+    if (isRequestError(err)) {
+      return json({ error: err instanceof Error ? err.message : String(err) }, 400);
     }
     const message = err instanceof Error ? err.message : String(err);
     const match = /^CloudflareShard RPC error (\d+): ([\s\S]*)$/.exec(message);
@@ -197,6 +237,24 @@ async function runReshardOp(fn: () => Promise<unknown>): Promise<Response> {
     }
     return json({ error: message }, 502);
   }
+}
+
+async function runReshardOp(fn: () => Promise<unknown>): Promise<Response> {
+  return runOperatorOp(fn, (err) => err instanceof ReshardValidationError);
+}
+
+/** Same calm-error contract as runReshardOp, plus src/chaos.ts's
+ * ChaosPreconditionError (a chaos attack that can't currently be attempted —
+ * e.g. no skew load running to derive a "hot shard" from — is a 400, not a
+ * 500 or a fabricated result). This is also where a lock-busy 409 from
+ * ./reshard.ts's admin wrappers (drain-hot-node / split-hot-vbucket /
+ * migrate-hot-vbucket / abort-migration all call straight into ./reshard.ts)
+ * naturally surfaces to the browser: the SAME "CloudflareShard RPC error
+ * <status>: <body>" unpacking above already handles it, so the Reshard
+ * console's existing topology-lock UI conventions apply here unchanged — no
+ * new lock-busy handling needed. */
+async function runChaosOp(fn: () => Promise<unknown>): Promise<Response> {
+  return runOperatorOp(fn, (err) => err instanceof ReshardValidationError || err instanceof ChaosPreconditionError);
 }
 
 export default {
@@ -294,6 +352,58 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/api/reshard/force-release-lock") {
         return runReshardOp(async () => forceReleaseTopologyLock(env, parseForceReleaseTopologyLockInput(await readReshardJsonBody(request))));
+      }
+    }
+
+    // /api/chaos/*: the Reshard room's "CHAOS — BREAK IT" panel (T9) — see
+    // src/chaos.ts's header comment for the full thesis. GATING
+    // CONFIRMATION: every path under here is a /api/* route, so it already
+    // passed the `isGateAuthorized` check at the top of this function (this
+    // code is unreachable otherwise) — same as /api/reshard/* above. These
+    // are the MOST DANGEROUS routes this Worker exposes (they fire real
+    // destructive writes and real topology ops against the live cluster), so
+    // this comment exists to make that double-checkable at a glance: nothing
+    // under /api/chaos/* is reachable without SHARDSCOPE_GATE_TOKEN, on top
+    // of ADMIN_TOKEN being threaded through server-side only (src/chaos.ts's
+    // reused ./reshard.ts wrappers for c/d/e; a real tenant bearer token via
+    // src/load/tenant-token-store.ts for a/b) — never sent to or read by the
+    // browser, exactly like every other admin-facing route in this file.
+    if (url.pathname.startsWith("/api/chaos/")) {
+      if (request.method === "POST" && url.pathname === "/api/chaos/double-submit") {
+        return runChaosOp(async () => runDoubleSubmitAttack(env, parseDoubleSubmitInput(await readChaosJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/chaos/mismatched-replay") {
+        return runChaosOp(async () => runMismatchedReplayAttack(env, parseMismatchedReplayInput(await readChaosJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/chaos/drain-hot-node") {
+        return runChaosOp(async () => runDrainHotNodeAttack(env, parseDrainHotNodeInput(await readChaosJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/chaos/split-hot-vbucket") {
+        return runChaosOp(async () => runSplitHotVbucketAttack(env, parseSplitHotVbucketInput(await readChaosJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/chaos/migrate-hot-vbucket") {
+        return runChaosOp(async () => runMigrateHotVbucketAttack(env, parseMigrateHotVbucketInput(await readChaosJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/chaos/abort-migration") {
+        return runChaosOp(async () => runAbortMigrationAttack(env, parseAbortMigrationInput(await readChaosJsonBody(request))));
+      }
+      // "Blip shard offline mid-cutover" (make a shard's Durable Object
+      // genuinely unreachable) is the ONE attack this demo cannot honestly
+      // implement: cloudflare-shard-mvp has no fault-injection primitive for
+      // it. There is deliberately NO runXxxAttack function for
+      // CHAOS_NOT_WIRED_ATTACK in src/chaos.ts — this route exists only to
+      // give a caller hitting it directly (curl, a stale UI build) an honest
+      // 501 explanation instead of an ambiguous 404, matching the UI's
+      // disabled button (public/index.html's "Blip shard offline" control) —
+      // never a faked 200.
+      if (request.method === "POST" && url.pathname === `/api/chaos/${CHAOS_NOT_WIRED_ATTACK}`) {
+        return json(
+          {
+            error:
+              "blip-shard-offline needs core fault-injection support that cloudflare-shard-mvp does not have today (a way to make one shard's Durable Object genuinely unreachable mid-cutover). Not wired — see examples/shardscope/src/chaos.ts's header comment. The UI's button for this attack is disabled, not faked.",
+          },
+          501,
+        );
       }
     }
 
