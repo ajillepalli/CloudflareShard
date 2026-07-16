@@ -15,7 +15,7 @@ Closes issue #16. A teammate asked for a demo project and benchmark using "TPC" 
 - Re-seeding a warehouse whose tenant was already registered (a normal workflow against a persistent local `wrangler dev` instance) crashed on the first row-level insert with a primary-key conflict. Fixed by using `op:"upsert"` instead of `op:"insert"` for every per-warehouse seed row, making a reseed a safe overwrite.
 - Seeding at the (previously) shipped defaults, including optional pre-existing orders, took over 3 minutes and didn't reliably finish in a reasonable time locally — defeating the "fast demo seeding" goal the reduced default cardinalities exist for. Pre-existing-order seeding (by far the most expensive part — thousands of extra `order_line` rows, and a proportionally slower index backfill) is now opt-in (`--seed-orders`) rather than default-on; the default seed now completes in under 2 minutes locally.
 
-
+## [2.3.0.0] - 2026-07-16 — Durable Object RPC / service-binding support (admin/topology)
 
 Closes issue #15, the follow-up to #14. Every remaining `/admin/*` route, plus `/v1/sql`, `/v1/scatter`, and `/v1/tx`, is now also callable via `CloudflareShardRpc` (the same `WorkerEntrypoint` export #14 introduced), alongside the tenant data path it already covered.
 

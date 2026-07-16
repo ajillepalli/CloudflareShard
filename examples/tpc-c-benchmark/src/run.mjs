@@ -88,7 +88,7 @@ function fmtMs(v) {
   return v === null ? "n/a".padStart(8) : v.toFixed(1).padStart(8);
 }
 
-function printReport(records, durationSeconds) {
+function printReport(records, requestedDurationSeconds, actualElapsedSeconds) {
   const total = records.length;
   const byType = new Map();
   for (const r of records) {
@@ -98,12 +98,18 @@ function printReport(records, durationSeconds) {
 
   // tpmC-equivalent: real TPC-C's actual throughput metric is specifically
   // successful New-Order transactions per minute, not total transaction
-  // count.
+  // count. Codex review P2 fix: divide by the ACTUAL elapsed wall-clock time
+  // (measured after every worker has fully finished), not the requested
+  // --duration -- a worker checks the deadline only BEFORE starting a
+  // transaction, so one that starts just before the deadline (especially a
+  // slow one, like Delivery) still runs to completion well past it. Dividing
+  // by the fixed requested duration in that case overstates throughput,
+  // since the real elapsed time was longer than what's being divided by.
   const newOrderOk = (byType.get("new-order") || []).filter((r) => r.ok).length;
-  const tpmC = (newOrderOk / durationSeconds) * 60;
+  const tpmC = (newOrderOk / actualElapsedSeconds) * 60;
 
   console.log("\n=== TPC-C-derived benchmark report (CloudflareShard, issue #16) ===");
-  console.log(`Duration: ${durationSeconds}s`);
+  console.log(`Requested duration: ${requestedDurationSeconds}s | Actual elapsed: ${actualElapsedSeconds.toFixed(1)}s`);
   console.log(`Total transactions attempted: ${total}`);
   console.log(`tpmC-equivalent (successful New-Order transactions / minute): ${tpmC.toFixed(2)}`);
 
@@ -151,7 +157,8 @@ async function runBenchmarkCmd(flags) {
   );
 
   const records = [];
-  const deadline = Date.now() + duration * 1000;
+  const startedAt = Date.now();
+  const deadline = startedAt + duration * 1000;
 
   async function worker() {
     while (Date.now() < deadline) {
@@ -161,8 +168,9 @@ async function runBenchmarkCmd(flags) {
 
   const workers = Array.from({ length: concurrency }, () => worker());
   await Promise.all(workers);
+  const actualElapsedSeconds = (Date.now() - startedAt) / 1000;
 
-  printReport(records, duration);
+  printReport(records, duration, actualElapsedSeconds);
 }
 
 async function main() {
