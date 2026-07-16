@@ -226,7 +226,15 @@ async function orderStatus(world) {
   const custRes = await home.client.indexQuery("tpcc_customer", "idx_customer_by_id", { d_id: d, c_id });
   if ((custRes.rows || []).length === 0) throw new Error(`customer ${c_id} in district ${d} not found`);
 
-  const ordersRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_customer", { d_id: d, c_id }, 20);
+  // limit:100 (not 20) -- 100 is /v1/index-query's own hard server-side cap
+  // (MAX_INDEX_QUERY_LIMIT in src/index.ts), and there's no pagination for
+  // this route, so a customer who accumulates more than 100 orders over one
+  // benchmark run's lifetime would still have this exact truncation problem
+  // (the code below picks the highest o_id it CAN see, not necessarily the
+  // true highest) -- an accepted, documented residual limit at this
+  // benchmark's realistic scale/duration, not something worth adding a
+  // dedicated "orders by district, most-recent-N" index to work around.
+  const ordersRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_customer", { d_id: d, c_id }, 100);
   const orderRows = ordersRes.rows || [];
   if (orderRows.length === 0) {
     // A customer with no orders yet is a legitimate (if, at steady state,
@@ -234,7 +242,8 @@ async function orderStatus(world) {
     return;
   }
   // Ascending by partition key (o_key), which embeds a zero-padded o_id --
-  // the LAST row is the highest o_id, i.e. the customer's most recent order.
+  // the LAST row is the highest o_id, i.e. the customer's most recent order
+  // among those returned (see the limit comment above for the residual edge case).
   const latestOrder = orderRows[orderRows.length - 1];
 
   await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id: latestOrder.o_id }, 15);
@@ -306,17 +315,43 @@ async function delivery(world) {
   }
 }
 
-/** Stock-Level: weight 4%, read-only. Server-side aggregate replaced with
- * table-scan + client-side counting, see file header. Note: `district` is
- * picked (matching the spec's structure) but not actually used to filter --
- * tpcc_stock is a per-warehouse (tenant), not per-district, table, so a
- * table-scan of it already covers the whole warehouse regardless of which
- * district was picked. */
+/** Stock-Level: weight 4%, read-only. Real TPC-C semantics: of the distinct
+ * items appearing in this district's last 20 orders, how many have stock
+ * below the threshold in this warehouse. The server-side aggregate is
+ * replaced with index-query/table-scan + client-side counting (no
+ * aggregation pushdown exists), but the actual QUESTION being measured
+ * still matches the spec -- Codex review P2 fix: an earlier version
+ * table-scanned the whole warehouse's stock table regardless of district or
+ * recent-order scoping, which reports a materially different (and
+ * inflated/irrelevant) number than real Stock-Level measures. */
 async function stockLevel(world) {
   const home = world.randomWarehouse();
+  const d = world.randomDistrictId();
   const threshold = randInt(10, 20);
-  const rows = await home.client.tableScanAll("tpcc_stock", 500);
-  return rows.filter((r) => r.s_quantity < threshold).length;
+
+  // idx_orders_by_district returns entries ascending by o_key (zero-padded
+  // o_id), so the LAST up to 20 of up to 100 returned are this district's
+  // most recent orders -- same "limit:100, take the tail" residual-limit
+  // reasoning as Order-Status above (see that function's comment) applies
+  // here too, at this benchmark's realistic scale.
+  const ordersRes = await home.client.indexQuery("tpcc_orders", "idx_orders_by_district", { d_id: d }, 100);
+  const orderRows = ordersRes.rows || [];
+  const recentOrders = orderRows.slice(-20);
+  if (recentOrders.length === 0) return 0; // no orders yet for this district
+
+  const itemIds = new Set();
+  for (const order of recentOrders) {
+    const linesRes = await home.client.indexQuery("tpcc_order_line", "idx_order_line_by_order", { d_id: d, o_id: order.o_id }, 15);
+    for (const line of linesRes.rows || []) itemIds.add(line.ol_i_id);
+  }
+  if (itemIds.size === 0) return 0;
+
+  const lowStockResults = await runPool([...itemIds], Math.min(8, itemIds.size), async (i_id) => {
+    const stockRes = await home.client.indexQuery("tpcc_stock", "idx_stock_by_item", { i_id });
+    const stockRow = (stockRes.rows || [])[0];
+    return stockRow ? stockRow.s_quantity < threshold : false;
+  });
+  return lowStockResults.filter(Boolean).length;
 }
 
 export const TRANSACTION_MIX = [

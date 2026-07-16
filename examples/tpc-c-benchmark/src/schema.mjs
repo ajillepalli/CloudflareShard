@@ -79,6 +79,11 @@ export const INDEXES = [
   { table: "tpcc_customer", indexName: "idx_customer_by_id", columns: ["d_id", "c_id"] },
   { table: "tpcc_orders", indexName: "idx_orders_by_customer", columns: ["d_id", "c_id"] },
   { table: "tpcc_orders", indexName: "idx_orders_by_id", columns: ["d_id", "o_id"] },
+  // Codex review P2 fix: Stock-Level needs "the last 20 orders for this
+  // district" (real TPC-C semantics), which idx_orders_by_customer can't
+  // give (it's scoped per customer, not per district) -- this index makes
+  // that lookup possible.
+  { table: "tpcc_orders", indexName: "idx_orders_by_district", columns: ["d_id"] },
   { table: "tpcc_order_line", indexName: "idx_order_line_by_order", columns: ["d_id", "o_id"] },
   { table: "tpcc_new_order", indexName: "idx_new_order_by_district", columns: ["d_id"] },
   { table: "tpcc_stock", indexName: "idx_stock_by_item", columns: ["i_id"] },

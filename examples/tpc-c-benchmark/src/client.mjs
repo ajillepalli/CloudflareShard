@@ -51,6 +51,10 @@ export class AdminClient {
     return post(this.baseUrl, this.adminToken, "/admin/create-table", { table, schema, partitionKeyColumn });
   }
 
+  listTables() {
+    return post(this.baseUrl, this.adminToken, "/admin/list-tables", {});
+  }
+
   createIndex(indexName, table, columns) {
     return post(this.baseUrl, this.adminToken, "/admin/create-index", { indexName, table, columns });
   }
@@ -113,21 +117,6 @@ export class TenantClient {
       limit,
       cursor,
     });
-  }
-
-  /** Follow nextCursor until the scan is exhausted. Used where the benchmark
-   * genuinely needs every row in a table (Stock-Level) rather than a single
-   * bounded page. */
-  async tableScanAll(table, pageLimit) {
-    let rows = [];
-    let cursor;
-    for (;;) {
-      const page = await this.tableScan(table, pageLimit, cursor);
-      rows = rows.concat(page.rows ?? []);
-      if (!page.nextCursor) break;
-      cursor = page.nextCursor;
-    }
-    return rows;
   }
 }
 

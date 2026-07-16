@@ -66,24 +66,27 @@ function randomWord(minLen, maxLen) {
 }
 
 async function createSchema(admin, log) {
+  // /admin/create-table deliberately has no "IF NOT EXISTS" escape hatch
+  // (README: silently no-oping on an existing table would undermine the
+  // route's own verification that its DDL push actually applied
+  // everywhere) -- a real re-attempt fails with a generic "Failed to create
+  // table on one or more shards" wrapping ShardDO's own deliberately-generic
+  // "SQL execution failed." (the raw SQLite "table already exists" text is
+  // never returned to the caller at all -- see shard.ts's handleExecute
+  // catch block), so there is no reliable error-message text to match on
+  // here. Instead, check /admin/list-tables up front and skip create-table
+  // entirely for anything already registered -- re-running `seed` against
+  // an already-seeded cluster is a normal demo workflow, so this needs to
+  // be a real pre-check against catalog state, not error-message sniffing.
+  const { tables: existing } = await admin.listTables();
+  const existingNames = new Set((existing ?? []).map((t) => t.table_name));
   for (const t of TABLES) {
-    try {
-      await admin.createTable(t.table, t.schema, t.partitionKeyColumn);
-      log(`  created table ${t.table}`);
-    } catch (err) {
-      // /admin/create-table deliberately has no "IF NOT EXISTS" escape hatch
-      // (README: silently no-oping on an existing table would undermine the
-      // route's own verification that its DDL push actually applied
-      // everywhere). Re-running `seed` against an already-seeded cluster is
-      // a normal demo workflow though, so treat "already exists" as
-      // idempotent-success here and surface anything else.
-      const msg = String(err && err.message).toLowerCase();
-      if (msg.includes("already exists")) {
-        log(`  table ${t.table} already exists, skipping create`);
-      } else {
-        throw err;
-      }
+    if (existingNames.has(t.table)) {
+      log(`  table ${t.table} already exists, skipping create`);
+      continue;
     }
+    await admin.createTable(t.table, t.schema, t.partitionKeyColumn);
+    log(`  created table ${t.table}`);
   }
 }
 
