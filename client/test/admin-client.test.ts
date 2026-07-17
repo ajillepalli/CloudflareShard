@@ -22,6 +22,15 @@ describe("CloudflareShardAdminClient", () => {
     expect(calls[0].body).toEqual({ numShards: undefined, totalVBuckets: undefined, force: undefined });
   });
 
+  it("revokeTenant() surfaces tenantId/revoked, not just {ok: true} (found during a manual cross-check after Codex hit its usage limit)", async () => {
+    const { fetchImpl } = mockFetch(200, { ok: true, tenantId: "t1", revoked: true });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.revokeTenant("t1");
+
+    expect(res).toEqual({ ok: true, tenantId: "t1", revoked: true });
+  });
+
   it("createTable() sends table/schema/partitionKeyColumn as given", async () => {
     const { fetchImpl, calls } = mockFetch(200, { ok: true, table: "events", shardsApplied: 4 });
     const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });

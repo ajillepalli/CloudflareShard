@@ -91,7 +91,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
     return this.post<RegisterTenantResponse>("/admin/register-tenant", request);
   }
 
-  async revokeTenant(tenantId: string): Promise<{ ok: true }> {
+  async revokeTenant(tenantId: string): Promise<{ ok: true; tenantId: string; revoked: true }> {
     return this.post("/admin/revoke-tenant", { tenantId });
   }
 
