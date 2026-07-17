@@ -104,6 +104,17 @@ const el = {
   loginError: hook("login-error"),
   logoutBtn: hook("logout-btn"),
 
+  // ---- Share + guided tour (deep-links) ----
+  shareBtn: hook("share-btn"),
+  tourStartBtn: hook("tour-start-btn"),
+  tourOverlay: hook("tour-overlay"),
+  tourStepIndicator: hook("tour-step-indicator"),
+  tourTitle: hook("tour-title"),
+  tourCaption: hook("tour-caption"),
+  tourBackBtn: hook("tour-back-btn"),
+  tourNextBtn: hook("tour-next-btn"),
+  tourSkipBtn: hook("tour-skip-btn"),
+
   // ---- Reshard room (T8) ----
   railTopology: hook("rail-topology"),
   railReshard: hook("rail-reshard"),
@@ -1054,6 +1065,14 @@ function setActiveRoom(room) {
   } else {
     stopAppRoom();
   }
+
+  // Shareable deep-links: keep the address bar reflecting whatever's on
+  // screen right now (see updateUrlForCurrentState below) so copy-pasting
+  // the current URL — or hitting "Share this view" — always lands a
+  // colleague on this exact room. replaceState, not pushState: no
+  // history-spam from routine room switching (a deep-link boot's own
+  // history.length stays at 1 the whole session).
+  updateUrlForCurrentState();
 }
 
 /** Forces the room back to Topology, bypassing setActiveRoom's normal
@@ -3244,6 +3263,231 @@ function connectLive() {
   });
 }
 
+// ============================================================================
+// Shareable deep-links (?room=..., &tour=1) + guided tour overlay.
+//
+// Deep-links: `?room=app|topology|reshard|edge|play` boots straight into
+// that room via the SAME setActiveRoom() every rail click already goes
+// through — no parallel room-entry path to keep in sync. Composes with
+// `?demo=1` (e.g. `?demo=1&room=reshard`); an absent/unrecognized `room`
+// falls back to index.html's shipped default (Topology) with no crash.
+// `&tour=1` (or bare `?tour`) auto-starts the guided tour below after boot.
+//
+// Share: "Share this view" (and the address bar itself, kept current via
+// updateUrlForCurrentState — called from setActiveRoom above) always encode
+// the CURRENT activeRoom + whether the tour is running right now, so a
+// pasted link reproduces exactly what's on screen.
+//
+// Guided tour: DEMO-SAFE by construction — every step is either `room: null`
+// (no-op, just a caption) or calls setActiveRoom(room), the exact same
+// view-switch a rail click performs. No step ever calls a chaos/reshard
+// mutation directly; the hero Reshard+chaos step NARRATES the "Break It"
+// panel ("click BREAK IT yourself") rather than firing an attack, per this
+// feature's DEMO-SAFE constraint. No auto-advance timer (optional per spec,
+// omitted here) — nothing to leak, Next/Back/Skip/Esc are the only ways the
+// step index ever changes, so "leak-free" holds trivially.
+// ============================================================================
+
+const VALID_DEEP_LINK_ROOMS = new Set(["app", "topology", "reshard", "edge", "play"]);
+
+/** `params.get("room")`, applied via setActiveRoom() iff it's one of the 5
+ * real room ids — an absent or unrecognized value is a silent no-op, leaving
+ * index.html's shipped default (Topology, already `.active` in the DOM)
+ * exactly as it renders today. */
+function applyInitialRoomFromUrl(params) {
+  const room = params.get("room");
+  if (VALID_DEEP_LINK_ROOMS.has(room)) setActiveRoom(room);
+}
+
+/** Builds the URLSearchParams for "the view currently on screen": every
+ * existing query param is preserved (so a live `?demo=1` boot's own flag
+ * survives into a copied/replaced URL), `room` is overwritten with
+ * activeRoom (always explicit, even when it's the default, so a pasted link
+ * never depends on what "no room param" happens to fall back to today), and
+ * `tour` is set/cleared to match whether the guided tour is running right
+ * now. Shared by both the address-bar sync (updateUrlForCurrentState) and
+ * the "Share this view" button (buildShareUrl), so they can never drift. */
+function currentShareParams() {
+  const params = new URLSearchParams(location.search);
+  params.set("room", activeRoom);
+  if (tourIsActive()) {
+    params.set("tour", "1");
+  } else {
+    params.delete("tour");
+  }
+  return params;
+}
+
+/** Rewrites the address bar to match currentShareParams(), via
+ * history.replaceState — no reload, no new history entry (called on every
+ * room change and every tour start/stop, so it would otherwise spam
+ * back/forward with every step of a 7-step tour). Defensive about
+ * history.replaceState's existence purely for old/exotic embeds; every
+ * environment this app actually ships to (real browsers, jsdom in tests)
+ * has it. */
+function updateUrlForCurrentState() {
+  if (typeof history === "undefined" || typeof history.replaceState !== "function") return;
+  const query = currentShareParams().toString();
+  const url = location.pathname + (query ? `?${query}` : "") + location.hash;
+  history.replaceState(null, "", url);
+}
+
+function buildShareUrl() {
+  return `${location.origin}${location.pathname}?${currentShareParams().toString()}`;
+}
+
+let shareLabelResetTimer = null;
+const SHARE_BTN_DEFAULT_LABEL = "Share this view";
+
+function flashShareLabel(text) {
+  if (!el.shareBtn) return;
+  el.shareBtn.textContent = text;
+  el.shareBtn.classList.toggle("copied", text === "Copied!");
+  clearTimeout(shareLabelResetTimer);
+  shareLabelResetTimer = setTimeout(() => {
+    el.shareBtn.textContent = SHARE_BTN_DEFAULT_LABEL;
+    el.shareBtn.classList.remove("copied");
+  }, 1600);
+}
+
+/** navigator.clipboard is unavailable in some embeds (non-HTTPS iframes,
+ * very old browsers, jsdom without a stub) — fails soft into a distinct
+ * "copy failed"/"unsupported" label rather than throwing, matching this
+ * file's overall never-crash-the-UI-over-a-non-essential-feature stance
+ * (see render()'s own try/catch doc comment). */
+function handleShareClick() {
+  const url = buildShareUrl();
+  const clipboard = navigator.clipboard;
+  if (clipboard && typeof clipboard.writeText === "function") {
+    clipboard.writeText(url).then(
+      () => flashShareLabel("Copied!"),
+      () => flashShareLabel("Copy failed"),
+    );
+  } else {
+    flashShareLabel("Copy unsupported");
+  }
+}
+
+// ---- guided tour steps ------------------------------------------------------
+// `room: null` steps (welcome/done) are pure narration — no view change.
+// Every other step's `room` is one of the 5 real room ids and goes through
+// setActiveRoom(), so it inherits that room's normal enter/leave behavior
+// (Reshard's lock-status poll starts/stops exactly as it would for a manual
+// rail click, etc.) with no tour-specific special-casing to maintain.
+const TOUR_STEPS = [
+  {
+    room: null,
+    title: "Welcome to Shardscope",
+    caption:
+      "A quick, hands-off walkthrough of the hero story: a sharded database that reshards live — under attack — and never loses a write. About a minute, 7 stops. Skip anytime with Esc.",
+  },
+  {
+    room: "topology",
+    title: "Topology — the living canvas",
+    caption:
+      "Every shard and vBucket, drawn live. Node color is heat (load); cyan arcs are vBuckets migrating between shards right now.",
+  },
+  {
+    room: "reshard",
+    title: "Reshard — the hero moment",
+    caption:
+      "Split, migrate, or drain shards live, with no maintenance window. Below, the “Break It” panel fires real attacks at a live cluster — on one, click BREAK IT yourself and watch the scoreboard's “lost” count hold at 0.",
+  },
+  {
+    room: "app",
+    title: "App — a real app on it",
+    caption:
+      "A real multi-tenant app on the same cluster: tenant-scoped reads and a same-tenant transaction, in a handful of API calls.",
+  },
+  {
+    room: "play",
+    title: "Playground — every primitive",
+    caption:
+      "Mutate, transact, index-query, table-scan, and inspect routing — every primitive the platform exposes, as a console you can drive by hand.",
+  },
+  {
+    room: "app",
+    title: "Build on it",
+    caption:
+      "Scroll down in the App room to “Build on it” for a real, runnable starter repo — download it and point it at your own cluster.",
+  },
+  {
+    room: null,
+    title: "That's the tour",
+    caption:
+      "Explore any room yourself, or click “Take the tour” again anytime. Every number you saw was either live or clearly labeled sample/illustrative — nothing here is fabricated.",
+  },
+];
+
+let tourStepIndex = -1; // -1 = not running
+
+function tourIsActive() {
+  return tourStepIndex >= 0;
+}
+
+function renderTourStep() {
+  const step = TOUR_STEPS[tourStepIndex];
+  if (el.tourTitle) el.tourTitle.textContent = step.title;
+  if (el.tourCaption) el.tourCaption.textContent = step.caption;
+  if (el.tourStepIndicator) el.tourStepIndicator.textContent = `${tourStepIndex + 1} / ${TOUR_STEPS.length}`;
+  if (el.tourBackBtn) el.tourBackBtn.disabled = tourStepIndex === 0;
+  if (el.tourNextBtn) el.tourNextBtn.textContent = tourStepIndex === TOUR_STEPS.length - 1 ? "Done" : "Next";
+  // setActiveRoom() itself calls updateUrlForCurrentState() — a room-having
+  // step's URL sync happens as a side effect of the switch. A `room: null`
+  // step (welcome/done) doesn't touch the room, so it doesn't need a fresh
+  // URL sync here either — startTour()/endTour() already cover the `tour`
+  // flag's own start/stop transitions below.
+  if (step.room) setActiveRoom(step.room);
+}
+
+function startTour() {
+  if (tourIsActive() || !el.tourOverlay) return;
+  tourStepIndex = 0;
+  el.tourOverlay.hidden = false;
+  renderTourStep();
+  updateUrlForCurrentState();
+}
+
+function endTour() {
+  if (!tourIsActive()) return;
+  tourStepIndex = -1;
+  if (el.tourOverlay) el.tourOverlay.hidden = true;
+  updateUrlForCurrentState();
+}
+
+function tourNext() {
+  if (!tourIsActive()) return;
+  if (tourStepIndex >= TOUR_STEPS.length - 1) {
+    endTour();
+    return;
+  }
+  tourStepIndex++;
+  renderTourStep();
+}
+
+function tourBack() {
+  if (!tourIsActive() || tourStepIndex === 0) return;
+  tourStepIndex--;
+  renderTourStep();
+}
+
+function handleGlobalKeydown(evt) {
+  if (evt.key === "Escape" && tourIsActive()) {
+    evt.preventDefault();
+    endTour();
+  }
+}
+
+/** `params.get("tour")`: supports both bare `?tour` and `?tour=1` (any
+ * present value other than the literal "0" auto-starts — `?tour=0` is a
+ * deliberate explicit opt-out, e.g. a deep-link generator that always
+ * appends the param). */
+function maybeAutoStartTour(params) {
+  if (!params.has("tour")) return;
+  if (params.get("tour") === "0") return;
+  startTour();
+}
+
 /** Click + Enter/Space (role="button" rail items aren't native <button>s). */
 function onActivate(elm, fn) {
   if (!elm) return;
@@ -3292,6 +3536,14 @@ function init() {
     el.chaosAttackStack.querySelectorAll("button[data-attack]").forEach((btn) => btn.addEventListener("click", handleChaosAttackClick));
   }
 
+  // ---- Share + guided tour wiring ----
+  if (el.shareBtn) el.shareBtn.addEventListener("click", handleShareClick);
+  if (el.tourStartBtn) el.tourStartBtn.addEventListener("click", () => startTour());
+  if (el.tourNextBtn) el.tourNextBtn.addEventListener("click", tourNext);
+  if (el.tourBackBtn) el.tourBackBtn.addEventListener("click", tourBack);
+  if (el.tourSkipBtn) el.tourSkipBtn.addEventListener("click", endTour);
+  document.addEventListener("keydown", handleGlobalKeydown);
+
   const params = new URLSearchParams(location.search);
   if (params.get("demo") === "1") {
     // Sample mode never touches /api/*, so it never touches the gate either
@@ -3304,9 +3556,19 @@ function init() {
     el.logoutBtn.hidden = true;
     render(buildSampleSnapshot());
     logLine("demo mode (?demo=1) — rendering embedded sample snapshot, no live connection opened", "mig");
-    return;
+  } else {
+    startLiveFlow();
   }
-  startLiveFlow();
+
+  // Deep-link room + tour: applied AFTER `mode` is settled above (demo vs.
+  // live) so a room switch triggered by ?room=... or &tour=1 sees the right
+  // mode — e.g. setActiveRoom("edge") reads `mode` to decide whether to take
+  // the demo-safe illustrative-only path or fire a real measurement (see
+  // startEdgeRoom); getting this ordering backwards would make
+  // `?demo=1&room=edge` fire a live /api/edge call, breaking demo mode's
+  // "never touches /api/*" contract.
+  applyInitialRoomFromUrl(params);
+  maybeAutoStartTour(params);
 }
 
 init();
