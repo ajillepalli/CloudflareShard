@@ -652,7 +652,33 @@ call — lives in [`examples/rpc-consumer/`](examples/rpc-consumer/).
    migration with dual-write backfill and a fenced, checksum-verified cutover;
    `/admin/drain-shard` fully evacuates a shard. Automatic split *heuristics* remain open.
 4. ~~Add index service~~ Done (Milestone 2); query planner enhancements remain open.
-5. Add observability and SLO alerting per shard and per route.
+5. Add observability and SLO alerting per shard and per route. **Partial (issue #35):**
+   every request now logs one structured `http.request` event (`path`, `method`, `status`,
+   `durationMs`), and Workers Logs is enabled (`wrangler.toml`'s `[observability]` block) —
+   see "Observability" below. Per-shard breakdowns and actual SLO *alerting* (paging on a
+   threshold breach, which needs an external system — Logpush to a metrics backend, or an
+   Analytics Engine binding) remain open.
+
+## Observability
+
+Every request logs a structured `http.request` event
+(`{path, method, status, durationMs}`) from the Worker's single `fetch()`
+entrypoint, regardless of which route or outcome — plus whatever
+event-specific `log()` calls the handler itself makes along the way (e.g.
+`catalog.admin_action`). Query them:
+
+```powershell
+# Live tail, JSON per line
+npx wrangler tail --format json
+
+# Filter to slow requests only
+npx wrangler tail --format json | Select-String '"event":"http.request"' | Select-String -NotMatch '"durationMs":[0-9]{1,2}[,}]'
+```
+
+Or use the Cloudflare dashboard's **Workers Logs** view (Workers & Pages →
+`cloudflare-shard-mvp` → Logs) for durable, searchable/filterable history —
+enabled via `wrangler.toml`'s `[observability]` block (`head_sampling_rate = 1`,
+i.e. every request, not a sample).
 
 ## License
 
