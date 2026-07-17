@@ -1,0 +1,85 @@
+name = "cloudflare-shard-shardscope"
+main = "src/index.ts"
+compatibility_date = "2026-07-14"
+
+# Service binding to CloudflareShard's RPC entrypoint (see issue #14). This is
+# what "no HTTP, no bearer-token header to construct" actually looks like: the
+# security boundary is this binding existing in this Worker's own config, not
+# a request-level credential — the admin token (and, later, per-tenant
+# tokens) is still passed as a method argument and checked internally by
+# CloudflareShardRpc, exactly as an HTTP caller's Authorization header would
+# be. See examples/rpc-consumer/wrangler.toml for the original pattern this
+# is copied from.
+#
+# Locally (`wrangler dev`), this resolves via Wrangler's local dev registry as
+# long as the main cloudflare-shard-mvp Worker is also running `wrangler dev`
+# on the same machine — no extra config needed for that. Deployed, both
+# Workers just need to exist in the same Cloudflare account under these names.
+[[services]]
+binding = "SHARD_API"
+service = "cloudflare-shard-mvp"
+entrypoint = "CloudflareShardRpc"
+
+# TopologyAggregator: a singleton Durable Object (see src/aggregator.ts) that
+# owns the single shared poll of the admin API on an alarm() tick and fans a
+# merged topology snapshot out to every open SSE subscriber. One DO instance
+# ("singleton", via idFromName) for the whole Worker — this is deliberate: we
+# want exactly one poller regardless of how many browser tabs are watching,
+# not one poll per connected client.
+[[durable_objects.bindings]]
+name = "AGGREGATOR"
+class_name = "TopologyAggregator"
+
+# LoadDriver (Shardscope T3): a singleton Durable Object (see
+# src/load/load-driver.ts) that runs alarm-driven rolling batches of a
+# TPC-C-style transaction mix against cloudflare-shard-mvp's gateway, in
+# either uniform (normal random keys) or deterministic hot-shard skew mode.
+# One instance ("singleton", via idFromName) for the whole Worker, same
+# reasoning as AGGREGATOR above.
+[[durable_objects.bindings]]
+name = "LOAD_DRIVER"
+class_name = "LoadDriver"
+
+# TenantTokenStore (Shardscope T5): a singleton Durable Object (see
+# src/load/tenant-token-store.ts) that durably get-or-creates the per-
+# warehouse tenant bearer tokens LoadDriver needs to issue real /v1/*
+# transactions. Chosen over a KV namespace: get-or-create needs real
+# atomicity (never register the same tenant twice, never rotate an existing
+# token) that KV's eventually-consistent, no-compare-and-swap put() can't
+# give without extra locking of its own -- see that file's header comment.
+[[durable_objects.bindings]]
+name = "TENANT_TOKEN_STORE"
+class_name = "TenantTokenStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TopologyAggregator"]
+
+# New migration tag for LoadDriver rather than appending to v1 -- once a
+# migration tag has shipped, editing its class list retroactively is unsafe;
+# a new DO class always gets its own migration entry.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["LoadDriver"]
+
+# Same reasoning as v2 above: TenantTokenStore is a new DO class, so it gets
+# its own migration entry rather than joining v1 or v2 retroactively.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["TenantTokenStore"]
+
+# --- Static SPA assets (the Topology room, public/) ------------------------
+# Serves the public/ dashboard SPA. Static assets are matched first for GET
+# requests; anything with no matching file (every /api/* route, plus POST
+# /login,/logout) falls through to the Worker (src/index.ts). GET / therefore
+# serves public/index.html, and the inline placeholderHtml() in src/index.ts
+# is now dead (kept only as a documented fallback).
+#
+# Deliberately NO `not_found_handling = "single-page-application"`: SPA mode
+# would serve index.html for any unmatched path — INCLUDING GET /api/stream —
+# shadowing the Worker's own routes. The dashboard is tab-based (no
+# client-side deep-link routing), so plain file serving with Worker
+# fall-through is the correct model here.
+[assets]
+directory = "./public"
+binding = "ASSETS"
