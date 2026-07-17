@@ -275,6 +275,17 @@ export function isInternalTableName(name: string): boolean {
   return INTERNAL_TABLE_SET.has(name) || name.startsWith("__cf_") || name.startsWith("sqlite_");
 }
 
+// SQLite accepts, in an UNQUOTED identifier, the ASCII set [A-Za-z0-9_] plus
+// ANY code point >= U+0080 (its IdChar rule admits every byte >= 0x80). The
+// class is built via String.fromCodePoint so the source carries no astral
+// literal or fragile unicode escape; the u flag keeps surrogate pairs intact.
+// A leading digit stays excluded (not a valid bare-identifier start).
+const IDENT_NON_ASCII = String.fromCodePoint(0x80) + "-" + String.fromCodePoint(0x10ffff);
+const BARE_IDENTIFIER_RE = new RegExp(
+  "^[A-Za-z_" + IDENT_NON_ASCII + "][A-Za-z0-9_" + IDENT_NON_ASCII + "]*",
+  "u",
+);
+
 /** Reads one identifier token starting at `pos` after skipping leading
  * whitespace: a quoted `"..."`/`` `...` ``/`[...]` span (honoring the doubled-
  * quote escape for the first two) or a bare identifier. Returns the raw
@@ -293,7 +304,10 @@ function readIdentifierToken(s: string, pos: number): { raw: string; next: numbe
     if (!terminated) return null;
     return { raw: s.slice(pos, end), next: end };
   }
-  const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(pos));
+  // Bare identifier via the module-level BARE_IDENTIFIER_RE (ASCII ident set +
+  // any code point >= U+0080), so an unquoted non-ASCII CTE name (ü, é, 中) is
+  // matched whole instead of returning null and making skipLeadingCte bail.
+  const m = BARE_IDENTIFIER_RE.exec(s.slice(pos));
   if (!m) return null;
   return { raw: m[0], next: pos + m[0].length };
 }

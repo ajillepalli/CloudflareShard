@@ -132,6 +132,17 @@ describe("isMutation", () => {
     // A doubled-quote-named CTE before a genuine SELECT stays non-mutating.
     expect(isMutation('WITH "a""b" AS (SELECT 1) SELECT * FROM "a""b"')).toBe(false);
   });
+  it("is not fooled by an unquoted non-ASCII CTE name (CVE-class bypass)", () => {
+    // SQLite accepts any code point >= 0x80 in a bare identifier; the old
+    // ASCII-only reader returned null on these and skipLeadingCte bailed.
+    expect(isMutation("WITH ü AS (SELECT 1) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH é AS (SELECT 1) UPDATE events SET x = 1")).toBe(true);
+    expect(isMutation("WITH 中 AS (SELECT 1) INSERT INTO events VALUES (1)")).toBe(true);
+    // No regression: unicode-named CTE before a genuine SELECT stays a read,
+    // and a QUOTED unicode name keeps working.
+    expect(isMutation("WITH ü AS (SELECT 1) SELECT * FROM ü")).toBe(false);
+    expect(isMutation('WITH "ü" AS (SELECT 1) DELETE FROM events')).toBe(true);
+  });
 });
 
 // The write-target extractor backs mutationTargetIsInternal, the admin-only
@@ -187,6 +198,12 @@ describe("mutationWriteTarget", () => {
     expect(mutationWriteTarget("WITH x AS (SELECT 1 AS [a)]) DELETE FROM events")).toBe("events");
     expect(mutationWriteTarget('WITH "a""b" AS (SELECT 1) DELETE FROM __cf_row_owners')).toBe("__cf_row_owners");
     expect(mutationWriteTarget("WITH `a``b` AS (SELECT 1) DELETE FROM events")).toBe("events");
+  });
+  it("reads the target through an unquoted non-ASCII CTE name (non-ASCII IdChar)", () => {
+    expect(mutationWriteTarget("WITH 中 AS (SELECT 1) DELETE FROM __cf_row_owners")).toBe("__cf_row_owners");
+    expect(mutationWriteTarget("WITH ü AS (SELECT 1) DELETE FROM events")).toBe("events");
+    // A bare non-ASCII TARGET name is also read whole.
+    expect(mutationWriteTarget("DELETE FROM café")).toBe("café");
   });
 
   it("fail-closed (null) on non-DML or an ambiguous/three-part target", () => {
@@ -256,6 +273,11 @@ describe("mutationTargetIsInternal (admin /v1/sql write guardrail)", () => {
     expect(mutationTargetIsInternal("WITH x AS (SELECT 1 AS `a(`) INSERT INTO __cf_row_owners VALUES (1)")).toBe(
       true,
     );
+  });
+
+  it("blocks an unquoted non-ASCII CTE-name bypass targeting an internal table (CVE-class bypass)", () => {
+    expect(mutationTargetIsInternal("WITH 中 AS (SELECT 1) DELETE FROM __cf_row_owners")).toBe(true);
+    expect(mutationTargetIsInternal("WITH ü AS (SELECT 1) DELETE FROM __cf_fenced_vbuckets")).toBe(true);
   });
 
   it("blocks a doubled-quote-CTE-name bypass targeting an internal table (CVE-class bypass)", () => {
@@ -339,6 +361,10 @@ describe("extractCreateTableName", () => {
     // reader returns the real identifier a"b (and ``a`b`` for backticks).
     expect(extractCreateTableName('CREATE TABLE "a""b" (id TEXT)')).toBe('a"b');
     expect(extractCreateTableName("CREATE TABLE `a``b` (id TEXT)")).toBe("a`b");
+  });
+  it("extracts an unquoted non-ASCII table name whole (non-ASCII IdChar)", () => {
+    expect(extractCreateTableName("CREATE TABLE café (id TEXT)")).toBe("café");
+    expect(extractCreateTableName("CREATE TABLE 中 (id TEXT)")).toBe("中");
   });
 });
 
