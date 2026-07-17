@@ -41,6 +41,24 @@ describe("CloudflareShardAdminClient", () => {
     expect(calls[0].body).toEqual({ shardId: "catalog-0-shard-0" });
   });
 
+  it("dropIndex() surfaces a partial-cleanup warning instead of erasing it (Codex review)", async () => {
+    const { fetchImpl } = mockFetch(200, { ok: true, indexName: "idx", warning: "Physical cleanup failed on shard(s): catalog-1-shard-0." });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.dropIndex("idx");
+
+    expect(res.warning).toContain("catalog-1-shard-0");
+  });
+
+  it("forceReleaseTopologyLock() surfaces released: false for a stale/mismatched operationId (Codex review: was erased from the type)", async () => {
+    const { fetchImpl } = mockFetch(200, { ok: true, released: false });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.forceReleaseTopologyLock("stale-operation-id");
+
+    expect(res.released).toBe(false);
+  });
+
   it("migrateVbucketStatus() surfaces toShard/startedAt as null for a vbucket with no active migration (Codex review: was typed as non-null string)", async () => {
     const { fetchImpl } = mockFetch(200, { vbucket: 42, status: "none", fromShard: "catalog-0-shard-0", toShard: null, rowsCopied: 0, mirrorQueueDepth: 0, startedAt: null });
     const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });

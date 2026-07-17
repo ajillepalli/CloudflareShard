@@ -136,7 +136,11 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
     }
   }
 
-  async dropIndex(indexName: string): Promise<{ ok: true; indexName: string }> {
+  /** `warning` is present when physical __cf_indexes cleanup failed on one
+   * or more shards -- the index is still unregistered and unqueryable
+   * either way, but stale rows may remain on those shards. Always check
+   * for it rather than assuming a 200 means fully clean. */
+  async dropIndex(indexName: string): Promise<{ ok: true; indexName: string; warning?: string }> {
     return this.post("/admin/drop-index", { indexName });
   }
 
@@ -167,8 +171,11 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
   /** Only for a genuinely stuck lock (a crashed operation that will never
    * heartbeat again) -- see TODOS.md/README for when this is actually
    * safe to use. Force-releasing a lock a live operation still holds can
-   * let two topology operations run concurrently against the same state. */
-  async forceReleaseTopologyLock(operationId: string): Promise<{ ok: true }> {
+   * let two topology operations run concurrently against the same state.
+   * released: false means operationId was stale/didn't match the current
+   * holder -- nothing was actually released; always check it rather than
+   * assuming a 200 means the lock is now free. */
+  async forceReleaseTopologyLock(operationId: string): Promise<{ ok: true; released: boolean }> {
     return this.post("/admin/force-release-topology-lock", { operationId });
   }
 
