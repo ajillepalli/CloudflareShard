@@ -190,6 +190,39 @@ html, body {
 }
 .scoreboard .sb-item.lost-red b { color: var(--danger-bright); }
 
+/* ============ TOPBAR ACTIONS (share + guided tour) ============
+   Small ghost buttons, matching .logout-btn's restrained treatment — this is
+   chrome, not a hero element, so it stays quiet per DESIGN.md's "minimal
+   decoration" rule. */
+.topbar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.topbar-btn {
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 5px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color .2s ease, border-color .2s ease, background .2s ease;
+  white-space: nowrap;
+}
+.topbar-btn:hover { color: var(--text-muted); border-color: var(--border); }
+/* "Share this view" borrows --safe only transiently, on copy confirmation —
+   see app.js's flashShareLabel; never a permanent claim of anything "live". */
+.topbar-btn.copied {
+  color: var(--safe);
+  border-color: var(--safe);
+}
+
 /* ============ MAIN AREA ============ */
 .main {
   flex: 1 1 auto;
@@ -431,6 +464,92 @@ html, body {
   margin-top: 12px;
   font-size: 11.5px;
   color: var(--danger-bright);
+}
+
+/* ============ GUIDED TOUR OVERLAY ============
+   Full-viewport modal, same visual family as .login-panel/.login-card
+   (dark backdrop + a single centered panel) — deliberately quiet, technical,
+   no bubble radius per DESIGN.md. position: fixed (not absolute like
+   .login-panel, which is scoped to .canvas-wrap) so it sits above every
+   room, not just Topology. */
+.tour-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(7, 10, 15, .78);
+  backdrop-filter: blur(3px);
+}
+.tour-card {
+  width: min(420px, 88vw);
+  padding: 20px 22px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  box-shadow: 0 16px 48px -14px rgba(0, 0, 0, .65);
+}
+.tour-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.tour-skip-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  cursor: pointer;
+  padding: 2px 4px;
+  transition: color .2s ease;
+}
+.tour-skip-btn:hover { color: var(--text-muted); }
+.tour-title {
+  margin-top: 14px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.tour-caption {
+  margin-top: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+.tour-controls {
+  margin-top: 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.tour-btn {
+  padding: 8px 16px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  cursor: pointer;
+  transition: background .2s ease, opacity .2s ease, border-color .2s ease;
+}
+.tour-btn:hover:not(:disabled) { border-color: var(--text-dim); color: var(--text-primary); }
+.tour-btn:disabled { opacity: .4; cursor: default; }
+.tour-btn-primary {
+  border-color: var(--safe);
+  background: rgba(53, 227, 176, .12);
+  color: var(--safe);
+}
+.tour-btn-primary:hover:not(:disabled) {
+  background: rgba(53, 227, 176, .2);
+  border-color: var(--safe);
+  color: var(--safe);
 }
 
 /* legend */
