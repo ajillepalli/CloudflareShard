@@ -420,6 +420,94 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
     expect(queryBody.rows.map((r) => r.id)).toEqual(["row-b-no-prov"]);
   });
+
+  // Codex round-4 review (PR #20): a scan request that comes back !ok (shard.
+  // ts's /execute has exactly one non-2xx path for a read-only scan -- its
+  // catch-all "SQL execution failed", e.g. the table is missing on this
+  // shard, which /admin/register-table can leave true since (unlike
+  // /admin/create-table) it never pushes DDL to any shard) used to be thrown
+  // as a plain Error, treated as transient by the alarm loop's shared catch,
+  // and retried forever -- heartbeating (never releasing) this index's
+  // topology lock and wedging every other topology operation, exactly the
+  // failure mode PermanentIndexBackfillError exists to avoid for
+  // PROVENANCE_MISSING_FOR_INDEX above.
+  it("gives up (does not retry forever) when a data shard can't scan the table at all, e.g. registered via /admin/register-table but never physically created there", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+
+    // /admin/register-table only writes catalog metadata (table_rules) --
+    // unlike /admin/create-table, it never pushes CREATE TABLE to any shard.
+    const registerRes = await post(
+      "/admin/register-table",
+      { table: "idx_noshard_evt", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    // Physically create the table on 3 of the 4 data shards, deliberately
+    // skipping catalog-1-shard-0 -- whichever tick reaches it will find no
+    // such table.
+    for (const shardId of ["catalog-0-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"]) {
+      const stub = env.SHARD.get(env.SHARD.idFromName(shardId));
+      const createRes = await stub.fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: "CREATE TABLE idx_noshard_evt (id TEXT PRIMARY KEY, v TEXT)",
+            params: [],
+            requestId: `noshard-ddl-${shardId}-${crypto.randomUUID()}`,
+            isMutation: false,
+          }),
+        }),
+      );
+      expect(createRes.ok).toBe(true);
+    }
+
+    const res = await post("/admin/create-index", { indexName: "idx_noshard_by_v", table: "idx_noshard_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
+      if (((await statusRes.json()) as { status: string }).status === "failed") break;
+    }
+    const failedStatusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
+    expect(((await failedStatusRes.json()) as { status: string }).status).toBe("failed");
+
+    // The lock was actually released -- an unrelated topology op succeeds
+    // immediately instead of 409 TOPOLOGY_OPERATION_IN_PROGRESS.
+    await createIndexTestTable("idx_noshard_unrelated_evt");
+    const unrelated = await post(
+      "/admin/create-index",
+      { indexName: "idx_noshard_unrelated_by_v", table: "idx_noshard_unrelated_evt", columns: ["v"] },
+      AUTH(),
+    );
+    expect(unrelated.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_noshard_unrelated_by_v");
+
+    // Once the operator actually creates the missing table, retrying
+    // /admin/create-index resumes and completes normally.
+    const fixRes = await env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0")).fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "CREATE TABLE idx_noshard_evt (id TEXT PRIMARY KEY, v TEXT)",
+          params: [],
+          requestId: `noshard-ddl-fix-${crypto.randomUUID()}`,
+          isMutation: false,
+        }),
+      }),
+    );
+    expect(fixRes.ok).toBe(true);
+    const retry = await post("/admin/create-index", { indexName: "idx_noshard_by_v", table: "idx_noshard_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_noshard_by_v");
+    const finalStatusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
+    expect(((await finalStatusRes.json()) as { status: string }).status).toBe("ready");
+  });
 });
 
 // Codex final-review P1 #1 (original synchronous version) / Codex

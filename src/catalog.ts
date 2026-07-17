@@ -2402,7 +2402,23 @@ export class CatalogDO extends DurableObject {
       requestId: `create-index-backfill-scan-${row.index_name}-${shardId}-${crypto.randomUUID()}`,
       isMutation: false,
     });
-    if (!scanRes.ok) throw new Error(`backfill scan failed on shard ${shardId} for index ${row.index_name}: ${scanRes.status}`);
+    // Codex round-4 fix: callShard resolves (doesn't reject) for a
+    // well-formed HTTP error response -- a genuinely transient failure
+    // (the shard DO unavailable, a network blip) throws instead and is
+    // caught by alarm()'s own try/catch below as an ordinary retryable
+    // error. A resolved !ok response here means the shard's /execute
+    // handler itself rejected this exact query (shard.ts's only non-2xx
+    // path for a read-only scan is its catch-all "SQL execution failed",
+    // e.g. the table or an indexed column is missing on THIS shard) --
+    // that can never self-resolve by retrying the same query against the
+    // same shard schema, so (like PROVENANCE_MISSING_FOR_INDEX) it must
+    // give up and release the lock rather than heartbeat it forever.
+    if (!scanRes.ok) {
+      const errorText = await scanRes.text().catch(() => "");
+      throw new PermanentIndexBackfillError(
+        `backfill scan failed on shard ${shardId} for index ${row.index_name}, table ${row.table_name} (HTTP ${scanRes.status}): ${errorText || "no response body"} -- likely a schema mismatch (the table or an indexed column may be missing on this shard); an operator must reconcile the shard's schema, then retry`,
+      );
+    }
     const scanBody = (await scanRes.json()) as { rows: Array<Record<string, unknown>> };
     const page = scanBody.rows;
 
