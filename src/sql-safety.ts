@@ -24,30 +24,72 @@ function stripLeadingComments(sql: string): string {
   return s;
 }
 
+/** THE single quote-span walker for this module. If `sql[start]` opens a quoted
+ * span — a `'...'` string literal or a `"..."` / `` `...` `` / `[...]` quoted
+ * identifier — returns `{ end }` pointing just past the closing delimiter and
+ * `terminated: true`. The doubled-delimiter escape is honored for `' " ``` (a
+ * doubled delimiter stays INSIDE the span, e.g. `'a''b'`, `"a""b"`); `[...]`
+ * has no escape and ends at the first `]`. If the span is unterminated, returns
+ * `{ end: sql.length, terminated: false }`. If `sql[start]` is not an opening
+ * quote char, returns `{ end: start, terminated: false }` (a no-op).
+ *
+ * Every structural scanner in this module (skipBalancedParens,
+ * stripCommentsPreservingStrings, readIdentifierToken) routes quoted spans
+ * through THIS function, so there is exactly one quote tracker — no "second,
+ * weaker" one that handles fewer quote types or forgets the doubled-quote
+ * escape and desyncs a paren/identifier/comment scan (the root cause of the
+ * backtick-paren, bracket-paren, and doubled-quote-CTE-name bypasses). */
+function skipQuoteSpan(sql: string, start: number): { end: number; terminated: boolean } {
+  const open = sql[start];
+  let close: string;
+  let escapable: boolean;
+  if (open === "'" || open === '"' || open === "`") {
+    close = open;
+    escapable = true;
+  } else if (open === "[") {
+    close = "]";
+    escapable = false;
+  } else {
+    return { end: start, terminated: false }; // not a quote opener
+  }
+  let i = start + 1;
+  while (i < sql.length) {
+    if (sql[i] === close) {
+      if (escapable && sql[i + 1] === close) {
+        i += 2; // doubled delimiter = escaped, stays inside the span
+        continue;
+      }
+      return { end: i + 1, terminated: true };
+    }
+    i += 1;
+  }
+  return { end: sql.length, terminated: false }; // unterminated
+}
+
+/** True if `c` opens one of the four quoted-span types this module recognizes. */
+function isQuoteOpen(c: string): boolean {
+  return c === "'" || c === '"' || c === "`" || c === "[";
+}
+
 /** Scans forward from an opening '(' at `start` to the index just past its
- * matching close paren, honoring quoted strings so a paren inside a string
- * literal doesn't unbalance the count. Returns sql.length if unterminated. */
+ * matching close paren, skipping over ALL quoted spans (string literals AND
+ * `"`/`` ` ``/`[` quoted identifiers) via skipQuoteSpan so a paren inside any
+ * quoted span doesn't unbalance the count. Returns sql.length if unterminated. */
 function skipBalancedParens(sql: string, start: number): number {
   let depth = 0;
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = start; i < sql.length; i += 1) {
+  let i = start;
+  while (i < sql.length) {
     const c = sql[i];
-    if (inSingle) {
-      if (c === "'") inSingle = false;
+    if (isQuoteOpen(c)) {
+      i = skipQuoteSpan(sql, i).end; // ignore any parens inside the quoted span
       continue;
     }
-    if (inDouble) {
-      if (c === '"') inDouble = false;
-      continue;
-    }
-    if (c === "'") inSingle = true;
-    else if (c === '"') inDouble = true;
-    else if (c === "(") depth += 1;
+    if (c === "(") depth += 1;
     else if (c === ")") {
       depth -= 1;
       if (depth === 0) return i + 1;
     }
+    i += 1;
   }
   return sql.length;
 }
@@ -69,9 +111,13 @@ function skipLeadingCte(sql: string): string {
   if (!/^\s*with\b/i.test(sql)) return sql;
   let s = sql.replace(/^\s*with\s+(recursive\s+)?/i, "");
   for (;;) {
-    const idMatch = /^\s*("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|[A-Za-z_][A-Za-z0-9_]*)/.exec(s);
-    if (!idMatch) return sql;
-    s = s.slice(idMatch[0].length);
+    // Consume the CTE name via the shared escape-aware identifier reader (NOT a
+    // hand-rolled regex) so a doubled-quote-escaped name — `"a""b"`, `` `a``b` ``
+    // — is matched whole instead of truncated, which would desync the parse and
+    // make this bail with "with" still leading (misclassifying the mutation).
+    const id = readIdentifierToken(s, 0);
+    if (!id) return sql;
+    s = s.slice(id.next);
 
     const afterId = s.replace(/^\s+/, "");
     if (afterId.startsWith("(")) {
@@ -128,37 +174,13 @@ function stripCommentsPreservingStrings(sql: string): string {
   let i = 0;
   while (i < sql.length) {
     const c = sql[i];
-    // Quoted string / identifier span: copy verbatim through its matching
-    // close, so a `--` or `/*` inside it is never treated as a comment.
-    if (c === "'" || c === '"' || c === "`") {
-      out += c;
-      i += 1;
-      while (i < sql.length) {
-        out += sql[i];
-        if (sql[i] === c) {
-          if (sql[i + 1] === c) {
-            out += sql[i + 1]; // doubled quote = escaped, stays inside the span
-            i += 2;
-            continue;
-          }
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
-      continue;
-    }
-    if (c === "[") {
-      out += c;
-      i += 1;
-      while (i < sql.length) {
-        out += sql[i];
-        if (sql[i] === "]") {
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
+    // Quoted string / identifier span: copy verbatim through its matching close
+    // (via the shared quote walker), so a `--` or `/*` inside it — including a
+    // paren, `]`, or doubled quote — is never treated as a comment.
+    if (isQuoteOpen(c)) {
+      const { end } = skipQuoteSpan(sql, i);
+      out += sql.slice(i, end);
+      i = end;
       continue;
     }
     if (c === "-" && sql[i + 1] === "-") {
@@ -262,21 +284,14 @@ function readIdentifierToken(s: string, pos: number): { raw: string; next: numbe
   while (pos < s.length && /\s/.test(s[pos])) pos += 1;
   if (pos >= s.length) return null;
   const c = s[pos];
+  // A quoted IDENTIFIER is `"..."` / `` `...` `` / `[...]` (single quotes are
+  // string literals, never identifiers, so they are not accepted here). Route
+  // through the shared quote walker so the doubled-quote escape is honored
+  // identically everywhere; an unterminated quote is ambiguous → fail closed.
   if (c === '"' || c === "`" || c === "[") {
-    const close = c === "[" ? "]" : c;
-    let j = pos + 1;
-    while (j < s.length) {
-      if (s[j] === close) {
-        if ((close === '"' || close === "`") && s[j + 1] === close) {
-          j += 2;
-          continue;
-        }
-        j += 1;
-        return { raw: s.slice(pos, j), next: j };
-      }
-      j += 1;
-    }
-    return null; // unterminated quote
+    const { end, terminated } = skipQuoteSpan(s, pos);
+    if (!terminated) return null;
+    return { raw: s.slice(pos, end), next: end };
   }
   const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(pos));
   if (!m) return null;
@@ -358,11 +373,15 @@ export function isDangerousSchema(sql: string): boolean {
  * statement doesn't match the expected shape, so callers can reject it rather
  * than silently create a table under a different name than the caller declared. */
 export function extractCreateTableName(sql: string): string | null {
-  const match = /^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))/i.exec(
-    sql,
-  );
-  if (!match) return null;
-  return match[2] ?? match[3] ?? match[4] ?? match[5] ?? null;
+  const prefix = /^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?/i.exec(sql);
+  if (!prefix) return null;
+  // Use the shared escape-aware identifier reader + unquoter instead of a
+  // hand-rolled `"([^"]+)"` regex, so a doubled-quote-escaped name (`"a""b"`)
+  // is read whole and unescaped — not truncated to `a`, which would desync the
+  // caller's name-match check (schemaSql name vs declared table).
+  const id = readIdentifierToken(sql, prefix[0].length);
+  if (!id) return null;
+  return unquoteIdentifier(id.raw);
 }
 
 /** Returns `sql` with `IF NOT EXISTS` injected after `CREATE TABLE` when it's a

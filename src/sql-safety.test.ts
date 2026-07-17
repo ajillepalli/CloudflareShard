@@ -109,6 +109,29 @@ describe("isMutation", () => {
     // delimiter in a string is still non-mutating.
     expect(isMutation("WITH x AS (SELECT '/*') SELECT * FROM x")).toBe(false);
   });
+
+  it("is not fooled by a paren inside a backtick/bracket-quoted identifier in the CTE body (CVE-class bypass)", () => {
+    // A `(` / `)` inside a backtick- or bracket-quoted identifier must NOT
+    // unbalance the CTE body-paren skip. skipBalancedParens previously tracked
+    // only ' and ", so these desynced the skip and the DELETE was missed.
+    expect(isMutation("WITH x AS (SELECT 1 AS `a(`) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH x AS (SELECT 1 AS `a)`) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH x AS (SELECT 1 AS [a(]) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH x AS (SELECT 1 AS [a)]) UPDATE events SET y = 1")).toBe(true);
+    expect(isMutation("WITH x AS (SELECT 1 AS `a(`) INSERT INTO events VALUES (1)")).toBe(true);
+  });
+
+  it("is not fooled by a doubled-quote-escaped CTE name (CVE-class bypass)", () => {
+    // `"a""b"` is one identifier (a"b); the old regex matched only `"a"` and
+    // desynced the parse, leaving 'with' as the leading keyword. INSERT/UPDATE
+    // variants too.
+    expect(isMutation('WITH "a""b" AS (SELECT 1) DELETE FROM events')).toBe(true);
+    expect(isMutation("WITH `a``b` AS (SELECT 1) DELETE FROM events")).toBe(true);
+    expect(isMutation('WITH "a""b" AS (SELECT 1) INSERT INTO events VALUES (1)')).toBe(true);
+    expect(isMutation("WITH `a``b` AS (SELECT 1) UPDATE events SET y = 1")).toBe(true);
+    // A doubled-quote-named CTE before a genuine SELECT stays non-mutating.
+    expect(isMutation('WITH "a""b" AS (SELECT 1) SELECT * FROM "a""b"')).toBe(false);
+  });
 });
 
 // The write-target extractor backs mutationTargetIsInternal, the admin-only
@@ -157,6 +180,13 @@ describe("mutationWriteTarget", () => {
       "__cf_fenced_vbuckets",
     );
     expect(mutationWriteTarget("WITH x AS (SELECT '--') DELETE FROM events")).toBe("events");
+  });
+
+  it("extracts the target through a paren in a backtick/bracket identifier, and a doubled-quote CTE name (unified quote walker)", () => {
+    expect(mutationWriteTarget("WITH x AS (SELECT 1 AS `a(`) DELETE FROM __cf_row_owners")).toBe("__cf_row_owners");
+    expect(mutationWriteTarget("WITH x AS (SELECT 1 AS [a)]) DELETE FROM events")).toBe("events");
+    expect(mutationWriteTarget('WITH "a""b" AS (SELECT 1) DELETE FROM __cf_row_owners')).toBe("__cf_row_owners");
+    expect(mutationWriteTarget("WITH `a``b` AS (SELECT 1) DELETE FROM events")).toBe("events");
   });
 
   it("fail-closed (null) on non-DML or an ambiguous/three-part target", () => {
@@ -215,6 +245,22 @@ describe("mutationTargetIsInternal (admin /v1/sql write guardrail)", () => {
     // write through; the quote-aware strip extracts the target correctly.
     expect(mutationTargetIsInternal("WITH x AS (SELECT '/*') DELETE FROM __cf_fenced_vbuckets")).toBe(true);
     expect(mutationTargetIsInternal("WITH x AS (SELECT '--') DELETE FROM __cf_fenced_vbuckets")).toBe(true);
+  });
+
+  it("blocks a backtick/bracket-quoted-paren CTE bypass targeting an internal table (CVE-class bypass)", () => {
+    // Paren inside a backtick/bracket identifier in the CTE body — must not
+    // desync the body-paren skip and hide the internal-table DELETE.
+    expect(mutationTargetIsInternal("WITH x AS (SELECT 1 AS `a(`) DELETE FROM __cf_row_owners")).toBe(true);
+    expect(mutationTargetIsInternal("WITH x AS (SELECT 1 AS [a(]) DELETE FROM __cf_row_owners")).toBe(true);
+    expect(mutationTargetIsInternal("WITH x AS (SELECT 1 AS `a)`) DELETE FROM __cf_row_owners")).toBe(true);
+    expect(mutationTargetIsInternal("WITH x AS (SELECT 1 AS `a(`) INSERT INTO __cf_row_owners VALUES (1)")).toBe(
+      true,
+    );
+  });
+
+  it("blocks a doubled-quote-CTE-name bypass targeting an internal table (CVE-class bypass)", () => {
+    expect(mutationTargetIsInternal('WITH "a""b" AS (SELECT 1) DELETE FROM __cf_row_owners')).toBe(true);
+    expect(mutationTargetIsInternal("WITH `a``b` AS (SELECT 1) DELETE FROM __cf_row_owners")).toBe(true);
   });
 
   it("ALLOWS a read-only CTE whose body string mentions a comment delimiter (no over-correction)", () => {
@@ -286,6 +332,13 @@ describe("extractCreateTableName", () => {
 
   it("returns null for a malformed statement", () => {
     expect(extractCreateTableName("CREATE TABLE (id TEXT PRIMARY KEY)")).toBe(null);
+  });
+
+  it("reads a doubled-quote-escaped name WHOLE (not truncated) so the caller's name-match check can't be desynced", () => {
+    // Old naive `"([^"]+)"` regex returned `a` for `"a""b"`; the escape-aware
+    // reader returns the real identifier a"b (and ``a`b`` for backticks).
+    expect(extractCreateTableName('CREATE TABLE "a""b" (id TEXT)')).toBe('a"b');
+    expect(extractCreateTableName("CREATE TABLE `a``b` (id TEXT)")).toBe("a`b");
   });
 });
 
