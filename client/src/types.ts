@@ -15,6 +15,9 @@ export interface MutateRequest {
   values?: Record<string, unknown>;
   where?: Record<string, unknown>;
   requestId?: string;
+  /** upsert only: the columns of the ON CONFLICT target. Defaults to
+   * [partitionKeyColumn] on the server when omitted (src/structured-op.ts). */
+  conflictColumns?: string[];
 }
 
 export interface MutateResponse {
@@ -30,7 +33,11 @@ export interface TxRequest {
 export interface TxResponse {
   ok: true;
   txId: string;
-  status: "committed";
+  /** "committed_pending_ack": durably committed, but one or more
+   * participants' commit acknowledgement is still outstanding and queued
+   * for alarm-driven retry (src/coordinator.ts) -- the transaction is
+   * committed either way, only the ack is pending. */
+  status: "committed" | "committed_pending_ack";
 }
 
 export interface IndexQueryRequest {
@@ -270,7 +277,12 @@ export interface DrainShardStatusResponse {
 }
 
 export interface BackfillProvenanceRequest {
-  catalogShardId: string;
+  /** Omit to run against every catalog shard -- only a full-cluster run
+   * (catalogShardId omitted) can ever flip a table's
+   * table_rules.provenance_complete to true (docs/SPEC.md). A scoped,
+   * single-catalog-shard run never certifies a table, since it only ever
+   * sees that one catalog shard's own shard pool. */
+  catalogShardId?: string;
 }
 
 export interface BackfillProvenanceResponse {
@@ -295,11 +307,11 @@ export interface TxStatusRequest {
   txId: string;
 }
 
-export interface TxStatusResponse {
-  txId: string;
-  status: string;
-  [key: string]: unknown;
-}
+/** src/coordinator.ts's handleTxStatus: {found: false} for an unknown
+ * txId, {found: true, status} for a known one -- never a bare txId/status
+ * pair, and no txId echoed back either way. Always check `found` before
+ * reading `status`. */
+export type TxStatusResponse = { found: false } | { found: true; status: string };
 
 export interface TxForceAbortRequest {
   txId: string;
@@ -308,4 +320,5 @@ export interface TxForceAbortRequest {
 export interface TxForceAbortResponse {
   ok: true;
   txId: string;
+  status: "aborted";
 }

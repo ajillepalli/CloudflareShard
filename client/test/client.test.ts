@@ -49,6 +49,15 @@ describe("CloudflareShardClient", () => {
     expect((calls[0].body as { requestId: string }).requestId).toBe("my-request-id");
   });
 
+  it("upsert() forwards conflictColumns as the ON CONFLICT target (Codex review: was missing from the type)", async () => {
+    const { fetchImpl, calls } = mockFetch(200, { ok: true, rowsAffected: 1 });
+    const client = new CloudflareShardClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    await client.upsert("events", "t1", "e1", { email: "a@example.com" }, ["email"]);
+
+    expect((calls[0].body as { conflictColumns: string[] }).conflictColumns).toEqual(["email"]);
+  });
+
   it("tx() fills in requestId when omitted, since the server rejects it as missing otherwise", async () => {
     const { fetchImpl, calls } = mockFetch(200, { ok: true, txId: "tx-1", status: "committed" });
     const client = new CloudflareShardClient({ baseUrl: "http://x", token: "t", fetchImpl });

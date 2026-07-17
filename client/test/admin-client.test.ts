@@ -41,6 +41,51 @@ describe("CloudflareShardAdminClient", () => {
     expect(calls[0].body).toEqual({ shardId: "catalog-0-shard-0" });
   });
 
+  it("backfillProvenance() defaults to a full-cluster run (catalogShardId omitted) -- only that mode can certify a table (Codex review)", async () => {
+    const { fetchImpl, calls } = mockFetch(200, { attributed: 0, ambiguous: [], orphaned: [] });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    await client.backfillProvenance();
+
+    expect(calls[0].body).toEqual({});
+  });
+
+  it("backfillProvenance() still accepts an explicit catalogShardId to scope the run", async () => {
+    const { fetchImpl, calls } = mockFetch(200, { attributed: 0, ambiguous: [], orphaned: [] });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    await client.backfillProvenance({ catalogShardId: "catalog-0" });
+
+    expect(calls[0].body).toEqual({ catalogShardId: "catalog-0" });
+  });
+
+  it("txStatus() returns the actual found/status shape, not a bare txId/status pair (Codex review)", async () => {
+    const { fetchImpl } = mockFetch(200, { found: true, status: "committed" });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.txStatus({ txId: "tx-1" });
+
+    expect(res).toEqual({ found: true, status: "committed" });
+  });
+
+  it("txStatus() reports found: false for an unknown txId, with no status field at all", async () => {
+    const { fetchImpl } = mockFetch(200, { found: false });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.txStatus({ txId: "unknown-tx" });
+
+    expect(res).toEqual({ found: false });
+  });
+
+  it("txForceAbort() reports the resulting status: 'aborted' (Codex review: was missing from the type)", async () => {
+    const { fetchImpl } = mockFetch(200, { ok: true, txId: "tx-1", status: "aborted" });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.txForceAbort({ txId: "tx-1" });
+
+    expect(res.status).toBe("aborted");
+  });
+
   describe("waitForIndexReady()", () => {
     it("resolves as soon as status flips to 'ready'", async () => {
       const { fetchImpl } = mockFetchSequence([

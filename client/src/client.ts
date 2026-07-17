@@ -66,14 +66,17 @@ export class CloudflareShardClient extends HttpClient {
     return this.mutate({ op: "delete", table, tenantId, partitionKey, where, requestId });
   }
 
+  /** conflictColumns sets the ON CONFLICT target explicitly; defaults to
+   * [partitionKeyColumn] on the server when omitted. */
   async upsert(
     table: string,
     tenantId: string,
     partitionKey: string,
     values: Record<string, unknown>,
+    conflictColumns?: string[],
     requestId?: string,
   ): Promise<MutateResponse> {
-    return this.mutate({ op: "upsert", table, tenantId, partitionKey, values, requestId });
+    return this.mutate({ op: "upsert", table, tenantId, partitionKey, values, conflictColumns, requestId });
   }
 
   /** Atomically commits a batch of mutations, possibly spanning multiple

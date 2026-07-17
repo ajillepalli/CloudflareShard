@@ -207,9 +207,12 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
   }
 
   /** Attributes rows written before row-provenance tracking existed to
-   * their owning tenant, on every shard belonging to catalogShardId.
-   * `ambiguous` rows need a manual setRowOwner() call. */
-  async backfillProvenance(request: BackfillProvenanceRequest): Promise<BackfillProvenanceResponse> {
+   * their owning tenant. Omit catalogShardId (the default) to run against
+   * every catalog shard -- only a full-cluster run can ever certify a
+   * table's provenance as complete (see BackfillProvenanceRequest's doc
+   * comment); pass catalogShardId to scope it to one catalog shard's own
+   * pool instead. `ambiguous` rows need a manual setRowOwner() call. */
+  async backfillProvenance(request: BackfillProvenanceRequest = {}): Promise<BackfillProvenanceResponse> {
     return this.post<BackfillProvenanceResponse>("/admin/backfill-provenance", request);
   }
 

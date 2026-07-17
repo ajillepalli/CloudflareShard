@@ -128,4 +128,34 @@ await step("error normalization (indexQuery with a bogus index)", async () => {
   }
 });
 
+// The following steps target fixes from Codex review round 1 on PR #24 --
+// each one previously had an inaccurate type, verified here against the
+// real server (not just mocked-fetch unit tests).
+
+await step("upsert() with conflictColumns", async () => {
+  const res = await tenant.upsert(table, tenantId, "row-1", { v: "alpha-updated" }, ["id"]);
+  assert.equal(res.ok, true);
+  const check = await tenant.indexQuery({ table, indexName, tenantId, values: { v: "alpha-updated" } });
+  assert.equal(check.rows.length, 1);
+  assert.equal(check.rows[0].id, "row-1");
+});
+
+await step("backfillProvenance() full-cluster (catalogShardId omitted)", async () => {
+  const res = await admin.backfillProvenance();
+  assert.equal(typeof res.attributed, "number");
+  assert.ok(Array.isArray(res.ambiguous));
+  assert.ok(Array.isArray(res.orphaned));
+});
+
+await step("txStatus() found/status shape", async () => {
+  const txRes = await tenant.tx([{ op: "insert", table, tenantId, partitionKey: "row-tx-status", values: { v: "delta" } }]);
+  const status = await admin.txStatus({ txId: txRes.txId });
+  assert.equal(status.found, true);
+  assert.equal(typeof status.status, "string");
+
+  const unknown = await admin.txStatus({ txId: "no-such-tx-id" });
+  assert.equal(unknown.found, false);
+  assert.equal("status" in unknown, false);
+});
+
 process.stdout.write("\nAll live verification steps passed.\n");
