@@ -100,6 +100,31 @@ describe("Worker multi-catalog-shard fan-out", () => {
     expect(res.status).toBe(401);
   });
 
+  it("/admin/vbucket-map returns a controlled admin error (not malformed output) when a catalog shard's response body is malformed", async () => {
+    // Pre-PR review fix 4 (Codex, medium): adminVbucketMapCore used to cast
+    // each catalog's /vbucket-map response straight through without checking
+    // its shape. Simulate a bad/stale catalog by corrupting catalog-1's
+    // underlying storage directly (same technique as the migration-state test
+    // above) so its OWN unmodified /vbucket-map handler naturally returns a
+    // non-numeric totalVBuckets — SQLite's INTEGER-affinity column silently
+    // stores the non-numeric string as TEXT instead of rejecting it, so this
+    // is a realistic "old/partial catalog" scenario, not a test-only shortcut.
+    await initCluster(2, 64);
+    const catalog1Stub = env.CATALOG.get(env.CATALOG.idFromName("catalog-1"));
+    await runInDurableObject(catalog1Stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE cluster_config SET total_vbuckets = 'not-a-number' WHERE singleton = 1",
+      );
+    });
+    const res = await post("/admin/vbucket-map", {}, AUTH());
+    // Must be a controlled admin error, not a 200 with malformed JSON and not
+    // an unhandled crash.
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string; catalogShardId: string };
+    expect(body.error).toContain("catalog-1");
+    expect(body.catalogShardId).toBe("catalog-1");
+  });
+
   it("/admin/split-vbucket requires catalogShardId", async () => {
     await initCluster();
     const res = await post("/admin/split-vbucket", { vbucket: 0 }, AUTH());

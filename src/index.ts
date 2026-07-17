@@ -1316,12 +1316,64 @@ async function adminVbucketMapCore(env: Env, authorization: string | undefined):
     totalVBuckets: number;
     map: VbucketMapRow[];
   };
+  // Pre-PR review fix 4 (Codex, medium): `r.body` is whatever the catalog
+  // shard's DO sent back over RPC/fetch — a bad, stale, or partially-migrated
+  // catalog binary could return a body missing `map` entirely or with rows
+  // that don't match VbucketMapRow's shape. Casting straight through (the old
+  // behavior) would silently propagate that malformed shape into the merged
+  // admin response instead of failing loudly, and could crash whatever
+  // downstream consumer trusts the documented shape. Validate before trusting.
+  for (const r of results) {
+    if (!isValidVbucketMapBody(r.body)) {
+      return json(
+        {
+          error: `Catalog shard ${r.catalogShardId} returned a malformed vbucket-map response.`,
+          catalogShardId: r.catalogShardId,
+        },
+        502,
+      );
+    }
+  }
   const catalogs: CatalogVbucketMap[] = results.map((r) => {
     const body = r.body as { totalVBuckets: number; map: VbucketMapRow[] };
     return { catalogShardId: r.catalogShardId, totalVBuckets: body.totalVBuckets, map: body.map };
   });
+  // NOTE: this is the SUM of each catalog's totalVBuckets across every
+  // catalog shard — a raw slot count, not a usable modulo base. vbucket IDs
+  // are catalog-local (see this function's header comment), so a consumer
+  // doing hashing/range math against a vbucket ID must use the matching
+  // catalog's own `catalogs[].totalVBuckets`, never this top-level sum.
+  // Kept for backward compatibility with existing callers of this field.
   const totalVBuckets = catalogs.reduce((sum, c) => sum + c.totalVBuckets, 0);
-  return json({ catalogShardCount: results.length, totalVBuckets, catalogs });
+  return json({
+    catalogShardCount: results.length,
+    // Total catalog-vbucket slot count across ALL catalog shards summed
+    // together — NOT a per-catalog modulo range. Use catalogs[].totalVBuckets
+    // for routing/hashing math against a specific catalog's vbucket IDs.
+    totalVBuckets,
+    catalogs,
+  });
+}
+
+/** Type guard for a single catalog shard's /vbucket-map response body.
+ * Pre-PR review fix 4: adminVbucketMapCore fans this out to every catalog
+ * shard and must not trust an old/partial/malformed body from any one of
+ * them before merging — see the call site's comment. */
+function isValidVbucketMapBody(body: unknown): body is { totalVBuckets: number; map: unknown[] } {
+  if (typeof body !== "object" || body === null) return false;
+  const b = body as { totalVBuckets?: unknown; map?: unknown };
+  if (typeof b.totalVBuckets !== "number" || !Number.isFinite(b.totalVBuckets)) return false;
+  if (!Array.isArray(b.map)) return false;
+  return b.map.every((row): boolean => {
+    if (typeof row !== "object" || row === null) return false;
+    const r = row as Record<string, unknown>;
+    if (typeof r.vbucket !== "number" || !Number.isFinite(r.vbucket)) return false;
+    if (typeof r.shardId !== "string") return false;
+    if (typeof r.migrationStatus !== "string") return false;
+    if (r.targetShardId !== null && typeof r.targetShardId !== "string") return false;
+    if (r.cutoverStartedAt !== null && typeof r.cutoverStartedAt !== "string") return false;
+    return true;
+  });
 }
 
 async function handleAdminVbucketMap(request: Request, env: Env): Promise<Response> {
