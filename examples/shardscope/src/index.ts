@@ -40,8 +40,12 @@
  * check every /api/* route already gets.
  * ============================================================================
  *
- * STATUS: Phase 1 skeleton. See README.md's "Status" section for exactly
- * what is stubbed vs. real.
+ * STATUS: the SPA (public/) is built and live for three of its five rail
+ * slots — Topology, Reshard (with the chaos "BREAK IT" panel folded in), and
+ * Edge; App and Playground remain disabled rail items ("Not built yet"). The
+ * SHARDSCOPE_GATE_TOKEN gate, the load/chaos engine, the Reshard console ops,
+ * and the aggregator's SSE poll are all live. See README.md's "Status"
+ * section for the full breakdown.
  */
 import { TopologyAggregator } from "./aggregator";
 import { LoadDriver } from "./load/load-driver";
@@ -149,12 +153,12 @@ function placeholderHtml(): string {
 </body>
 </html>
 `;
-  // TODO(shardscope): this is a Phase 1 stub only. The real dashboard is a
-  // four-room SPA (App / Topology / Reshard / Playground per DESIGN.md's
-  // layout section) served as static assets once it exists — see the
-  // commented-out [assets] block in wrangler.toml. Do not build the real UI
-  // inline in this string; this placeholder exists only to prove the Worker
-  // boots and to keep the dark theme correct from the very first commit.
+  // NOTE(shardscope): dead code kept as a documented fallback. The real
+  // dashboard now ships from public/ via the active [assets] block in
+  // wrangler.toml, which matches GET / before this Worker ever runs — this
+  // function is unreachable in practice. Left in place (dark theme intact)
+  // only in case [assets] is ever disabled; do not build real UI inline in
+  // this string.
 }
 
 const json = (data: unknown, status = 200): Response =>
