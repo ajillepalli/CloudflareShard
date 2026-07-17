@@ -21,7 +21,11 @@ if (!ADMIN_TOKEN) {
 // run the destructive init step against localhost by default; a non-local
 // target needs an explicit, unambiguous opt-in.
 const targetHost = new URL(BASE_URL).hostname;
-const isLocalTarget = targetHost === "127.0.0.1" || targetHost === "localhost" || targetHost === "::1";
+// Node's URL.hostname returns the bracketed form ("[::1]") for an IPv6
+// loopback URL like http://[::1]:8787, not the bare "::1" -- compare
+// against both forms so this documented local target isn't wrongly treated
+// as non-local.
+const isLocalTarget = targetHost === "127.0.0.1" || targetHost === "localhost" || targetHost === "::1" || targetHost === "[::1]";
 if (!isLocalTarget && process.env.I_UNDERSTAND_THIS_WILL_RESET_CLUSTER_TOPOLOGY !== "true") {
   console.error(
     `Refusing to run against non-local target ${BASE_URL}: this script calls /admin/init with force: true, ` +
