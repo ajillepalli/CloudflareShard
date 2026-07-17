@@ -154,7 +154,17 @@ await step("error normalization (indexQuery with a bogus index)", async () => {
 await step("upsert() with conflictColumns", async () => {
   const res = await tenant.upsert(table, tenantId, "row-1", { v: "alpha-updated" }, ["id"]);
   assert.equal(res.ok, true);
-  const check = await tenant.indexQuery({ table, indexName, tenantId, values: { v: "alpha-updated" } });
+  // Codex round-7 fix: /v1/mutate's index maintenance is dispatched via
+  // ctx.waitUntil and isn't guaranteed done by the time this call returns
+  // (docs/SPEC.md) -- querying immediately can legitimately race and see
+  // zero rows even on a correct deployment. Poll briefly instead of
+  // asserting on the first attempt.
+  let check;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    check = await tenant.indexQuery({ table, indexName, tenantId, values: { v: "alpha-updated" } });
+    if (check.rows.length > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   assert.equal(check.rows.length, 1);
   assert.equal(check.rows[0].id, "row-1");
 });
