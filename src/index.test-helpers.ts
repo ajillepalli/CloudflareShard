@@ -228,6 +228,25 @@ export async function driveMigrationToCompletion(vbucket: number, maxTicks = 25)
   throw new Error(`migration of vbucket ${vbucket} did not complete within ${maxTicks} ticks`);
 }
 
+/** Drives catalog-0's alarm-based index backfill (Codex live-deployment
+ * finding: /admin/create-index no longer backfills synchronously — it
+ * starts the alarm loop and returns immediately) until the index reports
+ * status 'ready' (completed), or the tick budget runs out. Mirrors
+ * driveMigrationToCompletion above exactly. */
+export async function driveIndexBackfillToCompletion(indexName: string, maxTicks = 25): Promise<void> {
+  const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  for (let tick = 0; tick < maxTicks; tick += 1) {
+    await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+    const statusRes = await post("/admin/create-index-status", { indexName }, AUTH());
+    const statusBody = (await statusRes.json()) as { status: string };
+    if (statusBody.status === "ready") return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`backfill of index ${indexName} did not complete within ${maxTicks} ticks`);
+}
+
 /** Finds `count` partition keys that all hash into the SAME vbucket as
  * `seedKey` for the given tenant/table (so a whole batch of writes exercises
  * one migrating vbucket). */

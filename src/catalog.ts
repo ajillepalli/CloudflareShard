@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "./http";
-import { hashKey, pickRingSubstitute } from "./hash";
+import { hashKey, pickRingSubstitute, indexShardIdForKey } from "./hash";
 import { checkAdminAuth, sha256Hex, timingSafeEqual } from "./auth";
 import { log } from "./log";
 import { MIGRATE_PAGE_SIZE } from "./shard";
@@ -26,7 +26,6 @@ const ADMIN_GATED_ROUTES = new Set([
   "/create-index",
   "/list-indexes",
   "/drop-index",
-  "/mark-index-ready",
   "/list-tenants",
   "/vbucket-map",
   "/migrate-vbucket",
@@ -34,6 +33,8 @@ const ADMIN_GATED_ROUTES = new Set([
   "/migrate-vbucket-abort",
   "/drain-shard-status",
   "/mark-table-provenance-complete",
+  "/start-index-backfill",
+  "/index-backfill-status",
 ]);
 
 // Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
@@ -62,6 +63,43 @@ const MIGRATION_TICK_MAX_MS = 30000;
 // completes on its own and clears the marker.
 const CUTOVER_PREPARED_WAIT_MAX_MS = 30000;
 
+// Codex live-deployment finding: bounds one index-backfill tick's work. Each
+// row costs one subrequest to refresh its current value immediately before
+// writing (Codex round 6: this can no longer be batched once per page --
+// see advanceIndexBackfill's doc comment there) plus one subrequest to WRITE
+// its index entry, plus one subrequest to scan the page itself -- so a
+// tick's worst case is 2 * INDEX_BACKFILL_PAGE_SIZE + 1 subrequests,
+// comfortably under Cloudflare's per-invocation cap with headroom for
+// INDEX_RING_FENCED retries on a handful of rows.
+const INDEX_BACKFILL_PAGE_SIZE = 250;
+// Codex review P2 fix: re-heartbeat the topology lock partway through a full
+// page's write loop, not just once before the tick starts. A full 250-row
+// page's writes run serially (each one its own subrequest, some possibly
+// retried on INDEX_RING_FENCED) -- if that genuinely takes longer than
+// TOPOLOGY_LOCK_TTL_MS (30s), the lease could expire and another topology
+// operation acquire it while this tick is still writing entries, reopening
+// the exact race the lock exists to prevent. Mirrors the retired synchronous
+// backfill's BACKFILL_HEARTBEAT_ROW_INTERVAL, just scoped to one tick's page
+// instead of a whole shard's unbounded scan.
+const INDEX_BACKFILL_HEARTBEAT_ROW_INTERVAL = 50;
+
+/** Codex review P1 fix: distinguishes a backfill failure that CANNOT resolve
+ * itself no matter how many times the alarm retries (e.g. a row with no
+ * __cf_row_owners provenance entry -- only an explicit
+ * /admin/backfill-provenance run, a genuine operator action, ever fixes
+ * that) from an ordinary transient one (a network blip, contention, a
+ * momentarily-fenced ring position) that's safe to retry forever with
+ * backoff. Treating BOTH the same way -- which the alarm loop's shared
+ * per-item catch, copied from migration's, originally did -- meant a
+ * permanent failure left the topology lock held indefinitely: every later
+ * tick would heartbeat the SAME lock, throw the SAME error, and never
+ * release it, wedging every other create-index/drop-index/drain-shard/
+ * split-vbucket/migrate-vbucket call behind TOPOLOGY_OPERATION_IN_PROGRESS
+ * until an operator noticed and force-released it by hand -- strictly worse
+ * than the retired synchronous path, which surfaced this exact condition as
+ * an immediate, visible 409 and released its lock right away. */
+class PermanentIndexBackfillError extends Error {}
+
 type MigrationRow = {
   vbucket: number;
   shard_id: string;
@@ -69,6 +107,18 @@ type MigrationRow = {
   migration_status: string;
   migration_rows_copied: number;
   topology_lock_operation_id?: string | null;
+};
+
+type IndexBackfillRow = {
+  index_name: string;
+  table_name: string;
+  columns_json: string;
+  placement_ring_json: string;
+  backfill_shard_ids_json: string;
+  backfill_shard_idx: number;
+  backfill_after_pk: string;
+  backfill_rows_copied: number;
+  topology_lock_operation_id: string | null;
 };
 
 export class CatalogDO extends DurableObject {
@@ -118,6 +168,8 @@ export class CatalogDO extends DurableObject {
       "/mark-table-provenance-complete": this.handleMarkTableProvenanceComplete.bind(this),
       "/drop-index": this.handleDropIndex.bind(this),
       "/mark-index-ready": this.handleMarkIndexReady.bind(this),
+      "/start-index-backfill": this.handleStartIndexBackfill.bind(this),
+      "/index-backfill-status": this.handleIndexBackfillStatus.bind(this),
       "/list-tenants": this.handleListTenants.bind(this),
       "/vbucket-map": this.handleVbucketMap.bind(this),
       "/migrate-vbucket": this.handleMigrateVbucket.bind(this),
@@ -392,6 +444,28 @@ export class CatalogDO extends DurableObject {
     // gateway routes to the TENANT's catalog, not necessarily the draining one —
     // can always answer it.
     this.ensureColumn("index_rules", "evac_from_shards_json", "TEXT NOT NULL DEFAULT '[]'");
+
+    // Codex live-deployment finding: /admin/create-index used to backfill
+    // every existing row SYNCHRONOUSLY, inside the one HTTP invocation that
+    // registered the index -- 2+ subrequests per row (a fresh re-read plus
+    // an index-entry write), no batching, no chunking. A moderate table
+    // (a few thousand rows) exceeds Cloudflare's per-invocation subrequest
+    // cap outright, leaving the index wedged at status='building' forever
+    // with no way to retry past the same wall. Converted to the SAME
+    // alarm-driven, persisted-cursor pattern vbucket migration already uses
+    // (see vbucket_map's backfill_table/backfill_after_pk and this file's
+    // MIGRATION_TICK_MS-driven alarm()) -- only CATALOG-0's copy of a given
+    // index's row ever has non-empty backfill_shard_ids_json (see
+    // handleStartIndexBackfill); every other catalog shard's replica keeps
+    // these at their defaults, so the alarm's backfill loop naturally only
+    // ever does work on catalog-0, the single driver, exactly mirroring how
+    // /create-index's OWN backfill was always a single global operation
+    // before this fix, never a per-catalog one.
+    this.ensureColumn("index_rules", "backfill_shard_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("index_rules", "backfill_shard_idx", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("index_rules", "backfill_after_pk", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("index_rules", "backfill_rows_copied", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("index_rules", "topology_lock_operation_id", "TEXT");
 
     // Codex round-13 fix: per-(draining shard, index) ring-evacuation progress.
     // A row means "index_name's ring is being evacuated off shard_id onto
@@ -909,10 +983,17 @@ export class CatalogDO extends DurableObject {
     return { found: true };
   }
 
-  /** Eng-review fix: flips an index from 'building' to 'ready' once the
-   * Worker's backfill loop has fully completed. Called as the last step of
-   * /admin/create-index, after every shard has been scanned and every row's
-   * __cf_indexes entry written — before this, /lookup-index (and therefore
+  /** Eng-review fix: flips an index from 'building' to 'ready' once its
+   * backfill has fully completed. Originally called by the Worker (as the
+   * last step of a synchronous /admin/create-index, admin-gated like any
+   * other Worker-facing route) — now called ONLY catalog-to-catalog, by
+   * fanMarkIndexReady, once catalog-0's alarm-driven backfill (see
+   * advanceIndexBackfill) finishes every shard. Codex live-deployment
+   * finding: removed from ADMIN_GATED_ROUTES accordingly — a DO-to-DO fetch
+   * has no admin token to present, and (now that the Worker never calls this
+   * route at all) there's nothing left for that gate to protect; same
+   * DO-binding-only trust model handleUpdateIndexRing's sibling fan-out
+   * already uses. Before this flips, /lookup-index (and therefore
    * /v1/index-query) rejects reads against the index rather than silently
    * returning partial results for rows backfill hasn't reached yet. */
   private async handleMarkIndexReady(request: Request): Promise<Response> {
@@ -924,6 +1005,111 @@ export class CatalogDO extends DurableObject {
     if (!rule.found) return rule.response;
     this.sql.exec("UPDATE index_rules SET status = 'ready' WHERE index_name = ?", body.indexName);
     return json({ ok: true, indexName: body.indexName });
+  }
+
+  /** Codex live-deployment finding: starts (or resumes, if already stamped —
+   * idempotent, matching /create-index's own retry contract) catalog-0's
+   * alarm-driven backfill for an already-registered index. Only ever called
+   * by the Worker against catalog-0 specifically (never fanned out) — see
+   * this file's index_rules schema comment for why only catalog-0's row
+   * ever carries non-empty backfill_shard_ids_json. `backfillShardIds` is
+   * the data-holding shard set (active + draining) the Worker captured at
+   * /admin/create-index time; `operationId` is the topology lock the
+   * Worker acquired for "create-index" and is HANDING OFF here (mirroring
+   * split-vbucket's Stage 3 hand-off) — this DO now owns heartbeating and
+   * eventually releasing it, across as many alarm ticks as backfill needs. */
+  private async handleStartIndexBackfill(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string; backfillShardIds?: string[]; operationId?: string };
+    if (!body.indexName || !body.backfillShardIds) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName or backfillShardIds." } }, 400);
+    }
+    const rule = this.requireIndexRule(body.indexName);
+    if (!rule.found) return rule.response;
+    // Live-deployment finding (round 2): a retry of an already-'ready' index
+    // (idempotent registration matching an index whose backfill already
+    // finished) used to still report handedOff-equivalent success
+    // unconditionally, which made the WORKER's wrapper (adminCreateIndexCore)
+    // treat it as "backfill just started, catalog-0 now owns the lock" and
+    // never release the lock IT had just acquired for THIS call -- since
+    // there's nothing left to hand off to (backfill is already done), that
+    // lock then leaked forever, wedging every future topology operation
+    // until an operator manually /admin/force-release-topology-lock'd it.
+    // Checking status FIRST and skipping the UPDATE/alarm-arm entirely for an
+    // already-'ready' index closes this: handedOff:false tells the Worker
+    // there's nothing to hand off, so IT releases the lock it just acquired,
+    // exactly like split-vbucket's own "release if nothing was actually
+    // started" convention.
+    const current = this.one<{ status: string }>("SELECT status FROM index_rules WHERE index_name = ?", body.indexName);
+    if (current?.status === "ready") {
+      return json({ ok: true, indexName: body.indexName, status: "ready", handedOff: false });
+    }
+    // Codex review P1 fix: a 'failed' index (backfill hit a PermanentIndex-
+    // BackfillError -- e.g. a provenance gap -- and gave up, see alarm()'s
+    // catch) is a genuine RETRY target once the operator fixes the
+    // underlying issue, not a dead end. Resetting status back to 'building'
+    // re-arms the alarm.
+    //
+    // Codex round-3/5 fix: the failed attempt's backfill_shard_idx/
+    // backfill_after_pk cursor was ORIGINALLY preserved here so a retry could
+    // resume instead of rescanning every shard -- but the topology lock is
+    // released the moment a backfill gives up (see alarm()'s catch), and the
+    // gap between that release and this retry is exactly when an operator
+    // (or anyone else) is free to run /admin/split-vbucket, /admin/drain-
+    // shard, or /admin/migrate-vbucket. Round 3 caught the case where that
+    // changes WHICH shards exist (comparing the old vs. new backfillShardIds
+    // list); round 5 found a narrower one it missed -- migrating a vbucket
+    // moves rows between shards that were BOTH already in the list, with the
+    // list itself unchanged, so the list-comparison saw nothing to reset for.
+    // Reliably distinguishing "safe to resume" from "unsafe" would mean
+    // tracking a full topology/vbucket-map version stamp across the release
+    // window, just to save re-scanning a few already-completed shards on an
+    // operator-driven, rare, non-hot-path retry. Not worth the complexity or
+    // the risk of missing a THIRD variant of the same problem: always start
+    // a retried-from-'failed' backfill over from shard 0. Every write here is
+    // idempotent (INSERT OR REPLACE index entries), so re-scanning already-
+    // indexed shards costs some redundant work, never incorrect results.
+    this.sql.exec(
+      "UPDATE index_rules SET status = 'building', backfill_shard_ids_json = ?, backfill_shard_idx = 0, backfill_after_pk = '', topology_lock_operation_id = ? WHERE index_name = ? AND status IN ('building', 'failed')",
+      JSON.stringify(body.backfillShardIds),
+      body.operationId ?? null,
+      body.indexName,
+    );
+    const soon = Date.now() + MIGRATION_TICK_MS;
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > soon) {
+      await this.ctx.storage.setAlarm(soon);
+    }
+    return json({ ok: true, indexName: body.indexName, status: "building", handedOff: true });
+  }
+
+  /** Observability for the alarm-driven backfill, modeled directly on
+   * handleMigrateVbucketStatus. Status stays 'building' (index_rules'
+   * existing status column) for the whole backfill; this endpoint adds the
+   * progress detail migrate-vbucket-status already gives migrations
+   * (rowsCopied, current shard cursor) so an operator isn't left guessing
+   * whether a 'building' index is progressing or wedged. */
+  private async handleIndexBackfillStatus(request: Request): Promise<Response> {
+    const body = (await request.json()) as { indexName?: string };
+    if (!body.indexName) {
+      return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName." } }, 400);
+    }
+    const row = this.one<IndexBackfillRow & { status: string }>(
+      "SELECT index_name, table_name, columns_json, placement_ring_json, backfill_shard_ids_json, backfill_shard_idx, backfill_after_pk, backfill_rows_copied, topology_lock_operation_id, status FROM index_rules WHERE index_name = ?",
+      body.indexName,
+    );
+    if (!row) {
+      return json({ error: { code: "INDEX_NOT_REGISTERED", message: `Index ${body.indexName} is not registered.` } }, 404);
+    }
+    const shardIds = JSON.parse(row.backfill_shard_ids_json) as string[];
+    return json({
+      indexName: row.index_name,
+      table: row.table_name,
+      status: row.status,
+      rowsCopied: row.backfill_rows_copied,
+      totalShards: shardIds.length,
+      currentShardIndex: row.backfill_shard_idx,
+      currentShardId: shardIds[row.backfill_shard_idx] ?? null,
+    });
   }
 
   /** Milestone 2, Chunk 6. Unregisters the index — the Worker calls this
@@ -2114,6 +2300,222 @@ export class CatalogDO extends DurableObject {
     this.applyIndexRingUpdate(indexName, ring, shadow);
   }
 
+  /** Codex live-deployment finding: fans an index's building→ready flip to
+   * every SIBLING catalog (each via its own already-existing
+   * /mark-index-ready route — no new sibling-side route needed, unlike
+   * fanUpdateIndexRing's /update-index-ring), then applies locally.
+   * Idempotent per-sibling exactly like /mark-index-ready itself; a thrown
+   * error here (a sibling unreachable) propagates to advanceIndexBackfill's
+   * caller, which treats it as a normal throwing tick — retried, with
+   * backoff, next alarm, leaving backfill_shard_idx already past every
+   * shard (so the retried fan-out is the ONLY remaining work, not a
+   * redundant re-scan). */
+  private async fanMarkIndexReady(indexName: string): Promise<void> {
+    const config = this.one<{ catalog_shard_count: number | null; catalog_shard_id: string | null }>(
+      "SELECT catalog_shard_count, catalog_shard_id FROM cluster_config WHERE singleton = 1",
+    );
+    const siblingCount = config?.catalog_shard_count ?? 0;
+    for (let i = 0; i < siblingCount; i += 1) {
+      const siblingId = `catalog-${i}`;
+      if (config?.catalog_shard_id === siblingId) continue; // self applied locally below
+      const stub = this.catalogEnv.CATALOG.get(this.catalogEnv.CATALOG.idFromName(siblingId));
+      const res = await stub.fetch("https://catalog.internal/mark-index-ready", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ indexName }),
+      });
+      if (!res.ok) throw new Error(`mark-index-ready failed on ${siblingId}: ${res.status}`);
+    }
+    this.sql.exec("UPDATE index_rules SET status = 'ready' WHERE index_name = ?", indexName);
+  }
+
+  /** Codex live-deployment finding: one alarm-tick's worth of index backfill
+   * work for ONE index (catalog-0 only — see index_rules schema comment).
+   * Returns true while more ticks are needed, false once this index is
+   * fully backfilled and flipped to 'ready'.
+   *
+   * Bounded to INDEX_BACKFILL_PAGE_SIZE rows per tick: scans the current
+   * shard's next page (one subrequest), then for each row re-reads its
+   * CURRENT values plus its __cf_row_owners tenant_id (one subrequest) and
+   * writes its index entry (one subrequest — this step can't batch, since
+   * different rows can hash to DIFFERENT index shards). The per-row refresh
+   * was briefly batched into one query for the whole page (an "Eng-review
+   * fix" for subrequest cost) but Codex round 6 found that widened the
+   * staleness window this refresh exists to close: a page can take up to
+   * INDEX_BACKFILL_PAGE_SIZE write round trips, and a concurrent /v1/mutate
+   * on a row not yet written can land anywhere in that window, not just
+   * between the scan and a single page-level read. Reverted to reading each
+   * row immediately before ITS OWN write narrows the race back to one
+   * read-then-write round trip per row, matching the original synchronous
+   * version's own reasoning here. */
+  private async advanceIndexBackfill(row: IndexBackfillRow): Promise<boolean> {
+    const shardIds = JSON.parse(row.backfill_shard_ids_json) as string[];
+    if (row.backfill_shard_idx >= shardIds.length) {
+      // Every shard already scanned (a prior tick advanced the cursor but a
+      // later step — the ready-flip fan-out — threw and left this
+      // unfinished). Just retry completion; no scanning work left.
+      await this.fanMarkIndexReady(row.index_name);
+      this.sql.exec(
+        "UPDATE index_rules SET backfill_shard_ids_json = '[]', backfill_shard_idx = 0, backfill_after_pk = '', topology_lock_operation_id = NULL WHERE index_name = ?",
+        row.index_name,
+      );
+      await this.releaseTopologyLockRemote(row.topology_lock_operation_id);
+      return false;
+    }
+
+    const columns = JSON.parse(row.columns_json) as string[];
+    const table = this.one<{ partition_key_column: string }>("SELECT partition_key_column FROM table_rules WHERE table_name = ?", row.table_name);
+    if (!table) throw new Error(`table ${row.table_name} no longer registered mid-backfill`);
+    const pkCol = table.partition_key_column;
+    const safeTable = `"${row.table_name}"`;
+    const safePk = `"${pkCol}"`;
+    const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
+    const shardId = shardIds[row.backfill_shard_idx];
+
+    // Codex review P1 fix: this shard's FIRST page (backfill_after_pk still
+    // at its '' default) must not filter with `WHERE pk > ''` at all. That
+    // predicate is only safe once a REAL previously-seen key is bound --
+    // SQLite's affinity rules convert a numeric-looking TEXT parameter (e.g.
+    // "251") for comparison against an INTEGER-affinity column, so later
+    // pages compare correctly (proven directly: `WHERE id > '250'` against
+    // an INTEGER PRIMARY KEY column correctly returns only rows > 250). An
+    // EMPTY string parameter doesn't convert the same way: SQLite's type
+    // ordering ranks any INTEGER below any TEXT, so `id > ''` is FALSE for
+    // every existing integer value, not true -- the first page would
+    // silently scan zero rows on any table using a non-TEXT-affinity
+    // partition key column, and the shard-exhausted branch below would then
+    // advance past it as if it had no data at all, permanently skipping
+    // every pre-existing row. Omitting the predicate entirely for the
+    // sentinel case sidesteps the whole affinity question -- ORDER BY +
+    // LIMIT alone correctly return "the first page," for any column type.
+    const hasCursor = row.backfill_after_pk !== "";
+    const scanRes = await this.callShard(shardId, "/execute", {
+      sql: hasCursor
+        ? `SELECT ${selectCols} FROM ${safeTable} WHERE ${safePk} > ? ORDER BY ${safePk} ASC LIMIT ?`
+        : `SELECT ${selectCols} FROM ${safeTable} ORDER BY ${safePk} ASC LIMIT ?`,
+      params: hasCursor ? [row.backfill_after_pk, INDEX_BACKFILL_PAGE_SIZE] : [INDEX_BACKFILL_PAGE_SIZE],
+      requestId: `create-index-backfill-scan-${row.index_name}-${shardId}-${crypto.randomUUID()}`,
+      isMutation: false,
+    });
+    // Codex round-4 fix: callShard resolves (doesn't reject) for a
+    // well-formed HTTP error response -- a genuinely transient failure
+    // (the shard DO unavailable, a network blip) throws instead and is
+    // caught by alarm()'s own try/catch below as an ordinary retryable
+    // error. A resolved !ok response here means the shard's /execute
+    // handler itself rejected this exact query (shard.ts's only non-2xx
+    // path for a read-only scan is its catch-all "SQL execution failed",
+    // e.g. the table or an indexed column is missing on THIS shard) --
+    // that can never self-resolve by retrying the same query against the
+    // same shard schema, so (like PROVENANCE_MISSING_FOR_INDEX) it must
+    // give up and release the lock rather than heartbeat it forever.
+    if (!scanRes.ok) {
+      const errorText = await scanRes.text().catch(() => "");
+      throw new PermanentIndexBackfillError(
+        `backfill scan failed on shard ${shardId} for index ${row.index_name}, table ${row.table_name} (HTTP ${scanRes.status}): ${errorText || "no response body"} -- likely a schema mismatch (the table or an indexed column may be missing on this shard); an operator must reconcile the shard's schema, then retry`,
+      );
+    }
+    const scanBody = (await scanRes.json()) as { rows: Array<Record<string, unknown>> };
+    const page = scanBody.rows;
+
+    if (page.length === 0) {
+      // This shard is exhausted -- advance to the next one and keep ticking
+      // (or finish, if that was the last shard).
+      this.sql.exec(
+        "UPDATE index_rules SET backfill_shard_idx = ?, backfill_after_pk = '' WHERE index_name = ? AND status = 'building'",
+        row.backfill_shard_idx + 1,
+        row.index_name,
+      );
+      // Always one more tick: either to scan the next shard, or (if that was
+      // the last one) to run this same method's completion branch above.
+      return true;
+    }
+
+    const pageKeys = page.map((r) => String(r[pkCol]));
+
+    // Codex round-6 fix: refresh each row IMMEDIATELY before writing its
+    // index entry, not once for the whole page up front. A page can take up
+    // to INDEX_BACKFILL_PAGE_SIZE write round trips; a live /v1/mutate can
+    // update this exact row's indexed column(s) at any point during that
+    // window. A page-level batched read (the prior "Eng-review fix",
+    // reverted here) snapshots every row's value ONCE before any writes
+    // start -- if a row changes between that snapshot and this row's turn in
+    // the loop, the backfill would write a now-STALE index_key_json entry
+    // that the live write's own index maintenance has no way to know about
+    // or clean up (it only touches the key pair for ITS OWN write).
+    // __cf_indexes is keyed by index_key_json, so that stale entry can
+    // persist forever once the index reaches 'ready', and enough of them for
+    // the same logical key can exhaust /v1/index-query's rawScanCap and hide
+    // later live matches. Costs one extra subrequest per row (matching
+    // INDEX_BACKFILL_PAGE_SIZE's doc comment, updated below) -- still
+    // comfortably under Cloudflare's per-invocation cap per tick.
+    const placementRing = JSON.parse(row.placement_ring_json) as string[];
+    let rowsWritten = 0;
+    let rowsSinceHeartbeat = 0;
+    for (const pk of pageKeys) {
+      const freshRes = await this.callShard(shardId, "/execute", {
+        sql: `SELECT ${selectCols}, ro.tenant_id AS __cf_tenant_id FROM ${safeTable} b LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b.${safePk} WHERE b.${safePk} = ?`,
+        params: [row.table_name, pk],
+        requestId: `create-index-backfill-refresh-${row.index_name}-${shardId}-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!freshRes.ok) throw new Error(`backfill refresh failed for partitionKey ${pk} on shard ${shardId}, index ${row.index_name}: ${freshRes.status}`);
+      const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown> & { __cf_tenant_id: string | null }> };
+      const freshRow = freshBody.rows[0];
+      if (!freshRow) continue; // deleted since the scan -- skip rather than index stale data
+      if (!freshRow.__cf_tenant_id) {
+        throw new PermanentIndexBackfillError(
+          `row ${pk} on shard ${shardId}, table ${row.table_name} has no row-provenance entry (__cf_row_owners) -- run /admin/backfill-provenance for this shard, then retry`,
+        );
+      }
+      rowsSinceHeartbeat += 1;
+      if (rowsSinceHeartbeat >= INDEX_BACKFILL_HEARTBEAT_ROW_INTERVAL) {
+        rowsSinceHeartbeat = 0;
+        if (!(await this.heartbeatTopologyLockOrPark(row.topology_lock_operation_id))) {
+          throw new Error(`topology lock lost partway through a backfill page for index ${row.index_name}`);
+        }
+      }
+      const tenantId = freshRow.__cf_tenant_id;
+      const indexKeyJson = JSON.stringify(columns.map((c) => freshRow[c] ?? null));
+      const sql =
+        "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+      const params = [row.table_name, row.index_name, indexKeyJson, pk, shardId, tenantId, new Date().toISOString()];
+      const requestId = `create-index-backfill-write-${row.index_name}-${crypto.randomUUID()}`;
+      const target = indexShardIdForKey(row.table_name, row.index_name, indexKeyJson, placementRing);
+      let wrote = await this.callShard(target, "/execute", { sql, params, requestId, isMutation: true, indexName: row.index_name });
+      if (!wrote.ok) {
+        // Codex round-14 P2 equivalent (see the retired Worker-side
+        // backfillWriteIndexEntry this replaces): on INDEX_RING_FENCED,
+        // re-resolve against THIS instance's own (always up to date —
+        // catalog-0 is the ring's canonical home) placement_ring_json
+        // instead of the possibly-stale copy captured when this tick
+        // started, and retry once against the substitute.
+        const errBody = (await wrote.clone().json().catch(() => ({}))) as { error?: { code?: string } };
+        if (errBody.error?.code === "INDEX_RING_FENCED") {
+          const freshRingRow = this.one<{ placement_ring_json: string }>("SELECT placement_ring_json FROM index_rules WHERE index_name = ?", row.index_name);
+          const freshRing = freshRingRow ? (JSON.parse(freshRingRow.placement_ring_json) as string[]) : [];
+          if (freshRing.length > 0) {
+            const resolved = indexShardIdForKey(row.table_name, row.index_name, indexKeyJson, freshRing);
+            if (resolved !== target) {
+              wrote = await this.callShard(resolved, "/execute", { sql, params, requestId, isMutation: true, indexName: row.index_name });
+            }
+          }
+        }
+        if (!wrote.ok) throw new Error(`backfill write failed for partitionKey ${pk} on index ${row.index_name}: ${wrote.status}`);
+      }
+      rowsWritten += 1;
+    }
+
+    const lastPk = pageKeys[pageKeys.length - 1];
+    const exhausted = page.length < INDEX_BACKFILL_PAGE_SIZE;
+    this.sql.exec(
+      exhausted
+        ? "UPDATE index_rules SET backfill_shard_idx = backfill_shard_idx + 1, backfill_after_pk = '', backfill_rows_copied = backfill_rows_copied + ? WHERE index_name = ? AND status = 'building'"
+        : "UPDATE index_rules SET backfill_after_pk = ?, backfill_rows_copied = backfill_rows_copied + ? WHERE index_name = ? AND status = 'building'",
+      ...(exhausted ? [rowsWritten, row.index_name] : [lastPk, rowsWritten, row.index_name]),
+    );
+    return true;
+  }
+
   /** Milestone 3, Chunk 5: one drain-orchestration step for one draining
    * shard, called from alarm(). Returns true while more ticks are needed.
    *
@@ -2807,6 +3209,75 @@ export class CatalogDO extends DurableObject {
         } catch (error) {
           log("catalog.drain_tick_failed", {
             shardId: d.shard_id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          anyActive = true;
+          anyThrew = true;
+        }
+      }
+
+      // Codex live-deployment finding: drive alarm-based index backfills.
+      // Only ever non-empty on catalog-0 — see index_rules schema comment —
+      // so this loop is a genuine no-op on every other catalog shard's own
+      // alarm firings (an empty result set, not wasted work).
+      const backfilling = this.many<IndexBackfillRow>(
+        "SELECT index_name, table_name, columns_json, placement_ring_json, backfill_shard_ids_json, backfill_shard_idx, backfill_after_pk, backfill_rows_copied, topology_lock_operation_id FROM index_rules WHERE status = 'building' AND backfill_shard_ids_json != '[]' ORDER BY index_name ASC",
+      );
+      for (const b of backfilling) {
+        try {
+          // Same Stage 3 lock-loss handling as migrations above: stop
+          // mutating this tick (every destructive step -- the ready-flip,
+          // the lock release -- lives inside advanceIndexBackfill) and keep
+          // ticking so a later tick notices if the lock situation resolves.
+          const stillHeld = await this.heartbeatTopologyLockOrPark(b.topology_lock_operation_id);
+          if (!stillHeld) {
+            log("catalog.index_backfill_topology_lock_lost", { indexName: b.index_name });
+            anyActive = true;
+            continue;
+          }
+          const stillActive = await this.advanceIndexBackfill(b);
+          anyActive = anyActive || stillActive;
+        } catch (error) {
+          if (error instanceof PermanentIndexBackfillError) {
+            // Codex review P1 fix: this specific error can NEVER resolve by
+            // simply retrying -- only an explicit operator action
+            // (/admin/backfill-provenance) can fix it. Retrying forever
+            // (the ordinary-error branch below) would hold this index's
+            // topology lock indefinitely, wedging every OTHER topology
+            // operation until someone happened to force-release it by
+            // hand. Give up instead: mark 'failed' (still non-'ready', so
+            // /v1/index-query keeps rejecting reads against it -- see
+            // handleLookupIndex's `status !== "ready"` gate), release the
+            // lock, and stop the alarm from matching this row again (the
+            // 'backfilling' query below also requires status = 'building',
+            // which this row no longer has, so leaving
+            // backfill_shard_ids_json populated can't make the alarm loop
+            // pick it back up). backfill_shard_idx/backfill_after_pk/
+            // backfill_shard_ids_json are left as-is purely for operator
+            // diagnostics (how far did the failed attempt get) -- Codex
+            // round 5 finding: handleStartIndexBackfill's 'failed'-retry
+            // branch does NOT resume this cursor (a same-shard-set vbucket
+            // migration in the release-to-retry window can move rows onto
+            // an already-scanned shard with no change to backfillShardIds
+            // at all, which a "did the shard list change" check can't catch)
+            // -- it always restarts the retried backfill from shard 0.
+            log("catalog.index_backfill_permanently_failed", {
+              indexName: b.index_name,
+              message: error.message,
+            });
+            this.sql.exec(
+              "UPDATE index_rules SET status = 'failed', topology_lock_operation_id = NULL WHERE index_name = ?",
+              b.index_name,
+            );
+            await this.releaseTopologyLockRemote(b.topology_lock_operation_id);
+            continue;
+          }
+          // Leave the cursor where it is and retry next tick -- every step
+          // is idempotent (INSERT OR REPLACE index-entry writes, a
+          // re-resolvable INDEX_RING_FENCED retry, a resumable scan
+          // cursor), the same reasoning migration ticks already rely on.
+          log("catalog.index_backfill_tick_failed", {
+            indexName: b.index_name,
             message: error instanceof Error ? error.message : String(error),
           });
           anyActive = true;
