@@ -334,6 +334,92 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     );
     expect(onPinned).toBe(1);
   });
+
+  // Codex round-3 review (PR #20): retrying a 'failed' backfill preserves its
+  // OLD numeric backfill_shard_idx/backfill_after_pk cursor, but the shard
+  // list it indexes into (backfillShardIds) is recomputed FRESH by the
+  // Worker on every /admin/create-index call. If the active+draining shard
+  // set changes between the original failed attempt and the retry (a shard
+  // fully drains and drops out of the list, here simulated directly), the
+  // stale cursor can point at the WRONG shard in the new list, silently
+  // skipping a shard that still has an unindexed row. handleStartIndexBackfill
+  // must detect the shard-list change and reset the cursor rather than
+  // resuming it blindly.
+  it("resets the backfill cursor (not resuming a stale shard index) when the shard list changed since a failed attempt, so no shard is silently skipped", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_topo_evt");
+
+    // Shard A (catalog-0-shard-0) gets a normal, fully-provenanced row —
+    // its backfill page completes cleanly, advancing the cursor to shard
+    // index 1 before the run below ever fails.
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    await post("/v1/mutate", { op: "insert", table: "idx_topo_evt", tenantId: tenantA, partitionKey: "row-a", values: { v: "alpha" } }, tokenA);
+
+    // Shard B (catalog-1-shard-0) — dataShardIds' position 1 — gets a row
+    // written directly, bypassing provenance (mirrors the
+    // PROVENANCE_MISSING_FOR_INDEX test): the tick that reaches shard index
+    // 1 throws PermanentIndexBackfillError immediately, before advancing
+    // past it, so backfill_shard_idx is left at 1 and backfill_after_pk at ''.
+    const shardB = env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0"));
+    await shardB.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_topo_evt (id, v) VALUES (?, ?)",
+          params: ["row-b-no-prov", "bravo"],
+          requestId: `topo-insert-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+
+    const res = await post("/admin/create-index", { indexName: "idx_topo_by_v", table: "idx_topo_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/create-index-status", { indexName: "idx_topo_by_v" }, AUTH());
+      if (((await statusRes.json()) as { status: string }).status === "failed") break;
+    }
+    const failedStatusRes = await post("/admin/create-index-status", { indexName: "idx_topo_by_v" }, AUTH());
+    expect(((await failedStatusRes.json()) as { status: string }).status).toBe("failed");
+
+    // Simulate the topology changing since the failed attempt: shard A
+    // fully drains and drops out of the active+draining set entirely. The
+    // NEXT /admin/create-index call recomputes dataShardIds as
+    // [catalog-1-shard-0, catalog-2-shard-0, catalog-3-shard-0] — shard B
+    // is now at position 0, not the position-1 the failed attempt's cursor
+    // still points at.
+    await runInDurableObject(env.CATALOG.get(env.CATALOG.idFromName("catalog-0")), async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM shards WHERE shard_id = ?", "catalog-0-shard-0");
+    });
+
+    // The operator fixes shard B's provenance gap before retrying.
+    const tenantB = tenantForCatalogShard(1, 4);
+    const setOwnerRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-1", shardId: "catalog-1-shard-0", table: "idx_topo_evt", partitionKey: "row-b-no-prov", tenantId: tenantB },
+      AUTH(),
+    );
+    expect(setOwnerRes.status).toBe(200);
+
+    const retry = await post("/admin/create-index", { indexName: "idx_topo_by_v", table: "idx_topo_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_topo_by_v");
+
+    // Shard B's row must be queryable — a stale cursor resuming at the old
+    // position 1 (now catalog-2-shard-0, empty) would have skipped it and
+    // still reached 'ready'.
+    const tokenB = await registerTenant(tenantB);
+    const queryRes = await post("/v1/index-query", { table: "idx_topo_evt", indexName: "idx_topo_by_v", tenantId: tenantB, values: { v: "bravo" } }, tokenB);
+    expect(queryRes.status).toBe(200);
+    const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(queryBody.rows.map((r) => r.id)).toEqual(["row-b-no-prov"]);
+  });
 });
 
 // Codex final-review P1 #1 (original synchronous version) / Codex

@@ -1038,7 +1038,10 @@ export class CatalogDO extends DurableObject {
     // there's nothing to hand off, so IT releases the lock it just acquired,
     // exactly like split-vbucket's own "release if nothing was actually
     // started" convention.
-    const current = this.one<{ status: string }>("SELECT status FROM index_rules WHERE index_name = ?", body.indexName);
+    const current = this.one<{ status: string; backfill_shard_ids_json: string }>(
+      "SELECT status, backfill_shard_ids_json FROM index_rules WHERE index_name = ?",
+      body.indexName,
+    );
     if (current?.status === "ready") {
       return json({ ok: true, indexName: body.indexName, status: "ready", handedOff: false });
     }
@@ -1051,8 +1054,26 @@ export class CatalogDO extends DurableObject {
     // backfill_after_pk cursor the earlier failed attempt left behind
     // (deliberately preserved, not cleared, by that catch branch) -- this
     // retry resumes rather than re-scanning from the very first shard.
+    //
+    // Codex round-3 fix: `backfillShardIds` is recomputed fresh by the
+    // Worker (active + draining shards) on every /admin/create-index call,
+    // including this retry -- if a split/migration changed the shard set
+    // (or its order) between the original attempt and this retry, the OLD
+    // numeric backfill_shard_idx cursor now indexes into a DIFFERENT
+    // physical shard than the one it was actually positioned in, and
+    // backfill_after_pk is a cursor into that wrong shard's keyspace. That
+    // combination can silently skip shards or rows before the index reaches
+    // 'ready'. The catch branch above deliberately preserves the FAILED
+    // attempt's shard list (never clearing it to '[]') specifically so this
+    // check can compare old vs. new; only resume the cursor as-is when the
+    // shard list is byte-for-byte identical, otherwise start over from
+    // shard 0 -- correctness over resuming a few pages sooner.
+    const previousShardIdsJson = current?.backfill_shard_ids_json;
+    const shardListUnchanged = previousShardIdsJson === JSON.stringify(body.backfillShardIds);
     this.sql.exec(
-      "UPDATE index_rules SET status = 'building', backfill_shard_ids_json = ?, topology_lock_operation_id = ? WHERE index_name = ? AND status IN ('building', 'failed')",
+      shardListUnchanged
+        ? "UPDATE index_rules SET status = 'building', backfill_shard_ids_json = ?, topology_lock_operation_id = ? WHERE index_name = ? AND status IN ('building', 'failed')"
+        : "UPDATE index_rules SET status = 'building', backfill_shard_ids_json = ?, backfill_shard_idx = 0, backfill_after_pk = '', topology_lock_operation_id = ? WHERE index_name = ? AND status IN ('building', 'failed')",
       JSON.stringify(body.backfillShardIds),
       body.operationId ?? null,
       body.indexName,
@@ -3205,19 +3226,25 @@ export class CatalogDO extends DurableObject {
             // hand. Give up instead: mark 'failed' (still non-'ready', so
             // /v1/index-query keeps rejecting reads against it -- see
             // handleLookupIndex's `status !== "ready"` gate), release the
-            // lock, and stop the alarm from matching this row again
-            // (backfill_shard_ids_json cleared) -- but deliberately
-            // PRESERVE backfill_shard_idx/backfill_after_pk (the cursor),
+            // lock, and stop the alarm from matching this row again (the
+            // 'backfilling' query below also requires status = 'building',
+            // which this row no longer has, so leaving
+            // backfill_shard_ids_json populated can't make the alarm loop
+            // pick it back up) -- but deliberately PRESERVE
+            // backfill_shard_idx/backfill_after_pk/backfill_shard_ids_json
+            // (the full cursor, including the shard list it indexes into),
             // so a retried /admin/create-index after the operator actually
             // fixes provenance resumes from where this left off instead of
             // re-scanning from the start (see handleStartIndexBackfill's
-            // 'failed'-retry branch).
+            // 'failed'-retry branch, which also uses the preserved shard
+            // list to detect whether topology changed since this failure
+            // and reset the cursor if so -- Codex round 3 finding).
             log("catalog.index_backfill_permanently_failed", {
               indexName: b.index_name,
               message: error.message,
             });
             this.sql.exec(
-              "UPDATE index_rules SET status = 'failed', backfill_shard_ids_json = '[]', topology_lock_operation_id = NULL WHERE index_name = ?",
+              "UPDATE index_rules SET status = 'failed', topology_lock_operation_id = NULL WHERE index_name = ?",
               b.index_name,
             );
             await this.releaseTopologyLockRemote(b.topology_lock_operation_id);
