@@ -4063,40 +4063,57 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/v1/scatter": handleV1Scatter,
 };
 
+/** Issue #35: every request's outcome, regardless of path (a known route, a
+ * 404, a 405, or the catch-all error handler below) -- separated from
+ * fetch() itself so there's exactly ONE call site that logs, rather than a
+ * log call duplicated before every return (easy to add a new return path
+ * later and forget it). Deliberately logs only path/method/status/duration
+ * -- never headers or body, which can carry tenant/admin bearer tokens. */
+async function handleRequest(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+  try {
+    if (request.method === "GET" && url.pathname === "/health") {
+      return json({ ok: true, service: "cloudflare-shard-mvp" });
+    }
+
+    if (request.method !== "POST") {
+      return json({ error: "Only POST is supported for this endpoint." }, 405);
+    }
+
+    // Structural safeguard: every /admin/* route requires the admin token,
+    // checked once here rather than trusting each handler to remember to call
+    // requireAdminAuth() itself (a per-handler check is exactly how
+    // /admin/shard-stats ended up unauthenticated). CatalogDO applies its own
+    // gate too for routes that pass through it — this is deliberately
+    // redundant defense-in-depth, not a replacement for it.
+    if (url.pathname.startsWith("/admin/")) {
+      const authError = requireAdminAuth(env, request);
+      if (authError) return authError;
+    }
+
+    const handler = ROUTES[url.pathname];
+    if (handler) {
+      return await handler(request, env, ctx);
+    }
+
+    return json({ error: `Unknown route: ${url.pathname}` }, 404);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log("worker.unhandled_error", { path: url.pathname, message });
+    return json({ error: "Internal error." }, 500);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    try {
-      const url = new URL(request.url);
-
-      if (request.method === "GET" && url.pathname === "/health") {
-        return json({ ok: true, service: "cloudflare-shard-mvp" });
-      }
-
-      if (request.method !== "POST") {
-        return json({ error: "Only POST is supported for this endpoint." }, 405);
-      }
-
-      // Structural safeguard: every /admin/* route requires the admin token,
-      // checked once here rather than trusting each handler to remember to call
-      // requireAdminAuth() itself (a per-handler check is exactly how
-      // /admin/shard-stats ended up unauthenticated). CatalogDO applies its own
-      // gate too for routes that pass through it — this is deliberately
-      // redundant defense-in-depth, not a replacement for it.
-      if (url.pathname.startsWith("/admin/")) {
-        const authError = requireAdminAuth(env, request);
-        if (authError) return authError;
-      }
-
-      const handler = ROUTES[url.pathname];
-      if (handler) {
-        return await handler(request, env, ctx);
-      }
-
-      return json({ error: `Unknown route: ${url.pathname}` }, 404);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log("worker.unhandled_error", { path: new URL(request.url).pathname, message });
-      return json({ error: "Internal error." }, 500);
-    }
+    const startedAt = Date.now();
+    const url = new URL(request.url);
+    const response = await handleRequest(request, env, ctx, url);
+    // Issue #35: one structured event per request, for every route and every
+    // outcome -- the uniform per-route latency/status signal that individual
+    // handlers logging their own ad-hoc events never gave, queryable via
+    // Cloudflare's Workers Logs (wrangler.toml's [observability] block) or
+    // `wrangler tail` once deployed.
+    log("http.request", { path: url.pathname, method: request.method, status: response.status, durationMs: Date.now() - startedAt });
+    return response;
   },
 };
