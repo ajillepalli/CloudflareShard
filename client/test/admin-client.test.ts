@@ -41,6 +41,16 @@ describe("CloudflareShardAdminClient", () => {
     expect(calls[0].body).toEqual({ shardId: "catalog-0-shard-0" });
   });
 
+  it("migrateVbucketStatus() surfaces toShard/startedAt as null for a vbucket with no active migration (Codex review: was typed as non-null string)", async () => {
+    const { fetchImpl } = mockFetch(200, { vbucket: 42, status: "none", fromShard: "catalog-0-shard-0", toShard: null, rowsCopied: 0, mirrorQueueDepth: 0, startedAt: null });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    const res = await client.migrateVbucketStatus({ catalogShardId: "catalog-0", vbucket: 42 });
+
+    expect(res.toShard).toBeNull();
+    expect(res.startedAt).toBeNull();
+  });
+
   it("backfillProvenance() defaults to a full-cluster run (catalogShardId omitted) -- only that mode can certify a table (Codex review)", async () => {
     const { fetchImpl, calls } = mockFetch(200, { attributed: 0, ambiguous: [], orphaned: [] });
     const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });

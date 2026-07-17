@@ -243,12 +243,24 @@ export interface MigrateVbucketStatusRequest {
 
 export interface MigrateVbucketStatusResponse {
   vbucket: number;
+  /** Usually one of "none" | "backfilling" | "cutover" |
+   * "cutover-blocked-on-prepared-intents" | "complete", but left as a plain
+   * string here rather than narrowed to a union -- src/catalog.ts treats
+   * migration_status as free-form and this SDK doesn't want to fall out of
+   * sync every time a new status value is added there. */
   status: string;
   fromShard: string;
-  toShard: string;
+  /** null before a migration has ever targeted this vbucket, or once one
+   * completes/aborts and target_shard_id is cleared (src/catalog.ts's
+   * handleMigrateVbucketStatus). */
+  toShard: string | null;
   rowsCopied: number;
   mirrorQueueDepth: number;
-  startedAt: string;
+  /** null for the same "no active/completed migration" cases as toShard. */
+  startedAt: string | null;
+  /** Only present when status is 'cutover-blocked-on-prepared-intents' --
+   * the txId(s) an operator needs to /admin/tx-force-abort to unstick it. */
+  blockedTxIds?: string[];
 }
 
 export interface DrainShardRequest {
