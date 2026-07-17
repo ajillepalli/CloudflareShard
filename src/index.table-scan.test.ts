@@ -351,6 +351,109 @@ describe("Worker /v1/table-scan (Milestone 4)", () => {
     expect(body.scan.shardCount).toBe(2);
   });
 
+  // Issue #33: /v1/table-scan is the only tenant route that fans out to
+  // every shard in a tenant's catalog-shard pool -- a per-tenant token
+  // bucket (CatalogDO.checkAndConsumeTableScanRateLimit, gated in
+  // handleLookupTableScan before the Worker ever reaches the fan-out)
+  // bounds how fast one tenant can drive that fan-out. These tests
+  // manipulate the stored bucket state directly (the established pattern
+  // in this file/session for time-based behavior) rather than making
+  // dozens of real HTTP round trips or waiting in real wall-clock time.
+  describe("per-tenant rate limiting on the fan-out (issue #33)", () => {
+    it("rejects a call with 429 RATE_LIMITED (naming a retryAfterMs) once the tenant's token bucket is exhausted", async () => {
+      await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+      await createIndexTestTable("scan_ratelimit_evt");
+      const tenantId = tenantForCatalogShard(0, 4);
+      const token = await registerTenant(tenantId);
+
+      const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+      await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "INSERT OR REPLACE INTO tenant_scan_rate_limit (tenant_id, tokens, last_refill_at) VALUES (?, ?, ?)",
+          tenantId,
+          0.5,
+          new Date().toISOString(),
+        );
+      });
+
+      const res = await post("/v1/table-scan", { tenantId, table: "scan_ratelimit_evt" }, token);
+      expect(res.status).toBe(429);
+      const body = (await res.json()) as { error: { code: string; retryAfterMs: number } };
+      expect(body.error.code).toBe("RATE_LIMITED");
+      expect(body.error.retryAfterMs).toBeGreaterThan(0);
+    });
+
+    it("does not rate-limit a tenant whose bucket has tokens available", async () => {
+      await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+      await createIndexTestTable("scan_ratelimit_ok_evt");
+      const tenantId = tenantForCatalogShard(0, 4);
+      const token = await registerTenant(tenantId);
+
+      const res = await post("/v1/table-scan", { tenantId, table: "scan_ratelimit_ok_evt" }, token);
+      expect(res.status).toBe(200);
+    });
+
+    it("refills over time -- a tenant with an old last_refill_at is not limited even from a near-empty bucket", async () => {
+      await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+      await createIndexTestTable("scan_ratelimit_refill_evt");
+      const tenantId = tenantForCatalogShard(0, 4);
+      const token = await registerTenant(tenantId);
+
+      const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+      await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "INSERT OR REPLACE INTO tenant_scan_rate_limit (tenant_id, tokens, last_refill_at) VALUES (?, ?, ?)",
+          tenantId,
+          0,
+          // Long enough ago that the sustained refill rate has produced
+          // well over 1 token since, regardless of the exact constant.
+          new Date(Date.now() - 60_000).toISOString(),
+        );
+      });
+
+      const res = await post("/v1/table-scan", { tenantId, table: "scan_ratelimit_refill_evt" }, token);
+      expect(res.status).toBe(200);
+    });
+
+    it("scopes the limit per tenant -- exhausting one tenant's bucket does not affect another tenant sharing the same catalog shard", async () => {
+      await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+      await createIndexTestTable("scan_ratelimit_scope_evt");
+      const tenantA = tenantForCatalogShard(0, 4);
+      const tokenA = await registerTenant(tenantA);
+      // A second, genuinely different tenant that ALSO routes to catalog-0
+      // -- tenantForCatalogShard always returns the FIRST "tenant-N" that
+      // hashes to the given catalog index, so find the next one after it by
+      // replicating its search directly rather than assuming an arbitrary
+      // suffix of tenantA hashes to the same catalog shard (it generally
+      // won't).
+      let tenantB = "";
+      for (let i = 0; ; i += 1) {
+        const candidate = `tenant-${i}`;
+        if (candidate !== tenantA && hashKey(candidate) % 4 === 0) {
+          tenantB = candidate;
+          break;
+        }
+      }
+      const tokenB = await registerTenant(tenantB);
+
+      const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+      await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          "INSERT OR REPLACE INTO tenant_scan_rate_limit (tenant_id, tokens, last_refill_at) VALUES (?, ?, ?)",
+          tenantA,
+          0,
+          new Date().toISOString(),
+        );
+      });
+
+      const resA = await post("/v1/table-scan", { tenantId: tenantA, table: "scan_ratelimit_scope_evt" }, tokenA);
+      expect(resA.status).toBe(429);
+
+      const resB = await post("/v1/table-scan", { tenantId: tenantB, table: "scan_ratelimit_scope_evt" }, tokenB);
+      expect(resB.status).toBe(200);
+    });
+  });
+
   // Fix (P1, drain-completeness gap found by 3 independent reviewers):
   // /list-shards used to default to ACTIVE-only shards for /v1/table-scan, so
   // a shard marked draining -- which still physically holds its base rows
