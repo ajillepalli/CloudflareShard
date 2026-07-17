@@ -59,6 +59,20 @@
       <span class="sep">·</span>
       <span class="sb-item safe" data-hook="sb-checksum" title="The migration checksum is a CUTOVER EVENT (computed once, inside cutover), not a continuously-readable invariant — this label reflects the cluster's live migration state, not a fabricated permanent &quot;OK&quot;.">checksum —</span>
     </div>
+
+    <!-- ============ SHARE + GUIDED TOUR ============
+         Frontend-only, no backend routes. "Take the tour" starts the tour
+         overlay below (see app.js's startTour/TOUR_STEPS); "Share this view"
+         copies a deep-link to the CURRENT room (+ tour state, if the tour is
+         running) via navigator.clipboard.writeText — see app.js's
+         handleShareClick/buildShareUrl. The address bar itself is kept in
+         sync on every room change via history.replaceState (no reload, no
+         history spam — see app.js's updateUrlForCurrentState, called from
+         setActiveRoom). -->
+    <div class="topbar-actions">
+      <button class="topbar-btn" type="button" data-hook="tour-start-btn" title="Start a short, hands-off narrated walkthrough of the hero story">Take the tour</button>
+      <button class="topbar-btn" type="button" data-hook="share-btn" title="Copy a link to this exact view">Share this view</button>
+    </div>
   </header>
 
   <div class="main">
@@ -824,6 +838,31 @@
       </div>
     </aside>
 
+  </div>
+
+  <!-- ============ GUIDED TOUR OVERLAY ============
+       Hidden by default; shown by app.js's startTour() (button click, or
+       boot-time `&tour=1` — see app.js's maybeAutoStartTour). DEMO-SAFE by
+       construction: every step only calls setActiveRoom() (switch room +
+       show a caption) — never a chaos/reshard mutation. Full-viewport fixed
+       overlay (blocks the rail/topbar behind it while open, same modal
+       pattern as #login-panel) so a tour step can't be interrupted by a
+       stray rail click mid-narration. All caption/title text below is
+       static app copy assigned via textContent (see app.js's
+       renderTourStep) — no innerHTML, matching this file's one XSS rule. -->
+  <div class="tour-overlay" data-hook="tour-overlay" hidden>
+    <div class="tour-card">
+      <div class="tour-card-head">
+        <span class="micro" data-hook="tour-step-indicator">1 / 1</span>
+        <button class="tour-skip-btn" type="button" data-hook="tour-skip-btn" title="Skip tour (Esc)">Skip ✕</button>
+      </div>
+      <div class="tour-title" data-hook="tour-title"></div>
+      <div class="tour-caption" data-hook="tour-caption"></div>
+      <div class="tour-controls">
+        <button class="tour-btn" type="button" data-hook="tour-back-btn">Back</button>
+        <button class="tour-btn tour-btn-primary" type="button" data-hook="tour-next-btn">Next</button>
+      </div>
+    </div>
   </div>
 </div>
 
