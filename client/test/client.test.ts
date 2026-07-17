@@ -80,6 +80,26 @@ describe("CloudflareShardClient", () => {
     });
   });
 
+  it("throws CloudflareShardError (not a raw SyntaxError) when an error response body isn't valid JSON (Codex review)", async () => {
+    const fetchImpl = (async () => new Response("<html>502 Bad Gateway</html>", { status: 502 })) as unknown as typeof fetch;
+    const client = new CloudflareShardClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    await expect(client.indexQuery({ table: "events", indexName: "events_by_v", tenantId: "t1", values: { v: "a" } })).rejects.toMatchObject({
+      name: "CloudflareShardError",
+      status: 502,
+    });
+  });
+
+  it("throws CloudflareShardError (not a raw SyntaxError) even for a 2xx response with a non-JSON body", async () => {
+    const fetchImpl = (async () => new Response("not json", { status: 200 })) as unknown as typeof fetch;
+    const client = new CloudflareShardClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+    await expect(client.indexQuery({ table: "events", indexName: "events_by_v", tenantId: "t1", values: { v: "a" } })).rejects.toMatchObject({
+      name: "CloudflareShardError",
+      status: 200,
+    });
+  });
+
   it("tableScanAll() pages through every shard's rows automatically until nextCursor is omitted", async () => {
     let call = 0;
     const fetchImpl = (async () => {

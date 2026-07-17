@@ -36,7 +36,17 @@ export class HttpClient {
       body: JSON.stringify(body ?? {}),
     });
     const text = await res.text();
-    const parsed: unknown = text.length > 0 ? JSON.parse(text) : {};
+    // Codex review: a non-JSON body (e.g. a Cloudflare/proxy 5xx HTML error
+    // page, or any malformed response) must never surface as a raw
+    // SyntaxError -- every failure mode this method can hit should come
+    // back as CloudflareShardError, with the real HTTP status attached,
+    // whether or not the body happened to be valid JSON.
+    let parsed: unknown;
+    try {
+      parsed = text.length > 0 ? JSON.parse(text) : {};
+    } catch {
+      throw new CloudflareShardError(res.status, text);
+    }
     if (!res.ok) {
       throw new CloudflareShardError(res.status, parsed);
     }
