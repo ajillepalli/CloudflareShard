@@ -8,11 +8,14 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:spa": "vitest run --config vitest.spa.config.ts",
     "smoke": "node scripts/smoke-test.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.2",
     "@cloudflare/workers-types": "^4.20260610.0",
+    "@types/jsdom": "^28.0.3",
+    "jsdom": "^29.1.1",
     "typescript": "^5.9.2",
     "vitest": "^4.1.10",
     "wrangler": "^4.24.0"
