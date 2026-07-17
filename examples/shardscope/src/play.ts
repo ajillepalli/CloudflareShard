@@ -66,8 +66,11 @@
  *      SHARD_API call is made — mirroring reshard.ts's parse*() style (throw
  *      PlayValidationError, never trust a browser-supplied shape). Arrays
  *      accepted from the browser (tx's `mutations`, sql's `params`) are
- *      length-bounded (MAX_TX_MUTATIONS, MAX_SQL_PARAMS) so a single request
- *      can't drive an unbounded fan-out or an unbounded loop.
+ *      length-bounded (MAX_TX_MUTATIONS, MAX_SQL_PARAMS), and browser-supplied
+ *      `values`/`where` objects (mutate, tx mutations, index-query) are
+ *      similarly key-count-bounded (MAX_OBJECT_KEYS, via requireRecord/
+ *      optionalRecord) — so a single request can't drive an unbounded
+ *      fan-out or an unbounded loop.
  * ============================================================================
  *
  * WHY RPC, NOT RAW HTTP FETCH (unlike ./chaos.ts's rawMutate): CloudflareShardRpc
@@ -188,11 +191,22 @@ function optionalNonEmptyString(value: unknown, field: string, maxLen = 256): st
   return requireNonEmptyString(value, field, maxLen);
 }
 
+// Every demo TPC-C row has well under 15 columns, so 64 is generous headroom
+// for any genuine `values`/`where` payload while still closing off an
+// unbounded-key-count object as a DoS/resource-exhaustion vector — the same
+// "browser input must be bounded" contract this file's header comment
+// (point 4) already applies to arrays via MAX_TX_MUTATIONS/MAX_SQL_PARAMS.
+const MAX_OBJECT_KEYS = 64;
+
 function requireRecord(value: unknown, field: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new PlayValidationError(`Missing or invalid "${field}" (must be a JSON object).`);
   }
-  return value as Record<string, unknown>;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).length > MAX_OBJECT_KEYS) {
+    throw new PlayValidationError(`"${field}" may contain at most ${MAX_OBJECT_KEYS} keys.`);
+  }
+  return record;
 }
 
 function optionalRecord(value: unknown, field: string): Record<string, unknown> | undefined {

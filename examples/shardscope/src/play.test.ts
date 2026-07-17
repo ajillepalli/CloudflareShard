@@ -266,6 +266,107 @@ describe("play.ts — extractScatterFromTable / playScatter scoping", () => {
 });
 
 // ============================================================================
+// Layer 1: regression coverage for core PR #29's CTE-header bypass hardening
+// (isMutation/isDangerous in ../../../src/sql-safety.ts) — proves the
+// Playground's read-only SQL/scatter consoles reject every bypass shape core
+// closed (MATERIALIZED hint, comment inside the CTE header, a string literal
+// containing "/*", a backtick-quoted identifier containing "(", a
+// doubled-quote-escaped CTE name, a non-ASCII CTE name, and a `$` mid a bare
+// CTE name), rather than assuming requireReadOnlySql's cross-boundary reuse
+// of core's classifiers (see this file's header comment, point 2) stays
+// correct with no Playground-level proof. Each payload is a genuine write
+// (terminal DELETE) wrapped in a CTE header shaped to desync a naive
+// classifier; before core's #29 hardening these all read as a harmless
+// leading "with"/SELECT and slipped through.
+// ============================================================================
+
+describe("play.ts — read-only console rejects core PR #29's CTE-header bypass payloads", () => {
+  const sqlBase = { warehouseId: 1 as const, table: "tpcc_customer" as const, partitionKey: "c-0001-000001" };
+
+  const bypassPayloads: Array<[string, string]> = [
+    ["MATERIALIZED hint before the CTE body", "WITH x AS MATERIALIZED (SELECT 1) DELETE FROM tpcc_customer"],
+    ["block comment between AS and the CTE body", "WITH x AS /*c*/ (SELECT 1) DELETE FROM tpcc_customer"],
+    ["string literal containing a block-comment opener", "WITH x AS (SELECT '/*') DELETE FROM tpcc_customer"],
+    ["backtick-quoted identifier containing a paren", "WITH x AS (SELECT 1 AS `a(`) DELETE FROM tpcc_customer"],
+    ["doubled-quote-escaped CTE name", 'WITH "a""b" AS (SELECT 1) DELETE FROM tpcc_customer'],
+    ["non-ASCII CTE name", "WITH 中 AS (SELECT 1) DELETE FROM tpcc_customer"],
+    ["`$` mid-identifier CTE name", "WITH x$y AS (SELECT 1) DELETE FROM tpcc_customer"],
+  ];
+
+  describe.each(bypassPayloads)("%s", (_label, sql) => {
+    it("parsePlaySqlInput throws PlayValidationError (does not let the write through)", () => {
+      expect(() => parsePlaySqlInput({ ...sqlBase, sql })).toThrow(PlayValidationError);
+    });
+
+    it("parsePlayScatterInput throws PlayValidationError (does not let the write through)", () => {
+      expect(() => parsePlayScatterInput({ sql })).toThrow(PlayValidationError);
+    });
+  });
+
+  it("sanity: a genuine read with the SAME wrapper fields is accepted (proves the rejections above are the read-only check, not the whitelist)", () => {
+    const input = parsePlaySqlInput({ ...sqlBase, sql: "SELECT * FROM tpcc_customer WHERE c_id = 1" });
+    expect(input.sql).toContain("SELECT");
+  });
+
+  it("does not over-correct: a genuine read-only CTE is still accepted by parsePlaySqlInput", () => {
+    const input = parsePlaySqlInput({ ...sqlBase, sql: "WITH x AS (SELECT 1) SELECT * FROM x" });
+    expect(input.sql).toContain("SELECT * FROM x");
+  });
+
+  it("does not over-correct: a genuine read-only CTE is still accepted by parsePlayScatterInput when it targets a single demo table", () => {
+    const input = parsePlayScatterInput({ sql: "WITH x AS (SELECT 1) SELECT * FROM tpcc_customer" });
+    expect(input.sql).toContain("tpcc_customer");
+  });
+});
+
+// ============================================================================
+// Layer 1: MAX_OBJECT_KEYS — values/where object key-count bound
+// ============================================================================
+
+describe("play.ts — values/where object key-count bound (MAX_OBJECT_KEYS)", () => {
+  function keyedObject(n: number): Record<string, number> {
+    return Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, i]));
+  }
+
+  it("rejects an over-cap values object on parsePlayMutateInput", () => {
+    expect(() =>
+      parsePlayMutateInput({ warehouseId: 1, op: "update", table: "tpcc_customer", partitionKey: "c-0001-000001", values: keyedObject(65) }),
+    ).toThrow(PlayValidationError);
+  });
+
+  it("accepts an at-cap values object on parsePlayMutateInput", () => {
+    const input = parsePlayMutateInput({ warehouseId: 1, op: "update", table: "tpcc_customer", partitionKey: "c-0001-000001", values: keyedObject(64) });
+    expect(Object.keys(input.values ?? {}).length).toBe(64);
+  });
+
+  it("rejects an over-cap where object on parsePlayMutateInput", () => {
+    expect(() =>
+      parsePlayMutateInput({ warehouseId: 1, op: "update", table: "tpcc_customer", partitionKey: "c-0001-000001", where: keyedObject(65) }),
+    ).toThrow(PlayValidationError);
+  });
+
+  it("rejects an over-cap values object inside a tx mutation entry", () => {
+    expect(() =>
+      parsePlayTxInput({
+        warehouseId: 1,
+        mutations: [{ op: "update", table: "tpcc_customer", partitionKey: "c-0001-000001", values: keyedObject(65) }],
+      }),
+    ).toThrow(PlayValidationError);
+  });
+
+  it("rejects an over-cap values object on parsePlayIndexQueryInput", () => {
+    expect(() =>
+      parsePlayIndexQueryInput({ warehouseId: 1, table: "tpcc_customer", indexName: "idx_customer_by_id", values: keyedObject(65) }),
+    ).toThrow(PlayValidationError);
+  });
+
+  it("accepts an under-cap values object on parsePlayIndexQueryInput", () => {
+    const input = parsePlayIndexQueryInput({ warehouseId: 1, table: "tpcc_customer", indexName: "idx_customer_by_id", values: keyedObject(10) });
+    expect(Object.keys(input.values).length).toBe(10);
+  });
+});
+
+// ============================================================================
 // Layer 1: execute*() functions — correct tenant/token/admin-token plumbing
 // ============================================================================
 
