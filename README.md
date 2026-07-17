@@ -29,6 +29,7 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 - `client/`: Typed TypeScript SDK + CLI for the HTTP API — see `client/README.md`. Recommended over hand-writing raw HTTP calls; the quickstart below leads with it.
 - `examples/rpc-consumer/`: Demo Worker calling the tenant data path over a Durable Object RPC / service binding instead of HTTP.
 - `examples/tpc-c-benchmark/`: TPC-C-derived OLTP benchmark and demo project.
+- `examples/shardscope/`: Live mission-control dashboard — topology visualization, operator reshard controls, and a chaos/load-testing panel. See `examples/shardscope/README.md`.
 
 ## Prerequisites
 
