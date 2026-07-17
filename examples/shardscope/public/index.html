@@ -270,8 +270,8 @@
           </div>
           <div class="app-panel-help">
             One button, one real <span class="mono">/v1/tx</span> call: a same-tenant, multi-row transaction across
-            the stock rows shown above (2–3 rows, well under <span class="mono">/v1/tx</span>'s real 8-participant
-            cap) — every row updates, or none does. This is <strong>not</strong> a full TPC-C order and
+            the first 2–3 of the stock rows shown above (well under <span class="mono">/v1/tx</span>'s real 8-participant
+            cap) — every row in the transaction updates, or none does. This is <strong>not</strong> a full TPC-C order and
             <strong>not</strong> a cross-tenant transaction; it is exactly what it looks like: one small, real,
             bounded two-phase-commit transaction, guarded by an optimistic-concurrency
             <span class="mono">where</span> clause on every row so a concurrent writer can't be silently

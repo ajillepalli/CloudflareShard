@@ -2745,6 +2745,16 @@ function handleAppWarehouseChange() {
  * pattern) so a concurrent writer — e.g. the load engine, if it's running
  * against this same tenant — can't be silently overwritten. */
 function handleAppTxClick() {
+  // Snapshot the tenant AND its rows together at click time, and lock the
+  // warehouse picker for the duration of the tx. Without this, switching
+  // tenant while a tx is in flight could re-enable the button with the
+  // previous tenant's rows still in appLastStockRows and fire a follow-up tx
+  // whose warehouseId (new tenant) and partitionKeys (old tenant) disagree —
+  // the server rejects it cleanly (tenant-scoped storage, tenantId derived
+  // from warehouseId), so it can't corrupt or cross tenants, but it's a
+  // confusing double-failure that briefly breaks this room's "the button
+  // acts on exactly the tenant on screen" invariant.
+  const txWarehouseId = appSelectedWarehouseId;
   const rows = appLastStockRows.slice(0, APP_MAX_RESTOCK_ROWS);
   if (rows.length < 2) return; // button is disabled below this floor; defensive no-op
 
@@ -2755,24 +2765,29 @@ function handleAppTxClick() {
     values: { s_quantity: (r.s_quantity || 0) + APP_RESTOCK_QTY },
     where: { s_quantity: r.s_quantity },
   }));
-  const body = { warehouseId: appSelectedWarehouseId, mutations };
+  const body = { warehouseId: txWarehouseId, mutations };
 
   el.appTxBtn.disabled = true;
+  el.appWarehouse.disabled = true;
   playFetch("/api/play/tx", body)
     .then((outcome) => {
+      el.appWarehouse.disabled = false;
       renderPlayResult(el.appTxResult, outcome);
       if (outcome.ok) {
-        logLine(`app/tx restock ${mutations.length} row(s) (wh ${body.warehouseId}) → committed`, "safe");
+        logLine(`app/tx restock ${mutations.length} row(s) (wh ${txWarehouseId}) → committed`, "safe");
         // Refresh both panels so the screen shows the committed values, not
         // the pre-tx snapshot — same "reflect real cluster state" rule every
-        // other room's post-write refresh already follows.
-        loadAppData(appSelectedWarehouseId);
+        // other room's post-write refresh already follows. Refresh the tenant
+        // the tx actually ran against; loadAppData's own appLoadSeq guard drops
+        // this if the user has since switched away.
+        loadAppData(txWarehouseId);
       } else {
-        logLine(`app/tx restock (wh ${body.warehouseId}) → ${outcome.status}`, "warn");
+        logLine(`app/tx restock (wh ${txWarehouseId}) → ${outcome.status}`, "warn");
         el.appTxBtn.disabled = false;
       }
     })
     .catch((err) => {
+      el.appWarehouse.disabled = false;
       renderPlayResult(el.appTxResult, { networkError: (err && err.message) || String(err) });
       el.appTxBtn.disabled = false;
     });
