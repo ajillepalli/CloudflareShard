@@ -104,6 +104,7 @@ import {
   parsePlayRouteInspectInput,
   playRouteInspect,
 } from "./play";
+import { generateScaffoldFiles, buildZip } from "./build";
 import type { Env } from "./env";
 
 export { TopologyAggregator, LoadDriver, TenantTokenStore };
@@ -507,6 +508,42 @@ export default {
       // warehouseId/table would.
       if (request.method === "POST" && url.pathname === "/api/play/route-inspect") {
         return runPlayOp(async () => playRouteInspect(env, parsePlayRouteInspectInput(await readPlayJsonBody(request))));
+      }
+    }
+
+    // /api/build/*: the "Build on it" panel (App room) — generates a REAL,
+    // runnable CloudflareShard starter repo (a small multi-tenant
+    // "inventory" app, service-bound to cloudflare-shard-mvp's
+    // CloudflareShardRpc entrypoint, mirroring examples/rpc-consumer) so a
+    // developer who watched the demo can leave with something they can
+    // actually run. See src/build.ts's header comment for the full
+    // accuracy/security contract (every generated line cross-checked
+    // against the real RPC surface; no secret ever appears in a generated
+    // file — generateScaffoldFiles() is a pure function with no Env access,
+    // so it's structurally incapable of embedding one). GATING
+    // CONFIRMATION: both routes below are /api/* routes, so they already
+    // passed the isGateAuthorized check at the top of this function (this
+    // code is unreachable otherwise) — same as every other /api/* family in
+    // this file.
+    if (url.pathname.startsWith("/api/build/")) {
+      // GET /api/build/manifest: the same file set as the zip below, as
+      // JSON — backs the frontend's inline browsable preview (no need to
+      // parse a zip client-side just to show file contents).
+      if (request.method === "GET" && url.pathname === "/api/build/manifest") {
+        return json({ files: generateScaffoldFiles() });
+      }
+      // GET /api/build/scaffold: the same file set, packaged as a
+      // dependency-free "stored" zip (src/build.ts's buildZip) and served
+      // as a real download.
+      if (request.method === "GET" && url.pathname === "/api/build/scaffold") {
+        const zipBytes = buildZip(generateScaffoldFiles());
+        return new Response(zipBytes, {
+          status: 200,
+          headers: {
+            "content-type": "application/zip",
+            "content-disposition": 'attachment; filename="cloudflareshard-inventory-starter.zip"',
+          },
+        });
       }
     }
 
