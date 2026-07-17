@@ -62,6 +62,53 @@ describe("isMutation", () => {
   it("is not fooled by a comment-then-WITH-then-comment stack", () => {
     expect(isMutation("-- a\nWITH x AS (SELECT 1) -- b\nDELETE FROM events")).toBe(true);
   });
+
+  it("is not fooled by a MATERIALIZED/NOT MATERIALIZED hint on a leading CTE (CVE-class bypass)", () => {
+    expect(isMutation("WITH x AS MATERIALIZED (SELECT 1) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH x AS NOT MATERIALIZED (SELECT 1) UPDATE events SET y = 1")).toBe(true);
+    // Multiple CTEs where only the LAST one carries the hint.
+    expect(
+      isMutation("WITH a AS (SELECT 1), b AS MATERIALIZED (SELECT 2) DELETE FROM events"),
+    ).toBe(true);
+    // Mixed case and arbitrary whitespace/newlines around the hint.
+    expect(isMutation("WITH x AS\n  mAtErIaLiZeD\n  (SELECT 1)\nDELETE FROM events")).toBe(true);
+    // Leading comments/whitespace before WITH, stacked with the hint.
+    expect(
+      isMutation("  -- op note\n  WITH x AS MATERIALIZED (SELECT 1) DELETE FROM events"),
+    ).toBe(true);
+  });
+
+  it("classifies a MATERIALIZED-hinted, WITH/CTE-prefixed SELECT as non-mutation (no over-correction)", () => {
+    expect(isMutation("WITH x AS MATERIALIZED (SELECT 1) SELECT * FROM x")).toBe(false);
+    expect(isMutation("WITH x AS NOT MATERIALIZED (SELECT 1) SELECT * FROM x")).toBe(false);
+    expect(isMutation("WITH x AS (SELECT 1) SELECT * FROM x")).toBe(false);
+    expect(isMutation("SELECT * FROM events")).toBe(false);
+  });
+
+  it("is not fooled by a comment lodged inside the CTE header (CVE-class bypass)", () => {
+    // Comment between AS and the body paren.
+    expect(isMutation("WITH x AS /*c*/ (SELECT 1) DELETE FROM events")).toBe(true);
+    // Comment between AS and the MATERIALIZED hint.
+    expect(isMutation("WITH x AS/*c*/MATERIALIZED (SELECT 1) DELETE FROM events")).toBe(true);
+    // Comment between the MATERIALIZED hint and the body paren.
+    expect(isMutation("WITH x AS  MATERIALIZED/*c*/ (SELECT 1) DELETE FROM events")).toBe(true);
+    // Comment between NOT and MATERIALIZED.
+    expect(isMutation("WITH x AS NOT/*c*/MATERIALIZED (SELECT 1) UPDATE events SET y = 1")).toBe(true);
+    // Line comment inside the header.
+    expect(isMutation("WITH x AS -- hint\n (SELECT 1) DELETE FROM events")).toBe(true);
+  });
+
+  it("does NOT let a comment delimiter inside a CTE-body string literal hide the mutation (no regression from quote-blind stripping)", () => {
+    // The `/*` lives inside a string literal — a quote-BLIND global comment
+    // strip would eat through end-of-input and delete the trailing DELETE,
+    // misclassifying this real mutation as a read. The quote-aware strip keeps
+    // it a mutation.
+    expect(isMutation("WITH x AS (SELECT '/*') DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH x AS (SELECT '--') DELETE FROM events")).toBe(true);
+    // And the reverse: a genuine read whose CTE body merely mentions a comment
+    // delimiter in a string is still non-mutating.
+    expect(isMutation("WITH x AS (SELECT '/*') SELECT * FROM x")).toBe(false);
+  });
 });
 
 // The write-target extractor backs mutationTargetIsInternal, the admin-only
@@ -102,6 +149,16 @@ describe("mutationWriteTarget", () => {
     expect(mutationWriteTarget("WITH x AS (SELECT 1) DELETE FROM events")).toBe("events");
   });
 
+  it("extracts the target through a comment delimiter held inside a CTE-body string literal (quote-aware)", () => {
+    // A quote-BLIND comment strip would eat from the `/*` inside the string to
+    // end-of-input, corrupting extraction to null; the quote-aware strip keeps
+    // the string intact and resolves the real DELETE target.
+    expect(mutationWriteTarget("WITH x AS (SELECT '/*') DELETE FROM __cf_fenced_vbuckets")).toBe(
+      "__cf_fenced_vbuckets",
+    );
+    expect(mutationWriteTarget("WITH x AS (SELECT '--') DELETE FROM events")).toBe("events");
+  });
+
   it("fail-closed (null) on non-DML or an ambiguous/three-part target", () => {
     expect(mutationWriteTarget("SELECT * FROM events")).toBeNull();
     expect(mutationWriteTarget("CREATE TABLE events (id TEXT)")).toBeNull();
@@ -137,6 +194,31 @@ describe("mutationTargetIsInternal (admin /v1/sql write guardrail)", () => {
     expect(mutationTargetIsInternal("DELETE/**/FROM __cf_row_owners")).toBe(true);
     expect(mutationTargetIsInternal("UPDATE `row_locks` SET x = 1")).toBe(true);
     expect(mutationTargetIsInternal("INSERT INTO [pending_intents] (x) VALUES (1)")).toBe(true);
+  });
+
+  it("blocks a MATERIALIZED-hinted CTE bypass targeting an internal table (CVE-class bypass)", () => {
+    expect(mutationTargetIsInternal("WITH x AS MATERIALIZED (SELECT 1) DELETE FROM __cf_fenced_vbuckets")).toBe(
+      true,
+    );
+  });
+
+  it("blocks a comment-in-CTE-header bypass targeting an internal table (CVE-class bypass)", () => {
+    expect(mutationTargetIsInternal("WITH x AS /*c*/ (SELECT 1) DELETE FROM __cf_fenced_vbuckets")).toBe(true);
+    expect(
+      mutationTargetIsInternal("WITH x AS/*c*/MATERIALIZED (SELECT 1) DELETE FROM __cf_fenced_vbuckets"),
+    ).toBe(true);
+  });
+
+  it("blocks a string-literal-comment CTE bypass targeting an internal table (quote-aware extraction)", () => {
+    // The comment delimiter lives inside a CTE-body string literal. A quote-BLIND
+    // strip would corrupt mutationWriteTarget (null) and let this internal-table
+    // write through; the quote-aware strip extracts the target correctly.
+    expect(mutationTargetIsInternal("WITH x AS (SELECT '/*') DELETE FROM __cf_fenced_vbuckets")).toBe(true);
+    expect(mutationTargetIsInternal("WITH x AS (SELECT '--') DELETE FROM __cf_fenced_vbuckets")).toBe(true);
+  });
+
+  it("ALLOWS a read-only CTE whose body string mentions a comment delimiter (no over-correction)", () => {
+    expect(mutationTargetIsInternal("WITH x AS (SELECT '/*') SELECT * FROM __cf_row_owners")).toBe(false);
   });
 
   it("ALLOWS a mutation to a normal table, even one that reads an internal table in a subquery", () => {

@@ -52,14 +52,19 @@ function skipBalancedParens(sql: string, start: number): number {
   return sql.length;
 }
 
-/** Skips past a leading "WITH [RECURSIVE] name [(cols)] AS (body) [, ...]"
- * common-table-expression clause to reach the terminal statement (SELECT,
- * INSERT, UPDATE, or DELETE — SQLite allows WITH before any of them). Without
- * this, "WITH x AS (SELECT 1) DELETE FROM t" reads as a harmless SELECT
- * because isMutation() only ever inspected the first keyword. Bails out
- * (returns the input unchanged) on anything that doesn't match the expected
- * CTE grammar — malformed input isn't valid SQL SQLite would execute as a
- * mutation anyway, so it's safe to leave unclassified here. */
+/** Skips past a leading "WITH [RECURSIVE] name [(cols)] AS [[NOT] MATERIALIZED]
+ * (body) [, ...]" common-table-expression clause to reach the terminal
+ * statement (SELECT, INSERT, UPDATE, or DELETE — SQLite allows WITH before any
+ * of them). Without this, "WITH x AS (SELECT 1) DELETE FROM t" reads as a
+ * harmless SELECT because isMutation() only ever inspected the first keyword.
+ * The optional MATERIALIZED / NOT MATERIALIZED hint (SQLite 3.35+) between AS
+ * and the opening paren must be consumed too — "WITH x AS MATERIALIZED
+ * (SELECT 1) DELETE FROM t" is the same bypass shape with the hint inserted,
+ * and previously made this function bail (see beforeBody check below) leaving
+ * the mutation unclassified. Bails out (returns the input unchanged) on
+ * anything that doesn't match the expected CTE grammar — malformed input
+ * isn't valid SQL SQLite would execute as a mutation anyway, so it's safe to
+ * leave unclassified here. */
 function skipLeadingCte(sql: string): string {
   if (!/^\s*with\b/i.test(sql)) return sql;
   let s = sql.replace(/^\s*with\s+(recursive\s+)?/i, "");
@@ -78,6 +83,15 @@ function skipLeadingCte(sql: string): string {
     if (!asMatch) return sql;
     s = s.slice(asMatch[0].length);
 
+    // Optional MATERIALIZED / NOT MATERIALIZED hint between AS and the body's
+    // opening paren (SQLite 3.35+). Must be consumed here, before the "(" check
+    // below, or a hinted CTE bails out and returns the un-skipped original —
+    // silently misclassifying the mutation that follows it.
+    const materializedMatch = /^\s*(not\s+)?materialized\s*/i.exec(s);
+    if (materializedMatch) {
+      s = s.slice(materializedMatch[0].length);
+    }
+
     const beforeBody = s.replace(/^\s+/, "");
     if (!beforeBody.startsWith("(")) return sql;
     s = s.slice(s.length - beforeBody.length);
@@ -92,9 +106,85 @@ function skipLeadingCte(sql: string): string {
   }
 }
 
+/** Removes SQL line comments (dash-dash to newline) and block comments from
+ * ANYWHERE in the SQL (each replaced with a space), while genuinely preserving
+ * quoted spans — single-quoted string literals and double-quote / backtick /
+ * bracket quoted identifiers (honoring the doubled-quote escape for the first
+ * three). This is the quote-aware counterpart the leading-keyword classifiers
+ * need: a comment can hide at any inter-token seam of a CTE header (between AS
+ * and the body paren, around the MATERIALIZED hint, etc.), and skipLeadingCte
+ * parses those seams with comment-blind regexes, so it must see comment-free
+ * text.
+ *
+ * Why not reuse stripComments(): that helper is NOT actually quote-aware (its
+ * doc comment overstates), so a block-comment opener inside a string literal
+ * fools it — e.g. a CTE body of SELECT 'BLOCK-OPEN' (an unterminated block
+ * opener held inside the string) makes stripComments eat everything through
+ * end-of-input, deleting the trailing DELETE and misclassifying a real mutation
+ * as a read. skipBalancedParens (used by skipLeadingCte) IS quote-aware and
+ * classifies that case correctly today, so this pre-strip must not regress it. */
+function stripCommentsPreservingStrings(sql: string): string {
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    // Quoted string / identifier span: copy verbatim through its matching
+    // close, so a `--` or `/*` inside it is never treated as a comment.
+    if (c === "'" || c === '"' || c === "`") {
+      out += c;
+      i += 1;
+      while (i < sql.length) {
+        out += sql[i];
+        if (sql[i] === c) {
+          if (sql[i + 1] === c) {
+            out += sql[i + 1]; // doubled quote = escaped, stays inside the span
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (c === "[") {
+      out += c;
+      i += 1;
+      while (i < sql.length) {
+        out += sql[i];
+        if (sql[i] === "]") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      i = nl === -1 ? sql.length : nl;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
 export function isMutation(sql: string): boolean {
-  const afterComments = stripLeadingComments(sql);
-  const afterCte = stripLeadingComments(skipLeadingCte(afterComments));
+  // Strip comments GLOBALLY (quote-aware) first so a comment lodged inside the
+  // CTE header ("WITH x AS /*c*/ (...) DELETE ...") can't make skipLeadingCte
+  // bail and leave the real leading keyword ("with") in place — which read as a
+  // harmless SELECT and defeated the read-only / internal-table guards.
+  const afterCte = stripLeadingComments(skipLeadingCte(stripCommentsPreservingStrings(sql)));
   return /^(insert|update|delete|replace|create|drop|alter)/i.test(afterCte);
 }
 
@@ -105,8 +195,9 @@ export function isMutation(sql: string): boolean {
  * same "ShardDO classifies its own writes" philosophy isMutation() already
  * uses, rather than trusting a caller-supplied hint. */
 export function isDeleteStatement(sql: string): boolean {
-  const afterComments = stripLeadingComments(sql);
-  const afterCte = stripLeadingComments(skipLeadingCte(afterComments));
+  // Same quote-aware global comment strip as isMutation (see its comment): a
+  // comment in the CTE header must not hide the terminal DELETE keyword.
+  const afterCte = stripLeadingComments(skipLeadingCte(stripCommentsPreservingStrings(sql)));
   return /^delete/i.test(afterCte);
 }
 
@@ -131,32 +222,11 @@ export const INTERNAL_TABLE_NAMES = [
 
 const INTERNAL_TABLE_SET = new Set<string>(INTERNAL_TABLE_NAMES);
 
-/** Removes `-- ...` line and `/* ... *​/` block comments from anywhere in the
- * SQL (replacing each with a space), leaving all quoted spans intact. Used
- * before write-target extraction so an inter-token comment (`DELETE/**​/FROM
- * x`) can't hide the keyword/target structure. */
-function stripComments(sql: string): string {
-  let out = "";
-  let i = 0;
-  while (i < sql.length) {
-    const c = sql[i];
-    if (c === "-" && sql[i + 1] === "-") {
-      const nl = sql.indexOf("\n", i);
-      i = nl === -1 ? sql.length : nl;
-      out += " ";
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      const end = sql.indexOf("*/", i + 2);
-      i = end === -1 ? sql.length : end + 2;
-      out += " ";
-      continue;
-    }
-    out += c;
-    i += 1;
-  }
-  return out;
-}
+// NOTE: the former quote-BLIND `stripComments` helper was removed. It claimed
+// (falsely) to leave quoted spans intact but had no quote tracking, so a
+// comment delimiter inside a string literal made it eat unbounded text — a
+// security footgun for the write-target/CTE classifiers. All callers now use
+// the quote-aware `stripCommentsPreservingStrings` above.
 
 /** Unquotes a single identifier token: `"x"`/`` `x` ``/`[x]` (honoring the
  * doubled-quote escape for the first two). Bare tokens pass through. */
@@ -222,7 +292,12 @@ function readIdentifierToken(s: string, pos: number): { raw: string; next: numbe
  * (not valid SQLite table syntax). Used by mutationTargetIsInternal (the
  * admin-only /v1/sql write guardrail against internal bookkeeping tables). */
 export function mutationWriteTarget(sql: string): string | null {
-  const s = stripLeadingComments(skipLeadingCte(stripComments(sql)));
+  // Quote-aware comment strip: a comment delimiter inside a CTE-body string
+  // literal (e.g. WITH x AS (SELECT '<block-open>') DELETE FROM __cf_...) must
+  // not corrupt target extraction, or the internal-table write guard is
+  // bypassed. See stripCommentsPreservingStrings' comment for the quote-blind
+  // failure mode this avoids.
+  const s = stripLeadingComments(skipLeadingCte(stripCommentsPreservingStrings(sql)));
   const kw = /^\s*(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|update(?:\s+or\s+\w+)?|delete\s+from)(?=\s|["`[])/i.exec(s);
   if (!kw) return null;
   const first = readIdentifierToken(s, kw[0].length);
