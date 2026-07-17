@@ -7,7 +7,11 @@ import assert from "node:assert/strict";
 import { CloudflareShardAdminClient } from "../dist/index.js";
 
 const BASE_URL = process.env.CLOUDFLARESHARD_URL ?? "http://127.0.0.1:8787";
-const ADMIN_TOKEN = process.env.CLOUDFLARESHARD_ADMIN_TOKEN ?? "BucketMap2026!";
+const ADMIN_TOKEN = process.env.CLOUDFLARESHARD_ADMIN_TOKEN;
+if (!ADMIN_TOKEN) {
+  console.error("Set CLOUDFLARESHARD_ADMIN_TOKEN to the target deployment's ADMIN_TOKEN before running this script.");
+  process.exit(1);
+}
 
 const admin = new CloudflareShardAdminClient({ baseUrl: BASE_URL, token: ADMIN_TOKEN });
 
