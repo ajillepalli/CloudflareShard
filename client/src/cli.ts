@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
 import { CloudflareShardAdminClient } from "./admin-client.js";
 import { CloudflareShardError } from "./errors.js";
 
@@ -146,7 +147,25 @@ export async function dispatch(client: CloudflareShardAdminClient, command: Comm
 // Only auto-run when this file is executed directly (the published `bin`
 // entry point) -- not when imported, e.g. by tests exercising dispatch()
 // directly against a mocked client.
-const isMain = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+//
+// Codex review: npm's installed CLI runs through a node_modules/.bin
+// symlink on POSIX -- import.meta.url resolves to this file's REAL path,
+// but process.argv[1] is the symlink path Node was invoked with, so a bare
+// string comparison never matches and the CLI would silently no-op for
+// every real npm install. realpathSync resolves argv[1] through the
+// symlink first so both sides compare the same real path. Wrapped in
+// try/catch (falling back to isMain: false) so a process.argv[1] that
+// doesn't resolve to a real file -- unlikely, but conceivable for some
+// non-standard invocation -- fails safe instead of throwing on import.
+function resolveIsMain(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+const isMain = resolveIsMain();
 if (isMain) {
   run(process.argv.slice(2))
     .then((code) => {
