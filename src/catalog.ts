@@ -47,6 +47,19 @@ const MIGRATION_TICK_MS = 250;
 // own lease lapse, while a crashed operation's lock still auto-expires quickly
 // enough that the cluster isn't wedged.
 const TOPOLOGY_LOCK_TTL_MS = 30_000;
+// Issue #26: /admin/register-tenant {rotate: true} used to invalidate the old
+// token the instant the new one was issued, with zero overlap window -- a
+// request already in flight with the old token, or a caller whose config/
+// secret propagation hasn't picked up the freshly-rotated token yet, would
+// hard-401. This window lets the OLD token keep working for a bounded time
+// after rotation instead of indefinitely; short enough to still meaningfully
+// bound how long a compromised/leaked old token stays valid post-rotation,
+// long enough to cover in-flight requests and ordinary propagation delay.
+// Explicit /admin/revoke-tenant is NOT softened by this -- it still
+// invalidates everything (current AND any in-grace previous token)
+// immediately, checked first in checkTenantAuth regardless of which hash a
+// caller's token matches.
+const TENANT_TOKEN_ROTATION_GRACE_MS = 5 * 60_000;
 // Review Tier 2 #8: cap the backfill work per tick and back off the alarm
 // re-arm when a tick throws, so a large migration resumes from its cursor
 // rather than restarting-and-throwing at 4Hz forever.
@@ -401,6 +414,12 @@ export class CatalogDO extends DurableObject {
         revoked_at TEXT
       )
     `);
+    // Issue #26: the previous token (and when its grace window expires),
+    // populated only by a rotate: true call against an already-registered
+    // tenant -- see TENANT_TOKEN_ROTATION_GRACE_MS's doc comment. Both NULL
+    // for a tenant that's never been rotated.
+    this.ensureColumn("tenant_auth", "previous_token_hash", "TEXT");
+    this.ensureColumn("tenant_auth", "previous_token_expires_at", "TEXT");
 
     // Milestone 2 (Index Service). One row per registered secondary index.
     // No tenant scoping here — matches table_rules/base-table rows, which
@@ -1459,8 +1478,13 @@ export class CatalogDO extends DurableObject {
       return null;
     }
 
-    const row = this.one<{ token_hash: string; revoked_at: string | null }>(
-      "SELECT token_hash, revoked_at FROM tenant_auth WHERE tenant_id = ?",
+    const row = this.one<{
+      token_hash: string;
+      revoked_at: string | null;
+      previous_token_hash: string | null;
+      previous_token_expires_at: string | null;
+    }>(
+      "SELECT token_hash, revoked_at, previous_token_hash, previous_token_expires_at FROM tenant_auth WHERE tenant_id = ?",
       tenantId,
     );
     if (!row) {
@@ -1476,6 +1500,9 @@ export class CatalogDO extends DurableObject {
       );
     }
     if (row.revoked_at) {
+      // Issue #26: explicit revocation is NOT softened by the rotation grace
+      // period below -- checked first, unconditionally, so a revoked tenant's
+      // in-grace previous token (if any) is also rejected immediately.
       return json(
         {
           error: {
@@ -1489,19 +1516,30 @@ export class CatalogDO extends DurableObject {
     }
 
     const tokenHash = await sha256Hex(token);
-    if (!timingSafeEqual(tokenHash, row.token_hash)) {
-      return json(
-        {
-          error: {
-            code: "TENANT_TOKEN_INVALID",
-            message: "Invalid tenant token.",
-            fix: "Check the token, or re-register via /register-tenant.",
-          },
-        },
-        401,
-      );
+    if (timingSafeEqual(tokenHash, row.token_hash)) {
+      return null;
     }
-    return null;
+    // Issue #26: a rotate: true call keeps the OLD token valid for a bounded
+    // grace window (see TENANT_TOKEN_ROTATION_GRACE_MS) instead of
+    // invalidating it the instant the new one is issued.
+    if (
+      row.previous_token_hash &&
+      row.previous_token_expires_at &&
+      Date.now() < Date.parse(row.previous_token_expires_at) &&
+      timingSafeEqual(tokenHash, row.previous_token_hash)
+    ) {
+      return null;
+    }
+    return json(
+      {
+        error: {
+          code: "TENANT_TOKEN_INVALID",
+          message: "Invalid tenant token.",
+          fix: "Check the token, or re-register via /register-tenant.",
+        },
+      },
+      401,
+    );
   }
 
   private async handleRegisterTenant(request: Request): Promise<Response> {
@@ -1513,8 +1551,8 @@ export class CatalogDO extends DurableObject {
       );
     }
 
-    const existing = this.one<{ tenant_id: string }>(
-      "SELECT tenant_id FROM tenant_auth WHERE tenant_id = ?",
+    const existing = this.one<{ tenant_id: string; token_hash: string; revoked_at: string | null }>(
+      "SELECT tenant_id, token_hash, revoked_at FROM tenant_auth WHERE tenant_id = ?",
       body.tenantId,
     );
     if (existing && body.rotate !== true) {
@@ -1532,6 +1570,7 @@ export class CatalogDO extends DurableObject {
 
     const token = crypto.randomUUID();
     const tokenHash = await sha256Hex(token);
+    const now = new Date();
 
     // Log only {tenantId, rotate} — never the token or its hash, unlike other
     // audit() call sites in this file that log their full parsed body by
@@ -1539,15 +1578,37 @@ export class CatalogDO extends DurableObject {
     // and readable via /admin/audit-log.
     this.audit("/register-tenant", { tenantId: body.tenantId, rotate: body.rotate === true });
 
-    this.sql.exec(
-      `
-      INSERT OR REPLACE INTO tenant_auth (tenant_id, token_hash, created_at, revoked_at)
-      VALUES (?, ?, ?, NULL)
-      `,
-      body.tenantId,
-      tokenHash,
-      new Date().toISOString(),
-    );
+    // Issue #26: a rotate: true call against an EXISTING, non-revoked tenant
+    // grants the old token a bounded grace period instead of killing it
+    // immediately (INSERT OR REPLACE previously wiped it outright). An
+    // explicitly-revoked tenant rotating back in gets no grace for its old
+    // token -- that token was already killed by deliberate operator action,
+    // and un-revoking via rotate must not resurrect it. A fresh registration
+    // has nothing to grace either way.
+    if (existing && !existing.revoked_at) {
+      const graceExpiresAt = new Date(now.getTime() + TENANT_TOKEN_ROTATION_GRACE_MS).toISOString();
+      this.sql.exec(
+        `
+        UPDATE tenant_auth
+        SET token_hash = ?, revoked_at = NULL, previous_token_hash = ?, previous_token_expires_at = ?
+        WHERE tenant_id = ?
+        `,
+        tokenHash,
+        existing.token_hash,
+        graceExpiresAt,
+        body.tenantId,
+      );
+    } else {
+      this.sql.exec(
+        `
+        INSERT OR REPLACE INTO tenant_auth (tenant_id, token_hash, created_at, revoked_at, previous_token_hash, previous_token_expires_at)
+        VALUES (?, ?, ?, NULL, NULL, NULL)
+        `,
+        body.tenantId,
+        tokenHash,
+        now.toISOString(),
+      );
+    }
 
     return json({ ok: true, tenantId: body.tenantId, token });
   }

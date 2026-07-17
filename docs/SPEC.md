@@ -490,7 +490,7 @@ POST /admin/drain-shard-status     {catalogShardId, shardId}
 POST /admin/register-tenant (ADMIN_TOKEN)
 Request:
 - tenantId string
-- rotate boolean (optional — issues a new token for an already-registered tenant, invalidating the old one immediately)
+- rotate boolean (optional — issues a new token for an already-registered tenant; the old token stays valid for a bounded grace period, `TENANT_TOKEN_ROTATION_GRACE_MS` — see README's "Tenant authorization" section — rather than being invalidated immediately)
 
 Response:
 - ok
