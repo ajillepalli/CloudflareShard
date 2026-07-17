@@ -110,6 +110,19 @@ const el = {
   consoleTitle: hook("console-title"),
   reshardPanel: hook("reshard-panel"),
 
+  // ---- App room (T8, Room 1) ----
+  railApp: hook("rail-app"),
+  appWrap: hook("app-wrap"),
+  appWarehouse: hook("app-warehouse"),
+  appCustomersSub: hook("app-customers-sub"),
+  appCustomersTable: hook("app-customers-table"),
+  appStockSub: hook("app-stock-sub"),
+  appStockTable: hook("app-stock-table"),
+  appTxBtn: hook("app-tx-btn"),
+  appTxResult: hook("app-tx-result"),
+  appCodeRead: hook("app-code-read"),
+  appCodeTx: hook("app-code-tx"),
+
   // ---- Edge room (T11) ----
   railEdge: hook("rail-edge"),
   canvasWrap: hook("canvas-wrap"),
@@ -999,11 +1012,14 @@ function setActiveRoom(room) {
   el.railReshard.classList.toggle("active", room === "reshard");
   if (el.railEdge) el.railEdge.classList.toggle("active", room === "edge");
   if (el.railPlay) el.railPlay.classList.toggle("active", room === "play");
+  if (el.railApp) el.railApp.classList.toggle("active", room === "app");
   el.reshardPanel.hidden = room !== "reshard";
-  if (el.canvasWrap) el.canvasWrap.hidden = room === "edge" || room === "play";
+  if (el.canvasWrap) el.canvasWrap.hidden = room === "edge" || room === "play" || room === "app";
   if (el.edgeWrap) el.edgeWrap.hidden = room !== "edge";
   if (el.playWrap) el.playWrap.hidden = room !== "play";
-  el.consoleTitle.textContent = room === "reshard" ? "Reshard Console" : room === "edge" ? "Edge" : room === "play" ? "Playground" : "Live Feed";
+  if (el.appWrap) el.appWrap.hidden = room !== "app";
+  el.consoleTitle.textContent =
+    room === "reshard" ? "Reshard Console" : room === "edge" ? "Edge" : room === "play" ? "Playground" : room === "app" ? "App" : "Live Feed";
 
   if (room === "reshard") {
     refreshReshardPickers();
@@ -1024,6 +1040,12 @@ function setActiveRoom(room) {
   } else {
     stopPlayRoom();
   }
+
+  if (room === "app") {
+    startAppRoom();
+  } else {
+    stopAppRoom();
+  }
 }
 
 /** Forces the room back to Topology, bypassing setActiveRoom's normal
@@ -1038,14 +1060,17 @@ function forceTopologyRoomForLogin() {
   el.railReshard.classList.remove("active");
   if (el.railEdge) el.railEdge.classList.remove("active");
   if (el.railPlay) el.railPlay.classList.remove("active");
+  if (el.railApp) el.railApp.classList.remove("active");
   el.reshardPanel.hidden = true;
   if (el.canvasWrap) el.canvasWrap.hidden = false;
   if (el.edgeWrap) el.edgeWrap.hidden = true;
   if (el.playWrap) el.playWrap.hidden = true;
+  if (el.appWrap) el.appWrap.hidden = true;
   el.consoleTitle.textContent = "Live Feed";
   stopReshardPolling();
   stopEdgeRoom();
   stopPlayRoom();
+  stopAppRoom();
 }
 
 function startReshardPolling() {
@@ -2499,6 +2524,319 @@ function startPlayRoom() {
 function stopPlayRoom() {}
 
 // ============================================================================
+// App room (T8 — Room 1): the DX story. "You can build a real multi-tenant,
+// sharded, transactional app on CloudflareShard with almost no code."
+//
+// Every read below goes through POST /api/play/table-scan (src/play.ts's
+// playTableScan) — the exact same gate-protected, whitelisted, tenant-scoped
+// proxy the Playground room's Table Scan panel already calls, reusing
+// playFetch/renderPlayResult/PLAYGROUND_WAREHOUSE_IDS from that section
+// verbatim rather than a second copy. The one action button fires a REAL
+// POST /api/play/tx (playTx) — a genuine same-tenant, multi-row 2PC
+// transaction against the exact rows this room just displayed.
+//
+// HONESTY CONTRACT (see docs/design-doc.md's "Room 1 — App" spec + its
+// eng-review correction, and index.html's identical header comment on
+// app-wrap): this is NOT a full TPC-C New Order and NOT a cross-tenant
+// transaction. It's a small, real, same-tenant, bounded-participant update
+// (2-3 rows, well under /v1/tx's real 8-participant cap). Every string this
+// section renders that touches that claim must stay precise — never let it
+// drift toward implying a full order or a cross-tenant 2PC.
+// ============================================================================
+
+const APP_RESTOCK_QTY = 10;
+const APP_ROWS_PER_PANEL = 5;
+const APP_MAX_RESTOCK_ROWS = 3;
+
+let appRoomInitialized = false;
+let appSelectedWarehouseId = PLAYGROUND_WAREHOUSE_IDS[0];
+/** Monotonic token guarding against a stale table-scan response landing
+ * after the operator has already switched tenants again — the same
+ * "ignore a response that's no longer for the current selection" shape
+ * every other async-then-render path in this file (SSE snapshots aside,
+ * which are single-stream and don't have this race) needs when a user
+ * action can race a fetch. */
+let appLoadSeq = 0;
+/** The stock rows currently on screen for the selected tenant — exactly
+ * what the Restock button acts on, so the transaction it fires always
+ * matches what the operator can see (never a stale or guessed row set). */
+let appLastStockRows = [];
+
+function fmtAppMoney(n) {
+  return typeof n === "number" && Number.isFinite(n) ? n.toFixed(2) : "—";
+}
+
+const APP_CUSTOMER_COLUMNS = [
+  { key: "c_id", label: "id" },
+  { key: "name", label: "name", format: (r) => `${r.c_first ?? ""} ${r.c_last ?? ""}`.trim() || "—" },
+  { key: "c_credit", label: "credit" },
+  { key: "c_balance", label: "balance", format: (r) => fmtAppMoney(r.c_balance) },
+];
+const APP_STOCK_COLUMNS = [
+  { key: "i_id", label: "item" },
+  { key: "s_quantity", label: "qty" },
+  { key: "s_ytd", label: "ytd" },
+  { key: "s_order_cnt", label: "orders" },
+];
+
+/** Renders a table-scan result as a small app-screen table — never a raw
+ * JSON dump (per this room's spec: "make it read like an app screen").
+ * Every cell reaches the DOM via textContent only; `container.innerHTML =
+ * ""` is used solely to clear prior content, never to inject data (same
+ * convention renderPlayResult above already uses). */
+function renderAppTable(container, rows, columns, emptyMessage) {
+  if (!container) return;
+  container.innerHTML = "";
+  if (!rows || rows.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "app-table-empty";
+    empty.textContent = emptyMessage || "no rows.";
+    container.appendChild(empty);
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "app-table";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const col of columns) {
+    const th = document.createElement("th");
+    th.textContent = col.label;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    for (const col of columns) {
+      const td = document.createElement("td");
+      td.textContent = col.format ? col.format(row) : String(row[col.key] ?? "—");
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
+/** The room's real client-side "how little code this takes" snippets — see
+ * this section's header comment for the honesty/accuracy contract. Built as
+ * arrays of single-quoted lines (not a template literal) purely so the
+ * snippet's own backticked template-literal syntax never has to be escaped;
+ * joined once and assigned via textContent below, matching the room's XSS
+ * rule even though these are our own constants, never cluster/user data.
+ * Copy-accurate to the real CloudflareShard API shapes documented in the
+ * project root README's "Tenant-scoped table scan" / "Cross-shard atomic
+ * transaction" sections — NOT to this demo's /api/play/* proxy wiring
+ * (that proxy exists only because a browser can't safely hold ADMIN_TOKEN
+ * or mint its own tenant token — see src/play.ts's header comment); a real
+ * app calls CloudflareShard's own /v1/* routes directly, exactly as shown. */
+const APP_CODE_READ = [
+  "const res = await fetch(`${API}/v1/table-scan`, {",
+  '  method: "POST",',
+  "  headers: {",
+  '    "content-type": "application/json",',
+  "    authorization: `Bearer ${tenantToken}`,",
+  "  },",
+  '  body: JSON.stringify({ tenantId, table: "tpcc_stock", limit: 5 }),',
+  "});",
+  "const { rows } = await res.json();",
+].join("\n");
+
+const APP_CODE_TX = [
+  "const res = await fetch(`${API}/v1/tx`, {",
+  '  method: "POST",',
+  "  headers: {",
+  '    "content-type": "application/json",',
+  "    authorization: `Bearer ${tenantToken}`,",
+  "  },",
+  "  body: JSON.stringify({",
+  "    mutations: rows.map((r) => ({",
+  '      op: "update",',
+  '      table: "tpcc_stock",',
+  "      tenantId,",
+  "      partitionKey: r.s_key,",
+  "      values: { s_quantity: r.s_quantity + 10 },",
+  "      where: { s_quantity: r.s_quantity },",
+  "    })),",
+  "    requestId: crypto.randomUUID(),",
+  "  }),",
+  "});",
+  "const { ok, status } = await res.json();",
+].join("\n");
+
+function renderAppCodeSnippets() {
+  if (el.appCodeRead) el.appCodeRead.textContent = APP_CODE_READ;
+  if (el.appCodeTx) el.appCodeTx.textContent = APP_CODE_TX;
+}
+
+/** Loads (or reloads) both data panels for `warehouseId` and refreshes the
+ * Restock button's enabled state from the freshly-loaded stock rows. Safe to
+ * call repeatedly (tenant switch, room re-entry, post-tx refresh) — guarded
+ * by appLoadSeq so an in-flight request for a since-abandoned tenant can
+ * never clobber a newer selection's result. */
+function loadAppData(warehouseId) {
+  const seq = ++appLoadSeq;
+  el.appCustomersSub.textContent = "loading…";
+  el.appStockSub.textContent = "loading…";
+  el.appTxBtn.disabled = true;
+
+  const customersP = playFetch("/api/play/table-scan", { warehouseId, table: "tpcc_customer", limit: APP_ROWS_PER_PANEL })
+    .then((outcome) => {
+      if (seq !== appLoadSeq) return;
+      if (outcome.ok) {
+        const rows = (outcome.body && outcome.body.rows) || [];
+        renderAppTable(el.appCustomersTable, rows, APP_CUSTOMER_COLUMNS, "no customer rows for this tenant yet.");
+        el.appCustomersSub.textContent = `${rows.length} row${rows.length === 1 ? "" : "s"}`;
+      } else {
+        renderAppTable(el.appCustomersTable, [], APP_CUSTOMER_COLUMNS, playErrorMessage(outcome.body));
+        el.appCustomersSub.textContent = "error";
+        logLine(`app/customers read failed (wh ${warehouseId}) → ${outcome.status}`, "warn");
+      }
+    })
+    .catch((err) => {
+      if (seq !== appLoadSeq) return;
+      renderAppTable(el.appCustomersTable, [], APP_CUSTOMER_COLUMNS, (err && err.message) || "network error");
+      el.appCustomersSub.textContent = "error";
+    });
+
+  const stockP = playFetch("/api/play/table-scan", { warehouseId, table: "tpcc_stock", limit: APP_ROWS_PER_PANEL })
+    .then((outcome) => {
+      if (seq !== appLoadSeq) return;
+      if (outcome.ok) {
+        const rows = (outcome.body && outcome.body.rows) || [];
+        appLastStockRows = rows;
+        renderAppTable(el.appStockTable, rows, APP_STOCK_COLUMNS, "no stock rows for this tenant yet.");
+        el.appStockSub.textContent = `${rows.length} row${rows.length === 1 ? "" : "s"}`;
+        el.appTxBtn.disabled = rows.length < 2;
+      } else {
+        appLastStockRows = [];
+        renderAppTable(el.appStockTable, [], APP_STOCK_COLUMNS, playErrorMessage(outcome.body));
+        el.appStockSub.textContent = "error";
+        el.appTxBtn.disabled = true;
+        logLine(`app/stock read failed (wh ${warehouseId}) → ${outcome.status}`, "warn");
+      }
+    })
+    .catch((err) => {
+      if (seq !== appLoadSeq) return;
+      appLastStockRows = [];
+      renderAppTable(el.appStockTable, [], APP_STOCK_COLUMNS, (err && err.message) || "network error");
+      el.appStockSub.textContent = "error";
+      el.appTxBtn.disabled = true;
+    });
+
+  return Promise.all([customersP, stockP]);
+}
+
+function handleAppWarehouseChange() {
+  const warehouseId = Number(el.appWarehouse.value);
+  if (!Number.isInteger(warehouseId)) return;
+  appSelectedWarehouseId = warehouseId;
+  if (el.appTxResult) el.appTxResult.hidden = true;
+  logLine(`app room: switched to warehouse ${warehouseId}`, "mig");
+  loadAppData(warehouseId);
+}
+
+/** The room's one 2PC action — see this section's header comment for the
+ * mandatory honesty framing. Builds a real, bounded (<= APP_MAX_RESTOCK_ROWS)
+ * same-tenant /v1/tx call straight from the stock rows currently on screen
+ * (never a guessed/hardcoded key), with an optimistic-concurrency `where`
+ * guard on every row (mirrors src/load/transactions.ts's own payment()
+ * pattern) so a concurrent writer — e.g. the load engine, if it's running
+ * against this same tenant — can't be silently overwritten. */
+function handleAppTxClick() {
+  // Snapshot the tenant AND its rows together at click time, and lock the
+  // warehouse picker for the duration of the tx. Without this, switching
+  // tenant while a tx is in flight could re-enable the button with the
+  // previous tenant's rows still in appLastStockRows and fire a follow-up tx
+  // whose warehouseId (new tenant) and partitionKeys (old tenant) disagree —
+  // the server rejects it cleanly (tenant-scoped storage, tenantId derived
+  // from warehouseId), so it can't corrupt or cross tenants, but it's a
+  // confusing double-failure that briefly breaks this room's "the button
+  // acts on exactly the tenant on screen" invariant.
+  const txWarehouseId = appSelectedWarehouseId;
+  const rows = appLastStockRows.slice(0, APP_MAX_RESTOCK_ROWS);
+  if (rows.length < 2) return; // button is disabled below this floor; defensive no-op
+
+  const mutations = rows.map((r) => ({
+    op: "update",
+    table: "tpcc_stock",
+    partitionKey: r.s_key,
+    values: { s_quantity: (r.s_quantity || 0) + APP_RESTOCK_QTY },
+    where: { s_quantity: r.s_quantity },
+  }));
+  const body = { warehouseId: txWarehouseId, mutations };
+
+  el.appTxBtn.disabled = true;
+  el.appWarehouse.disabled = true;
+  playFetch("/api/play/tx", body)
+    .then((outcome) => {
+      el.appWarehouse.disabled = false;
+      renderPlayResult(el.appTxResult, outcome);
+      if (outcome.ok) {
+        logLine(`app/tx restock ${mutations.length} row(s) (wh ${txWarehouseId}) → committed`, "safe");
+        // Refresh both panels so the screen shows the committed values, not
+        // the pre-tx snapshot — same "reflect real cluster state" rule every
+        // other room's post-write refresh already follows. Refresh the tenant
+        // the tx actually ran against; loadAppData's own appLoadSeq guard drops
+        // this if the user has since switched away.
+        loadAppData(txWarehouseId);
+      } else {
+        logLine(`app/tx restock (wh ${txWarehouseId}) → ${outcome.status}`, "warn");
+        el.appTxBtn.disabled = false;
+      }
+    })
+    .catch((err) => {
+      el.appWarehouse.disabled = false;
+      renderPlayResult(el.appTxResult, { networkError: (err && err.message) || String(err) });
+      el.appTxBtn.disabled = false;
+    });
+}
+
+/** Called by setActiveRoom() on entering the App room. Wiring (selects,
+ * listeners, the static code snippets) happens once; the data load re-runs
+ * on every entry (and every tenant switch) so the screen always reflects
+ * the cluster's current state — this room has no polling/SSE of its own,
+ * matching the Playground room's "plain request/response, no live
+ * subscription" shape, except the reads here fire proactively on entry
+ * rather than waiting for a manual submit. */
+function startAppRoom() {
+  if (!appRoomInitialized) {
+    appRoomInitialized = true;
+    populateSelect(
+      el.appWarehouse,
+      PLAYGROUND_WAREHOUSE_IDS.map((id) => ({ value: String(id), label: `warehouse ${id}` })),
+    );
+    el.appWarehouse.value = String(appSelectedWarehouseId);
+    el.appWarehouse.addEventListener("change", handleAppWarehouseChange);
+    el.appTxBtn.addEventListener("click", handleAppTxClick);
+    renderAppCodeSnippets();
+  }
+
+  // ?demo=1 never touches /api/* (see this file's header comment on `mode`
+  // and the Edge room's identical startEdgeRoom() precedent) — render an
+  // honest "no live read" state instead of firing a request that would only
+  // ever fail against a static preview with no backend.
+  if (mode === "demo") {
+    appLoadSeq++; // invalidate any in-flight live request from before demo mode
+    appLastStockRows = [];
+    renderAppTable(el.appCustomersTable, [], APP_CUSTOMER_COLUMNS, "demo mode (?demo=1) — no live read; drop the query param against a live cluster to see real tenant data.");
+    renderAppTable(el.appStockTable, [], APP_STOCK_COLUMNS, "demo mode — no live read.");
+    el.appCustomersSub.textContent = "demo";
+    el.appStockSub.textContent = "demo";
+    el.appTxBtn.disabled = true;
+    return;
+  }
+
+  loadAppData(appSelectedWarehouseId);
+}
+
+/** Called by setActiveRoom() on leaving the App room. No timer/poll to tear
+ * down (see startAppRoom's doc comment) — kept as its own function, mirroring
+ * stopEdgeRoom/stopPlayRoom, so a future addition has an obvious home. */
+function stopAppRoom() {}
+
+// ============================================================================
 // Auth gate (src/gate.ts): /api/* requires SHARDSCOPE_GATE_TOKEN, presented
 // as a `shardscope_gate` HttpOnly cookie set by POST /login. EventSource
 // can't read response status codes or set an Authorization header, so we
@@ -2756,6 +3094,7 @@ function init() {
   onActivate(el.railReshard, () => setActiveRoom("reshard"));
   onActivate(el.railEdge, () => setActiveRoom("edge"));
   onActivate(el.railPlay, () => setActiveRoom("play"));
+  onActivate(el.railApp, () => setActiveRoom("app"));
   if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.addEventListener("click", runEdgeMeasurement);
   el.oldwayToggle.addEventListener("click", toggleOldwayPanel);
   el.opTabSplit.addEventListener("click", () => setActiveOpTab("split"));
