@@ -545,9 +545,14 @@ kept structurally distinct in the code so a future hosted layer (a genuinely
 separate operator) could be added without a rewrite.
 
 `POST /admin/register-tenant {"tenantId": "...", "rotate": true}` issues a
-new token for an already-registered tenant, invalidating the old one
-immediately (no grace period — a scheduled rotation can break in-flight
-callers with zero overlap window; a known limitation, not yet addressed).
+new token for an already-registered tenant. The new token works
+immediately; the old one keeps working for a bounded grace period
+(`TENANT_TOKEN_ROTATION_GRACE_MS`, 5 minutes) instead of being invalidated
+the instant the new one is issued, so a rotation doesn't break an in-flight
+caller or one that hasn't yet picked up the new token. `POST
+/admin/revoke-tenant` is not softened by this grace period — it still
+invalidates the current token AND any still-in-grace previous token
+immediately.
 `POST /admin/revoke-tenant {"tenantId": "..."}` disables a tenant's access.
 
 **`/v1/sql` and `/v1/scatter` are admin-only** (`ADMIN_TOKEN`-gated operator
