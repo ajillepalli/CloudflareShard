@@ -349,6 +349,21 @@ const TICK_INTERVAL_MS = 900;
 // RPC calls from a single alarm tick.
 const MAX_CONCURRENT_SHARD_STATS_CALLS = 8;
 
+// Bounds how long a single subscriber's writer.write() is allowed to pend
+// before that subscriber is treated as stalled and dropped. A browser tab
+// that's connected but not reading (a full TCP receive window, a backgrounded
+// tab whose EventSource buffer isn't being drained, etc.) makes
+// writer.write() pend on backpressure indefinitely. Without this bound, ONE
+// such subscriber would wedge the entire singleton poller: runTick() holds
+// `this.polling = true` across the awaited broadcast() and only calls
+// scheduleNextTick() after it resolves, so an unbounded write starves every
+// OTHER subscriber's snapshot and the next tick's alarm reschedule — exactly
+// the "one shared poller, O(1) in viewers" availability promise this file's
+// header comment rests on. Small relative to TICK_INTERVAL_MS so a stall is
+// caught and the subscriber cleaned up within roughly one tick's worth of
+// real time, not a measured value.
+const SUBSCRIBER_WRITE_TIMEOUT_MS = 3_000;
+
 export class TopologyAggregator {
   private state: DurableObjectState;
   private env: Env;
@@ -383,9 +398,19 @@ export class TopologyAggregator {
   // lastSnapshot above.
   private checksumTracking: ChecksumTrackingState = initialChecksumTrackingState();
 
-  constructor(state: DurableObjectState, env: Env) {
+  // How long safeWrite() waits on one subscriber's writer.write() before
+  // treating it as stalled (see SUBSCRIBER_WRITE_TIMEOUT_MS's doc comment).
+  // The Workers runtime always constructs a Durable Object with exactly
+  // (state, env) — this third parameter is a test-only seam (aggregator.test.ts
+  // passes a small value so the stalled-subscriber regression test doesn't
+  // have to burn multiple real seconds waiting on the production timeout);
+  // every real instantiation gets the default.
+  private readonly writeTimeoutMs: number;
+
+  constructor(state: DurableObjectState, env: Env, writeTimeoutMs: number = SUBSCRIBER_WRITE_TIMEOUT_MS) {
     this.state = state;
     this.env = env;
+    this.writeTimeoutMs = writeTimeoutMs;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -412,7 +437,11 @@ export class TopologyAggregator {
     // the next tick's write() to discover it's gone.
     request.signal.addEventListener("abort", cleanup);
 
-    await writer.write(sseEvent("hello", { message: "shardscope aggregator: connected, waiting for first tick" }));
+    // Bounded + drop-on-failure, same as every other write to this writer
+    // (see safeWrite) — an unwrapped await here would leave a subscriber that
+    // rejected or stalled on this very first write lingering in
+    // `subscribers` forever if the abort listener above never fires for it.
+    await this.safeWrite(writer, sseEvent("hello", { message: "shardscope aggregator: connected, waiting for first tick" }));
 
     // Don't make a brand-new subscriber wait a full tick interval for data
     // that's already sitting in memory.
@@ -625,14 +654,33 @@ export class TopologyAggregator {
   }
 
   /** Writes `payload` to every open subscriber, dropping any writer whose
-   * write() throws (the tab disconnected without a clean abort signal). */
+   * write() throws OR stalls past this.writeTimeoutMs (see safeWrite and
+   * SUBSCRIBER_WRITE_TIMEOUT_MS's doc comment). Every per-subscriber write is
+   * independently bounded, so ONE stalled writer.write() can't hold up this
+   * Promise.all — and therefore can't hold up runTick()'s `this.polling`
+   * guard or its scheduleNextTick() reschedule — regardless of how many OTHER
+   * subscribers are healthy. */
   private async broadcast(payload: Uint8Array): Promise<void> {
     await Promise.all([...this.subscribers].map((writer) => this.safeWrite(writer, payload)));
   }
 
+  /** Writes `payload` to one subscriber, dropping it from `subscribers` if
+   * write() either throws (the tab disconnected without a clean abort
+   * signal) or doesn't settle within this.writeTimeoutMs (the tab is
+   * connected but not reading — see SUBSCRIBER_WRITE_TIMEOUT_MS). Either way
+   * this method itself never takes longer than this.writeTimeoutMs to
+   * resolve, which is what keeps a single bad subscriber from wedging
+   * broadcast()/runTick(). On a timeout, the writer is also closed
+   * best-effort — fired without being awaited, since a writer stalled on
+   * write() may never settle close() either, and this method's own bound
+   * must not depend on that settling. */
   private async safeWrite(writer: WritableStreamDefaultWriter<Uint8Array>, payload: Uint8Array): Promise<void> {
     try {
-      await writer.write(payload);
+      const result = await writeWithTimeout(writer, payload, this.writeTimeoutMs);
+      if (result === WRITE_TIMED_OUT) {
+        this.subscribers.delete(writer);
+        void writer.close().catch(() => {});
+      }
     } catch {
       this.subscribers.delete(writer);
     }
@@ -651,6 +699,35 @@ export class TopologyAggregator {
 function sseEvent(event: string, data: unknown): Uint8Array {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   return new TextEncoder().encode(payload);
+}
+
+// Sentinel safeWrite/writeWithTimeout use to signal "the timer won the race,
+// not writer.write()" — a Symbol rather than e.g. `null`/`undefined` so it
+// can never collide with whatever writer.write() itself resolves to (always
+// undefined per the Streams spec, but this stays correct even if that ever
+// changes).
+const WRITE_TIMED_OUT = Symbol("subscriber-write-timed-out");
+
+/** Races `writer.write(payload)` against a `timeoutMs` timer so a single
+ * stalled subscriber (connected but not reading — backpressure never
+ * resolves the write) can't hold its caller open indefinitely. Resolves to
+ * WRITE_TIMED_OUT if the timer wins; otherwise resolves/rejects exactly as
+ * writer.write() itself would. Always clears its timer in a `finally`, so a
+ * write that settles quickly doesn't leak a pending setTimeout. */
+async function writeWithTimeout(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  payload: Uint8Array,
+  timeoutMs: number,
+): Promise<typeof WRITE_TIMED_OUT | void> {
+  let timer!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<typeof WRITE_TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(WRITE_TIMED_OUT), timeoutMs);
+  });
+  try {
+    return await Promise.race([writer.write(payload), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Runs `fn` over `items` with at most `limit` calls in flight at once,
