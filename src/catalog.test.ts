@@ -581,6 +581,34 @@ describe("CatalogDO tenant authorization", () => {
     expect(newTokenRes.status).toBe(200);
   });
 
+  it("rotating twice before the first grace period expires drops the doubly-old token, not just the newest-superseded one", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: token1 } = (await firstRes.json()) as { token: string };
+    const secondRes = await stub.fetch(post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: token2 } = (await secondRes.json()) as { token: string };
+    const thirdRes = await stub.fetch(post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: token3 } = (await thirdRes.json()) as { token: string };
+
+    // token1 (superseded by the FIRST rotation, then superseded again by the
+    // SECOND) must be dead -- previous_token_hash only ever remembers the
+    // single most-recently-superseded token, not a full history.
+    const token1Res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token1}`));
+    expect(token1Res.status).toBe(401);
+
+    // token2 (superseded by the SECOND rotation) is the current grace-period
+    // token and must still work.
+    const token2Res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token2}`));
+    expect(token2Res.status).toBe(200);
+
+    // token3 is current and must work.
+    const token3Res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token3}`));
+    expect(token3Res.status).toBe(200);
+  });
+
   it("the old token stops working once its rotation grace period has elapsed", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
