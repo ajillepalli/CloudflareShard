@@ -161,6 +161,79 @@ export interface ShardApiBinding {
    * own. Idempotent — succeeds even if no fault is currently active. Success
    * body: `{ ok: true }`. */
   adminFaultClear(adminToken: string, body: { shardId: string; catalogShardId?: string }): Promise<unknown>;
+
+  // ---- Playground (src/play.ts) — tenant data-plane + operator primitive
+  // RPC methods. Every one of these ALREADY EXISTS on CloudflareShardRpc in
+  // the main repo's src/index.ts (the "RPC / Worker-service-binding
+  // entrypoint for the tenant data path" section for mutate/tx/indexQuery/
+  // tableScan, and the "Operator-only raw SQL"/"Cross-tenant fan-out read"
+  // methods for sql/scatter) — declared here only so this Worker's
+  // TypeScript build knows the shape of the SHARD_API service binding call,
+  // same convention as every method above.
+
+  /** Tenant-scoped structured mutate — RPC counterpart of /v1/mutate, taking
+   * a TENANT bearer token (not adminToken) as its first argument. See
+   * CloudflareShardRpc.mutate + structured-op.ts's StructuredMutation (main
+   * repo) for the authoritative shape. Success body: `{ ok: true,
+   * rowsAffected }`; a requestId reused with a different (sql/params) hash
+   * rejects with 409 (see src/play.ts's playMutate doc comment for the exact
+   * contract this demo exercises). */
+  mutate(
+    tenantToken: string,
+    body: {
+      op: "insert" | "update" | "delete" | "upsert";
+      table: string;
+      tenantId: string;
+      partitionKey: string;
+      where?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      requestId?: string;
+    },
+  ): Promise<unknown>;
+
+  /** Tenant-scoped cross-shard atomic write (2PC) — RPC counterpart of
+   * /v1/tx. See CloudflareShardRpc.tx + structured-op.ts's StructuredOperation. */
+  tx(
+    tenantToken: string,
+    body: {
+      mutations: Array<{
+        op: "insert" | "update" | "delete" | "upsert";
+        table: string;
+        tenantId: string;
+        partitionKey: string;
+        where?: Record<string, unknown>;
+        values?: Record<string, unknown>;
+      }>;
+      requestId?: string;
+    },
+  ): Promise<unknown>;
+
+  /** Tenant-scoped secondary-index lookup — RPC counterpart of
+   * /v1/index-query. See CloudflareShardRpc.indexQuery. */
+  indexQuery(
+    tenantToken: string,
+    body: { table: string; indexName: string; tenantId: string; values: Record<string, unknown>; limit?: number },
+  ): Promise<unknown>;
+
+  /** Tenant-scoped full table scan — RPC counterpart of /v1/table-scan. See
+   * CloudflareShardRpc.tableScan. */
+  tableScan(tenantToken: string, body: { tenantId: string; table: string; limit?: number; cursor?: string | null }): Promise<unknown>;
+
+  /** Operator-only raw SQL — see the main repo's src/index.ts's sqlCore doc
+   * comment for why this is admin-gated rather than tenant-gated (the
+   * per-tenant SQL guard was structurally unwinnable and was removed).
+   * Requires table+tenantId+partitionKey for deterministic single-shard
+   * routing; a SELECT without partitionKey is rejected by core itself (use
+   * scatter for fan-out reads). src/play.ts's playSql additionally enforces
+   * read-only (SELECT/EXPLAIN only) before this is ever called. */
+  sql(adminToken: string, body: { sql: string; params?: unknown[]; table: string; tenantId: string; partitionKey: string; requestId?: string }): Promise<unknown>;
+
+  /** Operator-only cross-tenant fan-out read — admin-gated for the same
+   * reason sql() is (reads across every tenant on every shard
+   * indiscriminately). Core's scatterCore itself rejects a mutation with
+   * 400 (SELECT only); src/play.ts's playScatter additionally scopes the
+   * query to one demo table (see that file's extractScatterFromTable). */
+  scatter(adminToken: string, body: { sql: string; params?: unknown[]; limit?: number }): Promise<unknown>;
 }
 
 export interface Env {

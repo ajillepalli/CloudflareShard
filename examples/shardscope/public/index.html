@@ -100,7 +100,7 @@
         </svg>
         <span class="rlabel">Edge</span>
       </div>
-      <div class="rail-item disabled" title="Not built yet">
+      <div class="rail-item" data-hook="rail-play" data-room="play" role="button" tabindex="0">
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
           <path d="M7 5 L15 10 L7 15 Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>
         </svg>
@@ -226,6 +226,235 @@
             <span class="edge-legend-item"><span class="edge-legend-dot edge-legend-dot-you"></span>You — real, measured</span>
             <span class="edge-legend-item"><span class="edge-legend-dot edge-legend-dot-illustrative"></span>Illustrative reference — not measured</span>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ CENTER: PLAYGROUND ROOM ============
+         Hidden on Topology/Reshard/Edge (see app.js's setActiveRoom). The
+         developer-primitive console — every panel below POSTs straight to
+         one of the gate-protected /api/play/* routes (src/play.ts), which
+         forward to CloudflareShard's real /v1/* primitives under a
+         controlled demo tenant (warehouse 1/2/3). Every dropdown here is
+         populated from the SAME whitelist src/play.ts enforces server-side
+         (PLAYGROUND_WAREHOUSE_IDS / PLAYGROUND_TABLES / PLAYGROUND_INDEXES —
+         mirrored as constants in app.js's Playground section) so a request
+         built in this UI is well-formed before it's ever sent; the server
+         re-validates independently regardless. Results are always rendered
+         via textContent (never innerHTML) — see app.js's renderPlayResult. -->
+    <div class="play-wrap" data-hook="play-wrap" hidden>
+      <div class="canvas-label">
+        <span class="micro">Playground — developer primitive console</span>
+      </div>
+
+      <div class="play-body">
+        <div class="play-intro">
+          Every panel below fires a real request against the live cluster, scoped to a controlled demo tenant
+          (warehouse <span class="mono">1</span>, <span class="mono">2</span>, or <span class="mono">3</span>) over the
+          same 8 TPC-C demo tables the load engine already writes. Dropdowns only offer values the server actually
+          accepts — an invalid request can't be built here, only rejected honestly by the cluster.
+        </div>
+
+        <div class="play-grid">
+
+          <!-- ============ MUTATE ============ -->
+          <div class="play-panel" data-hook="play-panel-mutate">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Mutate</span>
+            </div>
+            <div class="play-panel-help">
+              A single write via <span class="mono">/v1/mutate</span> — insert / update / delete / upsert one row by
+              partition key. Every mutate carries a <span class="mono">requestId</span>; replaying the exact same
+              request with the same id returns the identical cached result (no double effect), while replaying the
+              same id with a <em>different</em> body is refused with a 409 — see the idempotency demo below the form.
+            </div>
+            <form class="op-form" data-hook="play-mutate-form" autocomplete="off">
+              <label class="field-label micro" for="play-mutate-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-mutate-warehouse" data-hook="play-mutate-warehouse"></select>
+              <label class="field-label micro" for="play-mutate-op">Operation</label>
+              <select class="field-select mono" id="play-mutate-op" data-hook="play-mutate-op"></select>
+              <label class="field-label micro" for="play-mutate-table">Table</label>
+              <select class="field-select mono" id="play-mutate-table" data-hook="play-mutate-table"></select>
+              <label class="field-label micro" for="play-mutate-key">Partition key</label>
+              <input class="field-input mono" id="play-mutate-key" type="text" data-hook="play-mutate-key" placeholder="e.g. tpcc-w0001-i0042" spellcheck="false" />
+              <label class="field-label micro" for="play-mutate-values">Values — JSON object (insert/update/upsert)</label>
+              <textarea class="field-input mono play-json" id="play-mutate-values" data-hook="play-mutate-values" rows="3" placeholder='{"i_price": 12.5}' spellcheck="false"></textarea>
+              <label class="field-label micro" for="play-mutate-where">Where — JSON object (optional guard)</label>
+              <textarea class="field-input mono play-json" id="play-mutate-where" data-hook="play-mutate-where" rows="2" placeholder='{"i_price": 11.0}' spellcheck="false"></textarea>
+              <label class="field-label micro" for="play-mutate-requestid">Request ID (blank = auto-generated; auto-filled with the last response's id)</label>
+              <input class="field-input mono" id="play-mutate-requestid" type="text" data-hook="play-mutate-requestid" placeholder="auto" spellcheck="false" />
+              <div class="reshard-error" data-hook="play-mutate-json-error" hidden></div>
+              <div class="btn-row">
+                <button class="field-submit" type="submit" data-hook="play-mutate-submit">Send</button>
+                <button class="field-submit play-secondary" type="button" data-hook="play-mutate-replay" disabled>Replay same requestId</button>
+              </div>
+            </form>
+            <div class="play-panel-caption" data-hook="play-mutate-caption" hidden></div>
+            <div class="play-result" data-hook="play-mutate-result" hidden></div>
+          </div>
+
+          <!-- ============ TX ============ -->
+          <div class="play-panel" data-hook="play-panel-tx">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Tx</span>
+            </div>
+            <div class="play-panel-help">
+              Same-tenant two-phase commit via <span class="mono">/v1/tx</span> — 1 to 10 mutations against the
+              chosen warehouse, applied atomically: every mutation commits, or none does.
+            </div>
+            <form class="op-form" data-hook="play-tx-form" autocomplete="off">
+              <label class="field-label micro" for="play-tx-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-tx-warehouse" data-hook="play-tx-warehouse"></select>
+              <div class="play-tx-rows" data-hook="play-tx-rows"></div>
+              <button class="play-add-row-btn" type="button" data-hook="play-tx-add-row">+ Add mutation</button>
+              <label class="field-label micro" for="play-tx-requestid">Request ID (optional)</label>
+              <input class="field-input mono" id="play-tx-requestid" type="text" data-hook="play-tx-requestid" placeholder="auto" spellcheck="false" />
+              <div class="reshard-error" data-hook="play-tx-json-error" hidden></div>
+              <button class="field-submit" type="submit" data-hook="play-tx-submit">Send transaction</button>
+            </form>
+            <div class="play-result" data-hook="play-tx-result" hidden></div>
+          </div>
+
+          <!-- ============ INDEX QUERY ============ -->
+          <div class="play-panel" data-hook="play-panel-iq">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Index Query</span>
+            </div>
+            <div class="play-panel-help">
+              A point lookup via <span class="mono">/v1/index-query</span> against one of the table's registered
+              secondary indexes — the same indexes the real TPC-C load mix already queries.
+            </div>
+            <form class="op-form" data-hook="play-iq-form" autocomplete="off">
+              <label class="field-label micro" for="play-iq-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-iq-warehouse" data-hook="play-iq-warehouse"></select>
+              <label class="field-label micro" for="play-iq-table">Table</label>
+              <select class="field-select mono" id="play-iq-table" data-hook="play-iq-table"></select>
+              <label class="field-label micro" for="play-iq-index">Index</label>
+              <select class="field-select mono" id="play-iq-index" data-hook="play-iq-index"></select>
+              <label class="field-label micro" for="play-iq-values">Values — JSON object (index key columns)</label>
+              <textarea class="field-input mono play-json" id="play-iq-values" data-hook="play-iq-values" rows="2" placeholder='{"c_id": 42}' spellcheck="false"></textarea>
+              <label class="field-label micro" for="play-iq-limit">Limit (1–100, optional)</label>
+              <input class="field-input mono" id="play-iq-limit" type="number" min="1" max="100" data-hook="play-iq-limit" placeholder="default" />
+              <div class="reshard-error" data-hook="play-iq-json-error" hidden></div>
+              <button class="field-submit" type="submit" data-hook="play-iq-submit">Query index</button>
+            </form>
+            <div class="play-result" data-hook="play-iq-result" hidden></div>
+          </div>
+
+          <!-- ============ TABLE SCAN ============ -->
+          <div class="play-panel" data-hook="play-panel-ts">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Table Scan</span>
+            </div>
+            <div class="play-panel-help">
+              A paginated, tenant-scoped full scan via <span class="mono">/v1/table-scan</span>. Pass the
+              <span class="mono">cursor</span> from a result back in to page forward.
+            </div>
+            <form class="op-form" data-hook="play-ts-form" autocomplete="off">
+              <label class="field-label micro" for="play-ts-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-ts-warehouse" data-hook="play-ts-warehouse"></select>
+              <label class="field-label micro" for="play-ts-table">Table</label>
+              <select class="field-select mono" id="play-ts-table" data-hook="play-ts-table"></select>
+              <label class="field-label micro" for="play-ts-limit">Limit (1–100, default 20)</label>
+              <input class="field-input mono" id="play-ts-limit" type="number" min="1" max="100" data-hook="play-ts-limit" placeholder="20" />
+              <label class="field-label micro" for="play-ts-cursor">Cursor (optional — paste from a previous result)</label>
+              <input class="field-input mono" id="play-ts-cursor" type="text" data-hook="play-ts-cursor" placeholder="" spellcheck="false" />
+              <button class="field-submit" type="submit" data-hook="play-ts-submit">Scan table</button>
+            </form>
+            <div class="play-result" data-hook="play-ts-result" hidden></div>
+          </div>
+
+          <!-- ============ ROUTING INSPECTOR ============
+               Read-only — resolves EXACTLY how the cluster routes a key
+               (tenant -> catalog shard, then tenant:table:key -> vBucket ->
+               owning physical shard) against the LIVE vbucket map (src/play.ts's
+               playRouteInspect; reuses ./load/skew.ts's real vbucketForKey
+               formula, never a client-side reimplementation). On a successful
+               resolve, also asks the Topology canvas to highlight the owning
+               shard (see app.js's setRoutingHighlight) — a no-op with an honest
+               inline note if the canvas isn't showing live topology right now
+               (sample/demo data, or not connected yet). -->
+          <div class="play-panel" data-hook="play-panel-route-inspect">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Routing Inspector</span>
+            </div>
+            <div class="play-panel-help">
+              Two-step hash routing, exactly as the cluster applies it: <span class="mono">tenantId</span> picks a
+              catalog shard (<span class="mono">hashKey(tenantId) % catalogShardCount</span>), then
+              <span class="mono">tenantId:table:partitionKey</span> picks a vBucket within that catalog
+              (<span class="mono">hashKey(...) % totalVBuckets</span>), which the live vBucket map resolves to an
+              owning physical shard. Read-only — reflects the cluster's real current state, including a reshard
+              happening in another room right now.
+            </div>
+            <form class="op-form" data-hook="play-route-form" autocomplete="off">
+              <label class="field-label micro" for="play-route-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-route-warehouse" data-hook="play-route-warehouse"></select>
+              <label class="field-label micro" for="play-route-table">Table</label>
+              <select class="field-select mono" id="play-route-table" data-hook="play-route-table"></select>
+              <label class="field-label micro" for="play-route-key">Partition key</label>
+              <input class="field-input mono" id="play-route-key" type="text" data-hook="play-route-key" placeholder="e.g. s-0001-000001" spellcheck="false" />
+              <div class="btn-row">
+                <button class="field-submit" type="submit" data-hook="play-route-submit">Resolve</button>
+                <button class="field-submit play-secondary" type="button" data-hook="play-route-clear" disabled>Clear highlight</button>
+              </div>
+            </form>
+            <div class="play-route-summary" data-hook="play-route-summary" hidden></div>
+            <div class="play-result" data-hook="play-route-result" hidden></div>
+          </div>
+
+          <!-- ============ SQL (operator-only, read-only) ============ -->
+          <div class="play-panel play-panel-operator" data-hook="play-panel-sql">
+            <div class="play-panel-head">
+              <span class="play-panel-title">SQL</span>
+              <span class="play-op-badge">Operator-only · read-only</span>
+            </div>
+            <div class="play-panel-help">
+              Runs a single read-only <span class="mono">SELECT</span>/<span class="mono">EXPLAIN</span> statement
+              against one shard via <span class="mono">/v1/sql</span>, server-side under the admin token — the
+              browser never sees it. Writes, DDL, and multi-statement payloads are rejected with a 400 before they
+              ever reach the cluster.
+            </div>
+            <form class="op-form" data-hook="play-sql-form" autocomplete="off">
+              <label class="field-label micro" for="play-sql-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-sql-warehouse" data-hook="play-sql-warehouse"></select>
+              <label class="field-label micro" for="play-sql-table">Table</label>
+              <select class="field-select mono" id="play-sql-table" data-hook="play-sql-table"></select>
+              <label class="field-label micro" for="play-sql-key">Partition key (routes to one shard)</label>
+              <input class="field-input mono" id="play-sql-key" type="text" data-hook="play-sql-key" placeholder="e.g. tpcc-w0001-i0042" spellcheck="false" />
+              <label class="field-label micro" for="play-sql-text">SQL (SELECT / EXPLAIN only)</label>
+              <textarea class="field-input mono play-json" id="play-sql-text" data-hook="play-sql-text" rows="3" placeholder="SELECT * FROM tpcc_stock WHERE s_i_id = ?" spellcheck="false"></textarea>
+              <label class="field-label micro" for="play-sql-params">Params — JSON array (optional, ≤20)</label>
+              <textarea class="field-input mono play-json" id="play-sql-params" data-hook="play-sql-params" rows="1" placeholder="[42]" spellcheck="false"></textarea>
+              <div class="reshard-error" data-hook="play-sql-json-error" hidden></div>
+              <button class="field-submit" type="submit" data-hook="play-sql-submit">Run SQL</button>
+            </form>
+            <div class="play-result" data-hook="play-sql-result" hidden></div>
+          </div>
+
+          <!-- ============ SCATTER (operator-only, read-only) ============ -->
+          <div class="play-panel play-panel-operator" data-hook="play-panel-scatter">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Scatter</span>
+              <span class="play-op-badge">Operator-only · read-only</span>
+            </div>
+            <div class="play-panel-help">
+              Fans a single-table, no-JOIN <span class="mono">SELECT</span> across every tenant on every shard via
+              <span class="mono">/v1/scatter</span>, server-side under the admin token. Scoped to one of the demo
+              tables below — no arbitrary or joined table is accepted.
+            </div>
+            <form class="op-form" data-hook="play-scatter-form" autocomplete="off">
+              <label class="field-label micro" for="play-scatter-text">SQL — single table, no JOIN</label>
+              <textarea class="field-input mono play-json" id="play-scatter-text" data-hook="play-scatter-text" rows="3" placeholder="SELECT * FROM tpcc_stock WHERE s_quantity < ?" spellcheck="false"></textarea>
+              <label class="field-label micro" for="play-scatter-params">Params — JSON array (optional, ≤20)</label>
+              <textarea class="field-input mono play-json" id="play-scatter-params" data-hook="play-scatter-params" rows="1" placeholder="[10]" spellcheck="false"></textarea>
+              <label class="field-label micro" for="play-scatter-limit">Limit (1–200, optional)</label>
+              <input class="field-input mono" id="play-scatter-limit" type="number" min="1" max="200" data-hook="play-scatter-limit" placeholder="default" />
+              <div class="reshard-error" data-hook="play-scatter-json-error" hidden></div>
+              <button class="field-submit" type="submit" data-hook="play-scatter-submit">Run scatter</button>
+            </form>
+            <div class="play-result" data-hook="play-scatter-result" hidden></div>
+          </div>
+
         </div>
       </div>
     </div>
