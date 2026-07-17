@@ -275,14 +275,21 @@ export function isInternalTableName(name: string): boolean {
   return INTERNAL_TABLE_SET.has(name) || name.startsWith("__cf_") || name.startsWith("sqlite_");
 }
 
-// SQLite accepts, in an UNQUOTED identifier, the ASCII set [A-Za-z0-9_] plus
-// ANY code point >= U+0080 (its IdChar rule admits every byte >= 0x80). The
-// class is built via String.fromCodePoint so the source carries no astral
+// SQLite accepts, in an UNQUOTED identifier, the ASCII set [A-Za-z0-9_$] plus
+// ANY code point >= U+0080 (its IdChar rule admits every byte >= 0x80). `$` is
+// valid only NON-leading (SQLite rejects a leading `$`, and rejects `#`
+// entirely), so it appears in the trailing class only. An exhaustive brute
+// force of every ASCII byte against a real SQLite tokenizer confirmed `$` is
+// the ONLY ASCII IdChar beyond [A-Za-z0-9_] SQLite allows mid-identifier.
+// The class is built via String.fromCodePoint so the source carries no astral
 // literal or fragile unicode escape; the u flag keeps surrogate pairs intact.
-// A leading digit stays excluded (not a valid bare-identifier start).
+// A leading digit (and leading `$`) stay excluded (not a valid bare-identifier
+// start). Getting this set exactly right matters: a bare CTE name containing a
+// char this regex rejects but SQLite accepts (e.g. `x$y`) would desync
+// skipLeadingCte and let a real mutation read as a harmless SELECT.
 const IDENT_NON_ASCII = String.fromCodePoint(0x80) + "-" + String.fromCodePoint(0x10ffff);
 const BARE_IDENTIFIER_RE = new RegExp(
-  "^[A-Za-z_" + IDENT_NON_ASCII + "][A-Za-z0-9_" + IDENT_NON_ASCII + "]*",
+  "^[A-Za-z_" + IDENT_NON_ASCII + "][A-Za-z0-9_$" + IDENT_NON_ASCII + "]*",
   "u",
 );
 

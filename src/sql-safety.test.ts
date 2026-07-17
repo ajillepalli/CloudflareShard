@@ -143,6 +143,22 @@ describe("isMutation", () => {
     expect(isMutation("WITH ü AS (SELECT 1) SELECT * FROM ü")).toBe(false);
     expect(isMutation('WITH "ü" AS (SELECT 1) DELETE FROM events')).toBe(true);
   });
+
+  it("is not fooled by a `$` in a bare CTE name (SQLite IdChar accepts $ mid-identifier; CVE-class bypass)", () => {
+    // SQLite accepts `$` in a non-leading position of an unquoted identifier;
+    // the reader's char class had omitted it, so `x$y` matched only `x`,
+    // desynced skipLeadingCte, and left "with" leading -> misclassified.
+    expect(isMutation("WITH x$y AS (SELECT 1) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH xy$ AS (SELECT 1) UPDATE events SET x = 1")).toBe(true);
+    expect(isMutation("WITH x$y(n) AS (SELECT 1) INSERT INTO events VALUES (1)")).toBe(true);
+    expect(isMutation("WITH RECURSIVE x$y AS (SELECT 1) DELETE FROM events")).toBe(true);
+    expect(isMutation("WITH a AS (SELECT 1), b$c AS (SELECT 2) DELETE FROM events")).toBe(true);
+    expect(mutationTargetIsInternal("WITH x$y AS (SELECT 1) DELETE FROM __cf_row_owners")).toBe(true);
+    // No regression: a `$`-named CTE before a genuine SELECT stays a read.
+    expect(isMutation("WITH x$y AS (SELECT 1) SELECT * FROM x$y")).toBe(false);
+    // Leading `$` is a SQLite syntax error, so a non-mutation result is correct.
+    expect(isMutation("WITH $xy AS (SELECT 1) DELETE FROM events")).toBe(false);
+  });
 });
 
 // The write-target extractor backs mutationTargetIsInternal, the admin-only
