@@ -308,6 +308,45 @@
             </div>
           </div>
         </div>
+
+        <!-- ============ BUILD ON IT ============
+             The watch->build bridge: a real, runnable CloudflareShard
+             starter repo (a small multi-tenant "inventory" app,
+             service-bound to cloudflare-shard-mvp the same way
+             examples/rpc-consumer is — see src/build.ts's header comment)
+             generated server-side by GET /api/build/scaffold (download,
+             zipped) and GET /api/build/manifest (this panel's inline
+             preview, JSON). NO secret is ever in either response — see
+             src/build.ts's ACCURACY CONTRACT.
+
+             XSS: every file path and every byte of file content below
+             reaches the DOM via textContent only (app.js's
+             renderBuildFileList/renderBuildFilePreview) — same one-rule,
+             no-exceptions convention as the rest of this room. -->
+        <div class="app-panel" data-hook="app-panel-build">
+          <div class="app-panel-head">
+            <span class="app-panel-title">Build on it</span>
+            <span class="app-panel-sub mono" data-hook="build-status">—</span>
+          </div>
+          <div class="app-panel-help">
+            Everything you just watched, as a repo you can run: a real Worker service-bound to CloudflareShard's
+            <span class="mono">CloudflareShardRpc</span> entrypoint, doing tenant-scoped <span class="mono">mutate</span>,
+            <span class="mono">tx</span>, and <span class="mono">table-scan</span> calls — the exact pattern this demo
+            uses, accurate to the real API. No secrets ship in the download; you configure your own token, same as
+            <span class="mono">examples/rpc-consumer</span> does.
+          </div>
+          <button class="field-submit" type="button" data-hook="build-download-btn">Download starter repo</button>
+          <div class="reshard-error" data-hook="build-error" hidden></div>
+          <div class="build-browser">
+            <div class="build-file-list" data-hook="build-file-list"></div>
+            <div class="play-result build-file-preview-wrap">
+              <div class="play-result-head">
+                <span class="play-result-status mono" data-hook="build-file-preview-name">—</span>
+              </div>
+              <pre class="play-result-body mono" data-hook="build-file-preview"></pre>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 

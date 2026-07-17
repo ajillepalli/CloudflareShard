@@ -110,6 +110,13 @@ function defaultRespond(r: RouteResponse | undefined) {
     status,
     ok,
     json: () => Promise.resolve(body),
+    // The Build panel's download flow (app.js's handleBuildDownloadClick)
+    // calls res.blob() against GET /api/build/scaffold — a real zip binary
+    // in production, but tests only need SOMETHING blob-shaped to exercise
+    // the download click through to a synthetic <a download> without
+    // throwing; the bytes themselves are never asserted on here (that's
+    // build.test.ts's job, against the real server-side zip bytes).
+    blob: () => Promise.resolve(new Blob([JSON.stringify(body)])),
   };
 }
 
@@ -198,6 +205,15 @@ export function bootApp(options: HarnessOptions = {}): Harness {
     (window as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame = (cb) =>
       window.setTimeout(() => cb(Date.now()), 0) as unknown as number;
     (window as unknown as { cancelAnimationFrame: (id: number) => void }).cancelAnimationFrame = (id) => window.clearTimeout(id);
+  }
+  // jsdom doesn't implement URL.createObjectURL/revokeObjectURL (throws
+  // "Not implemented" if called) — stubbed defensively so the Build panel's
+  // handleBuildDownloadClick (URL.createObjectURL(blob) -> synthetic <a
+  // download> click -> revokeObjectURL) can run end to end in tests without
+  // that unrelated jsdom gap surfacing as a false failure.
+  if (!("createObjectURL" in window.URL)) {
+    (window.URL as unknown as { createObjectURL: (b: unknown) => string }).createObjectURL = () => "blob:stub-url";
+    (window.URL as unknown as { revokeObjectURL: (u: string) => void }).revokeObjectURL = () => {};
   }
   if (!("matchMedia" in window)) {
     (window as unknown as { matchMedia: (q: string) => MediaQueryList }).matchMedia = ((query: string) =>
