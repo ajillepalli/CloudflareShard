@@ -137,6 +137,11 @@ async function setUpStockCluster(numShards: number, totalVBuckets: number): Prom
   // acquire that same lock instead of racing the backfill and getting a 409
   // TOPOLOGY_OPERATION_IN_PROGRESS.
   await driveIndexBackfillToCompletion(STOCK_INDEX_NAME);
+  // driveIndexBackfillToCompletion ticks CatalogDO.alarm() by hand but does
+  // not consume the alarm /start-index-backfill already SCHEDULED — cancel it
+  // so a stale wall-clock firing can't race the migration below into a
+  // premature cutover. See clearCatalogAlarm's doc comment.
+  await clearCatalogAlarm();
 }
 
 /** In-process analog of ./gateway-client.ts's HttpTxExecutor: the SAME
@@ -237,64 +242,37 @@ function pollingReadBack(inner: ReadBackFn): ReadBackFn {
   };
 }
 
-/** Ticks catalog-0's alarm-driven migration orchestration ONE step — the
- * exact same primitive ../../../../src/index.test-helpers's
- * driveMigrationToCompletion loops on internally, exposed here standalone so
- * mutateThroughFence (below) can force one step of REAL progress on demand.
- * Safe to race with catalog-0's own REAL background alarm (main's PR #20
- * made backfill/cutover alarm-driven against actual wall-clock time,
- * MIGRATION_TICK_MS = 250ms in src/catalog.ts): catalog.ts's alarm() opens
- * with a `migrationTickInFlight` reentrancy guard, so a concurrent
- * invocation either advances the SAME tick or is a safe, idempotent no-op
- * that just re-arms the alarm — never interleaves. */
-async function tickMigrationOrchestration(): Promise<void> {
+/** Cancels catalog-0's pending storage alarm so the alarm-driven migration
+ * AND index-backfill orchestration (main's PR #20) advances ONLY under this
+ * test's explicit manual ticks (driveIndexBackfillToCompletion /
+ * driveMigrationToCompletion), never on Miniflare's wall clock.
+ *
+ * WHY this is required for a HONEST proof, not just a green test: both
+ * /admin/create-index (its backfill) and /admin/migrate-vbucket SCHEDULE a
+ * real alarm on catalog-0 — `state.storage.setAlarm(Date.now() + 250ms)`
+ * (MIGRATION_TICK_MS in src/catalog.ts). The driveXToCompletion helpers tick
+ * CatalogDO.alarm() by HAND but never CONSUME that already-scheduled alarm,
+ * so once its fire time passes Miniflare fires it on its own, between the
+ * test's own calls. Two distinct failures both trace to this:
+ *   (1) create-index's leftover backfill alarm, or the migration's own tick
+ *       alarm, fires mid-"during"-batch and carries the migration from
+ *       'backfilling' into cutover — fencing the source — so a write 409s
+ *       VBUCKET_FENCED (the original flake); and, more insidiously,
+ *   (2) that same premature advance can push the migration THROUGH cutover
+ *       before any "during" write lands, so the batch routes post-cutover and
+ *       the proof passes while covering NOTHING of the mirrored-backfilling
+ *       window it exists to exercise (Codex P2 — a hollow, not a wrong,
+ *       proof).
+ * Clearing the pending alarm right after each op that schedules one closes
+ * both: the migration can then ONLY move when the test ticks it, so the
+ * "during" batch is deterministically inside the true mirrored window every
+ * run (locked in by the explicit `migrate-vbucket-status === backfilling`
+ * assertion just before each "during" batch below). */
+async function clearCatalogAlarm(): Promise<void> {
   const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
-  await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
-    await instance.alarm();
+  await runInDurableObject(catalogStub, async (_instance: CatalogDO, state: DurableObjectState) => {
+    await state.storage.deleteAlarm();
   });
-}
-
-/** Wraps a tracked.mutate() call with the SAME bounded-retry idiom
- * pollingReadBack/driveMigrationToCompletion use elsewhere in this file.
- *
- * WHY this exists: PR #20 (see setUpStockCluster's doc comment) made
- * create-index backfill — and migration backfill/cutover, which this test
- * predates and now inherits the same mechanism from — alarm-driven against
- * REAL wall-clock time instead of synchronous. The "during" writeBatch below
- * is a sequential loop of WRITE_COUNT awaited /v1/mutate calls; on a loaded
- * test run that loop can take longer than MIGRATION_TICK_MS (250ms), and
- * catalog-0's own REAL background alarm can fire mid-loop and carry the
- * migration from 'backfilling' into 'cutover' — fencing the source — before
- * the loop finishes. Confirmed by repro: this raced on the very FIRST test
- * in this file, before any other test had run, so it is NOT a cross-test
- * fence leak (afterEach's reset() genuinely clears __cf_fenced_vbuckets and
- * every DO's storage, migration state included, between tests) — it's an
- * intra-test race against real time that PR #20 introduced.
- *
- * The fence itself is real and correctly applied (this is not a bug to
- * paper over) — the 409's own "fix" text says exactly what to do: "the
- * fence lifts when the migration's map flip completes, and the retry will
- * route to the new shard." A plain retry loop would still be racing the
- * SAME real 250ms alarm and could spin for a while (or, worse, forever if
- * something stalls it); ticking the orchestration manually here makes the
- * fence-lift deterministic instead. This does not weaken the test's proof:
- * the write still genuinely spans the migration lifecycle (it was attempted
- * while backfilling/cutover was in flight) and still lands — either
- * mirrored to the target pre-flip, or, if this call is what drives cutover
- * the rest of the way, directly on the target post-flip — either way
- * CorrectnessTracker.verify()'s later read-back is what proves lost:0, not
- * this retry. */
-async function mutateThroughFence(tracked: TrackingTxExecutor, warehouseId: number, call: MutateCall): Promise<MutateResult> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await tracked.mutate(warehouseId, call);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("VBUCKET_FENCED") || attempt >= 25) throw error;
-      await tickMigrationOrchestration();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-  }
 }
 
 // ----------------------------------------------------------------------------
@@ -425,12 +403,7 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
 
       async function writeBatch(phase: string, quantity: number): Promise<void> {
         for (const item of items) {
-          // mutateThroughFence, not a bare tracked.mutate(): see its doc
-          // comment (near pollingReadBack, above) — this "during" batch can
-          // race catalog-0's REAL alarm-driven cutover (PR #20) into a
-          // genuine VBUCKET_FENCED, and a plain retry would just keep
-          // racing the same real timer.
-          const result = await mutateThroughFence(tracked, warehouseId, {
+          const result = await tracked.mutate(warehouseId, {
             op: "update",
             table: "tpcc_stock",
             partitionKey: item.partitionKey,
@@ -461,9 +434,20 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
       expect(migrateBody.status).toBe("backfilling");
       expect(migrateBody.fromShard).toBe(sourceShardId);
       expect(migrateBody.toShard).toBe(targetShardId);
+      // Cancel the tick alarm /admin/migrate-vbucket just scheduled so the
+      // migration advances ONLY when driveMigrationToCompletion ticks it
+      // below — a stray wall-clock firing must not push it into cutover
+      // before (or during) the "during" batch. See clearCatalogAlarm.
+      await clearCatalogAlarm();
 
       // Phase B: writes DURING the backfill window — still authoritative on
       // the source, mirrored atomically to the target (Milestone 3, Chunk 3).
+      // Lock in the coverage this batch claims: with the alarm cleared, the
+      // migration is provably STILL pre-cutover here, so these writes really
+      // do exercise the mirrored-backfilling window (not a post-cutover route
+      // that would make the "during" label a lie — Codex P2).
+      const duringStatus = await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket: targetVbucket }, AUTH());
+      expect(((await duringStatus.json()) as { status: string }).status).toBe("backfilling");
       await writeBatch("during", 47);
 
       // Drive the REAL orchestration (CatalogDO alarm ticks) to completion —
@@ -622,11 +606,7 @@ describe("Shardscope live-cluster proof: notifyClusterChanged() keeps `verified`
 
       async function writeBatch(phase: string, quantity: number): Promise<void> {
         for (const item of items) {
-          // mutateThroughFence — see its doc comment near pollingReadBack
-          // above, and the identical comment in the other describe block's
-          // writeBatch: this "during" batch can race catalog-0's REAL
-          // alarm-driven cutover (PR #20) into a genuine VBUCKET_FENCED.
-          const result = await mutateThroughFence(tracked, warehouseId, {
+          const result = await tracked.mutate(warehouseId, {
             op: "update",
             table: "tpcc_stock",
             partitionKey: item.partitionKey,
@@ -659,13 +639,22 @@ describe("Shardscope live-cluster proof: notifyClusterChanged() keeps `verified`
       expect(migrateRes.status).toBe(200);
       const migrateBody = (await migrateRes.json()) as { status: string };
       expect(migrateBody.status).toBe("backfilling");
+      // Cancel the tick alarm /admin/migrate-vbucket just scheduled so the
+      // migration advances ONLY under driveMigrationToCompletion below (see
+      // clearCatalogAlarm) — no stray wall-clock cutover during the "during"
+      // batch.
+      await clearCatalogAlarm();
       tracker.notifyClusterChanged();
       expect(tracker.snapshot().verified).toBe(false);
       expect(tracker.snapshot().lost).toBe(0); // nothing PROVEN lost — just no longer freshly verified
 
       // Writes DURING the backfill window, mirroring another load-driver
       // tick that still observes migration activity and re-invalidates
-      // (matches runTick's per-tick call, not a one-shot).
+      // (matches runTick's per-tick call, not a one-shot). With the alarm
+      // cleared, the migration is provably STILL pre-cutover here, so these
+      // writes genuinely exercise the mirrored-backfilling window (Codex P2).
+      const duringStatus = await post("/admin/migrate-vbucket-status", { catalogShardId: "catalog-0", vbucket: targetVbucket }, AUTH());
+      expect(((await duringStatus.json()) as { status: string }).status).toBe("backfilling");
       await writeBatch("during", 66);
       tracker.promoteToTracked(tracker.drainPendingCandidates());
       tracker.notifyClusterChanged();
