@@ -2,6 +2,13 @@ name = "cloudflare-shard-mvp"
 main = "src/index.ts"
 compatibility_date = "2026-06-29"
 
+# Issue #35: durable, queryable Workers Logs -- every log() call (including
+# the per-request http.request event logged from fetch()) becomes searchable
+# in the dashboard / `wrangler tail`, not just visible during a live tail.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [[durable_objects.bindings]]
 name = "CATALOG"
 class_name = "CatalogDO"
