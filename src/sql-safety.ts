@@ -24,49 +24,100 @@ function stripLeadingComments(sql: string): string {
   return s;
 }
 
+/** THE single quote-span walker for this module. If `sql[start]` opens a quoted
+ * span — a `'...'` string literal or a `"..."` / `` `...` `` / `[...]` quoted
+ * identifier — returns `{ end }` pointing just past the closing delimiter and
+ * `terminated: true`. The doubled-delimiter escape is honored for `' " ``` (a
+ * doubled delimiter stays INSIDE the span, e.g. `'a''b'`, `"a""b"`); `[...]`
+ * has no escape and ends at the first `]`. If the span is unterminated, returns
+ * `{ end: sql.length, terminated: false }`. If `sql[start]` is not an opening
+ * quote char, returns `{ end: start, terminated: false }` (a no-op).
+ *
+ * Every structural scanner in this module (skipBalancedParens,
+ * stripCommentsPreservingStrings, readIdentifierToken) routes quoted spans
+ * through THIS function, so there is exactly one quote tracker — no "second,
+ * weaker" one that handles fewer quote types or forgets the doubled-quote
+ * escape and desyncs a paren/identifier/comment scan (the root cause of the
+ * backtick-paren, bracket-paren, and doubled-quote-CTE-name bypasses). */
+function skipQuoteSpan(sql: string, start: number): { end: number; terminated: boolean } {
+  const open = sql[start];
+  let close: string;
+  let escapable: boolean;
+  if (open === "'" || open === '"' || open === "`") {
+    close = open;
+    escapable = true;
+  } else if (open === "[") {
+    close = "]";
+    escapable = false;
+  } else {
+    return { end: start, terminated: false }; // not a quote opener
+  }
+  let i = start + 1;
+  while (i < sql.length) {
+    if (sql[i] === close) {
+      if (escapable && sql[i + 1] === close) {
+        i += 2; // doubled delimiter = escaped, stays inside the span
+        continue;
+      }
+      return { end: i + 1, terminated: true };
+    }
+    i += 1;
+  }
+  return { end: sql.length, terminated: false }; // unterminated
+}
+
+/** True if `c` opens one of the four quoted-span types this module recognizes. */
+function isQuoteOpen(c: string): boolean {
+  return c === "'" || c === '"' || c === "`" || c === "[";
+}
+
 /** Scans forward from an opening '(' at `start` to the index just past its
- * matching close paren, honoring quoted strings so a paren inside a string
- * literal doesn't unbalance the count. Returns sql.length if unterminated. */
+ * matching close paren, skipping over ALL quoted spans (string literals AND
+ * `"`/`` ` ``/`[` quoted identifiers) via skipQuoteSpan so a paren inside any
+ * quoted span doesn't unbalance the count. Returns sql.length if unterminated. */
 function skipBalancedParens(sql: string, start: number): number {
   let depth = 0;
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = start; i < sql.length; i += 1) {
+  let i = start;
+  while (i < sql.length) {
     const c = sql[i];
-    if (inSingle) {
-      if (c === "'") inSingle = false;
+    if (isQuoteOpen(c)) {
+      i = skipQuoteSpan(sql, i).end; // ignore any parens inside the quoted span
       continue;
     }
-    if (inDouble) {
-      if (c === '"') inDouble = false;
-      continue;
-    }
-    if (c === "'") inSingle = true;
-    else if (c === '"') inDouble = true;
-    else if (c === "(") depth += 1;
+    if (c === "(") depth += 1;
     else if (c === ")") {
       depth -= 1;
       if (depth === 0) return i + 1;
     }
+    i += 1;
   }
   return sql.length;
 }
 
-/** Skips past a leading "WITH [RECURSIVE] name [(cols)] AS (body) [, ...]"
- * common-table-expression clause to reach the terminal statement (SELECT,
- * INSERT, UPDATE, or DELETE — SQLite allows WITH before any of them). Without
- * this, "WITH x AS (SELECT 1) DELETE FROM t" reads as a harmless SELECT
- * because isMutation() only ever inspected the first keyword. Bails out
- * (returns the input unchanged) on anything that doesn't match the expected
- * CTE grammar — malformed input isn't valid SQL SQLite would execute as a
- * mutation anyway, so it's safe to leave unclassified here. */
+/** Skips past a leading "WITH [RECURSIVE] name [(cols)] AS [[NOT] MATERIALIZED]
+ * (body) [, ...]" common-table-expression clause to reach the terminal
+ * statement (SELECT, INSERT, UPDATE, or DELETE — SQLite allows WITH before any
+ * of them). Without this, "WITH x AS (SELECT 1) DELETE FROM t" reads as a
+ * harmless SELECT because isMutation() only ever inspected the first keyword.
+ * The optional MATERIALIZED / NOT MATERIALIZED hint (SQLite 3.35+) between AS
+ * and the opening paren must be consumed too — "WITH x AS MATERIALIZED
+ * (SELECT 1) DELETE FROM t" is the same bypass shape with the hint inserted,
+ * and previously made this function bail (see beforeBody check below) leaving
+ * the mutation unclassified. Bails out (returns the input unchanged) on
+ * anything that doesn't match the expected CTE grammar — malformed input
+ * isn't valid SQL SQLite would execute as a mutation anyway, so it's safe to
+ * leave unclassified here. */
 function skipLeadingCte(sql: string): string {
   if (!/^\s*with\b/i.test(sql)) return sql;
   let s = sql.replace(/^\s*with\s+(recursive\s+)?/i, "");
   for (;;) {
-    const idMatch = /^\s*("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|[A-Za-z_][A-Za-z0-9_]*)/.exec(s);
-    if (!idMatch) return sql;
-    s = s.slice(idMatch[0].length);
+    // Consume the CTE name via the shared escape-aware identifier reader (NOT a
+    // hand-rolled regex) so a doubled-quote-escaped name — `"a""b"`, `` `a``b` ``
+    // — is matched whole instead of truncated, which would desync the parse and
+    // make this bail with "with" still leading (misclassifying the mutation).
+    const id = readIdentifierToken(s, 0);
+    if (!id) return sql;
+    s = s.slice(id.next);
 
     const afterId = s.replace(/^\s+/, "");
     if (afterId.startsWith("(")) {
@@ -77,6 +128,15 @@ function skipLeadingCte(sql: string): string {
     const asMatch = /^\s*as\s*/i.exec(s);
     if (!asMatch) return sql;
     s = s.slice(asMatch[0].length);
+
+    // Optional MATERIALIZED / NOT MATERIALIZED hint between AS and the body's
+    // opening paren (SQLite 3.35+). Must be consumed here, before the "(" check
+    // below, or a hinted CTE bails out and returns the un-skipped original —
+    // silently misclassifying the mutation that follows it.
+    const materializedMatch = /^\s*(not\s+)?materialized\s*/i.exec(s);
+    if (materializedMatch) {
+      s = s.slice(materializedMatch[0].length);
+    }
 
     const beforeBody = s.replace(/^\s+/, "");
     if (!beforeBody.startsWith("(")) return sql;
@@ -92,9 +152,61 @@ function skipLeadingCte(sql: string): string {
   }
 }
 
+/** Removes SQL line comments (dash-dash to newline) and block comments from
+ * ANYWHERE in the SQL (each replaced with a space), while genuinely preserving
+ * quoted spans — single-quoted string literals and double-quote / backtick /
+ * bracket quoted identifiers (honoring the doubled-quote escape for the first
+ * three). This is the quote-aware counterpart the leading-keyword classifiers
+ * need: a comment can hide at any inter-token seam of a CTE header (between AS
+ * and the body paren, around the MATERIALIZED hint, etc.), and skipLeadingCte
+ * parses those seams with comment-blind regexes, so it must see comment-free
+ * text.
+ *
+ * Why not reuse stripComments(): that helper is NOT actually quote-aware (its
+ * doc comment overstates), so a block-comment opener inside a string literal
+ * fools it — e.g. a CTE body of SELECT 'BLOCK-OPEN' (an unterminated block
+ * opener held inside the string) makes stripComments eat everything through
+ * end-of-input, deleting the trailing DELETE and misclassifying a real mutation
+ * as a read. skipBalancedParens (used by skipLeadingCte) IS quote-aware and
+ * classifies that case correctly today, so this pre-strip must not regress it. */
+function stripCommentsPreservingStrings(sql: string): string {
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    // Quoted string / identifier span: copy verbatim through its matching close
+    // (via the shared quote walker), so a `--` or `/*` inside it — including a
+    // paren, `]`, or doubled quote — is never treated as a comment.
+    if (isQuoteOpen(c)) {
+      const { end } = skipQuoteSpan(sql, i);
+      out += sql.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      i = nl === -1 ? sql.length : nl;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
 export function isMutation(sql: string): boolean {
-  const afterComments = stripLeadingComments(sql);
-  const afterCte = stripLeadingComments(skipLeadingCte(afterComments));
+  // Strip comments GLOBALLY (quote-aware) first so a comment lodged inside the
+  // CTE header ("WITH x AS /*c*/ (...) DELETE ...") can't make skipLeadingCte
+  // bail and leave the real leading keyword ("with") in place — which read as a
+  // harmless SELECT and defeated the read-only / internal-table guards.
+  const afterCte = stripLeadingComments(skipLeadingCte(stripCommentsPreservingStrings(sql)));
   return /^(insert|update|delete|replace|create|drop|alter)/i.test(afterCte);
 }
 
@@ -105,8 +217,9 @@ export function isMutation(sql: string): boolean {
  * same "ShardDO classifies its own writes" philosophy isMutation() already
  * uses, rather than trusting a caller-supplied hint. */
 export function isDeleteStatement(sql: string): boolean {
-  const afterComments = stripLeadingComments(sql);
-  const afterCte = stripLeadingComments(skipLeadingCte(afterComments));
+  // Same quote-aware global comment strip as isMutation (see its comment): a
+  // comment in the CTE header must not hide the terminal DELETE keyword.
+  const afterCte = stripLeadingComments(skipLeadingCte(stripCommentsPreservingStrings(sql)));
   return /^delete/i.test(afterCte);
 }
 
@@ -131,32 +244,11 @@ export const INTERNAL_TABLE_NAMES = [
 
 const INTERNAL_TABLE_SET = new Set<string>(INTERNAL_TABLE_NAMES);
 
-/** Removes `-- ...` line and `/* ... *​/` block comments from anywhere in the
- * SQL (replacing each with a space), leaving all quoted spans intact. Used
- * before write-target extraction so an inter-token comment (`DELETE/**​/FROM
- * x`) can't hide the keyword/target structure. */
-function stripComments(sql: string): string {
-  let out = "";
-  let i = 0;
-  while (i < sql.length) {
-    const c = sql[i];
-    if (c === "-" && sql[i + 1] === "-") {
-      const nl = sql.indexOf("\n", i);
-      i = nl === -1 ? sql.length : nl;
-      out += " ";
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      const end = sql.indexOf("*/", i + 2);
-      i = end === -1 ? sql.length : end + 2;
-      out += " ";
-      continue;
-    }
-    out += c;
-    i += 1;
-  }
-  return out;
-}
+// NOTE: the former quote-BLIND `stripComments` helper was removed. It claimed
+// (falsely) to leave quoted spans intact but had no quote tracking, so a
+// comment delimiter inside a string literal made it eat unbounded text — a
+// security footgun for the write-target/CTE classifiers. All callers now use
+// the quote-aware `stripCommentsPreservingStrings` above.
 
 /** Unquotes a single identifier token: `"x"`/`` `x` ``/`[x]` (honoring the
  * doubled-quote escape for the first two). Bare tokens pass through. */
@@ -183,6 +275,24 @@ export function isInternalTableName(name: string): boolean {
   return INTERNAL_TABLE_SET.has(name) || name.startsWith("__cf_") || name.startsWith("sqlite_");
 }
 
+// SQLite accepts, in an UNQUOTED identifier, the ASCII set [A-Za-z0-9_$] plus
+// ANY code point >= U+0080 (its IdChar rule admits every byte >= 0x80). `$` is
+// valid only NON-leading (SQLite rejects a leading `$`, and rejects `#`
+// entirely), so it appears in the trailing class only. An exhaustive brute
+// force of every ASCII byte against a real SQLite tokenizer confirmed `$` is
+// the ONLY ASCII IdChar beyond [A-Za-z0-9_] SQLite allows mid-identifier.
+// The class is built via String.fromCodePoint so the source carries no astral
+// literal or fragile unicode escape; the u flag keeps surrogate pairs intact.
+// A leading digit (and leading `$`) stay excluded (not a valid bare-identifier
+// start). Getting this set exactly right matters: a bare CTE name containing a
+// char this regex rejects but SQLite accepts (e.g. `x$y`) would desync
+// skipLeadingCte and let a real mutation read as a harmless SELECT.
+const IDENT_NON_ASCII = String.fromCodePoint(0x80) + "-" + String.fromCodePoint(0x10ffff);
+const BARE_IDENTIFIER_RE = new RegExp(
+  "^[A-Za-z_" + IDENT_NON_ASCII + "][A-Za-z0-9_$" + IDENT_NON_ASCII + "]*",
+  "u",
+);
+
 /** Reads one identifier token starting at `pos` after skipping leading
  * whitespace: a quoted `"..."`/`` `...` ``/`[...]` span (honoring the doubled-
  * quote escape for the first two) or a bare identifier. Returns the raw
@@ -192,23 +302,19 @@ function readIdentifierToken(s: string, pos: number): { raw: string; next: numbe
   while (pos < s.length && /\s/.test(s[pos])) pos += 1;
   if (pos >= s.length) return null;
   const c = s[pos];
+  // A quoted IDENTIFIER is `"..."` / `` `...` `` / `[...]` (single quotes are
+  // string literals, never identifiers, so they are not accepted here). Route
+  // through the shared quote walker so the doubled-quote escape is honored
+  // identically everywhere; an unterminated quote is ambiguous → fail closed.
   if (c === '"' || c === "`" || c === "[") {
-    const close = c === "[" ? "]" : c;
-    let j = pos + 1;
-    while (j < s.length) {
-      if (s[j] === close) {
-        if ((close === '"' || close === "`") && s[j + 1] === close) {
-          j += 2;
-          continue;
-        }
-        j += 1;
-        return { raw: s.slice(pos, j), next: j };
-      }
-      j += 1;
-    }
-    return null; // unterminated quote
+    const { end, terminated } = skipQuoteSpan(s, pos);
+    if (!terminated) return null;
+    return { raw: s.slice(pos, end), next: end };
   }
-  const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(pos));
+  // Bare identifier via the module-level BARE_IDENTIFIER_RE (ASCII ident set +
+  // any code point >= U+0080), so an unquoted non-ASCII CTE name (ü, é, 中) is
+  // matched whole instead of returning null and making skipLeadingCte bail.
+  const m = BARE_IDENTIFIER_RE.exec(s.slice(pos));
   if (!m) return null;
   return { raw: m[0], next: pos + m[0].length };
 }
@@ -222,7 +328,12 @@ function readIdentifierToken(s: string, pos: number): { raw: string; next: numbe
  * (not valid SQLite table syntax). Used by mutationTargetIsInternal (the
  * admin-only /v1/sql write guardrail against internal bookkeeping tables). */
 export function mutationWriteTarget(sql: string): string | null {
-  const s = stripLeadingComments(skipLeadingCte(stripComments(sql)));
+  // Quote-aware comment strip: a comment delimiter inside a CTE-body string
+  // literal (e.g. WITH x AS (SELECT '<block-open>') DELETE FROM __cf_...) must
+  // not corrupt target extraction, or the internal-table write guard is
+  // bypassed. See stripCommentsPreservingStrings' comment for the quote-blind
+  // failure mode this avoids.
+  const s = stripLeadingComments(skipLeadingCte(stripCommentsPreservingStrings(sql)));
   const kw = /^\s*(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|update(?:\s+or\s+\w+)?|delete\s+from)(?=\s|["`[])/i.exec(s);
   if (!kw) return null;
   const first = readIdentifierToken(s, kw[0].length);
@@ -283,11 +394,15 @@ export function isDangerousSchema(sql: string): boolean {
  * statement doesn't match the expected shape, so callers can reject it rather
  * than silently create a table under a different name than the caller declared. */
 export function extractCreateTableName(sql: string): string | null {
-  const match = /^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))/i.exec(
-    sql,
-  );
-  if (!match) return null;
-  return match[2] ?? match[3] ?? match[4] ?? match[5] ?? null;
+  const prefix = /^\s*create\s+table\s+(?:if\s+not\s+exists\s+)?/i.exec(sql);
+  if (!prefix) return null;
+  // Use the shared escape-aware identifier reader + unquoter instead of a
+  // hand-rolled `"([^"]+)"` regex, so a doubled-quote-escaped name (`"a""b"`)
+  // is read whole and unescaped — not truncated to `a`, which would desync the
+  // caller's name-match check (schemaSql name vs declared table).
+  const id = readIdentifierToken(sql, prefix[0].length);
+  if (!id) return null;
+  return unquoteIdentifier(id.raw);
 }
 
 /** Returns `sql` with `IF NOT EXISTS` injected after `CREATE TABLE` when it's a
