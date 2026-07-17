@@ -551,7 +551,11 @@ describe("CatalogDO tenant authorization", () => {
     expect(res.status).toBe(409);
   });
 
-  it("rotate:true issues a new token that invalidates the old one", async () => {
+  // Issue #26: rotate:true used to invalidate the old token the instant the
+  // new one was issued (zero overlap window) -- a documented known
+  // limitation that could break an in-flight caller mid-rotation. It now
+  // keeps the old token valid for a bounded grace period instead.
+  it("rotate:true issues a new token that works immediately, while the old token keeps working during its grace period", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
     await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
@@ -565,6 +569,105 @@ describe("CatalogDO tenant authorization", () => {
     expect(rotateRes.status).toBe(200);
     const { token: newToken } = (await rotateRes.json()) as { token: string };
     expect(newToken).not.toBe(oldToken);
+
+    const oldTokenRes = await stub.fetch(
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${oldToken}`),
+    );
+    expect(oldTokenRes.status).toBe(200);
+
+    const newTokenRes = await stub.fetch(
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${newToken}`),
+    );
+    expect(newTokenRes.status).toBe(200);
+  });
+
+  it("rotating twice before the first grace period expires drops the doubly-old token, not just the newest-superseded one", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: token1 } = (await firstRes.json()) as { token: string };
+    const secondRes = await stub.fetch(post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: token2 } = (await secondRes.json()) as { token: string };
+    const thirdRes = await stub.fetch(post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: token3 } = (await thirdRes.json()) as { token: string };
+
+    // token1 (superseded by the FIRST rotation, then superseded again by the
+    // SECOND) must be dead -- previous_token_hash only ever remembers the
+    // single most-recently-superseded token, not a full history.
+    const token1Res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token1}`));
+    expect(token1Res.status).toBe(401);
+
+    // token2 (superseded by the SECOND rotation) is the current grace-period
+    // token and must still work.
+    const token2Res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token2}`));
+    expect(token2Res.status).toBe(200);
+
+    // token3 is current and must work.
+    const token3Res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token3}`));
+    expect(token3Res.status).toBe(200);
+  });
+
+  it("the old token stops working once its rotation grace period has elapsed", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: oldToken } = (await firstRes.json()) as { token: string };
+    await stub.fetch(post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    // Simulate the grace period having already elapsed, directly, rather
+    // than waiting TENANT_TOKEN_ROTATION_GRACE_MS in real wall-clock time.
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE tenant_auth SET previous_token_expires_at = ? WHERE tenant_id = 't1'",
+        new Date(Date.now() - 1000).toISOString(),
+      );
+    });
+
+    const oldTokenRes = await stub.fetch(
+      post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${oldToken}`),
+    );
+    expect(oldTokenRes.status).toBe(401);
+  });
+
+  it("revoking a tenant invalidates both the current and an in-grace previous token immediately", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: oldToken } = (await firstRes.json()) as { token: string };
+    const rotateRes = await stub.fetch(
+      post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    const { token: newToken } = (await rotateRes.json()) as { token: string };
+
+    const revokeRes = await stub.fetch(post("/revoke-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(revokeRes.status).toBe(200);
+
+    for (const token of [oldToken, newToken]) {
+      const res = await stub.fetch(post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${token}`));
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it("rotating an already-revoked tenant does not grace the old (revoked) token", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 1, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await stub.fetch(post("/register-table", { table: "events", partitionKeyColumn: "id" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const firstRes = await stub.fetch(post("/register-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+    const { token: oldToken } = (await firstRes.json()) as { token: string };
+    await stub.fetch(post("/revoke-tenant", { tenantId: "t1" }, `Bearer ${env.ADMIN_TOKEN}`));
+
+    const rotateRes = await stub.fetch(
+      post("/register-tenant", { tenantId: "t1", rotate: true }, `Bearer ${env.ADMIN_TOKEN}`),
+    );
+    expect(rotateRes.status).toBe(200);
+    const { token: newToken } = (await rotateRes.json()) as { token: string };
 
     const oldTokenRes = await stub.fetch(
       post("/route", { table: "events", tenantId: "t1", partitionKey: "p1" }, `Bearer ${oldToken}`),
