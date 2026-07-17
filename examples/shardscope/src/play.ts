@@ -1,5 +1,7 @@
-/** play.ts — Shardscope's Playground room server-side layer (backend only;
- * no UI yet — see the room's rail item in README.md, currently disabled).
+/** play.ts — Shardscope's Playground room server-side layer. Also backs the
+ * App room's multi-tenant view + same-tenant transaction (playTableScan /
+ * playTx, reused verbatim — see README.md's "The App room" section and
+ * public/app.js's "App room" section for the client side of both rooms).
  *
  * ============================================================================
  * WHAT THIS ROOM IS: a gate-protected proxy that lets a browser drive
