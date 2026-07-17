@@ -643,6 +643,62 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
     expect(queryBody.rows.map((r) => r.id)).toEqual(["row-c"]);
   });
+
+  // Codex round-6 review (PR #20): the page-level batched freshness read (an
+  // earlier "Eng-review fix" for subrequest cost) snapshotted every row's
+  // value ONCE before any writes in the page started. A page can take up to
+  // INDEX_BACKFILL_PAGE_SIZE write round trips; a row mutated after that one
+  // snapshot but before its own turn in the write loop would get a STALE
+  // index_key_json written for it -- permanently, since __cf_indexes is
+  // keyed by that value and the live mutate's own index maintenance has no
+  // way to know a differently-keyed stale entry exists to clean up. This
+  // test proves the fix structurally: each row's freshness read must happen
+  // as its OWN request, interleaved with writes, not clustered together
+  // before any of them.
+  it("refreshes each row's value immediately before its own write, not batched once for the whole page up front", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_stale_evt");
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    await post("/v1/mutate", { op: "insert", table: "idx_stale_evt", tenantId: tenantA, partitionKey: "row-1", values: { v: "alpha" } }, tokenA);
+    await post("/v1/mutate", { op: "insert", table: "idx_stale_evt", tenantId: tenantA, partitionKey: "row-2", values: { v: "beta" } }, tokenA);
+
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const callLog: Array<{ type: "refresh" | "write" | "other"; pks: string[] }> = [];
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        callShard: (shardId: string, path: string, payload: unknown) => Promise<Response>;
+        __realCallShard?: (shardId: string, path: string, payload: unknown) => Promise<Response>;
+      };
+      inst.__realCallShard = inst.callShard.bind(inst);
+      inst.callShard = async (shardId: string, path: string, payload: unknown) => {
+        const p = payload as { params?: unknown[]; requestId?: string };
+        const pks = (p.params ?? []).filter((x): x is string => x === "row-1" || x === "row-2");
+        if (p.requestId?.includes("-refresh-")) callLog.push({ type: "refresh", pks });
+        else if (p.requestId?.includes("-write-")) callLog.push({ type: "write", pks });
+        return inst.__realCallShard!(shardId, path, payload);
+      };
+    });
+
+    const res = await post("/admin/create-index", { indexName: "idx_stale_by_v", table: "idx_stale_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    // Both rows are well under INDEX_BACKFILL_PAGE_SIZE, on the same shard
+    // (both written by tenantA) -- one tick processes the whole page.
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    // Under the reverted page-level batched read, ONE refresh call would
+    // cover both row-1 and row-2 up front, before either write -- so the
+    // (only) refresh call touching row-2 would appear BEFORE write:row-1.
+    // Under the per-row fix, row-2's dedicated refresh call happens AFTER
+    // row-1 has already been written.
+    const write1Idx = callLog.findIndex((c) => c.type === "write" && c.pks.includes("row-1"));
+    const refresh2Idx = callLog.findIndex((c) => c.type === "refresh" && c.pks.includes("row-2"));
+    expect(write1Idx).toBeGreaterThan(-1);
+    expect(refresh2Idx).toBeGreaterThan(-1);
+    expect(write1Idx).toBeLessThan(refresh2Idx);
+  });
 });
 
 // Codex final-review P1 #1 (original synchronous version) / Codex

@@ -64,12 +64,13 @@ const MIGRATION_TICK_MAX_MS = 30000;
 const CUTOVER_PREPARED_WAIT_MAX_MS = 30000;
 
 // Codex live-deployment finding: bounds one index-backfill tick's work. Each
-// row costs exactly ONE subrequest to WRITE its index entry (the fresh
-// re-read that used to cost a SECOND subrequest per row is now batched into
-// one query per page, see advanceIndexBackfill) plus one subrequest to scan
-// the page itself -- so a tick's worst case is INDEX_BACKFILL_PAGE_SIZE + 2
-// subrequests, comfortably under Cloudflare's per-invocation cap with
-// headroom for INDEX_RING_FENCED retries on a handful of rows.
+// row costs one subrequest to refresh its current value immediately before
+// writing (Codex round 6: this can no longer be batched once per page --
+// see advanceIndexBackfill's doc comment there) plus one subrequest to WRITE
+// its index entry, plus one subrequest to scan the page itself -- so a
+// tick's worst case is 2 * INDEX_BACKFILL_PAGE_SIZE + 1 subrequests,
+// comfortably under Cloudflare's per-invocation cap with headroom for
+// INDEX_RING_FENCED retries on a handful of rows.
 const INDEX_BACKFILL_PAGE_SIZE = 250;
 // Codex review P2 fix: re-heartbeat the topology lock partway through a full
 // page's write loop, not just once before the tick starts. A full 250-row
@@ -2334,20 +2335,19 @@ export class CatalogDO extends DurableObject {
    * fully backfilled and flipped to 'ready'.
    *
    * Bounded to INDEX_BACKFILL_PAGE_SIZE rows per tick: scans the current
-   * shard's next page (one subrequest), batches the "read every matching
-   * row's CURRENT values plus its __cf_row_owners tenant_id" step into ONE
-   * query for the whole page (one subrequest — the original synchronous
-   * version did this per-row, doubling its subrequest cost for no benefit,
-   * since nothing between the scan and this read can have changed within
-   * the same tick), then writes each row's index entry individually (one
-   * subrequest per row — this step alone can't batch, since different
-   * rows can hash to DIFFERENT index shards). Same "re-read fresh
-   * immediately before writing" correctness reasoning the original
-   * synchronous version used (Eng-review fix): a concurrent /v1/mutate on
-   * a row backfill hasn't reached yet has its OWN async index write racing
-   * this scan, and re-reading narrows that race to one read-then-write
-   * round trip instead of trusting a value that could be an entire tick
-   * stale. */
+   * shard's next page (one subrequest), then for each row re-reads its
+   * CURRENT values plus its __cf_row_owners tenant_id (one subrequest) and
+   * writes its index entry (one subrequest — this step can't batch, since
+   * different rows can hash to DIFFERENT index shards). The per-row refresh
+   * was briefly batched into one query for the whole page (an "Eng-review
+   * fix" for subrequest cost) but Codex round 6 found that widened the
+   * staleness window this refresh exists to close: a page can take up to
+   * INDEX_BACKFILL_PAGE_SIZE write round trips, and a concurrent /v1/mutate
+   * on a row not yet written can land anywhere in that window, not just
+   * between the scan and a single page-level read. Reverted to reading each
+   * row immediately before ITS OWN write narrows the race back to one
+   * read-then-write round trip per row, matching the original synchronous
+   * version's own reasoning here. */
   private async advanceIndexBackfill(row: IndexBackfillRow): Promise<boolean> {
     const shardIds = JSON.parse(row.backfill_shard_ids_json) as string[];
     if (row.backfill_shard_idx >= shardIds.length) {
@@ -2430,26 +2430,37 @@ export class CatalogDO extends DurableObject {
       return true;
     }
 
-    // Batched fresh re-read (Eng-review fix, batched instead of per-row —
-    // see this method's doc comment) plus this shard's __cf_row_owners join
-    // for each row's owning tenant, in ONE query for the whole page.
     const pageKeys = page.map((r) => String(r[pkCol]));
-    const inPlaceholders = pageKeys.map(() => "?").join(", ");
-    const freshRes = await this.callShard(shardId, "/execute", {
-      sql: `SELECT ${selectCols}, ro.tenant_id AS __cf_tenant_id FROM ${safeTable} b LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b.${safePk} WHERE b.${safePk} IN (${inPlaceholders})`,
-      params: [row.table_name, ...pageKeys],
-      requestId: `create-index-backfill-refresh-${row.index_name}-${shardId}-${crypto.randomUUID()}`,
-      isMutation: false,
-    });
-    if (!freshRes.ok) throw new Error(`backfill refresh failed on shard ${shardId} for index ${row.index_name}: ${freshRes.status}`);
-    const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown> & { __cf_tenant_id: string | null }> };
-    const freshByPk = new Map(freshBody.rows.map((r) => [String(r[pkCol]), r]));
 
+    // Codex round-6 fix: refresh each row IMMEDIATELY before writing its
+    // index entry, not once for the whole page up front. A page can take up
+    // to INDEX_BACKFILL_PAGE_SIZE write round trips; a live /v1/mutate can
+    // update this exact row's indexed column(s) at any point during that
+    // window. A page-level batched read (the prior "Eng-review fix",
+    // reverted here) snapshots every row's value ONCE before any writes
+    // start -- if a row changes between that snapshot and this row's turn in
+    // the loop, the backfill would write a now-STALE index_key_json entry
+    // that the live write's own index maintenance has no way to know about
+    // or clean up (it only touches the key pair for ITS OWN write).
+    // __cf_indexes is keyed by index_key_json, so that stale entry can
+    // persist forever once the index reaches 'ready', and enough of them for
+    // the same logical key can exhaust /v1/index-query's rawScanCap and hide
+    // later live matches. Costs one extra subrequest per row (matching
+    // INDEX_BACKFILL_PAGE_SIZE's doc comment, updated below) -- still
+    // comfortably under Cloudflare's per-invocation cap per tick.
     const placementRing = JSON.parse(row.placement_ring_json) as string[];
     let rowsWritten = 0;
     let rowsSinceHeartbeat = 0;
     for (const pk of pageKeys) {
-      const freshRow = freshByPk.get(pk);
+      const freshRes = await this.callShard(shardId, "/execute", {
+        sql: `SELECT ${selectCols}, ro.tenant_id AS __cf_tenant_id FROM ${safeTable} b LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b.${safePk} WHERE b.${safePk} = ?`,
+        params: [row.table_name, pk],
+        requestId: `create-index-backfill-refresh-${row.index_name}-${shardId}-${crypto.randomUUID()}`,
+        isMutation: false,
+      });
+      if (!freshRes.ok) throw new Error(`backfill refresh failed for partitionKey ${pk} on shard ${shardId}, index ${row.index_name}: ${freshRes.status}`);
+      const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown> & { __cf_tenant_id: string | null }> };
+      const freshRow = freshBody.rows[0];
       if (!freshRow) continue; // deleted since the scan -- skip rather than index stale data
       if (!freshRow.__cf_tenant_id) {
         throw new PermanentIndexBackfillError(
