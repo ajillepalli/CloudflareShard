@@ -95,6 +95,14 @@ import { TenantTokenStoreTokenProvider } from "./load/tenant-token-store";
 // read-only enforcement can never drift from what core itself considers a
 // mutation/dangerous statement.
 import { isDangerous, isMutation } from "../../../src/sql-safety";
+// Same cross-boundary-reuse pattern for the routing math itself (playRouteInspect,
+// below): ./load/skew.ts already inverts + verifies this EXACT formula for the
+// hot-shard skew driver, so its `vbucketForKey` (the piece that formula lives
+// in) is imported here rather than a second copy being written — see that
+// file's own header comment for the formula's source-of-truth pointer into
+// core (src/hash.ts's hashKey + src/index.ts's mutate/tx routing path).
+import { vbucketForKey } from "./load/skew";
+import { hashKey } from "../../../src/hash";
 
 /** Thrown by every parse*() function below on a malformed or
  * whitelist-violating request from the browser — distinct from whatever
@@ -531,6 +539,148 @@ export function parsePlayScatterInput(body: unknown): PlayScatterInput {
 
 export function playScatter(env: Env, input: PlayScatterInput): Promise<unknown> {
   return env.SHARD_API.scatter(env.ADMIN_TOKEN, { sql: input.sql, params: input.params, limit: input.limit });
+}
+
+// ============================================================================
+// /api/play/route-inspect — the Playground's routing inspector (READ-ONLY,
+// no cluster mutation). Given a whitelisted (warehouseId, table,
+// partitionKey), resolves the SAME two-step hash routing core itself applies
+// to a real /v1/mutate call:
+//   1. tenantId -> catalogShardId: `catalog-${hashKey(tenantId) %
+//      catalogShardCount}` (src/index.ts's catalogShardIdForTenant — mirrored
+//      here as a local pure function exactly the way ./load/load-driver.ts
+//      already mirrors it, with the identical "MUST stay in sync" comment;
+//      that file's own header comment explains why this small formula is
+//      duplicated rather than imported: src/index.ts is a separate
+//      deployable Worker's *private*, non-exported function, not a shared
+//      library).
+//   2. tenantId:table:partitionKey -> vbucket: ./load/skew.ts's
+//      vbucketForKey — imported, NOT re-derived (see this file's import
+//      comment above) — the exact function the hot-shard skew driver itself
+//      uses and verifies against the live map, so this resolver can never
+//      silently drift from core's real routing.
+// Both catalogShardCount and totalVBuckets/the vbucket->shard ownership map
+// come from a LIVE env.SHARD_API.adminVbucketMap(env.ADMIN_TOKEN) call — the
+// same admin RPC ./aggregator.ts's TopologyAggregator already polls for the
+// Topology room (see that file's pollSnapshot) — never a hardcoded/guessed
+// count, so a key's reported owner reflects the cluster's ACTUAL current
+// state (including a live reshard happening in another room), not a stale or
+// assumed one.
+// ============================================================================
+
+/** Loosely-typed slice of adminVbucketMap's response this resolver needs —
+ * mirrors aggregator.ts's own local AdminVbucketMapResponse (env.d.ts's
+ * ShardApiBinding.adminVbucketMap intentionally returns `unknown`; every
+ * caller narrows it locally, same established convention as
+ * aggregator.ts/chaos.ts's VbucketMapLike/./load/load-driver.ts's own copy). */
+interface RouteInspectVbucketMapRow {
+  vbucket: number;
+  shardId: string;
+  migrationStatus: string;
+  targetShardId: string | null;
+}
+
+interface RouteInspectVbucketMapResponse {
+  catalogShardCount: number;
+  totalVBuckets: number;
+  catalogs: Array<{ catalogShardId: string; totalVBuckets: number; map: RouteInspectVbucketMapRow[] }>;
+}
+
+/** Which catalog shard governs a given tenant — deliberately duplicated (not
+ * imported) from src/index.ts's private, non-exported `catalogShardIdForTenant`,
+ * the same mirrored-formula pattern ./load/load-driver.ts's own copy already
+ * establishes (see that file's identical doc comment for the full reasoning).
+ * MUST stay in sync with src/index.ts's version: `catalog-${hashKey(tenantId)
+ * % catalogShardCount}`. `catalogShardCount` here always comes from the live
+ * adminVbucketMap response (never a locally-guessed env var), so this can
+ * never drift from whatever the cluster was actually initialized with. */
+function catalogShardIdForTenant(tenantId: string, catalogShardCount: number): string {
+  return `catalog-${hashKey(tenantId) % catalogShardCount}`;
+}
+
+export interface PlayRouteInspectInput {
+  warehouseId: PlaygroundWarehouseId;
+  table: PlaygroundTable;
+  partitionKey: string;
+}
+
+export function parsePlayRouteInspectInput(body: unknown): PlayRouteInspectInput {
+  const b = asRecord(body);
+  return {
+    warehouseId: requireWarehouseId(b.warehouseId),
+    table: requireTable(b.table),
+    partitionKey: requireNonEmptyString(b.partitionKey, "partitionKey"),
+  };
+}
+
+export interface PlayRouteInspectMigration {
+  status: string;
+  fromShardId: string;
+  toShardId: string;
+}
+
+export interface PlayRouteInspectResult {
+  tenantId: string;
+  catalogShardId: string;
+  vbucket: number;
+  totalVBuckets: number;
+  catalogShardCount: number;
+  ownerShardId: string;
+  migration?: PlayRouteInspectMigration;
+}
+
+/** Resolves a (warehouseId, table, partitionKey) to its real current owning
+ * shard against the LIVE vbucket map — see this section's header comment for
+ * the two-step formula and why every count/mapping comes from a fresh
+ * env.SHARD_API.adminVbucketMap call rather than a cached/guessed value.
+ *
+ * If the resolved catalog or vbucket isn't present in the live map (an
+ * uninitialized cluster, or a catalogShardCount that has changed out from
+ * under a stale assumption), this throws PlayValidationError rather than
+ * fabricating an owner — same "fail honestly, never guess" contract as
+ * ./chaos.ts's ChaosPreconditionError for an analogous "catalog not found in
+ * the live vBucket map" case (see that file's pickHotVbucketTarget), reusing
+ * this file's single PlayValidationError class since Playground doesn't
+ * otherwise distinguish "malformed request" from "current cluster state
+ * can't satisfy this request" — both are calm 400s to the browser via
+ * runPlayOp, never a 500 or a fabricated result. */
+export async function playRouteInspect(env: Env, input: PlayRouteInspectInput): Promise<PlayRouteInspectResult> {
+  const tenantId = tenantIdForWarehouse(input.warehouseId);
+  const vbucketMap = (await env.SHARD_API.adminVbucketMap(env.ADMIN_TOKEN)) as RouteInspectVbucketMapResponse;
+
+  const catalogShardId = catalogShardIdForTenant(tenantId, vbucketMap.catalogShardCount);
+  const catalog = vbucketMap.catalogs.find((c) => c.catalogShardId === catalogShardId);
+  if (!catalog) {
+    throw new PlayValidationError(
+      `Catalog ${catalogShardId} not found in the live vBucket map — the cluster may not be initialized yet. Try again once it is.`,
+    );
+  }
+
+  const vbucket = vbucketForKey(tenantId, input.table, input.partitionKey, catalog.totalVBuckets);
+  const row = catalog.map.find((r) => r.vbucket === vbucket);
+  if (!row) {
+    throw new PlayValidationError(
+      `vBucket ${vbucket} not found in catalog ${catalogShardId}'s live map — the cluster may not be initialized yet. Try again once it is.`,
+    );
+  }
+
+  const result: PlayRouteInspectResult = {
+    tenantId,
+    catalogShardId,
+    vbucket,
+    totalVBuckets: catalog.totalVBuckets,
+    catalogShardCount: vbucketMap.catalogShardCount,
+    ownerShardId: row.shardId,
+  };
+  // A vbucket mid-migration still routes writes to its CURRENT shardId (the
+  // cutover hasn't flipped ownership yet) — same "current shardId is the
+  // real owner" rule ./load/skew.ts's ownedVBuckets doc comment states for
+  // the identical reason. Reported honestly alongside the target, never
+  // hidden or presented as already-moved.
+  if (row.migrationStatus !== "none" && row.targetShardId) {
+    result.migration = { status: row.migrationStatus, fromShardId: row.shardId, toShardId: row.targetShardId };
+  }
+  return result;
 }
 
 // ============================================================================

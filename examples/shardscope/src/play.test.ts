@@ -38,18 +38,23 @@ import {
   extractScatterFromTable,
   parsePlayIndexQueryInput,
   parsePlayMutateInput,
+  parsePlayRouteInspectInput,
   parsePlayScatterInput,
   parsePlaySqlInput,
   parsePlayTableScanInput,
   parsePlayTxInput,
   playIndexQuery,
   playMutate,
+  playRouteInspect,
   playScatter,
   playSql,
   playTableScan,
   playTx,
 } from "./play";
 import type { Env } from "./env";
+import { hashKey } from "../../../src/hash";
+import { vbucketForKey } from "./load/skew";
+import { tenantIdForWarehouse } from "./load/transactions";
 
 // ----------------------------------------------------------------------------
 // fakeEnv — same shape/spirit as reshard.test.ts's fakeEnv(): only what
@@ -348,6 +353,149 @@ describe("play.ts — playSql/playScatter (operator-scoped, ADMIN_TOKEN, never a
 });
 
 // ============================================================================
+// Layer 1: playRouteInspect — the routing inspector's resolver. Fixture built
+// from the REAL hashKey/vbucketForKey formulas (imported, never re-derived —
+// same anti-drift discipline as ./load/load.test.ts's own skew.ts tests), so
+// these tests double as a guard against src/play.ts's playRouteInspect ever
+// silently diverging from core's actual routing.
+// ============================================================================
+
+describe("play.ts — playRouteInspect (routing inspector resolver)", () => {
+  const CATALOG_SHARD_COUNT = 4;
+  const TOTAL_VBUCKETS = 16;
+
+  /** Builds a fakeEnv() whose adminVbucketMap mock reports a REAL,
+   * internally-consistent vbucket map for the given warehouse/table/key: the
+   * target vbucket (computed via the real vbucketForKey formula) is owned by
+   * `ownerShardId` in its catalog (optionally mid-migration toward
+   * `targetShardId`), and every OTHER vbucket in that catalog — plus a
+   * second, unrelated catalog — is owned by filler shard ids, so a test
+   * accidentally passing because the resolver picked "whatever's first"
+   * would be caught. */
+  function envForRouteInspect(
+    warehouseId: number,
+    table: string,
+    partitionKey: string,
+    ownerShardId: string,
+    migration?: { status: string; targetShardId: string },
+  ): {
+    env: Env & { SHARD_API: { [K in keyof Env["SHARD_API"]]: ReturnType<typeof vi.fn> } };
+    tenantId: string;
+    catalogShardId: string;
+    vbucket: number;
+    rawVbucketMap: { catalogs: Array<{ catalogShardId: string; map: Array<{ vbucket: number; shardId: string }> }> };
+  } {
+    const env = fakeEnv();
+    const tenantId = tenantIdForWarehouse(warehouseId);
+    const catalogShardId = `catalog-${hashKey(tenantId) % CATALOG_SHARD_COUNT}`;
+    const vbucket = vbucketForKey(tenantId, table, partitionKey, TOTAL_VBUCKETS);
+
+    const targetCatalogMap = Array.from({ length: TOTAL_VBUCKETS }, (_, v) => ({
+      vbucket: v,
+      shardId: v === vbucket ? ownerShardId : "shard-filler",
+      migrationStatus: v === vbucket && migration ? migration.status : "none",
+      targetShardId: v === vbucket && migration ? migration.targetShardId : null,
+    }));
+
+    // A second, unrelated catalog — proves the resolver actually filters by
+    // catalogShardId rather than scanning/matching the first catalog it sees.
+    const otherCatalogId = catalogShardId === "catalog-0" ? "catalog-1" : "catalog-0";
+    const otherCatalogMap = Array.from({ length: TOTAL_VBUCKETS }, (_, v) => ({
+      vbucket: v,
+      shardId: "shard-in-other-catalog",
+      migrationStatus: "none",
+      targetShardId: null,
+    }));
+
+    const rawVbucketMap = {
+      catalogShardCount: CATALOG_SHARD_COUNT,
+      totalVBuckets: TOTAL_VBUCKETS * CATALOG_SHARD_COUNT,
+      catalogs: [
+        { catalogShardId, totalVBuckets: TOTAL_VBUCKETS, map: targetCatalogMap },
+        { catalogShardId: otherCatalogId, totalVBuckets: TOTAL_VBUCKETS, map: otherCatalogMap },
+      ],
+    };
+    env.SHARD_API.adminVbucketMap.mockResolvedValue(rawVbucketMap);
+
+    return { env, tenantId, catalogShardId, vbucket, rawVbucketMap };
+  }
+
+  it("resolves tenantId/catalogShardId/vbucket/ownerShardId matching the real hashKey/vbucketForKey formulas", async () => {
+    const { env, tenantId, catalogShardId, vbucket } = envForRouteInspect(1, "tpcc_stock", "s-0001-000001", "shard-target");
+    const input = parsePlayRouteInspectInput({ warehouseId: 1, table: "tpcc_stock", partitionKey: "s-0001-000001" });
+    const result = await playRouteInspect(env, input);
+
+    expect(result.tenantId).toBe(tenantId);
+    expect(result.catalogShardId).toBe(catalogShardId);
+    expect(result.vbucket).toBe(vbucket);
+    expect(result.totalVBuckets).toBe(TOTAL_VBUCKETS);
+    expect(result.catalogShardCount).toBe(CATALOG_SHARD_COUNT);
+    expect(result.ownerShardId).toBe("shard-target");
+    expect(result.migration).toBeUndefined();
+  });
+
+  it("is deterministic: the same (warehouseId, table, partitionKey) resolves identically across repeated calls", async () => {
+    const { env } = envForRouteInspect(2, "tpcc_orders", "o-0002-05-000000123", "shard-a");
+    const input = parsePlayRouteInspectInput({ warehouseId: 2, table: "tpcc_orders", partitionKey: "o-0002-05-000000123" });
+
+    const first = await playRouteInspect(env, input);
+    const second = await playRouteInspect(env, input);
+
+    expect(second).toEqual(first);
+  });
+
+  it("anti-drift: the resolved vbucket's ownerShardId matches what /admin/vbucket-map actually reports for that vbucket", async () => {
+    const { env, catalogShardId, vbucket, rawVbucketMap } = envForRouteInspect(3, "tpcc_customer", "c-0003-07-000042", "shard-real-owner");
+    const input = parsePlayRouteInspectInput({ warehouseId: 3, table: "tpcc_customer", partitionKey: "c-0003-07-000042" });
+
+    const result = await playRouteInspect(env, input);
+
+    // Independently re-derive the "ground truth" straight from the SAME raw
+    // adminVbucketMap payload the resolver consumed (not from the resolver's
+    // own output) — this is the guard against the resolver silently
+    // returning a plausible-but-wrong owner.
+    const catalog = rawVbucketMap.catalogs.find((c) => c.catalogShardId === catalogShardId);
+    const row = catalog?.map.find((r) => r.vbucket === vbucket);
+
+    expect(row?.shardId).toBe(result.ownerShardId);
+    expect(result.ownerShardId).toBe("shard-real-owner");
+  });
+
+  it("reports a mid-migration vbucket honestly: ownerShardId stays the CURRENT (source) shard, migration carries both ends + status", async () => {
+    const { env } = envForRouteInspect(1, "tpcc_stock", "s-0001-000099", "shard-source", {
+      status: "backfilling",
+      targetShardId: "shard-destination",
+    });
+    const input = parsePlayRouteInspectInput({ warehouseId: 1, table: "tpcc_stock", partitionKey: "s-0001-000099" });
+
+    const result = await playRouteInspect(env, input);
+
+    expect(result.ownerShardId).toBe("shard-source");
+    expect(result.migration).toEqual({ status: "backfilling", fromShardId: "shard-source", toShardId: "shard-destination" });
+  });
+
+  it("throws PlayValidationError (never fabricates an owner) when the resolved catalog isn't in the live map", async () => {
+    const env = fakeEnv();
+    env.SHARD_API.adminVbucketMap.mockResolvedValue({ catalogShardCount: 4, totalVBuckets: 64, catalogs: [] });
+    const input = parsePlayRouteInspectInput({ warehouseId: 1, table: "tpcc_stock", partitionKey: "s-0001-000001" });
+
+    await expect(playRouteInspect(env, input)).rejects.toThrow(PlayValidationError);
+  });
+
+  it("parsePlayRouteInspectInput rejects a warehouseId outside PLAYGROUND_WAREHOUSE_IDS", () => {
+    expect(() => parsePlayRouteInspectInput({ warehouseId: 999, table: "tpcc_stock", partitionKey: "x" })).toThrow(PlayValidationError);
+  });
+
+  it("parsePlayRouteInspectInput rejects a table outside PLAYGROUND_TABLES", () => {
+    expect(() => parsePlayRouteInspectInput({ warehouseId: 1, table: "applied_requests", partitionKey: "x" })).toThrow(PlayValidationError);
+  });
+
+  it("parsePlayRouteInspectInput rejects an empty partitionKey", () => {
+    expect(() => parsePlayRouteInspectInput({ warehouseId: 1, table: "tpcc_stock", partitionKey: "" })).toThrow(PlayValidationError);
+  });
+});
+
+// ============================================================================
 // Layer 2: route-level tests through src/index.ts's default export — the
 // gate, whitelist-400s, and the idempotent-replay/mismatch demo contract.
 // ============================================================================
@@ -509,5 +657,56 @@ describe("index.ts — /api/play/* gate + wiring", () => {
     const res = await worker.fetch(playRequest("/api/play/scatter", { sql: "SELECT * FROM applied_requests" }), env);
     expect(res.status).toBe(400);
     expect(env.SHARD_API.scatter).not.toHaveBeenCalled();
+  });
+
+  it("authorized POST /api/play/route-inspect happy path returns 200 with the resolved routing", async () => {
+    const env = fakeEnv();
+    env.SHARD_API.adminVbucketMap.mockResolvedValue({
+      catalogShardCount: 1,
+      totalVBuckets: 4,
+      catalogs: [
+        {
+          catalogShardId: "catalog-0",
+          totalVBuckets: 4,
+          map: [
+            { vbucket: 0, shardId: "shard-a", migrationStatus: "none", targetShardId: null },
+            { vbucket: 1, shardId: "shard-a", migrationStatus: "none", targetShardId: null },
+            { vbucket: 2, shardId: "shard-a", migrationStatus: "none", targetShardId: null },
+            { vbucket: 3, shardId: "shard-a", migrationStatus: "none", targetShardId: null },
+          ],
+        },
+      ],
+    });
+    const res = await worker.fetch(playRequest("/api/play/route-inspect", { warehouseId: 1, table: "tpcc_stock", partitionKey: "s-0001-000001" }), env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { tenantId: string; catalogShardId: string; ownerShardId: string; vbucket: number };
+    expect(body.tenantId).toBe("tpcc-w0001");
+    expect(body.catalogShardId).toBe("catalog-0");
+    expect(body.ownerShardId).toBe("shard-a");
+    expect(env.SHARD_API.adminVbucketMap).toHaveBeenCalledWith("test-admin-token");
+  });
+
+  it("authorized POST /api/play/route-inspect with a bad warehouseId is rejected with 400 (input-whitelist rejection)", async () => {
+    const env = fakeEnv();
+    const res = await worker.fetch(playRequest("/api/play/route-inspect", { warehouseId: 42, table: "tpcc_stock", partitionKey: "x" }), env);
+    expect(res.status).toBe(400);
+    expect(env.SHARD_API.adminVbucketMap).not.toHaveBeenCalled();
+  });
+
+  it("authorized POST /api/play/route-inspect with a bad table is rejected with 400 (input-whitelist rejection)", async () => {
+    const env = fakeEnv();
+    const res = await worker.fetch(playRequest("/api/play/route-inspect", { warehouseId: 1, table: "row_locks", partitionKey: "x" }), env);
+    expect(res.status).toBe(400);
+    expect(env.SHARD_API.adminVbucketMap).not.toHaveBeenCalled();
+  });
+
+  it("unauthenticated POST /api/play/route-inspect is rejected with 401 before ever touching SHARD_API", async () => {
+    const env = fakeEnv();
+    const res = await worker.fetch(
+      playRequest("/api/play/route-inspect", { warehouseId: 1, table: "tpcc_stock", partitionKey: "x" }, { authorized: false }),
+      env,
+    );
+    expect(res.status).toBe(401);
+    expect(env.SHARD_API.adminVbucketMap).not.toHaveBeenCalled();
   });
 });

@@ -364,6 +364,44 @@
             <div class="play-result" data-hook="play-ts-result" hidden></div>
           </div>
 
+          <!-- ============ ROUTING INSPECTOR ============
+               Read-only — resolves EXACTLY how the cluster routes a key
+               (tenant -> catalog shard, then tenant:table:key -> vBucket ->
+               owning physical shard) against the LIVE vbucket map (src/play.ts's
+               playRouteInspect; reuses ./load/skew.ts's real vbucketForKey
+               formula, never a client-side reimplementation). On a successful
+               resolve, also asks the Topology canvas to highlight the owning
+               shard (see app.js's setRoutingHighlight) — a no-op with an honest
+               inline note if the canvas isn't showing live topology right now
+               (sample/demo data, or not connected yet). -->
+          <div class="play-panel" data-hook="play-panel-route-inspect">
+            <div class="play-panel-head">
+              <span class="play-panel-title">Routing Inspector</span>
+            </div>
+            <div class="play-panel-help">
+              Two-step hash routing, exactly as the cluster applies it: <span class="mono">tenantId</span> picks a
+              catalog shard (<span class="mono">hashKey(tenantId) % catalogShardCount</span>), then
+              <span class="mono">tenantId:table:partitionKey</span> picks a vBucket within that catalog
+              (<span class="mono">hashKey(...) % totalVBuckets</span>), which the live vBucket map resolves to an
+              owning physical shard. Read-only — reflects the cluster's real current state, including a reshard
+              happening in another room right now.
+            </div>
+            <form class="op-form" data-hook="play-route-form" autocomplete="off">
+              <label class="field-label micro" for="play-route-warehouse">Warehouse</label>
+              <select class="field-select mono" id="play-route-warehouse" data-hook="play-route-warehouse"></select>
+              <label class="field-label micro" for="play-route-table">Table</label>
+              <select class="field-select mono" id="play-route-table" data-hook="play-route-table"></select>
+              <label class="field-label micro" for="play-route-key">Partition key</label>
+              <input class="field-input mono" id="play-route-key" type="text" data-hook="play-route-key" placeholder="e.g. s-0001-000001" spellcheck="false" />
+              <div class="btn-row">
+                <button class="field-submit" type="submit" data-hook="play-route-submit">Resolve</button>
+                <button class="field-submit play-secondary" type="button" data-hook="play-route-clear" disabled>Clear highlight</button>
+              </div>
+            </form>
+            <div class="play-route-summary" data-hook="play-route-summary" hidden></div>
+            <div class="play-result" data-hook="play-route-result" hidden></div>
+          </div>
+
           <!-- ============ SQL (operator-only, read-only) ============ -->
           <div class="play-panel play-panel-operator" data-hook="play-panel-sql">
             <div class="play-panel-head">

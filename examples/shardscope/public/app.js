@@ -181,6 +181,14 @@ const el = {
   playScatterJsonError: hook("play-scatter-json-error"),
   playScatterResult: hook("play-scatter-result"),
 
+  playRouteForm: hook("play-route-form"),
+  playRouteWarehouse: hook("play-route-warehouse"),
+  playRouteTable: hook("play-route-table"),
+  playRouteKey: hook("play-route-key"),
+  playRouteClear: hook("play-route-clear"),
+  playRouteSummary: hook("play-route-summary"),
+  playRouteResult: hook("play-route-result"),
+
   // ---- "The old way" contrast beat (T10) ----
   oldwayToggle: hook("oldway-toggle"),
   oldwayBody: hook("oldway-body"),
@@ -626,6 +634,18 @@ function computeTotalRows(stats) {
 
 let lastRenderedSnapshot = null;
 
+/** Playground's Routing Inspector "spotlight" — the shardId (or null) the
+ * Topology canvas should highlight on its NEXT render, set by
+ * setRoutingHighlight() below. Deliberately module-level and independent of
+ * activeRoom: the canvas is hidden WHILE the Playground room is open (see
+ * setActiveRoom — canvasWrap.hidden for room === "play"), so this can only
+ * ever become visible after switching to Topology/Reshard; clearing it on
+ * Playground room-exit would make the whole feature unobservable. It's reset
+ * on logout (handleLogout), the one point this file already resets every
+ * other per-session UI state (activeOp, etc), and by the panel's own "Clear
+ * highlight" button (handlePlayRouteClear). */
+let routingHighlightShardId = null;
+
 function render(snapshot) {
   try {
     renderInner(snapshot);
@@ -814,8 +834,18 @@ function renderInner(snapshot) {
     }
     const ringTitle = `${owned.length} vbucket(s) owned` + (outgoing.length ? `, ${outgoing.length} migrating out` : "");
 
+    // Playground's Routing Inspector highlight (see setRoutingHighlight) — a
+    // transient, additive "you resolved this one" pointer, layered on TOP of
+    // whatever state class this node already has (hot/target/draining/
+    // unavailable) rather than replacing it, so it never fights the heat ramp
+    // or the --safe/--danger reserved colors (DESIGN.md). `id` is already the
+    // same trusted, escapeHtml()'d shard identity used two lines below —
+    // routingHighlightShardId is only ever compared by strict equality, never
+    // interpolated into markup itself.
+    const isRouteHighlighted = id === routingHighlightShardId;
+
     nodeHtml.push(`
-      <div class="shard${stateClass ? " " + stateClass : ""}" style="left:${pos.x}%; top:${pos.y}%; --sz:${sizePx.toFixed(0)}px; --heat:${heatColor};">
+      <div class="shard${stateClass ? " " + stateClass : ""}${isRouteHighlighted ? " route-highlight" : ""}" style="left:${pos.x}%; top:${pos.y}%; --sz:${sizePx.toFixed(0)}px; --heat:${heatColor};">
         <div class="shard-core">
           <div class="vring" style="--ring-r:${(sizePx / 2 + 12).toFixed(0)}px;" title="${escapeHtml(ringTitle)}">${dots}</div>
           <div>
@@ -823,6 +853,7 @@ function renderInner(snapshot) {
             <div class="shard-rate">${escapeHtml(rateText)}</div>
           </div>
           ${tagHtml}
+          ${isRouteHighlighted ? '<div class="shard-tag route-badge" title="Resolved by the Playground’s Routing Inspector">◆ routed key</div>' : ""}
         </div>
       </div>
     `);
@@ -1838,15 +1869,15 @@ function playErrorMessage(body) {
 
 function populatePlaygroundStaticSelects() {
   const warehouseItems = PLAYGROUND_WAREHOUSE_IDS.map((id) => ({ value: String(id), label: `warehouse ${id}` }));
-  [el.playMutateWarehouse, el.playTxWarehouse, el.playIqWarehouse, el.playTsWarehouse, el.playSqlWarehouse].forEach((sel) =>
-    populateSelect(sel, warehouseItems),
+  [el.playMutateWarehouse, el.playTxWarehouse, el.playIqWarehouse, el.playTsWarehouse, el.playSqlWarehouse, el.playRouteWarehouse].forEach(
+    (sel) => populateSelect(sel, warehouseItems),
   );
 
   const opItems = PLAYGROUND_MUTATE_OPS.map((op) => ({ value: op, label: op }));
   populateSelect(el.playMutateOp, opItems);
 
   const tableItems = PLAYGROUND_TABLES.map((t) => ({ value: t, label: t }));
-  [el.playMutateTable, el.playIqTable, el.playTsTable, el.playSqlTable].forEach((sel) => populateSelect(sel, tableItems));
+  [el.playMutateTable, el.playIqTable, el.playTsTable, el.playSqlTable, el.playRouteTable].forEach((sel) => populateSelect(sel, tableItems));
 
   // Default the Index Query panel's table to the first one that actually
   // HAS a registered index (rather than PLAYGROUND_TABLES[0], which may not
@@ -2269,6 +2300,170 @@ function handlePlayScatterSubmit(evt) {
     .finally(() => setFormBusy(el.playScatterForm, false));
 }
 
+// ---- Routing Inspector panel ------------------------------------------------
+//
+// POSTs to /api/play/route-inspect (src/play.ts's playRouteInspect — the REAL
+// two-step hash routing against the live vBucket map, never reimplemented
+// client-side) and renders the result two ways: a tabular mono summary below
+// the form (this section), and a transient highlight on the matching shard
+// node in the Topology canvas (renderInner's isRouteHighlighted, this file
+// above — see routingHighlightShardId's own doc comment for why that
+// highlight deliberately survives leaving the Playground room).
+
+/** Currently-rendered summary's honest "why (not) highlighted" note element,
+ * so handlePlayRouteClear can update just that line in place (leaving the
+ * resolved fields on screen — they're still true, only the highlight state
+ * changed) without rebuilding the whole panel. Reset to null whenever
+ * renderRouteSummary rebuilds the panel from scratch. */
+let playRouteNoteEl = null;
+
+/** Mirrors renderInner's own shard-id union logic (this file, ~line 700:
+ * every row's current shardId AND non-null targetShardId, unioned with
+ * shards[].shardId) — kept in sync by hand since renderInner doesn't expose
+ * that set. Used only to give the routing summary's note an honest "is this
+ * shard actually in the currently-rendered topology" answer; never used for
+ * rendering itself. */
+function collectKnownShardIds(snapshot) {
+  const ids = new Set();
+  const catalogs = Array.isArray(snapshot.catalogs) ? snapshot.catalogs : [];
+  for (const cat of catalogs) {
+    for (const row of cat.vbuckets || []) {
+      if (row.shardId) ids.add(row.shardId);
+      if (row.targetShardId) ids.add(row.targetShardId);
+    }
+  }
+  for (const s of Array.isArray(snapshot.shards) ? snapshot.shards : []) {
+    if (s.shardId) ids.add(s.shardId);
+  }
+  return ids;
+}
+
+/** Honest explanation of the CURRENT routingHighlightShardId's visibility —
+ * never claims a highlight is showing unless it actually will be. Three
+ * degrade paths, matching this feature's "skip the canvas highlight, say
+ * why" requirement: sample/demo data (mode !== "live" — highlighting a real
+ * cluster's resolved owner against a fabricated topology would be
+ * misleading, since the sample's shard ids aren't guaranteed to mean
+ * anything), no snapshot rendered yet at all, or a snapshot that simply
+ * doesn't currently know this shard id (a stale resolve, or it just changed
+ * out from under this call — the whole point of re-resolving live each
+ * time). */
+function describeHighlightState() {
+  if (!routingHighlightShardId) return "No shard highlighted on the Topology canvas right now.";
+  if (mode !== "live") {
+    return `Resolved owner is "${routingHighlightShardId}", but the Topology canvas is showing sample/demo data right now — skipping the highlight rather than pointing at a shard that may not mean anything in this fabricated topology.`;
+  }
+  if (!lastRenderedSnapshot) {
+    return `Resolved owner is "${routingHighlightShardId}" — the Topology canvas hasn't loaded a live snapshot yet; the highlight will apply as soon as it does.`;
+  }
+  return collectKnownShardIds(lastRenderedSnapshot).has(routingHighlightShardId)
+    ? `Highlighted "${routingHighlightShardId}" on the Topology canvas — switch rooms to see it.`
+    : `Resolved owner is "${routingHighlightShardId}", but it isn't in the currently-rendered topology (may have just changed) — no highlight to show.`;
+}
+
+/** Sets (or clears, with a falsy shardId) the Topology canvas's routing
+ * highlight and forces an immediate re-render (if a snapshot is already
+ * held) so the change is visible without waiting for the next ~900ms SSE
+ * tick. Safe to call with a shardId absent from the current topology —
+ * renderInner's per-node check is a simple equality match, so a
+ * non-matching id just never highlights anything; no error, no fabricated
+ * node (see describeHighlightState for how that's surfaced honestly). */
+function setRoutingHighlight(shardId) {
+  routingHighlightShardId = shardId || null;
+  if (el.playRouteClear) el.playRouteClear.disabled = !routingHighlightShardId;
+  if (lastRenderedSnapshot) render(lastRenderedSnapshot);
+}
+
+/** Builds one label/value summary row — same createElement/textContent
+ * discipline as renderPlayResult (this file): every value here originated
+ * from a real cluster response, so it goes through textContent only, never
+ * innerHTML. */
+function routeSummaryRow(label, value, cls) {
+  const row = document.createElement("div");
+  row.className = "play-route-row" + (cls ? " " + cls : "");
+  const labelEl = document.createElement("span");
+  labelEl.className = "play-route-label micro";
+  labelEl.textContent = label;
+  const valueEl = document.createElement("span");
+  valueEl.className = "play-route-value mono";
+  valueEl.textContent = value;
+  row.appendChild(labelEl);
+  row.appendChild(valueEl);
+  return row;
+}
+
+/** Renders playRouteInspect's resolved fields as a tabular mono summary
+ * (DESIGN.md), plus describeHighlightState()'s honest highlight note.
+ * `body` is null to clear the panel entirely (a failed/errored resolve —
+ * renderPlayResult already shows the real error in el.playRouteResult; this
+ * panel just goes back to hidden, matching every other Playground panel's
+ * "hide on error" convention). Always call setRoutingHighlight() BEFORE this
+ * on a successful resolve, so the note reflects the just-applied state, not
+ * the previous one. */
+function renderRouteSummary(body) {
+  if (!el.playRouteSummary) return;
+  el.playRouteSummary.innerHTML = "";
+  playRouteNoteEl = null;
+  if (!body) {
+    el.playRouteSummary.hidden = true;
+    return;
+  }
+
+  el.playRouteSummary.hidden = false;
+  el.playRouteSummary.appendChild(routeSummaryRow("tenant", body.tenantId));
+  el.playRouteSummary.appendChild(routeSummaryRow("catalog shard", body.catalogShardId));
+  el.playRouteSummary.appendChild(routeSummaryRow("vbucket", `${body.vbucket} / ${body.totalVBuckets}`));
+  el.playRouteSummary.appendChild(routeSummaryRow("catalog shard count", String(body.catalogShardCount)));
+  el.playRouteSummary.appendChild(routeSummaryRow("owning shard", body.ownerShardId));
+  if (body.migration) {
+    el.playRouteSummary.appendChild(
+      routeSummaryRow("migration", `${body.migration.status} · ${body.migration.fromShardId} → ${body.migration.toShardId}`, "migrate"),
+    );
+  }
+
+  const note = document.createElement("div");
+  note.className = "play-route-note";
+  note.textContent = describeHighlightState();
+  el.playRouteSummary.appendChild(note);
+  playRouteNoteEl = note;
+}
+
+function handlePlayRouteInspectSubmit(evt) {
+  evt.preventDefault();
+  const body = {
+    warehouseId: Number(el.playRouteWarehouse.value),
+    table: el.playRouteTable.value,
+    partitionKey: el.playRouteKey.value.trim(),
+  };
+
+  setFormBusy(el.playRouteForm, true);
+  playFetch("/api/play/route-inspect", body)
+    .then((outcome) => {
+      renderPlayResult(el.playRouteResult, outcome);
+      if (outcome.ok) {
+        setRoutingHighlight(outcome.body.ownerShardId);
+        renderRouteSummary(outcome.body);
+        logLine(`play/route-inspect → owner ${outcome.body.ownerShardId} (vbucket ${outcome.body.vbucket})`, "mig");
+      } else {
+        renderRouteSummary(null);
+        logLine(`play/route-inspect → ${outcome.status}`, "warn");
+      }
+    })
+    .catch((err) => {
+      renderPlayResult(el.playRouteResult, { networkError: (err && err.message) || String(err) });
+      renderRouteSummary(null);
+    })
+    .finally(() => setFormBusy(el.playRouteForm, false));
+}
+
+/** "Clear highlight" button — turns off the Topology canvas spotlight without
+ * discarding the resolved fields still on screen (they're still true; only
+ * the highlight state changed), by updating just the note line in place. */
+function handlePlayRouteClear() {
+  setRoutingHighlight(null);
+  if (playRouteNoteEl) playRouteNoteEl.textContent = describeHighlightState();
+}
+
 // ---- room lifecycle ---------------------------------------------------------
 
 /** Called by setActiveRoom() on first entering the Playground room. Wiring
@@ -2292,6 +2487,8 @@ function startPlayRoom() {
   el.playTsForm.addEventListener("submit", handlePlayTsSubmit);
   el.playSqlForm.addEventListener("submit", handlePlaySqlSubmit);
   el.playScatterForm.addEventListener("submit", handlePlayScatterSubmit);
+  el.playRouteForm.addEventListener("submit", handlePlayRouteInspectSubmit);
+  el.playRouteClear.addEventListener("click", handlePlayRouteClear);
 }
 
 /** Called by setActiveRoom() on leaving the Playground room. Every panel here
@@ -2406,6 +2603,16 @@ function handleLogout() {
   stopReshardPolling();
   activeOp = null;
   if (el.opCard) el.opCard.hidden = true;
+  // Same per-session reset for the Routing Inspector's canvas highlight — a
+  // logout is a clean session boundary, so a shard resolved under the
+  // previous session shouldn't still be spotlighted after logging back in.
+  routingHighlightShardId = null;
+  if (el.playRouteClear) el.playRouteClear.disabled = true;
+  if (el.playRouteSummary) {
+    el.playRouteSummary.hidden = true;
+    el.playRouteSummary.innerHTML = "";
+  }
+  playRouteNoteEl = null;
   // Bring canvas-wrap (and the login panel it hosts) back into view
   // regardless of which room was open when the session expired — see
   // forceTopologyRoomForLogin's own comment for why this matters for Edge.

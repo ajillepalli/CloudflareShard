@@ -101,6 +101,8 @@ import {
   playSql,
   parsePlayScatterInput,
   playScatter,
+  parsePlayRouteInspectInput,
+  playRouteInspect,
 } from "./play";
 import type { Env } from "./env";
 
@@ -496,6 +498,15 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/api/play/scatter") {
         return runPlayOp(async () => playScatter(env, parsePlayScatterInput(await readPlayJsonBody(request))));
+      }
+      // POST /api/play/route-inspect: the Playground's routing inspector
+      // (READ-ONLY — see src/play.ts's playRouteInspect doc comment). Reuses
+      // this same runPlayOp calm-error contract as every other Playground
+      // route above; a catalog/vbucket the live map doesn't (yet) recognize
+      // surfaces as PlayValidationError -> 400, exactly like a bad
+      // warehouseId/table would.
+      if (request.method === "POST" && url.pathname === "/api/play/route-inspect") {
+        return runPlayOp(async () => playRouteInspect(env, parsePlayRouteInspectInput(await readPlayJsonBody(request))));
       }
     }
 

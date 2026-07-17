@@ -635,6 +635,33 @@ html, body {
   background: rgba(7, 10, 15, .7);
 }
 
+/* Playground's Routing Inspector highlight (app.js's setRoutingHighlight /
+ * renderInner's isRouteHighlighted) — a transient "you resolved this one"
+ * pointer, ADDITIVE on top of whatever state class the node already has
+ * (hot/target/draining/unavailable all keep their own coloring underneath).
+ * Deliberately neutral (--text-primary), not --safe (reserved for lost/
+ * checksum/live), not --migrate (reserved for real in-flight vBuckets/
+ * reshard), and not the heat ramp (that encodes load, not "look here") — a
+ * plain dashed selection ring + a top-side badge (the existing per-node
+ * shard-tag sits at the BOTTOM, so this never overlaps it), per DESIGN.md's
+ * restrained/strictly-semantic color rule. */
+.shard.route-highlight .shard-core {
+  outline: 2px dashed var(--text-primary);
+  outline-offset: 7px;
+  animation: routeHighlightPulse 1.8s ease-in-out infinite;
+}
+@keyframes routeHighlightPulse {
+  0%, 100% { outline-color: var(--text-primary); }
+  50% { outline-color: var(--text-dim); }
+}
+.route-badge {
+  top: calc(-1 * var(--sz) / 2 - 20px);
+  bottom: auto;
+  color: var(--text-primary);
+  border-color: var(--border);
+  background: rgba(230, 234, 242, .1);
+}
+
 /* ============ RIGHT PANEL — LIVE FEED ============ */
 .console {
   flex: 0 0 280px;
@@ -1561,4 +1588,47 @@ textarea.play-json {
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Routing Inspector's structured summary — a tabular mono readout of
+   playRouteInspect's resolved fields (DESIGN.md's "data carried in mono"
+   rule), separate from the raw JSON in .play-result below it. `.migrate` row
+   variant reuses the existing --migrate-bright "routine flow" register
+   (same as .play-result.ok) for the migration row specifically — it's
+   in-flight-vBucket information, the one place --migrate's real semantic
+   meaning applies here. */
+.play-route-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 11px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-well);
+}
+.play-route-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+}
+.play-route-label {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.play-route-value {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  word-break: break-all;
+}
+.play-route-row.migrate .play-route-value { color: var(--migrate-bright); }
+.play-route-note {
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  padding-top: 6px;
+  margin-top: 2px;
+  border-top: 1px dashed var(--border-soft);
 }
