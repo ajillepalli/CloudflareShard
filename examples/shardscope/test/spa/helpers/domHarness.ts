@@ -65,6 +65,15 @@ export interface HarnessOptions {
   routes?: Record<string, RouteResponse | RouteHandler>;
 }
 
+/** A single stubbed `EventSource` instance app.js opened via `new EventSource(url)`
+ * (only ever reached on the live, non-`?demo=1` path — see connectLive()). Exposed
+ * read-only so tests can inspect what URL was opened; use `dispatchServerEvent`
+ * below to drive its listeners rather than reaching into `listeners` directly. */
+export interface StubEventSourceHandle {
+  url: string;
+  listeners: Map<string, Array<(ev: unknown) => void>>;
+}
+
 export interface Harness {
   window: DOMWindow;
   document: Document;
@@ -76,6 +85,19 @@ export interface Harness {
   setRoute: (pathname: string, handler: RouteResponse | RouteHandler) => void;
   /** Waits a few microtask/macrotask turns so in-flight fetch().then() chains settle before assertions. */
   flush: () => Promise<void>;
+  /** Every EventSource the app has opened so far, in order (only ever populated on
+   * the live path — connectLive() opens exactly one, against "/api/stream", after a
+   * successful gate check). Empty in ?demo=1 mode, which never opens one. */
+  eventSources: StubEventSourceHandle[];
+  /** Drives a server-sent event on the most recently opened EventSource, calling
+   * every listener app.js registered for `type` via `addEventListener`. Pass `data`
+   * as a string to become `ev.data` verbatim (e.g. a pre-serialized JSON snapshot
+   * payload), or any other value to have it JSON.stringify'd first; omit `data`
+   * entirely to simulate a native, data-less browser Event (e.g. EventSource's own
+   * connection-level "error", as opposed to the server's named "error" SSE frame —
+   * see connectLive()'s own doc comment on telling the two apart). Throws if no
+   * EventSource has been opened yet. */
+  dispatchServerEvent: (type: string, data?: unknown) => void;
   /** Stops the Reshard room's poll interval (if one is running) and closes the jsdom window. Call in afterEach. */
   cleanup: () => void;
 }
@@ -136,11 +158,12 @@ export function bootApp(options: HarnessOptions = {}): Harness {
   // ---- EventSource stub -------------------------------------------------
   // connectLive() is only reached on the live (non-?demo=1) path, but is
   // stubbed unconditionally per the task brief — cheap insurance against
-  // any test that boots in live mode. Records the last URL opened; never
-  // opens a real connection, never fires events (tests that need live
-  // "snapshot"/"error" events can reach in via `lastEventSource` and call
-  // the recorded listeners directly).
-  class StubEventSource {
+  // any test that boots in live mode. Records every instance opened; never
+  // opens a real connection, never fires events on its own — tests that need
+  // live "snapshot"/"error" events reach in via the harness's own
+  // `eventSources` / `dispatchServerEvent` below, which are just a thin,
+  // documented wrapper over this class's `instances` + `listeners`.
+  class StubEventSource implements StubEventSourceHandle {
     static instances: StubEventSource[] = [];
     url: string;
     listeners = new Map<string, Array<(ev: unknown) => void>>();
@@ -157,6 +180,18 @@ export function bootApp(options: HarnessOptions = {}): Harness {
     close() {}
   }
   (window as unknown as { EventSource: unknown }).EventSource = StubEventSource;
+
+  function dispatchServerEvent(type: string, data?: unknown): void {
+    const instance = StubEventSource.instances[StubEventSource.instances.length - 1];
+    if (!instance) {
+      throw new Error(
+        "dispatchServerEvent: no EventSource has been opened yet — app.js only opens one on the live (non-?demo=1) path, via connectLive(), after a successful gate check (see startLiveFlow()).",
+      );
+    }
+    const listeners = instance.listeners.get(type) ?? [];
+    const event = data === undefined ? {} : { data: typeof data === "string" ? data : JSON.stringify(data) };
+    listeners.forEach((fn) => fn(event));
+  }
 
   // ---- other browser APIs app.js doesn't call today, stubbed defensively ----
   if (!("requestAnimationFrame" in window)) {
@@ -203,5 +238,15 @@ export function bootApp(options: HarnessOptions = {}): Harness {
     window.close();
   }
 
-  return { window, document: window.document, hook, calls, setRoute, flush, cleanup };
+  return {
+    window,
+    document: window.document,
+    hook,
+    calls,
+    setRoute,
+    flush,
+    eventSources: StubEventSource.instances,
+    dispatchServerEvent,
+    cleanup,
+  };
 }
