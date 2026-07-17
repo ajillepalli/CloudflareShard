@@ -531,11 +531,10 @@ export function generateScaffoldFiles(): ScaffoldFile[] {
 // raw bytes per entry, then one central directory record per entry, then a
 // single end-of-central-directory record — the same three-section
 // structure every ZIP reader (Windows Explorer, macOS Archive Utility,
-// `unzip`, `zipfile` in Python, JSZip in a browser) expects. Verified
-// end-to-end in build.test.ts (round-tripped through Node's built-in `zlib`
-// gunzip-adjacent `DecompressionStream`... actually via a hand-rolled
-// central-directory parse, since Workers/Node have no built-in zip reader —
-// see that file for exactly what's asserted).
+// `unzip`, `zipfile` in Python, JSZip in a browser) expects. Verified in
+// build.test.ts via a hand-rolled central-directory parse (Workers/Node have
+// no built-in zip reader) that re-reads the entries back out and checks the
+// offsets, sizes, CRCs, and counts — see that file for exactly what's asserted.
 // ============================================================================
 
 const CRC32_TABLE: number[] = (() => {
