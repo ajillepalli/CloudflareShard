@@ -89,6 +89,11 @@ export interface Harness {
    * the live path — connectLive() opens exactly one, against "/api/stream", after a
    * successful gate check). Empty in ?demo=1 mode, which never opens one. */
   eventSources: StubEventSourceHandle[];
+  /** Every string app.js has passed to `navigator.clipboard.writeText(...)` so far, in
+   * order (see handleShareClick's "Share this view" flow). jsdom doesn't implement the
+   * Clipboard API, so bootApp() always stubs `window.navigator.clipboard.writeText` to
+   * resolve immediately and record here — tests never need their own stub. */
+  clipboardWrites: string[];
   /** Drives a server-sent event on the most recently opened EventSource, calling
    * every listener app.js registered for `type` via `addEventListener`. Pass `data`
    * as a string to become `ev.data` verbatim (e.g. a pre-serialized JSON snapshot
@@ -200,6 +205,22 @@ export function bootApp(options: HarnessOptions = {}): Harness {
     listeners.forEach((fn) => fn(event));
   }
 
+  // ---- clipboard stub (Share this view) --------------------------------
+  // jsdom has no Clipboard API at all (navigator.clipboard is undefined),
+  // which would make handleShareClick() silently fall into its "copy
+  // unsupported" branch in every test. Stub it unconditionally so tests can
+  // assert on what got copied via `clipboardWrites` instead.
+  const clipboardWrites: string[] = [];
+  Object.defineProperty(window.navigator, "clipboard", {
+    configurable: true,
+    value: {
+      writeText: (text: string) => {
+        clipboardWrites.push(text);
+        return Promise.resolve();
+      },
+    },
+  });
+
   // ---- other browser APIs app.js doesn't call today, stubbed defensively ----
   if (!("requestAnimationFrame" in window)) {
     (window as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame = (cb) =>
@@ -263,6 +284,7 @@ export function bootApp(options: HarnessOptions = {}): Harness {
     flush,
     eventSources: StubEventSource.instances,
     dispatchServerEvent,
+    clipboardWrites,
     cleanup,
   };
 }
