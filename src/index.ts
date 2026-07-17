@@ -33,18 +33,6 @@ export interface Env {
 const DEFAULT_CATALOG_SHARD_COUNT = 4;
 const SHARD_FANOUT_CONCURRENCY = 10;
 const MAX_TX_PARTICIPANT_KEYS = 8;
-// Codex final-review P1 #1: create-index's backfill holds the topology lock
-// for its entire (synchronous, potentially long) scan-and-write loop, but
-// only ever refreshed the lease once, at acquisition. A large table's
-// backfill can run past the lock's 30s TTL with no renewal, letting the
-// lease expire mid-backfill — a concurrent drain could then acquire it and
-// start moving rows off a shard this backfill hasn't scanned yet (migration
-// import doesn't create index entries, so those rows would be permanently
-// missing from the new index). Re-heartbeat at a cadence far tighter than
-// the TTL: once per data shard (bounding the gap even when a shard has very
-// few rows) AND every N rows within a shard's scan (bounding a single huge
-// shard).
-const BACKFILL_HEARTBEAT_ROW_INTERVAL = 200;
 
 /** Maps over items in bounded-size batches so a large shard count can't fire
  * unbounded simultaneous Durable Object calls in one request. */
@@ -178,23 +166,6 @@ async function releaseTopologyLock(env: Env, operationId: string): Promise<void>
     await routeToCatalog(env, "catalog-0", "/release-topology-lock", { operationId });
   } catch {
     // ignore — the lease expires on its own
-  }
-}
-
-/** Codex final-review P1 #1: refresh this operation's lease mid-flight (a
- * long-running Worker-side loop — e.g. create-index's backfill — that isn't
- * ticked by CatalogDO's own alarm still needs to renew the same lock it
- * acquired up front). Returns false — LOCK LOST — on a non-2xx response
- * (expired, force-released, or reacquired by another operation) OR if
- * catalog-0 can't be reached at all; fail-safe, matching
- * heartbeatTopologyLockOrPark's convention in catalog.ts: an unconfirmable
- * lock must be treated the same as a lost one, never as "still fine". */
-async function heartbeatTopologyLock(env: Env, operationId: string): Promise<boolean> {
-  try {
-    const res = await routeToCatalog(env, "catalog-0", "/heartbeat-topology-lock", { operationId });
-    return res.ok;
-  } catch {
-    return false;
   }
 }
 
@@ -919,26 +890,41 @@ async function handleAdminSetPartitionKeyColumn(request: Request, env: Env): Pro
 /** Milestone 2, Chunk 1. Registers a secondary index and backfills it against
  * existing rows. Index entries live on a shard chosen by hashing
  * (table, indexName, indexKeyJson) — independent of the base row's own
- * shard (see the Milestone 2 design doc's index-placement decision) — so
- * backfill writes each entry to its own computed shard, not the base row's
- * shard. Single-pass, not chunked: acceptable for this milestone's stated
- * pre-product scale (see design doc Premise 1); a very large table could hit
- * a Worker CPU-time limit, a known simplification, not a silent bug. */
+ * shard (see the Milestone 2 design doc's index-placement decision).
+ *
+ * Codex live-deployment finding: backfill itself is no longer synchronous
+ * here (see adminCreateIndexLockedCore's own comment) — this function's
+ * job is just registration plus handing the backfill off to catalog-0's
+ * alarm loop. Topology lock (Stage 2/3): create-index mutates every
+ * catalog's index_rules and races drain ring-evacuation, so it's still
+ * acquired up front and serialized against every other topology op — but,
+ * mirroring split-vbucket's own Stage 3 hand-off, it's released here ONLY
+ * if backfill never actually started (a validation failure, or catalog-0
+ * unreachable for the hand-off call) — nothing to hand off to in that
+ * case. Once backfill starts, catalog-0 owns the lock's lifecycle. */
 async function adminCreateIndexCore(
   env: Env,
   body: { indexName?: string; table?: string; columns?: string[] },
   authorization: string | undefined,
 ): Promise<Response> {
-  // Topology lock (Stage 2): create-index mutates every catalog's index_rules
-  // and races drain ring-evacuation; serialize it against all other topology
-  // ops. Held for the whole (synchronous) registration + backfill, released in
-  // finally on any exit.
   const lock = await acquireTopologyLock(env, "create-index");
   if (lock instanceof Response) return lock;
+  let handedOff = false;
   try {
-    return await adminCreateIndexLockedCore(env, body, authorization, lock.operationId);
+    const res = await adminCreateIndexLockedCore(env, body, authorization, lock.operationId);
+    // Live-deployment finding (round 2): res.ok alone isn't enough to tell
+    // "backfill just started, catalog-0 now owns the lock" apart from "this
+    // was an idempotent retry against an index whose backfill already
+    // finished, nothing to hand off to" -- both return 200. The response
+    // body's status distinguishes them ('building' only for a genuine fresh
+    // hand-off; 'ready' for the no-op retry, matching
+    // handleStartIndexBackfill's own handedOff field). Peeking at a clone
+    // leaves the original response body intact for the actual caller.
+    const peek = (await res.clone().json().catch(() => ({}))) as { status?: string };
+    handedOff = res.ok && peek.status !== "ready";
+    return res;
   } finally {
-    await releaseTopologyLock(env, lock.operationId);
+    if (!handedOff) await releaseTopologyLock(env, lock.operationId);
   }
 }
 
@@ -990,8 +976,6 @@ async function adminCreateIndexLockedCore(
       409,
     );
   }
-  const pkCol = tableInfo.partition_key_column;
-
   // The index's PLACEMENT RING is active shards only: a draining shard is
   // about to be evacuated and must never be pinned into a new ring (it would
   // strand entries on a shard headed for decommission). shardIds is captured
@@ -1102,164 +1086,33 @@ async function adminCreateIndexLockedCore(
   const registerFailed = firstCatalogFanOutFailure(registerResults, "Failed to register index.");
   if (registerFailed) return registerFailed;
 
-  // Codex round-14 P2: backfill placement must use the catalog's PERSISTED ring
-  // for this index — never the locally-recomputed active set. On a RETRY of
-  // /admin/create-index (idempotent registration), `shardIds` reflects the live
-  // active set at retry time, which can differ from the ring pinned by the FIRST
-  // call; placing over `shardIds` would then write entries to shards
-  // /v1/index-query (which reads the pinned ring) never looks at. The persisted
-  // ring equals `verifiedRingShardIds` on the first call and the original pinned
-  // ring on a retry; fall back to `verifiedRingShardIds` (never the pre-verification
-  // `shardIds`) only if it can't be fetched.
-  const persistedRing = await fetchIndexRing(env, indexName);
-  const placementRing = persistedRing.length > 0 ? persistedRing : verifiedRingShardIds;
-
-  // Backfill: scan every data-holding shard's existing rows for this table
-  // (active + draining — see dataShardIds above), compute each row's index
-  // entry, and write it to its own computed index shard (placed on the active
-  // ring via indexShardIdForKey(..., shardIds)).
-  //
-  // Codex final-review P1 #1: this loop holds the topology lock acquired once
-  // in handleAdminCreateIndex, for its ENTIRE (synchronous) duration — a large
-  // table can run well past the lock's 30s TTL with no renewal otherwise. Two
-  // heartbeat points below re-confirm the lease: once per shard (so even a
-  // backfill spread across many small shards keeps refreshing) and every
-  // BACKFILL_HEARTBEAT_ROW_INTERVAL rows (so a single huge shard does too). A
-  // failed heartbeat means the lease is gone — expired, force-released, or
-  // reacquired by another topology op — so this ABORTS rather than risk
-  // writing more index entries while a concurrent drain/migration may already
-  // be moving rows this backfill hasn't scanned yet off their source shard
-  // (migration import never creates index entries, so those rows would be
-  // silently, permanently missing from the new index).
-  let rowsSinceHeartbeat = 0;
-  for (const shardId of dataShardIds) {
-    if (!(await heartbeatTopologyLock(env, operationId))) {
-      return json(
-        {
-          error: {
-            code: "TOPOLOGY_LOCK_LOST",
-            message: `The topology lock backing this backfill was lost before scanning shard ${shardId} (expired, force-released, or reacquired by another operation).`,
-            fix: "Retry /admin/create-index once any concurrent topology operation completes (idempotent on registration and on already-written entries).",
-          },
-        },
-        409,
-      );
-    }
-    const safeTable = `"${table}"`;
-    const selectCols = [pkCol, ...columns].map((c) => `"${c}"`).join(", ");
-    const scanRes = await routeToShard(env, shardId, "/execute", {
-      sql: `SELECT ${selectCols} FROM ${safeTable}`,
-      requestId: `create-index-backfill-scan-${indexName}-${shardId}-${crypto.randomUUID()}`,
-      isMutation: false,
-    });
-    if (!scanRes.ok) {
-      return json(
-        { error: { code: "BACKFILL_SCAN_FAILED", message: `Failed to scan shard ${shardId} for backfill.` } },
-        500,
-      );
-    }
-    const scanBody = (await scanRes.json()) as { rows: Array<Record<string, unknown>> };
-    for (const row of scanBody.rows) {
-      rowsSinceHeartbeat += 1;
-      if (rowsSinceHeartbeat >= BACKFILL_HEARTBEAT_ROW_INTERVAL) {
-        rowsSinceHeartbeat = 0;
-        if (!(await heartbeatTopologyLock(env, operationId))) {
-          return json(
-            {
-              error: {
-                code: "TOPOLOGY_LOCK_LOST",
-                message: `The topology lock backing this backfill was lost partway through shard ${shardId} (expired, force-released, or reacquired by another operation).`,
-                fix: "Retry /admin/create-index once any concurrent topology operation completes (idempotent on registration and on already-written entries).",
-              },
-            },
-            409,
-          );
-        }
-      }
-      const partitionKey = String(row[pkCol]);
-
-      // Re-read this row's CURRENT values immediately before writing its
-      // index entry, instead of trusting the value captured by the bulk
-      // scan above (eng-review fix). Registration already happened, so a
-      // concurrent /v1/mutate on this row runs its own async index write
-      // concurrently with backfill; without this re-read, backfill could
-      // clobber that fresher write with the stale value it scanned earlier
-      // (a wide window spanning the whole scan+loop). Re-reading narrows the
-      // hazard to a single read-then-write round trip — the same order of
-      // race the rest of the async index-maintenance path already accepts
-      // elsewhere, not a new or larger one. The row may have been deleted
-      // since the scan; skip it if so rather than indexing stale data.
-      //
-      // Milestone 3, Chunk 2: also joins __cf_row_owners (Chunk 0) for this
-      // row's tenant_id — index-topology v2 needs the OWNING tenant identity
-      // to re-route hydration reads at query time (vbucket =
-      // hashKey(tenant_id:table:partition_key) % total_vbuckets), since the
-      // base row's own columns carry no tenant identity (docs/SPEC.md §14).
-      const freshRes = await routeToShard(env, shardId, "/execute", {
-        sql: `SELECT ${selectCols}, ro.tenant_id AS __cf_tenant_id FROM ${safeTable} b LEFT JOIN __cf_row_owners ro ON ro.table_name = ? AND ro.partition_key = b."${pkCol}" WHERE b."${pkCol}" = ?`,
-        params: [table, row[pkCol]],
-        requestId: `create-index-backfill-refresh-${indexName}-${crypto.randomUUID()}`,
-        isMutation: false,
-      });
-      if (!freshRes.ok) {
-        return json(
-          { error: { code: "BACKFILL_SCAN_FAILED", message: `Failed to refresh row for partitionKey ${partitionKey} during backfill.` } },
-          500,
-        );
-      }
-      const freshBody = (await freshRes.json()) as { rows: Array<Record<string, unknown> & { __cf_tenant_id: string | null }> };
-      const freshRow = freshBody.rows[0];
-      if (!freshRow) continue;
-
-      // No __cf_row_owners entry for this row — it predates Milestone 3
-      // Chunk 0's provenance tracking (or Chunk 1's re-attribution hasn't
-      // run yet) and its tenant identity can't be safely recovered here.
-      // Rejecting rather than guessing/defaulting to '' keeps a bad tenant_id
-      // from ever landing in __cf_indexes, where it would silently misroute
-      // hydration forever instead of failing loudly once, up front.
-      if (!freshRow.__cf_tenant_id) {
-        return json(
-          {
-            error: {
-              code: "PROVENANCE_MISSING_FOR_INDEX",
-              message: `Row ${partitionKey} on shard ${shardId}, table ${table} has no row-provenance entry (__cf_row_owners) — its tenant identity can't be determined for index placement.`,
-              fix: "Run /admin/backfill-provenance for this shard, then retry /admin/create-index (idempotent on registration and on already-written entries).",
-            },
-          },
-          409,
-        );
-      }
-      const tenantId = freshRow.__cf_tenant_id;
-
-      const indexKeyJson = JSON.stringify(columns.map((c) => freshRow[c] ?? null));
-      // Codex round-14 P2: place over the PERSISTED ring, and on INDEX_RING_FENCED
-      // re-resolve to the substitute instead of hard-failing (a drain may have
-      // fenced a shard after this /admin/create-index captured the ring).
-      const wrote = await backfillWriteIndexEntry(env, table, indexName, indexKeyJson, partitionKey, shardId, tenantId, placementRing);
-      if (!wrote) {
-        return json(
-          { error: { code: "BACKFILL_WRITE_FAILED", message: `Failed to write index entry for partitionKey ${partitionKey}.` } },
-          500,
-        );
-      }
-    }
+  // Codex live-deployment finding: backfill (scanning every data-holding
+  // shard's rows and writing each one's index entry) used to run
+  // SYNCHRONOUSLY right here, inside this one HTTP invocation — 2+
+  // subrequests per row, no batching, no chunking. A real (not even large,
+  // just realistic-scale) table exceeds Cloudflare's per-invocation
+  // subrequest cap outright, leaving the index wedged at status='building'
+  // forever with no way to ever finish, regardless of retries (every retry
+  // hits the identical wall). Converted to an alarm-driven, persisted-cursor
+  // background process on catalog-0 — see index_rules' schema comment in
+  // catalog.ts and advanceIndexBackfill — the same pattern vbucket
+  // migration already uses for its own similarly long-running work
+  // (Stage 3: this Worker request hands the topology lock it acquired OFF
+  // to catalog-0's alarm loop, which now owns heartbeating and eventually
+  // releasing it across as many ticks as backfill needs, instead of this
+  // request holding it for one synchronous duration). This request returns
+  // once backfill has STARTED, not once it's finished; poll
+  // /admin/create-index-status (or /admin/list-indexes) to watch status
+  // flip from 'building' to 'ready'.
+  const startRes = await routeToCatalog(env, "catalog-0", "/start-index-backfill", { indexName, backfillShardIds: dataShardIds, operationId }, authorization);
+  if (!startRes.ok) {
+    return new Response(startRes.body, { status: startRes.status, headers: startRes.headers });
   }
-
-  // Backfill fully succeeded on every shard — flip the index from 'building'
-  // to 'ready' so /v1/index-query stops rejecting reads against it. If this
-  // fan-out fails, the index stays 'building'; a retry of this whole
-  // /admin/create-index call (idempotent on registration, redundant-but-safe
-  // on backfill) will attempt it again.
-  const readyResults = await fanOutToAllCatalogs(
-    env,
-    "/mark-index-ready",
-    () => ({ indexName }),
-    authorization,
-  );
-  const readyFailed = firstCatalogFanOutFailure(readyResults, "Failed to mark index ready.");
-  if (readyFailed) return readyFailed;
-
-  return json({ ok: true, indexName, table, columns });
+  // Reports whatever /start-index-backfill actually found -- 'building' for
+  // a genuinely fresh start, but 'ready' for an idempotent retry against an
+  // index whose backfill already finished (see that handler's own comment).
+  const startBody = (await startRes.json()) as { status?: string };
+  return json({ ok: true, indexName, table, columns, status: startBody.status ?? "building" });
 }
 
 async function adminSplitVbucketCore(
@@ -1369,6 +1222,24 @@ const handleAdminDrainShardStatus = makeCatalogMigrationForwarder<DrainShardStat
 const adminMigrateVbucketStatusCore = makeCatalogMigrationForwarderCore<MigrateVbucketStatusOrAbortBody>("/migrate-vbucket-status");
 const adminMigrateVbucketAbortCore = makeCatalogMigrationForwarderCore<MigrateVbucketStatusOrAbortBody>("/migrate-vbucket-abort");
 const adminDrainShardStatusCore = makeCatalogMigrationForwarderCore<DrainShardStatusBody>("/drain-shard-status");
+
+/** Codex live-deployment finding: progress of an index's alarm-driven
+ * backfill (see catalog.ts's advanceIndexBackfill) — always catalog-0
+ * specifically (the sole backfill driver, see index_rules' schema
+ * comment), so unlike the migration/drain forwarders above this never
+ * needs a caller-supplied catalogShardId. Read-only, no topology lock. */
+async function adminCreateIndexStatusCore(env: Env, body: { indexName?: string }, authorization: string | undefined): Promise<Response> {
+  if (!body.indexName) {
+    return json({ error: { code: "MISSING_FIELDS", message: "Missing indexName." } }, 400);
+  }
+  const res = await routeToCatalog(env, "catalog-0", "/index-backfill-status", body, authorization);
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
+async function handleAdminCreateIndexStatus(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as { indexName?: string };
+  return adminCreateIndexStatusCore(env, body, request.headers.get("authorization") ?? undefined);
+}
 
 async function adminStatusCore(env: Env, authorization: string | undefined): Promise<Response> {
   const results = await fanOutToAllCatalogs(env, "/status", () => ({}), authorization);
@@ -2195,43 +2066,6 @@ async function isIndexRingFenced(res: Response): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/** Codex round-14 P2: a blocking backfill index-entry write that participates in
- * the index-ring fence. Places the entry over `ring` (the index's PERSISTED
- * placement ring), labels it with indexName, and on an INDEX_RING_FENCED
- * rejection RE-RESOLVES the index's current ring and writes to the substitute —
- * so a drain that fenced a shard after /admin/create-index captured the ring
- * doesn't hard-fail the backfill or strand the entry on the drained shard.
- * Returns true on success. */
-async function backfillWriteIndexEntry(
-  env: Env,
-  table: string,
-  indexName: string,
-  indexKeyJson: string,
-  partitionKey: string,
-  sourceShardId: string,
-  tenantId: string,
-  ring: string[],
-): Promise<boolean> {
-  const sql =
-    "INSERT OR REPLACE INTO __cf_indexes (table_name, index_name, index_key_json, partition_key, source_shard_id, tenant_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
-  const params = [table, indexName, indexKeyJson, partitionKey, sourceShardId, tenantId, new Date().toISOString()];
-  const requestId = `create-index-backfill-write-${indexName}-${crypto.randomUUID()}`;
-  const target = indexShardIdForKey(table, indexName, indexKeyJson, ring);
-  const res = await routeToShard(env, target, "/execute", { sql, params, requestId, isMutation: true, indexName });
-  if (res.ok) return true;
-  if (await isIndexRingFenced(res)) {
-    const fresh = await fetchIndexRing(env, indexName);
-    if (fresh.length > 0) {
-      const resolved = indexShardIdForKey(table, indexName, indexKeyJson, fresh);
-      if (resolved !== target) {
-        const retry = await routeToShard(env, resolved, "/execute", { sql, params, requestId, isMutation: true, indexName });
-        if (retry.ok) return true;
-      }
-    }
-  }
-  return false;
 }
 
 /** Writes one __cf_indexes entry (insert/replace or delete), best-effort. On
@@ -3944,6 +3778,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/revoke-tenant": handleAdminRevokeTenant,
   "/admin/set-partition-key-column": handleAdminSetPartitionKeyColumn,
   "/admin/create-index": handleAdminCreateIndex,
+  "/admin/create-index-status": handleAdminCreateIndexStatus,
   "/admin/list-indexes": handleAdminListIndexes,
   "/admin/drop-index": handleAdminDropIndex,
   "/admin/tx-status": handleAdminTxStatus,

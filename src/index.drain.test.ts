@@ -4,7 +4,7 @@ import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { AUTH, createIndexTestTable, driveMigrationToCompletion, initCluster, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
+import { AUTH, createIndexTestTable, driveIndexBackfillToCompletion, driveMigrationToCompletion, initCluster, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -87,6 +87,11 @@ describe("Worker /admin/drain-shard: draining interaction with in-flight transac
     await createIndexTestTable("m5_e2e_evt");
     const createIndexRes = await post("/admin/create-index", { indexName: "idx_m5_e2e_by_v", table: "m5_e2e_evt", columns: ["v"] }, AUTH());
     expect(createIndexRes.status).toBe(200);
+    // numShards:8 per catalog x 4 catalogs = 32 data shards to scan -- even
+    // with only 12 rows total (mostly-empty shards each cost one tick to
+    // detect-and-advance), that's above driveIndexBackfillToCompletion's
+    // default tick budget.
+    await driveIndexBackfillToCompletion("idx_m5_e2e_by_v", 40);
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
