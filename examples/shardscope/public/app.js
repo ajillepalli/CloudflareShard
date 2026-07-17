@@ -122,6 +122,73 @@ const el = {
   edgeRemeasureBtn: hook("edge-remeasure-btn"),
   edgeMapSvg: hook("edge-map-svg"),
 
+  // ---- Playground room ----
+  railPlay: hook("rail-play"),
+  playWrap: hook("play-wrap"),
+
+  playMutateForm: hook("play-mutate-form"),
+  playMutateWarehouse: hook("play-mutate-warehouse"),
+  playMutateOp: hook("play-mutate-op"),
+  playMutateTable: hook("play-mutate-table"),
+  playMutateKey: hook("play-mutate-key"),
+  playMutateValues: hook("play-mutate-values"),
+  playMutateWhere: hook("play-mutate-where"),
+  playMutateRequestId: hook("play-mutate-requestid"),
+  playMutateJsonError: hook("play-mutate-json-error"),
+  playMutateSubmit: hook("play-mutate-submit"),
+  playMutateReplay: hook("play-mutate-replay"),
+  playMutateCaption: hook("play-mutate-caption"),
+  playMutateResult: hook("play-mutate-result"),
+
+  playTxForm: hook("play-tx-form"),
+  playTxWarehouse: hook("play-tx-warehouse"),
+  playTxRows: hook("play-tx-rows"),
+  playTxAddRow: hook("play-tx-add-row"),
+  playTxRequestId: hook("play-tx-requestid"),
+  playTxJsonError: hook("play-tx-json-error"),
+  playTxSubmit: hook("play-tx-submit"),
+  playTxResult: hook("play-tx-result"),
+
+  playIqForm: hook("play-iq-form"),
+  playIqWarehouse: hook("play-iq-warehouse"),
+  playIqTable: hook("play-iq-table"),
+  playIqIndex: hook("play-iq-index"),
+  playIqValues: hook("play-iq-values"),
+  playIqLimit: hook("play-iq-limit"),
+  playIqJsonError: hook("play-iq-json-error"),
+  playIqResult: hook("play-iq-result"),
+
+  playTsForm: hook("play-ts-form"),
+  playTsWarehouse: hook("play-ts-warehouse"),
+  playTsTable: hook("play-ts-table"),
+  playTsLimit: hook("play-ts-limit"),
+  playTsCursor: hook("play-ts-cursor"),
+  playTsResult: hook("play-ts-result"),
+
+  playSqlForm: hook("play-sql-form"),
+  playSqlWarehouse: hook("play-sql-warehouse"),
+  playSqlTable: hook("play-sql-table"),
+  playSqlKey: hook("play-sql-key"),
+  playSqlText: hook("play-sql-text"),
+  playSqlParams: hook("play-sql-params"),
+  playSqlJsonError: hook("play-sql-json-error"),
+  playSqlResult: hook("play-sql-result"),
+
+  playScatterForm: hook("play-scatter-form"),
+  playScatterText: hook("play-scatter-text"),
+  playScatterParams: hook("play-scatter-params"),
+  playScatterLimit: hook("play-scatter-limit"),
+  playScatterJsonError: hook("play-scatter-json-error"),
+  playScatterResult: hook("play-scatter-result"),
+
+  playRouteForm: hook("play-route-form"),
+  playRouteWarehouse: hook("play-route-warehouse"),
+  playRouteTable: hook("play-route-table"),
+  playRouteKey: hook("play-route-key"),
+  playRouteClear: hook("play-route-clear"),
+  playRouteSummary: hook("play-route-summary"),
+  playRouteResult: hook("play-route-result"),
+
   // ---- "The old way" contrast beat (T10) ----
   oldwayToggle: hook("oldway-toggle"),
   oldwayBody: hook("oldway-body"),
@@ -567,6 +634,18 @@ function computeTotalRows(stats) {
 
 let lastRenderedSnapshot = null;
 
+/** Playground's Routing Inspector "spotlight" — the shardId (or null) the
+ * Topology canvas should highlight on its NEXT render, set by
+ * setRoutingHighlight() below. Deliberately module-level and independent of
+ * activeRoom: the canvas is hidden WHILE the Playground room is open (see
+ * setActiveRoom — canvasWrap.hidden for room === "play"), so this can only
+ * ever become visible after switching to Topology/Reshard; clearing it on
+ * Playground room-exit would make the whole feature unobservable. It's reset
+ * on logout (handleLogout), the one point this file already resets every
+ * other per-session UI state (activeOp, etc), and by the panel's own "Clear
+ * highlight" button (handlePlayRouteClear). */
+let routingHighlightShardId = null;
+
 function render(snapshot) {
   try {
     renderInner(snapshot);
@@ -755,8 +834,18 @@ function renderInner(snapshot) {
     }
     const ringTitle = `${owned.length} vbucket(s) owned` + (outgoing.length ? `, ${outgoing.length} migrating out` : "");
 
+    // Playground's Routing Inspector highlight (see setRoutingHighlight) — a
+    // transient, additive "you resolved this one" pointer, layered on TOP of
+    // whatever state class this node already has (hot/target/draining/
+    // unavailable) rather than replacing it, so it never fights the heat ramp
+    // or the --safe/--danger reserved colors (DESIGN.md). `id` is already the
+    // same trusted, escapeHtml()'d shard identity used two lines below —
+    // routingHighlightShardId is only ever compared by strict equality, never
+    // interpolated into markup itself.
+    const isRouteHighlighted = id === routingHighlightShardId;
+
     nodeHtml.push(`
-      <div class="shard${stateClass ? " " + stateClass : ""}" style="left:${pos.x}%; top:${pos.y}%; --sz:${sizePx.toFixed(0)}px; --heat:${heatColor};">
+      <div class="shard${stateClass ? " " + stateClass : ""}${isRouteHighlighted ? " route-highlight" : ""}" style="left:${pos.x}%; top:${pos.y}%; --sz:${sizePx.toFixed(0)}px; --heat:${heatColor};">
         <div class="shard-core">
           <div class="vring" style="--ring-r:${(sizePx / 2 + 12).toFixed(0)}px;" title="${escapeHtml(ringTitle)}">${dots}</div>
           <div>
@@ -764,6 +853,7 @@ function renderInner(snapshot) {
             <div class="shard-rate">${escapeHtml(rateText)}</div>
           </div>
           ${tagHtml}
+          ${isRouteHighlighted ? '<div class="shard-tag route-badge" title="Resolved by the Playground’s Routing Inspector">◆ routed key</div>' : ""}
         </div>
       </div>
     `);
@@ -908,10 +998,12 @@ function setActiveRoom(room) {
   el.railTopology.classList.toggle("active", room === "topology");
   el.railReshard.classList.toggle("active", room === "reshard");
   if (el.railEdge) el.railEdge.classList.toggle("active", room === "edge");
+  if (el.railPlay) el.railPlay.classList.toggle("active", room === "play");
   el.reshardPanel.hidden = room !== "reshard";
-  if (el.canvasWrap) el.canvasWrap.hidden = room === "edge";
+  if (el.canvasWrap) el.canvasWrap.hidden = room === "edge" || room === "play";
   if (el.edgeWrap) el.edgeWrap.hidden = room !== "edge";
-  el.consoleTitle.textContent = room === "reshard" ? "Reshard Console" : room === "edge" ? "Edge" : "Live Feed";
+  if (el.playWrap) el.playWrap.hidden = room !== "play";
+  el.consoleTitle.textContent = room === "reshard" ? "Reshard Console" : room === "edge" ? "Edge" : room === "play" ? "Playground" : "Live Feed";
 
   if (room === "reshard") {
     refreshReshardPickers();
@@ -926,6 +1018,12 @@ function setActiveRoom(room) {
   } else {
     stopEdgeRoom();
   }
+
+  if (room === "play") {
+    startPlayRoom();
+  } else {
+    stopPlayRoom();
+  }
 }
 
 /** Forces the room back to Topology, bypassing setActiveRoom's normal
@@ -939,12 +1037,15 @@ function forceTopologyRoomForLogin() {
   el.railTopology.classList.add("active");
   el.railReshard.classList.remove("active");
   if (el.railEdge) el.railEdge.classList.remove("active");
+  if (el.railPlay) el.railPlay.classList.remove("active");
   el.reshardPanel.hidden = true;
   if (el.canvasWrap) el.canvasWrap.hidden = false;
   if (el.edgeWrap) el.edgeWrap.hidden = true;
+  if (el.playWrap) el.playWrap.hidden = true;
   el.consoleTitle.textContent = "Live Feed";
   stopReshardPolling();
   stopEdgeRoom();
+  stopPlayRoom();
 }
 
 function startReshardPolling() {
@@ -1618,6 +1719,786 @@ function startEdgeRoom() {
 function stopEdgeRoom() {}
 
 // ============================================================================
+// Playground room: the developer-primitive console. Every panel POSTs to a
+// gate-protected /api/play/* route (see ../src/play.ts — read that file's
+// header comment for the full security model) which forwards to
+// CloudflareShard's real /v1/mutate, /v1/tx, /v1/index-query, /v1/table-scan,
+// /v1/sql, /v1/scatter under a controlled demo tenant (or, for sql/scatter,
+// server-side under the admin token — the browser never sees it).
+//
+// WHITELISTS: the four constant lists immediately below are a hand-mirror of
+// play.ts's own PLAYGROUND_WAREHOUSE_IDS / PLAYGROUND_TABLES /
+// PLAYGROUND_INDEXES / MUTATE_OPS. This is a no-build static file with no
+// import from src/play.ts available to it, so these MUST be kept in sync by
+// hand with that file — every dropdown here only ever offers one of these
+// values, so a request built in this UI is well-formed before it's sent; the
+// server re-validates independently regardless (never trust the client).
+// ============================================================================
+
+const PLAYGROUND_WAREHOUSE_IDS = [1, 2, 3];
+const PLAYGROUND_TABLES = [
+  "tpcc_warehouse",
+  "tpcc_district",
+  "tpcc_customer",
+  "tpcc_history",
+  "tpcc_new_order",
+  "tpcc_order_line",
+  "tpcc_orders",
+  "tpcc_stock",
+];
+const PLAYGROUND_INDEXES = {
+  tpcc_warehouse: [],
+  tpcc_district: [],
+  tpcc_customer: ["idx_customer_by_id"],
+  tpcc_history: [],
+  tpcc_new_order: ["idx_new_order_by_district"],
+  tpcc_order_line: ["idx_order_line_by_order"],
+  tpcc_orders: ["idx_orders_by_customer", "idx_orders_by_id", "idx_orders_by_district"],
+  tpcc_stock: ["idx_stock_by_item"],
+};
+const PLAYGROUND_MUTATE_OPS = ["insert", "update", "delete", "upsert"];
+const PLAYGROUND_MAX_TX_MUTATIONS = 10;
+
+let playRoomInitialized = false;
+/** The exact last body successfully POSTed by the Mutate panel (verbatim,
+ * including whatever requestId was sent) — "Replay same requestId" resends
+ * THIS unchanged, regardless of what the operator has since typed into the
+ * form, so it always demonstrates a true identical-body replay rather than
+ * whatever the form happens to currently hold. */
+let lastMutateSentBody = null;
+
+/** fetch() wrapper for every /api/play/* call. Unlike reshardFetch (which
+ * throws away the status code on a non-2xx response), the Playground's whole
+ * point is to show the operator the REAL status + body the cluster/validator
+ * returned — success and failure are both first-class, honest outcomes, not
+ * something to unwrap into a single error string. Never throws except on a
+ * genuine network failure or an expired gate session (401), which route into
+ * the same handleLogout() flow every other /api/* caller in this file uses. */
+function playFetch(path, body) {
+  return fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((res) => {
+    if (res.status === 401) {
+      handleLogout();
+      throw new Error("session expired — please log in again");
+    }
+    return res.json().catch(() => ({})).then((json) => ({ status: res.status, ok: res.ok, body: json }));
+  });
+}
+
+/** Parses a JSON-shaped textarea's value. Blank input resolves to `undefined`
+ * (an omitted optional field) rather than an error. Throws a plain Error with
+ * a friendly, field-named message on invalid JSON — callers catch this and
+ * render it inline via the panel's reshard-error hook, never let it reach
+ * fetch(). */
+function parseOptionalJsonField(raw, fieldLabel) {
+  const trimmed = (raw || "").trim();
+  if (trimmed === "") return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error(`"${fieldLabel}" is not valid JSON.`);
+  }
+}
+
+function setPlayFieldError(hookEl, msg) {
+  if (!hookEl) return;
+  if (!msg) {
+    hookEl.hidden = true;
+    hookEl.textContent = "";
+    return;
+  }
+  hookEl.hidden = false;
+  hookEl.textContent = msg;
+}
+
+/** Renders a /api/play/* outcome — {status, ok, body} from playFetch, or
+ * {networkError: message} when the request never got a response at all.
+ * Always via textContent (JSON.stringify'd, never innerHTML) so a malicious
+ * or merely surprising value coming back from the cluster (a string field
+ * containing "<script>", say) can never execute — same non-negotiable rule
+ * every other response-rendering path in this file already follows. */
+function renderPlayResult(resultEl, outcome) {
+  if (!resultEl) return;
+  resultEl.hidden = false;
+  resultEl.innerHTML = "";
+
+  const head = document.createElement("div");
+  head.className = "play-result-head";
+  const statusSpan = document.createElement("span");
+  statusSpan.className = "play-result-status mono";
+  const verdictSpan = document.createElement("span");
+  verdictSpan.className = "play-result-verdict";
+
+  const body = document.createElement("pre");
+  body.className = "play-result-body mono";
+
+  if ("networkError" in outcome) {
+    resultEl.className = "play-result err";
+    statusSpan.textContent = "network error";
+    verdictSpan.textContent = "request failed";
+    body.textContent = outcome.networkError;
+  } else {
+    const isOk = outcome.ok;
+    resultEl.className = "play-result " + (isOk ? "ok" : "err");
+    statusSpan.textContent = String(outcome.status);
+    verdictSpan.textContent = isOk ? "ok" : "rejected";
+    body.textContent = JSON.stringify(outcome.body, null, 2);
+  }
+
+  head.appendChild(statusSpan);
+  head.appendChild(verdictSpan);
+  resultEl.appendChild(head);
+  resultEl.appendChild(body);
+}
+
+/** Extracts a human-readable message from a play.ts error body — {error:
+ * string} for a PlayValidationError 400, or whatever structured body the
+ * cluster's own rejection forwarded (often {error: {message, ...}}) — falls
+ * back to the raw JSON so nothing is ever silently swallowed. */
+function playErrorMessage(body) {
+  if (body && typeof body.error === "string") return body.error;
+  if (body && body.error && typeof body.error.message === "string") return body.error.message;
+  return JSON.stringify(body);
+}
+
+// ---- shared select population ------------------------------------------
+
+function populatePlaygroundStaticSelects() {
+  const warehouseItems = PLAYGROUND_WAREHOUSE_IDS.map((id) => ({ value: String(id), label: `warehouse ${id}` }));
+  [el.playMutateWarehouse, el.playTxWarehouse, el.playIqWarehouse, el.playTsWarehouse, el.playSqlWarehouse, el.playRouteWarehouse].forEach(
+    (sel) => populateSelect(sel, warehouseItems),
+  );
+
+  const opItems = PLAYGROUND_MUTATE_OPS.map((op) => ({ value: op, label: op }));
+  populateSelect(el.playMutateOp, opItems);
+
+  const tableItems = PLAYGROUND_TABLES.map((t) => ({ value: t, label: t }));
+  [el.playMutateTable, el.playIqTable, el.playTsTable, el.playSqlTable, el.playRouteTable].forEach((sel) => populateSelect(sel, tableItems));
+
+  // Default the Index Query panel's table to the first one that actually
+  // HAS a registered index (rather than PLAYGROUND_TABLES[0], which may not
+  // — e.g. tpcc_warehouse has none) so the panel opens immediately usable
+  // instead of defaulting into the disabled "no indexes" placeholder.
+  const firstIndexedTable = PLAYGROUND_TABLES.find((t) => (PLAYGROUND_INDEXES[t] || []).length > 0);
+  if (firstIndexedTable) el.playIqTable.value = firstIndexedTable;
+  refreshIndexPicker(el.playIqTable, el.playIqIndex);
+}
+
+/** Populates an index <select> from PLAYGROUND_INDEXES for the currently
+ * selected table. Some demo tables (e.g. tpcc_warehouse) have no registered
+ * secondary index at all — that's rendered as a single, honest disabled
+ * placeholder option rather than an empty (and confusingly submittable)
+ * dropdown. */
+function refreshIndexPicker(tableSelect, indexSelect) {
+  if (!tableSelect || !indexSelect) return;
+  const table = tableSelect.value;
+  const indexes = PLAYGROUND_INDEXES[table] || [];
+  if (indexes.length === 0) {
+    indexSelect.innerHTML = "";
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(no indexes registered for this table)";
+    indexSelect.appendChild(opt);
+    indexSelect.disabled = true;
+    return;
+  }
+  indexSelect.disabled = false;
+  populateSelect(indexSelect, indexes.map((name) => ({ value: name, label: name })));
+}
+
+// ---- Mutate panel ---------------------------------------------------------
+
+function handlePlayMutateSubmit(evt) {
+  evt.preventDefault();
+  setPlayFieldError(el.playMutateJsonError, null);
+
+  let values, where;
+  try {
+    values = parseOptionalJsonField(el.playMutateValues.value, "values");
+    where = parseOptionalJsonField(el.playMutateWhere.value, "where");
+  } catch (err) {
+    setPlayFieldError(el.playMutateJsonError, err.message);
+    return;
+  }
+
+  const requestIdRaw = el.playMutateRequestId.value.trim();
+  const body = {
+    warehouseId: Number(el.playMutateWarehouse.value),
+    op: el.playMutateOp.value,
+    table: el.playMutateTable.value,
+    partitionKey: el.playMutateKey.value.trim(),
+    values,
+    where,
+    requestId: requestIdRaw || undefined,
+  };
+
+  setFormBusy(el.playMutateForm, true);
+  playFetch("/api/play/mutate", body)
+    .then((outcome) => {
+      renderPlayResult(el.playMutateResult, outcome);
+      // Only a genuinely successful send becomes replayable — replaying a
+      // 400 (a validation/whitelist rejection) would just deterministically
+      // fail again and demonstrates nothing about the idempotency contract.
+      if (outcome.ok) {
+        lastMutateSentBody = body;
+        if (outcome.body && typeof outcome.body.requestId === "string") {
+          // Auto-fill the requestId field with what the server actually used
+          // (it generates one when the operator leaves the field blank) —
+          // this is what makes "edit a value, hit Send again" naturally
+          // replay the SAME requestId with a different body, demonstrating
+          // the 409 mismatch path without any extra step.
+          el.playMutateRequestId.value = outcome.body.requestId;
+        }
+      }
+      setPlayMutateCaption(outcome);
+      logLine(
+        `play/mutate ${body.op} ${body.table} (wh ${body.warehouseId}) → ${outcome.status}`,
+        outcome.ok ? "mig" : "warn",
+      );
+    })
+    .catch((err) => {
+      renderPlayResult(el.playMutateResult, { networkError: (err && err.message) || String(err) });
+    })
+    .finally(() => {
+      setFormBusy(el.playMutateForm, false);
+      // setFormBusy blanket-(re)enables every field in the form, including
+      // the Replay button — override it back to "no replayable body yet" if
+      // that's still true (e.g. this very request was the one that failed).
+      el.playMutateReplay.disabled = !lastMutateSentBody;
+    });
+}
+
+function handlePlayMutateReplay() {
+  if (!lastMutateSentBody) return;
+  setFormBusy(el.playMutateForm, true);
+  el.playMutateReplay.disabled = true;
+  playFetch("/api/play/mutate", lastMutateSentBody)
+    .then((outcome) => {
+      renderPlayResult(el.playMutateResult, outcome);
+      setPlayMutateCaption(outcome);
+      logLine(`play/mutate replay (same requestId, same body) → ${outcome.status}`, outcome.ok ? "safe" : "warn");
+    })
+    .catch((err) => {
+      renderPlayResult(el.playMutateResult, { networkError: (err && err.message) || String(err) });
+    })
+    .finally(() => {
+      setFormBusy(el.playMutateForm, false);
+      el.playMutateReplay.disabled = false;
+    });
+}
+
+/** Honest, contract-accurate caption under the Mutate result — mirrors
+ * play.ts's own playMutate doc comment (never marketing copy): a replay with
+ * an IDENTICAL body returns ShardDO's cached result for that requestId (no
+ * double effect); a replay with the SAME requestId but a DIFFERENT body is
+ * refused with a 409. */
+function setPlayMutateCaption(outcome) {
+  if (!el.playMutateCaption) return;
+  if (outcome.status === 409) {
+    el.playMutateCaption.hidden = false;
+    el.playMutateCaption.textContent =
+      "409 — this requestId was already used with a different body. This is the real idempotency contract: " +
+      "the server refuses to replay a mismatched result rather than silently applying (or silently ignoring) it.";
+  } else if (outcome.ok && lastMutateSentBody) {
+    el.playMutateCaption.hidden = false;
+    el.playMutateCaption.textContent =
+      "Try it: click \"Replay same requestId\" to resend this exact request — same requestId, same body — and " +
+      "watch it come back as the identical cached result, not a second write. Then edit a value above and hit " +
+      "Send again (same requestId, different body) to see the 409 above instead.";
+  } else {
+    el.playMutateCaption.hidden = true;
+  }
+}
+
+// ---- Tx panel ---------------------------------------------------------
+
+let playTxRowSeq = 0;
+
+/** Builds one repeatable mutation row for the Tx panel via DOM APIs (not a
+ * static index.html block, since rows are added/removed at runtime) — op and
+ * table are still constrained <select>s built from the SAME whitelists as
+ * every other panel, never free text, per this task's whitelist requirement. */
+function createPlayTxRow() {
+  const id = ++playTxRowSeq;
+  const row = document.createElement("div");
+  row.className = "play-tx-row";
+  row.dataset.rowId = String(id);
+
+  const head = document.createElement("div");
+  head.className = "play-tx-row-head";
+  const label = document.createElement("span");
+  label.className = "play-tx-row-label";
+  label.textContent = `mutation ${id}`;
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.className = "play-remove-row-btn";
+  removeBtn.textContent = "remove";
+  removeBtn.addEventListener("click", () => removePlayTxRow(row));
+  head.appendChild(label);
+  head.appendChild(removeBtn);
+
+  const opSelect = document.createElement("select");
+  opSelect.className = "field-select mono";
+  opSelect.dataset.role = "op";
+  populateSelect(opSelect, PLAYGROUND_MUTATE_OPS.map((op) => ({ value: op, label: op })));
+
+  const tableSelect = document.createElement("select");
+  tableSelect.className = "field-select mono";
+  tableSelect.dataset.role = "table";
+  populateSelect(tableSelect, PLAYGROUND_TABLES.map((t) => ({ value: t, label: t })));
+
+  const keyInput = document.createElement("input");
+  keyInput.className = "field-input mono";
+  keyInput.type = "text";
+  keyInput.dataset.role = "partitionKey";
+  keyInput.placeholder = "partition key";
+  keyInput.spellcheck = false;
+
+  const valuesArea = document.createElement("textarea");
+  valuesArea.className = "field-input mono play-json";
+  valuesArea.dataset.role = "values";
+  valuesArea.rows = 2;
+  valuesArea.placeholder = "values — JSON object (optional)";
+  valuesArea.spellcheck = false;
+
+  const whereArea = document.createElement("textarea");
+  whereArea.className = "field-input mono play-json";
+  whereArea.dataset.role = "where";
+  whereArea.rows = 1;
+  whereArea.placeholder = "where — JSON object (optional)";
+  whereArea.spellcheck = false;
+
+  row.appendChild(head);
+  row.appendChild(opSelect);
+  row.appendChild(tableSelect);
+  row.appendChild(keyInput);
+  row.appendChild(valuesArea);
+  row.appendChild(whereArea);
+  return row;
+}
+
+function refreshPlayTxRowControls() {
+  if (!el.playTxRows) return;
+  const rows = [...el.playTxRows.children];
+  rows.forEach((row) => {
+    const btn = row.querySelector(".play-remove-row-btn");
+    if (btn) btn.disabled = rows.length <= 1; // always keep at least one mutation row
+  });
+  if (el.playTxAddRow) el.playTxAddRow.disabled = rows.length >= PLAYGROUND_MAX_TX_MUTATIONS;
+}
+
+function removePlayTxRow(row) {
+  if (!el.playTxRows || el.playTxRows.children.length <= 1) return; // always keep at least one mutation row
+  row.remove();
+  refreshPlayTxRowControls();
+}
+
+function addPlayTxRow() {
+  if (!el.playTxRows) return;
+  if (el.playTxRows.children.length >= PLAYGROUND_MAX_TX_MUTATIONS) return;
+  el.playTxRows.appendChild(createPlayTxRow());
+  refreshPlayTxRowControls();
+}
+
+function readPlayTxRows() {
+  if (!el.playTxRows) return [];
+  return [...el.playTxRows.children].map((row) => {
+    const get = (role) => row.querySelector(`[data-role="${role}"]`);
+    return {
+      op: get("op").value,
+      table: get("table").value,
+      partitionKey: get("partitionKey").value.trim(),
+      valuesRaw: get("values").value,
+      whereRaw: get("where").value,
+    };
+  });
+}
+
+function handlePlayTxSubmit(evt) {
+  evt.preventDefault();
+  setPlayFieldError(el.playTxJsonError, null);
+
+  const rawRows = readPlayTxRows();
+  let mutations;
+  try {
+    mutations = rawRows.map((r, i) => ({
+      op: r.op,
+      table: r.table,
+      partitionKey: r.partitionKey,
+      values: parseOptionalJsonField(r.valuesRaw, `mutations[${i}].values`),
+      where: parseOptionalJsonField(r.whereRaw, `mutations[${i}].where`),
+    }));
+  } catch (err) {
+    setPlayFieldError(el.playTxJsonError, err.message);
+    return;
+  }
+  if (mutations.some((m) => m.partitionKey === "")) {
+    setPlayFieldError(el.playTxJsonError, "every mutation needs a partition key.");
+    return;
+  }
+
+  const requestIdRaw = el.playTxRequestId.value.trim();
+  const body = {
+    warehouseId: Number(el.playTxWarehouse.value),
+    mutations,
+    requestId: requestIdRaw || undefined,
+  };
+
+  setFormBusy(el.playTxForm, true);
+  playFetch("/api/play/tx", body)
+    .then((outcome) => {
+      renderPlayResult(el.playTxResult, outcome);
+      logLine(`play/tx ${mutations.length} mutation(s) (wh ${body.warehouseId}) → ${outcome.status}`, outcome.ok ? "mig" : "warn");
+    })
+    .catch((err) => renderPlayResult(el.playTxResult, { networkError: (err && err.message) || String(err) }))
+    .finally(() => setFormBusy(el.playTxForm, false));
+}
+
+// ---- Index Query panel -----------------------------------------------------
+
+function handlePlayIqSubmit(evt) {
+  evt.preventDefault();
+  setPlayFieldError(el.playIqJsonError, null);
+
+  if (el.playIqIndex.disabled || !el.playIqIndex.value) {
+    setPlayFieldError(el.playIqJsonError, "this table has no registered index to query — pick a different table.");
+    return;
+  }
+
+  let values;
+  try {
+    values = parseOptionalJsonField(el.playIqValues.value, "values");
+  } catch (err) {
+    setPlayFieldError(el.playIqJsonError, err.message);
+    return;
+  }
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    setPlayFieldError(el.playIqJsonError, '"values" is required and must be a JSON object.');
+    return;
+  }
+
+  const limitRaw = el.playIqLimit.value.trim();
+  const body = {
+    warehouseId: Number(el.playIqWarehouse.value),
+    table: el.playIqTable.value,
+    indexName: el.playIqIndex.value,
+    values,
+    limit: limitRaw ? Number(limitRaw) : undefined,
+  };
+
+  setFormBusy(el.playIqForm, true);
+  playFetch("/api/play/index-query", body)
+    .then((outcome) => {
+      renderPlayResult(el.playIqResult, outcome);
+      logLine(`play/index-query ${body.table}.${body.indexName} (wh ${body.warehouseId}) → ${outcome.status}`, outcome.ok ? "mig" : "warn");
+    })
+    .catch((err) => renderPlayResult(el.playIqResult, { networkError: (err && err.message) || String(err) }))
+    .finally(() => setFormBusy(el.playIqForm, false));
+}
+
+// ---- Table Scan panel -------------------------------------------------------
+
+function handlePlayTsSubmit(evt) {
+  evt.preventDefault();
+  const limitRaw = el.playTsLimit.value.trim();
+  const cursorRaw = el.playTsCursor.value.trim();
+  const body = {
+    warehouseId: Number(el.playTsWarehouse.value),
+    table: el.playTsTable.value,
+    limit: limitRaw ? Number(limitRaw) : undefined,
+    cursor: cursorRaw || undefined,
+  };
+
+  setFormBusy(el.playTsForm, true);
+  playFetch("/api/play/table-scan", body)
+    .then((outcome) => {
+      renderPlayResult(el.playTsResult, outcome);
+      // Offer the returned cursor back to the operator so "scan next page" is
+      // a one-click "run again" rather than hand-copying JSON out of the
+      // result pane.
+      if (outcome.ok && outcome.body && typeof outcome.body.cursor === "string") {
+        el.playTsCursor.value = outcome.body.cursor;
+      }
+      logLine(`play/table-scan ${body.table} (wh ${body.warehouseId}) → ${outcome.status}`, outcome.ok ? "mig" : "warn");
+    })
+    .catch((err) => renderPlayResult(el.playTsResult, { networkError: (err && err.message) || String(err) }))
+    .finally(() => setFormBusy(el.playTsForm, false));
+}
+
+// ---- SQL panel (operator-only, read-only) -----------------------------------
+
+function handlePlaySqlSubmit(evt) {
+  evt.preventDefault();
+  setPlayFieldError(el.playSqlJsonError, null);
+
+  let params;
+  try {
+    params = parseOptionalJsonField(el.playSqlParams.value, "params");
+  } catch (err) {
+    setPlayFieldError(el.playSqlJsonError, err.message);
+    return;
+  }
+  if (params !== undefined && !Array.isArray(params)) {
+    setPlayFieldError(el.playSqlJsonError, '"params" must be a JSON array.');
+    return;
+  }
+
+  const body = {
+    warehouseId: Number(el.playSqlWarehouse.value),
+    table: el.playSqlTable.value,
+    partitionKey: el.playSqlKey.value.trim(),
+    sql: el.playSqlText.value,
+    params,
+  };
+
+  setFormBusy(el.playSqlForm, true);
+  playFetch("/api/play/sql", body)
+    .then((outcome) => {
+      renderPlayResult(el.playSqlResult, outcome);
+      logLine(`play/sql (wh ${body.warehouseId}, table ${body.table}) → ${outcome.status}`, outcome.ok ? "mig" : "warn");
+    })
+    .catch((err) => renderPlayResult(el.playSqlResult, { networkError: (err && err.message) || String(err) }))
+    .finally(() => setFormBusy(el.playSqlForm, false));
+}
+
+// ---- Scatter panel (operator-only, read-only) -------------------------------
+
+function handlePlayScatterSubmit(evt) {
+  evt.preventDefault();
+  setPlayFieldError(el.playScatterJsonError, null);
+
+  let params;
+  try {
+    params = parseOptionalJsonField(el.playScatterParams.value, "params");
+  } catch (err) {
+    setPlayFieldError(el.playScatterJsonError, err.message);
+    return;
+  }
+  if (params !== undefined && !Array.isArray(params)) {
+    setPlayFieldError(el.playScatterJsonError, '"params" must be a JSON array.');
+    return;
+  }
+
+  const limitRaw = el.playScatterLimit.value.trim();
+  const body = {
+    sql: el.playScatterText.value,
+    params,
+    limit: limitRaw ? Number(limitRaw) : undefined,
+  };
+
+  setFormBusy(el.playScatterForm, true);
+  playFetch("/api/play/scatter", body)
+    .then((outcome) => {
+      renderPlayResult(el.playScatterResult, outcome);
+      logLine(`play/scatter → ${outcome.status}`, outcome.ok ? "mig" : "warn");
+    })
+    .catch((err) => renderPlayResult(el.playScatterResult, { networkError: (err && err.message) || String(err) }))
+    .finally(() => setFormBusy(el.playScatterForm, false));
+}
+
+// ---- Routing Inspector panel ------------------------------------------------
+//
+// POSTs to /api/play/route-inspect (src/play.ts's playRouteInspect — the REAL
+// two-step hash routing against the live vBucket map, never reimplemented
+// client-side) and renders the result two ways: a tabular mono summary below
+// the form (this section), and a transient highlight on the matching shard
+// node in the Topology canvas (renderInner's isRouteHighlighted, this file
+// above — see routingHighlightShardId's own doc comment for why that
+// highlight deliberately survives leaving the Playground room).
+
+/** Currently-rendered summary's honest "why (not) highlighted" note element,
+ * so handlePlayRouteClear can update just that line in place (leaving the
+ * resolved fields on screen — they're still true, only the highlight state
+ * changed) without rebuilding the whole panel. Reset to null whenever
+ * renderRouteSummary rebuilds the panel from scratch. */
+let playRouteNoteEl = null;
+
+/** Mirrors renderInner's own shard-id union logic (this file, ~line 700:
+ * every row's current shardId AND non-null targetShardId, unioned with
+ * shards[].shardId) — kept in sync by hand since renderInner doesn't expose
+ * that set. Used only to give the routing summary's note an honest "is this
+ * shard actually in the currently-rendered topology" answer; never used for
+ * rendering itself. */
+function collectKnownShardIds(snapshot) {
+  const ids = new Set();
+  const catalogs = Array.isArray(snapshot.catalogs) ? snapshot.catalogs : [];
+  for (const cat of catalogs) {
+    for (const row of cat.vbuckets || []) {
+      if (row.shardId) ids.add(row.shardId);
+      if (row.targetShardId) ids.add(row.targetShardId);
+    }
+  }
+  for (const s of Array.isArray(snapshot.shards) ? snapshot.shards : []) {
+    if (s.shardId) ids.add(s.shardId);
+  }
+  return ids;
+}
+
+/** Honest explanation of the CURRENT routingHighlightShardId's visibility —
+ * never claims a highlight is showing unless it actually will be. Three
+ * degrade paths, matching this feature's "skip the canvas highlight, say
+ * why" requirement: sample/demo data (mode !== "live" — highlighting a real
+ * cluster's resolved owner against a fabricated topology would be
+ * misleading, since the sample's shard ids aren't guaranteed to mean
+ * anything), no snapshot rendered yet at all, or a snapshot that simply
+ * doesn't currently know this shard id (a stale resolve, or it just changed
+ * out from under this call — the whole point of re-resolving live each
+ * time). */
+function describeHighlightState() {
+  if (!routingHighlightShardId) return "No shard highlighted on the Topology canvas right now.";
+  if (mode !== "live") {
+    return `Resolved owner is "${routingHighlightShardId}", but the Topology canvas is showing sample/demo data right now — skipping the highlight rather than pointing at a shard that may not mean anything in this fabricated topology.`;
+  }
+  if (!lastRenderedSnapshot) {
+    return `Resolved owner is "${routingHighlightShardId}" — the Topology canvas hasn't loaded a live snapshot yet; the highlight will apply as soon as it does.`;
+  }
+  return collectKnownShardIds(lastRenderedSnapshot).has(routingHighlightShardId)
+    ? `Highlighted "${routingHighlightShardId}" on the Topology canvas — switch rooms to see it.`
+    : `Resolved owner is "${routingHighlightShardId}", but it isn't in the currently-rendered topology (may have just changed) — no highlight to show.`;
+}
+
+/** Sets (or clears, with a falsy shardId) the Topology canvas's routing
+ * highlight and forces an immediate re-render (if a snapshot is already
+ * held) so the change is visible without waiting for the next ~900ms SSE
+ * tick. Safe to call with a shardId absent from the current topology —
+ * renderInner's per-node check is a simple equality match, so a
+ * non-matching id just never highlights anything; no error, no fabricated
+ * node (see describeHighlightState for how that's surfaced honestly). */
+function setRoutingHighlight(shardId) {
+  routingHighlightShardId = shardId || null;
+  if (el.playRouteClear) el.playRouteClear.disabled = !routingHighlightShardId;
+  if (lastRenderedSnapshot) render(lastRenderedSnapshot);
+}
+
+/** Builds one label/value summary row — same createElement/textContent
+ * discipline as renderPlayResult (this file): every value here originated
+ * from a real cluster response, so it goes through textContent only, never
+ * innerHTML. */
+function routeSummaryRow(label, value, cls) {
+  const row = document.createElement("div");
+  row.className = "play-route-row" + (cls ? " " + cls : "");
+  const labelEl = document.createElement("span");
+  labelEl.className = "play-route-label micro";
+  labelEl.textContent = label;
+  const valueEl = document.createElement("span");
+  valueEl.className = "play-route-value mono";
+  valueEl.textContent = value;
+  row.appendChild(labelEl);
+  row.appendChild(valueEl);
+  return row;
+}
+
+/** Renders playRouteInspect's resolved fields as a tabular mono summary
+ * (DESIGN.md), plus describeHighlightState()'s honest highlight note.
+ * `body` is null to clear the panel entirely (a failed/errored resolve —
+ * renderPlayResult already shows the real error in el.playRouteResult; this
+ * panel just goes back to hidden, matching every other Playground panel's
+ * "hide on error" convention). Always call setRoutingHighlight() BEFORE this
+ * on a successful resolve, so the note reflects the just-applied state, not
+ * the previous one. */
+function renderRouteSummary(body) {
+  if (!el.playRouteSummary) return;
+  el.playRouteSummary.innerHTML = "";
+  playRouteNoteEl = null;
+  if (!body) {
+    el.playRouteSummary.hidden = true;
+    return;
+  }
+
+  el.playRouteSummary.hidden = false;
+  el.playRouteSummary.appendChild(routeSummaryRow("tenant", body.tenantId));
+  el.playRouteSummary.appendChild(routeSummaryRow("catalog shard", body.catalogShardId));
+  el.playRouteSummary.appendChild(routeSummaryRow("vbucket", `${body.vbucket} / ${body.totalVBuckets}`));
+  el.playRouteSummary.appendChild(routeSummaryRow("catalog shard count", String(body.catalogShardCount)));
+  el.playRouteSummary.appendChild(routeSummaryRow("owning shard", body.ownerShardId));
+  if (body.migration) {
+    el.playRouteSummary.appendChild(
+      routeSummaryRow("migration", `${body.migration.status} · ${body.migration.fromShardId} → ${body.migration.toShardId}`, "migrate"),
+    );
+  }
+
+  const note = document.createElement("div");
+  note.className = "play-route-note";
+  note.textContent = describeHighlightState();
+  el.playRouteSummary.appendChild(note);
+  playRouteNoteEl = note;
+}
+
+function handlePlayRouteInspectSubmit(evt) {
+  evt.preventDefault();
+  const body = {
+    warehouseId: Number(el.playRouteWarehouse.value),
+    table: el.playRouteTable.value,
+    partitionKey: el.playRouteKey.value.trim(),
+  };
+
+  setFormBusy(el.playRouteForm, true);
+  playFetch("/api/play/route-inspect", body)
+    .then((outcome) => {
+      renderPlayResult(el.playRouteResult, outcome);
+      if (outcome.ok) {
+        setRoutingHighlight(outcome.body.ownerShardId);
+        renderRouteSummary(outcome.body);
+        logLine(`play/route-inspect → owner ${outcome.body.ownerShardId} (vbucket ${outcome.body.vbucket})`, "mig");
+      } else {
+        renderRouteSummary(null);
+        logLine(`play/route-inspect → ${outcome.status}`, "warn");
+      }
+    })
+    .catch((err) => {
+      renderPlayResult(el.playRouteResult, { networkError: (err && err.message) || String(err) });
+      renderRouteSummary(null);
+    })
+    .finally(() => setFormBusy(el.playRouteForm, false));
+}
+
+/** "Clear highlight" button — turns off the Topology canvas spotlight without
+ * discarding the resolved fields still on screen (they're still true; only
+ * the highlight state changed), by updating just the note line in place. */
+function handlePlayRouteClear() {
+  setRoutingHighlight(null);
+  if (playRouteNoteEl) playRouteNoteEl.textContent = describeHighlightState();
+}
+
+// ---- room lifecycle ---------------------------------------------------------
+
+/** Called by setActiveRoom() on first entering the Playground room. Wiring
+ * (event listeners, whitelist-driven <select> population, the Tx panel's
+ * first mutation row) happens ONCE, the first time the room is opened — the
+ * panels hold no live/polled state, so unlike Reshard/Edge there is nothing
+ * to refresh on every subsequent visit. */
+function startPlayRoom() {
+  if (playRoomInitialized) return;
+  playRoomInitialized = true;
+
+  populatePlaygroundStaticSelects();
+  addPlayTxRow();
+
+  el.playMutateForm.addEventListener("submit", handlePlayMutateSubmit);
+  el.playMutateReplay.addEventListener("click", handlePlayMutateReplay);
+  el.playTxForm.addEventListener("submit", handlePlayTxSubmit);
+  el.playTxAddRow.addEventListener("click", addPlayTxRow);
+  el.playIqForm.addEventListener("submit", handlePlayIqSubmit);
+  el.playIqTable.addEventListener("change", () => refreshIndexPicker(el.playIqTable, el.playIqIndex));
+  el.playTsForm.addEventListener("submit", handlePlayTsSubmit);
+  el.playSqlForm.addEventListener("submit", handlePlaySqlSubmit);
+  el.playScatterForm.addEventListener("submit", handlePlayScatterSubmit);
+  el.playRouteForm.addEventListener("submit", handlePlayRouteInspectSubmit);
+  el.playRouteClear.addEventListener("click", handlePlayRouteClear);
+}
+
+/** Called by setActiveRoom() on leaving the Playground room. Every panel here
+ * is a plain request/response form with no timer/poll/subscription (unlike
+ * Reshard's lock/op polling or a live SSE stream), so there is nothing to
+ * tear down — kept as its own function, mirroring stopEdgeRoom, so a future
+ * addition (e.g. a live tail of recent Playground calls) has an obvious home. */
+function stopPlayRoom() {}
+
+// ============================================================================
 // Auth gate (src/gate.ts): /api/* requires SHARDSCOPE_GATE_TOKEN, presented
 // as a `shardscope_gate` HttpOnly cookie set by POST /login. EventSource
 // can't read response status codes or set an Authorization header, so we
@@ -1722,6 +2603,16 @@ function handleLogout() {
   stopReshardPolling();
   activeOp = null;
   if (el.opCard) el.opCard.hidden = true;
+  // Same per-session reset for the Routing Inspector's canvas highlight — a
+  // logout is a clean session boundary, so a shard resolved under the
+  // previous session shouldn't still be spotlighted after logging back in.
+  routingHighlightShardId = null;
+  if (el.playRouteClear) el.playRouteClear.disabled = true;
+  if (el.playRouteSummary) {
+    el.playRouteSummary.hidden = true;
+    el.playRouteSummary.innerHTML = "";
+  }
+  playRouteNoteEl = null;
   // Bring canvas-wrap (and the login panel it hosts) back into view
   // regardless of which room was open when the session expired — see
   // forceTopologyRoomForLogin's own comment for why this matters for Edge.
@@ -1864,6 +2755,7 @@ function init() {
   onActivate(el.railTopology, () => setActiveRoom("topology"));
   onActivate(el.railReshard, () => setActiveRoom("reshard"));
   onActivate(el.railEdge, () => setActiveRoom("edge"));
+  onActivate(el.railPlay, () => setActiveRoom("play"));
   if (el.edgeRemeasureBtn) el.edgeRemeasureBtn.addEventListener("click", runEdgeMeasurement);
   el.oldwayToggle.addEventListener("click", toggleOldwayPanel);
   el.opTabSplit.addEventListener("click", () => setActiveOpTab("split"));

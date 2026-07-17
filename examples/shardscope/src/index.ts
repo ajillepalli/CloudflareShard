@@ -87,6 +87,23 @@ import {
   parseBlipShardOfflineInput,
   runBlipShardOfflineAttack,
 } from "./chaos";
+import {
+  PlayValidationError,
+  parsePlayMutateInput,
+  playMutate,
+  parsePlayTxInput,
+  playTx,
+  parsePlayIndexQueryInput,
+  playIndexQuery,
+  parsePlayTableScanInput,
+  playTableScan,
+  parsePlaySqlInput,
+  playSql,
+  parsePlayScatterInput,
+  playScatter,
+  parsePlayRouteInspectInput,
+  playRouteInspect,
+} from "./play";
 import type { Env } from "./env";
 
 export { TopologyAggregator, LoadDriver, TenantTokenStore };
@@ -268,6 +285,31 @@ async function runChaosOp(fn: () => Promise<unknown>): Promise<Response> {
   return runOperatorOp(fn, (err) => err instanceof ReshardValidationError || err instanceof ChaosPreconditionError);
 }
 
+/** Same calm-error contract as runReshardOp/runChaosOp above, for the
+ * Playground room (src/play.ts): a PlayValidationError (malformed input, or
+ * a warehouse/table/index/SQL-shape outside src/play.ts's whitelists) is a
+ * 400 with that message; everything else (including the idempotent-mismatch
+ * 409 src/play.ts's playMutate doc comment describes) flows through
+ * runOperatorOp's existing "CloudflareShard RPC error <status>: <body>"
+ * unpacking unchanged — this is what lets the Playground's requestId-replay
+ * demo show the REAL contract to the browser instead of a simulated one. */
+async function runPlayOp(fn: () => Promise<unknown>): Promise<Response> {
+  return runOperatorOp(fn, (err) => err instanceof PlayValidationError);
+}
+
+/** Parses a Playground POST body — same strict contract as
+ * readReshardJsonBody (every Playground call is an explicit, developer-typed
+ * request, not a one-click button with a sane empty-body default like
+ * Chaos's readChaosJsonBody), so invalid/absent JSON is a PlayValidationError
+ * -> 400, not a silently-defaulted `{}`. */
+async function readPlayJsonBody(request: Request): Promise<unknown> {
+  try {
+    return await request.json();
+  } catch {
+    throw new PlayValidationError("Invalid JSON body.");
+  }
+}
+
 export default {
   // Request<unknown, IncomingRequestCfProperties>: narrows request.cf from
   // the bare Request default (CfProperties<unknown>, a union that also
@@ -424,6 +466,47 @@ export default {
       // fabricated success or a generic 502.
       if (request.method === "POST" && url.pathname === "/api/chaos/blip-shard-offline") {
         return runChaosOp(async () => runBlipShardOfflineAttack(env, parseBlipShardOfflineInput(await readChaosJsonBody(request))));
+      }
+    }
+
+    // /api/play/*: the Playground room's backend (src/play.ts) — a
+    // gate-protected proxy letting a browser drive CloudflareShard's
+    // developer primitives (mutate/tx/index-query/table-scan under a
+    // controlled demo tenant; sql/scatter server-side under ADMIN_TOKEN,
+    // read-only). GATING CONFIRMATION: every path under here is a /api/*
+    // route, so it already passed the `isGateAuthorized` check at the top of
+    // this function (this code is unreachable otherwise) — same as
+    // /api/reshard/* and /api/chaos/* above. See src/play.ts's header
+    // comment for the full security model (never a browser-supplied
+    // token/tenant identity; whitelisted demo tenants/tables/indexes;
+    // read-only enforcement on the operator SQL/scatter routes).
+    if (url.pathname.startsWith("/api/play/")) {
+      if (request.method === "POST" && url.pathname === "/api/play/mutate") {
+        return runPlayOp(async () => playMutate(env, parsePlayMutateInput(await readPlayJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/play/tx") {
+        return runPlayOp(async () => playTx(env, parsePlayTxInput(await readPlayJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/play/index-query") {
+        return runPlayOp(async () => playIndexQuery(env, parsePlayIndexQueryInput(await readPlayJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/play/table-scan") {
+        return runPlayOp(async () => playTableScan(env, parsePlayTableScanInput(await readPlayJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/play/sql") {
+        return runPlayOp(async () => playSql(env, parsePlaySqlInput(await readPlayJsonBody(request))));
+      }
+      if (request.method === "POST" && url.pathname === "/api/play/scatter") {
+        return runPlayOp(async () => playScatter(env, parsePlayScatterInput(await readPlayJsonBody(request))));
+      }
+      // POST /api/play/route-inspect: the Playground's routing inspector
+      // (READ-ONLY — see src/play.ts's playRouteInspect doc comment). Reuses
+      // this same runPlayOp calm-error contract as every other Playground
+      // route above; a catalog/vbucket the live map doesn't (yet) recognize
+      // surfaces as PlayValidationError -> 400, exactly like a bad
+      // warehouseId/table would.
+      if (request.method === "POST" && url.pathname === "/api/play/route-inspect") {
+        return runPlayOp(async () => playRouteInspect(env, parsePlayRouteInspectInput(await readPlayJsonBody(request))));
       }
     }
 

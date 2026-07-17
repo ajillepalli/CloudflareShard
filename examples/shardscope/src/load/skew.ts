@@ -39,6 +39,18 @@ export interface VBucketOwnership {
   shardId: string;
 }
 
+/** The exact routing formula CloudflareShard's gateway uses to place a key
+ * into a vBucket — see this file's header comment for the source-of-truth
+ * pointer (src/hash.ts's hashKey + src/index.ts's mutate/tx routing path).
+ * Exported so callers OUTSIDE this file (e.g. the Playground room's routing
+ * inspector, ../play.ts) can compute the same vbucket number this module's
+ * own routesToShard/generateSkewedKeys use internally, without re-deriving
+ * the modulo themselves — a single formula, never two copies that could
+ * drift apart. */
+export function vbucketForKey(tenantId: string, table: string, partitionKey: string, totalVBuckets: number): number {
+  return hashKey(`${tenantId}:${table}:${partitionKey}`) % totalVBuckets;
+}
+
 /** Computes the set of vBucket numbers currently owned by `targetShardId`
  * within one catalog's map. A vbucket mid-migration (its row's
  * `targetShardId` set, cutover not yet committed) is deliberately NOT
@@ -113,7 +125,7 @@ export function generateSkewedKeys<T>(params: SkewParams<T>): SkewedKey<T>[] {
 
   for (let attempt = 0; attempt < maxAttempts && results.length < count; attempt++) {
     const { value, partitionKey } = candidateToKey(attempt);
-    const vbucket = hashKey(`${tenantId}:${table}:${partitionKey}`) % totalVBuckets;
+    const vbucket = vbucketForKey(tenantId, table, partitionKey, totalVBuckets);
     if (owned.has(vbucket)) {
       results.push({ value, partitionKey, vbucket });
     }
@@ -156,6 +168,6 @@ export function routesToShard(
   targetShardId: string,
 ): boolean {
   if (totalVBuckets <= 0) return false;
-  const vbucket = hashKey(`${tenantId}:${table}:${partitionKey}`) % totalVBuckets;
+  const vbucket = vbucketForKey(tenantId, table, partitionKey, totalVBuckets);
   return ownedVBuckets(vbucketMap, targetShardId).has(vbucket);
 }
