@@ -1,0 +1,51 @@
+# Deploy-template wrangler config for "Deploy your own CloudflareShard cluster".
+#
+# This is a STAGED ARTIFACT for review (see ./NOTES.md), not a live repo. It
+# mirrors the core cloudflare-shard-mvp Worker's real wrangler config (repo-root
+# wrangler.toml) so the "Deploy to Cloudflare" button can stand up a full cluster
+# in a user's own account: one self-contained Worker + its three SQLite Durable
+# Object classes, provisioned from the [[migrations]] below. No external service
+# bindings, no KV/D1/R2 — that self-containment is exactly what makes the core
+# button-friendly.
+#
+# The Deploy button reads this file, lets the user rename the Worker on the setup
+# page, provisions the Durable Objects, and rewrites this file with the created
+# ids. The ADMIN_TOKEN secret is NOT set here (secrets never live in wrangler
+# config) — it's declared in ./.env.example so the button's setup page
+# prompts for it; see ./README.md "After deploy".
+
+name = "cloudflare-shard"
+main = "src/index.ts"
+compatibility_date = "2026-06-29"
+
+# Optional. Enables searchable Workers Logs (adds Workers Logs usage to the
+# account's bill). Fine to leave on for a real cluster; set enabled = false to
+# minimize cost on a throwaway try-it deploy.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# The control plane. Owns vBucket routing + the topology-operation lock.
+[[durable_objects.bindings]]
+name = "CATALOG"
+class_name = "CatalogDO"
+
+# The data plane. One instance per physical shard; holds the tenant SQL data.
+[[durable_objects.bindings]]
+name = "SHARD"
+class_name = "ShardDO"
+
+# The 2PC transaction coordinator.
+[[durable_objects.bindings]]
+name = "COORDINATOR"
+class_name = "CoordinatorDO"
+
+# SQLite-backed Durable Objects must be declared in a migration so Cloudflare
+# provisions their storage. Byte-identical to the core Worker's migrations.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CatalogDO", "ShardDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CoordinatorDO"]
