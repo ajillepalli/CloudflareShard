@@ -1691,3 +1691,45 @@ textarea.play-json {
   font-family: var(--font-sans);
   color: var(--text-dim);
 }
+
+/* ============ BUILD ON IT PANEL (App room) ============
+   The watch->build bridge: a file-browser two-up layout (list left, preview
+   right) reusing .play-result/.play-result-head/.play-result-body verbatim
+   for the preview pane so it inherits that component's existing look with
+   no new rules of its own. */
+.build-browser {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) 1fr;
+  gap: 12px;
+  align-items: start;
+}
+.build-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-well);
+  padding: 4px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.build-file-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 6px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.build-file-item:hover { color: var(--text-primary); background: rgba(230, 234, 242, .04); }
+.build-file-item.active { color: var(--safe); background: rgba(53, 227, 176, .08); }
+.build-file-preview-wrap .play-result-body { max-height: 280px; }

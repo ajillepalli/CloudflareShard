@@ -123,6 +123,14 @@ const el = {
   appCodeRead: hook("app-code-read"),
   appCodeTx: hook("app-code-tx"),
 
+  // ---- Build on it panel (App room) ----
+  buildDownloadBtn: hook("build-download-btn"),
+  buildStatus: hook("build-status"),
+  buildError: hook("build-error"),
+  buildFileList: hook("build-file-list"),
+  buildFilePreview: hook("build-file-preview"),
+  buildFilePreviewName: hook("build-file-preview-name"),
+
   // ---- Edge room (T11) ----
   railEdge: hook("rail-edge"),
   canvasWrap: hook("canvas-wrap"),
@@ -2793,6 +2801,167 @@ function handleAppTxClick() {
     });
 }
 
+// ============================================================================
+// Build on it panel (App room) — the watch->build bridge. Fetches the SAME
+// file set src/build.ts's generateScaffoldFiles() produces: GET
+// /api/build/manifest (JSON, for this panel's inline preview) and GET
+// /api/build/scaffold (a real zip download). Both are gate-protected /api/*
+// routes, same as everything else in this room.
+//
+// XSS: every file path/content byte below reaches the DOM via
+// createElement + .textContent only — never innerHTML with server/user
+// data — same rule renderAppTable/renderPlayResult already follow
+// elsewhere in this file. .innerHTML = "" below is used solely to CLEAR
+// prior content before re-rendering, never to inject data (identical
+// convention to renderAppTable).
+// ============================================================================
+
+let buildPanelInitialized = false;
+let buildManifestLoaded = false;
+/** The manifest's file set, once loaded — [{path, content}], the exact
+ * shape GET /api/build/manifest returns (mirrors generateScaffoldFiles()'s
+ * ScaffoldFile[] in src/build.ts). */
+let buildFiles = [];
+let buildSelectedPath = null;
+
+function setBuildStatus(text) {
+  if (el.buildStatus) el.buildStatus.textContent = text;
+}
+
+function setBuildError(msg) {
+  if (!el.buildError) return;
+  if (!msg) {
+    el.buildError.hidden = true;
+    el.buildError.textContent = "";
+    return;
+  }
+  el.buildError.hidden = false;
+  el.buildError.textContent = msg;
+}
+
+/** Renders the left-hand file list from `buildFiles` — one button per file,
+ * clicking selects it as the preview (renderBuildFilePreview below). Every
+ * label reaches the DOM via textContent only. */
+function renderBuildFileList() {
+  if (!el.buildFileList) return;
+  el.buildFileList.innerHTML = "";
+  for (const file of buildFiles) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "build-file-item" + (file.path === buildSelectedPath ? " active" : "");
+    btn.textContent = file.path;
+    btn.addEventListener("click", () => renderBuildFilePreview(file));
+    el.buildFileList.appendChild(btn);
+  }
+}
+
+/** Shows one file's real content in the preview pane — via .textContent
+ * only, so a surprising byte sequence in a generated file (there never is
+ * one today, but this is the same non-negotiable rule every other
+ * response-rendering path in this file follows) can never execute as
+ * markup. */
+function renderBuildFilePreview(file) {
+  buildSelectedPath = file.path;
+  if (el.buildFilePreviewName) el.buildFilePreviewName.textContent = file.path;
+  if (el.buildFilePreview) el.buildFilePreview.textContent = file.content;
+  renderBuildFileList();
+}
+
+function loadBuildManifest() {
+  setBuildStatus("loading…");
+  setBuildError("");
+  return fetch("/api/build/manifest", { credentials: "same-origin" })
+    .then((res) => {
+      if (res.status === 401) {
+        handleLogout();
+        throw new Error("session expired — please log in again");
+      }
+      if (!res.ok) throw new Error(`request failed (${res.status})`);
+      return res.json();
+    })
+    .then((body) => {
+      buildFiles = (body && body.files) || [];
+      buildSelectedPath = buildFiles.length > 0 ? buildFiles[0].path : null;
+      renderBuildFileList();
+      if (buildFiles.length > 0) renderBuildFilePreview(buildFiles[0]);
+      setBuildStatus(`${buildFiles.length} file${buildFiles.length === 1 ? "" : "s"}`);
+    })
+    .catch((err) => {
+      setBuildError((err && err.message) || "network error");
+      setBuildStatus("error");
+    });
+}
+
+/** Fires GET /api/build/scaffold and hands the real zip bytes to the
+ * browser's normal download flow via a throwaway blob: URL + synthetic
+ * click — no server-authored HTML/script is ever involved, only binary zip
+ * bytes the browser saves as a file. */
+function handleBuildDownloadClick() {
+  if (!el.buildDownloadBtn) return;
+  el.buildDownloadBtn.disabled = true;
+  el.buildDownloadBtn.textContent = "Preparing…";
+  setBuildError("");
+  fetch("/api/build/scaffold", { credentials: "same-origin" })
+    .then((res) => {
+      if (res.status === 401) {
+        handleLogout();
+        throw new Error("session expired — please log in again");
+      }
+      if (!res.ok) throw new Error(`download failed (${res.status})`);
+      return res.blob();
+    })
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "cloudflareshard-inventory-starter.zip";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    })
+    .catch((err) => {
+      setBuildError((err && err.message) || "network error");
+    })
+    .finally(() => {
+      el.buildDownloadBtn.disabled = false;
+      el.buildDownloadBtn.textContent = "Download starter repo";
+    });
+}
+
+/** Called by startAppRoom() below on every entry to the App room. Wiring
+ * (the download button's listener) happens once; the manifest itself loads
+ * once and is cached in buildFiles (it's static/deterministic — see
+ * src/build.ts's generateScaffoldFiles() doc comment — so there's nothing
+ * to refresh on re-entry, unlike the tenant data panels above). */
+function startBuildPanel() {
+  if (!el.buildDownloadBtn) return; // hooks absent (e.g. an older cached page) — no-op rather than throw
+  if (!buildPanelInitialized) {
+    buildPanelInitialized = true;
+    el.buildDownloadBtn.addEventListener("click", handleBuildDownloadClick);
+  }
+
+  // ?demo=1 never touches /api/* (see this file's header comment on `mode`
+  // and startAppRoom's identical precedent just below) — render an honest
+  // "no live preview" state instead of firing a request that would only
+  // ever fail against a static preview with no backend.
+  if (mode === "demo") {
+    el.buildDownloadBtn.disabled = true;
+    setBuildStatus("demo mode — no live preview");
+    setBuildError("");
+    if (el.buildFileList) el.buildFileList.innerHTML = "";
+    if (el.buildFilePreview) el.buildFilePreview.textContent = "";
+    if (el.buildFilePreviewName) el.buildFilePreviewName.textContent = "demo mode (?demo=1) — drop the query param against a live cluster to browse the real generated files.";
+    return;
+  }
+  el.buildDownloadBtn.disabled = false;
+
+  if (!buildManifestLoaded) {
+    buildManifestLoaded = true;
+    loadBuildManifest();
+  }
+}
+
 /** Called by setActiveRoom() on entering the App room. Wiring (selects,
  * listeners, the static code snippets) happens once; the data load re-runs
  * on every entry (and every tenant switch) so the screen always reflects
@@ -2812,6 +2981,8 @@ function startAppRoom() {
     el.appTxBtn.addEventListener("click", handleAppTxClick);
     renderAppCodeSnippets();
   }
+
+  startBuildPanel();
 
   // ?demo=1 never touches /api/* (see this file's header comment on `mode`
   // and the Edge room's identical startEdgeRoom() precedent) — render an
