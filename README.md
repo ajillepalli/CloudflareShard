@@ -26,7 +26,9 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
 - `src/catalog.ts`: Catalog durable object (metadata, routing, map changes).
 - `src/shard.ts`: Shard durable object (SQLite execution + idempotency).
 - `docs/SPEC.md`: Concrete architecture and protocol spec.
+- `client/`: Typed TypeScript SDK + CLI for the HTTP API — see `client/README.md`. Recommended over hand-writing raw HTTP calls; the quickstart below leads with it.
 - `examples/rpc-consumer/`: Demo Worker calling the tenant data path over a Durable Object RPC / service binding instead of HTTP.
+- `examples/tpc-c-benchmark/`: TPC-C-derived OLTP benchmark and demo project.
 
 ## Prerequisites
 
@@ -54,6 +56,72 @@ npm run deploy
 ```
 
 ## API quickstart
+
+### Using the SDK (recommended)
+
+`client/` is a typed TypeScript SDK + CLI wrapping this whole API — the
+walkthrough below (steps 1-11) shown as SDK calls instead of raw curl. See
+`client/README.md` for the full reference; this is the condensed version.
+
+```ts
+import { CloudflareShardAdminClient, CloudflareShardClient } from "cloudflare-shard-client";
+
+const admin = new CloudflareShardAdminClient({ baseUrl: "http://127.0.0.1:8787", token: process.env.ADMIN_TOKEN! });
+
+// 1) Initialize cluster metadata and shard map
+await admin.init({ numShards: 4, totalVBuckets: 256 });
+
+// 2) Register a logical table + 3) create its schema on every shard
+await admin.createTable({
+  table: "events",
+  schema: "CREATE TABLE events (id TEXT PRIMARY KEY, user_id TEXT, body TEXT, created_at TEXT)",
+  partitionKeyColumn: "id",
+});
+
+// 4) Register a tenant
+const { token } = await admin.registerTenant({ tenantId: "t1" });
+const tenant = new CloudflareShardClient({ baseUrl: "http://127.0.0.1:8787", token });
+
+// 5) Insert data (8: same call, tenant.update()/.delete()/.upsert() for the other ops)
+await tenant.insert("events", "t1", "e1", { user_id: "user-1", body: "hello", created_at: new Date().toISOString() });
+
+// 6)/7) Read: exact-tuple index lookups, or a tenant-scoped table scan
+for await (const page of tenant.tableScanAll({ tenantId: "t1", table: "events" })) {
+  console.log(page);
+}
+
+// 9) Cross-shard atomic transaction
+await tenant.tx([
+  { op: "insert", table: "events", tenantId: "t1", partitionKey: "e2", values: { user_id: "user-1", body: "a" } },
+  { op: "insert", table: "events", tenantId: "t1", partitionKey: "e3", values: { user_id: "user-1", body: "b" } },
+]);
+
+// 11) Move one vbucket to a new shard, then watch it
+await admin.splitVbucket({ catalogShardId: "catalog-0", vbucket: 42, newShardId: "shard-hotfix-1" });
+await admin.migrateVbucketStatus({ catalogShardId: "catalog-0", vbucket: 42 });
+```
+
+(Step 10, the admin-only cross-tenant fan-out `/v1/scatter`, deliberately has
+no SDK wrapper — see `client/README.md`'s "What's covered" section for why —
+use raw curl for it, shown below.)
+
+The CLI covers the admin calls above too, for scripting/one-offs without
+writing any TypeScript:
+
+```bash
+export CLOUDFLARESHARD_URL=http://127.0.0.1:8787
+export CLOUDFLARESHARD_ADMIN_TOKEN=<your ADMIN_TOKEN>
+node client/dist/cli.js init --num-shards 4 --total-vbuckets 256
+node client/dist/cli.js create-table --table events --schema "CREATE TABLE events (id TEXT PRIMARY KEY, body TEXT)" --partition-key-column id
+node client/dist/cli.js status
+```
+
+### Raw HTTP (the wire protocol the SDK wraps)
+
+The rest of this section is the same walkthrough at the HTTP level — useful
+for understanding the actual wire format, debugging with curl, or writing a
+client in another language. `docs/SPEC.md` is the canonical protocol
+reference.
 
 ### 1) Initialize cluster metadata and shard map
 

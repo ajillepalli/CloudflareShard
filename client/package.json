@@ -1,0 +1,33 @@
+{
+  "name": "cloudflare-shard-client",
+  "version": "1.0.0",
+  "description": "Typed TypeScript SDK and CLI for CloudflareShard's HTTP API (tenant data-plane: mutate/tx/index-query/table-scan; admin: init/create-table/create-index/status/shard-stats and more). See issue #22.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "cloudflareshard": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.10"
+  }
+}
