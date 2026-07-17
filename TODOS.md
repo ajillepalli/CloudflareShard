@@ -26,6 +26,8 @@
 **Priority:** P3
 **Depends on:** Milestone 1 shipping with real usage data available.
 
+**Update (2026-07-16):** first real production-scale data point, from running the TPC-C benchmark (issue #16, `examples/tpc-c-benchmark`) against a live Cloudflare deployment (`cloudflare-shard-mvp`) — 8 warehouses, ~4,400 rows, 90s/15-concurrency sustained load, 1094 transactions. Per-type p50 latency: Payment 554ms, Order-Status 137ms, Stock-Level 963ms, New-Order 1829ms, Delivery 4927ms. Nothing in this run points at CoordinatorDO cold-start as a dominant cost specifically — New-Order and Delivery's higher latency is consistent with them simply being genuinely multi-round-trip operations (a header tx plus N lines' worth of retry-guarded stock updates for New-Order; per-district sequential processing for Delivery), not an unexplained tax layered on top. This is still a single, modest-scale, short run, not a real production traffic pattern — not enough to close this TODO, but the first actual evidence to weigh instead of reasoning from the billing model alone.
+
 ### CLI/SDK wrapper or write-path consolidation
 
 **What:** Decide whether `/v1/sql`, `/v1/mutate`, and `/v1/tx` should stay three separate raw-HTTP contracts developers learn individually, or whether a CLI/SDK wrapper (or eventual deprecation of raw SQL mutations) is needed to keep the developer experience coherent as the write-path count grows.
@@ -49,6 +51,8 @@
 **Effort:** L
 **Priority:** P3
 **Depends on:** ~~Milestone 1 (Transaction Coordinator) and Milestone 2 (Index Service).~~ Mechanism shipped (Milestone 3); heuristics need production usage data.
+
+**Update (2026-07-16):** first real data point, from the same live TPC-C benchmark run described in the CoordinatorDO TODO above. Row counts across all 16 physical shards after seeding + a 90s sustained mixed-transaction load: 506–581 rows per shard (±7% of the ~545 mean) — no hot or oversized shard, consistent with the hash-based partitioning working as designed at this scale. This is real, but at a scale far below anything split heuristics would need to trigger on — it demonstrates the MEASURING approach (`/admin/shard-stats` per shard) works and gives a real baseline, not evidence either way on when a genuine hot shard would emerge under sustained production load.
 
 ### Cross-tenant/cross-shard analytics aggregation
 

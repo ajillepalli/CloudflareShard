@@ -4,7 +4,7 @@ import { hashKey, indexShardIdForKey } from "./hash";
 import { sha256Hex } from "./auth";
 import type { CatalogDO } from "./catalog";
 import type { ShardDO } from "./shard";
-import { ALL_TEST_SHARD_IDS, AUTH, createIndexTestTable, initCluster, pollIndexRows, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
+import { ALL_TEST_SHARD_IDS, AUTH, createIndexTestTable, driveIndexBackfillToCompletion, initCluster, pollIndexRows, post, registerTenant, tenantForCatalogShard } from "./index.test-helpers";
 
 // This file is one of several index.*.test.ts files split out of a single
 // index.test.ts (see index.test-helpers.ts's header comment for why). DO
@@ -72,6 +72,7 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     const body = (await res.json()) as { ok: boolean; indexName: string; table: string; columns: string[] };
     expect(body.ok).toBe(true);
     expect(body.indexName).toBe("idx_backfill_by_v");
+    await driveIndexBackfillToCompletion("idx_backfill_by_v");
 
     // numShards:1 still means 4 total physical shards (one per default
     // catalog shard) — indexShardIdForKey can hash a given entry onto any of
@@ -104,6 +105,59 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     expect(listBody.indexes.map((i) => i.indexName)).toContain("idx_backfill_by_v");
   });
 
+  // Codex review P1 fix: a fresh shard's FIRST backfill page used to run
+  // `WHERE pk > ''`. For a TEXT-affinity partition key that's a correct
+  // "everything" sentinel (any non-empty TEXT sorts after ''), but for an
+  // INTEGER-affinity partition key column, SQLite's type-ordering ranks
+  // every INTEGER below every TEXT value, so `id > ''` is FALSE for every
+  // existing integer -- the first page would silently scan zero rows, the
+  // shard-exhausted branch would advance past it as if it had no data, and
+  // the index would reach 'ready' having silently skipped every pre-existing
+  // row on a table using a non-TEXT-affinity partition key.
+  it("backfills pre-existing rows on a table whose partition key column is INTEGER-affinity, not just TEXT (Codex review P1 fix)", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    const createRes = await post(
+      "/admin/create-table",
+      { table: "idx_intpk_evt", schema: "CREATE TABLE idx_intpk_evt (id INTEGER PRIMARY KEY, v TEXT)", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(createRes.status).toBe(200);
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+
+    // Insert rows BEFORE the index exists, same as the TEXT-partition-key
+    // test above -- proves backfill actually indexes pre-existing data on
+    // an INTEGER-affinity column, not just a TEXT one.
+    await post("/v1/mutate", { op: "insert", table: "idx_intpk_evt", tenantId, partitionKey: "1", values: { v: "alpha" } }, token);
+    await post("/v1/mutate", { op: "insert", table: "idx_intpk_evt", tenantId, partitionKey: "2", values: { v: "beta" } }, token);
+
+    const res = await post("/admin/create-index", { indexName: "idx_intpk_by_v", table: "idx_intpk_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_intpk_by_v");
+
+    const foundRows: Array<{ partition_key: string; index_key_json: string }> = [];
+    for (const candidateShardId of ["catalog-0-shard-0", "catalog-1-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"]) {
+      const shardStub = env.SHARD.get(env.SHARD.idFromName(candidateShardId));
+      await runInDurableObject(shardStub, async (_instance: unknown, state: DurableObjectState) => {
+        foundRows.push(
+          ...(Array.from(
+            state.storage.sql.exec("SELECT partition_key, index_key_json FROM __cf_indexes WHERE index_name = ?", "idx_intpk_by_v"),
+          ) as Array<{ partition_key: string; index_key_json: string }>),
+        );
+      });
+    }
+    // Both pre-existing rows must be indexed -- neither silently skipped.
+    foundRows.sort((a, b) => (a.partition_key < b.partition_key ? -1 : 1));
+    expect(foundRows).toHaveLength(2);
+    expect(JSON.parse(foundRows[0].index_key_json)).toEqual(["alpha"]);
+    expect(JSON.parse(foundRows[1].index_key_json)).toEqual(["beta"]);
+
+    // Also confirmed via the actual query path, not just physical inspection.
+    const q = await post("/v1/index-query", { table: "idx_intpk_evt", indexName: "idx_intpk_by_v", tenantId, values: { v: "alpha" } }, token);
+    expect(q.status).toBe(200);
+    expect(((await q.json()) as { rows: unknown[] }).rows).toHaveLength(1);
+  });
+
   // Codex full-PR review P1 (silent index miss): an index created AFTER a
   // shard is marked draining but BEFORE its vbuckets migrate must still index
   // that shard's existing rows — the backfill scan is drain-aware (active +
@@ -133,6 +187,7 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     // must still index row-1.
     const res = await post("/admin/create-index", { indexName: "idx_draining_by_v", table: "idx_draining_evt", columns: ["v"] }, AUTH());
     expect(res.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_draining_by_v");
 
     // The row is queryable — not silently missed.
     const queryRes = await post("/v1/index-query", { table: "idx_draining_evt", indexName: "idx_draining_by_v", tenantId, values: { v: "alpha" } }, token);
@@ -154,8 +209,29 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     await createIndexTestTable("idx_dup_evt");
     const first = await post("/admin/create-index", { indexName: "idx_dup_by_v", table: "idx_dup_evt", columns: ["v"] }, AUTH());
     expect(first.status).toBe(200);
+    // Codex live-deployment finding: backfill now runs on catalog-0's alarm,
+    // which holds the topology lock this whole call acquired for "create-
+    // index" until backfill genuinely finishes (or fails) — a retry
+    // attempted WHILE it's still in flight would 409
+    // TOPOLOGY_OPERATION_IN_PROGRESS, not the registration-idempotency 200
+    // this test is actually about. Drive the first attempt's backfill to
+    // completion (releasing the lock) before retrying, matching how a real
+    // caller would behave: retry once the first attempt is done, not while
+    // it's still running.
+    await driveIndexBackfillToCompletion("idx_dup_by_v");
     const second = await post("/admin/create-index", { indexName: "idx_dup_by_v", table: "idx_dup_evt", columns: ["v"] }, AUTH());
     expect(second.status).toBe(200);
+
+    // Codex live-deployment finding (round 2, caught only in production, NOT
+    // by this test suite -- closing that gap here): this SECOND, idempotent
+    // call against an ALREADY-'ready' index acquires its OWN fresh topology
+    // lock, but /start-index-backfill correctly reports nothing to hand off
+    // to (backfill already finished) -- the Worker must release that lock
+    // itself rather than treating a bare 200 as "handed off" and leaking it
+    // forever. Confirmed by checking the lock is actually free afterward: a
+    // genuinely NEW topology operation must succeed immediately, not 409.
+    const lockCheck = await post("/admin/drop-index", { indexName: "idx_dup_by_v" }, AUTH());
+    expect(lockCheck.status).toBe(200); // would be 409 TOPOLOGY_OPERATION_IN_PROGRESS if leaked
   });
 
   it("rejects reusing an indexName with different table/columns as a genuine conflict", async () => {
@@ -164,6 +240,11 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     await createIndexTestTable("idx_conflict_evt_b");
     const first = await post("/admin/create-index", { indexName: "idx_conflict_by_v", table: "idx_conflict_evt_a", columns: ["v"] }, AUTH());
     expect(first.status).toBe(200);
+    // The first call's topology lock is held by catalog-0 until ITS backfill
+    // finishes (see the idempotent-retry test's comment above) — drain it so
+    // the conflicting second call reaches the actual INDEX_ALREADY_REGISTERED
+    // check instead of 409 TOPOLOGY_OPERATION_IN_PROGRESS.
+    await driveIndexBackfillToCompletion("idx_conflict_by_v");
     const second = await post("/admin/create-index", { indexName: "idx_conflict_by_v", table: "idx_conflict_evt_b", columns: ["v"] }, AUTH());
     expect(second.status).toBe(409);
     // firstCatalogFanOutFailure wraps the per-shard error under `details`,
@@ -239,6 +320,7 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     // (catalog-0-shard-0), not the recomputed active set.
     const res = await post("/admin/create-index", { indexName: "persistring_by_v", table: "persistring_evt", columns: ["v"] }, AUTH());
     expect(res.status).toBe(200);
+    await driveIndexBackfillToCompletion("persistring_by_v");
 
     // Queryable — the entry landed where the pinned ring reads it.
     const q = await post("/v1/index-query", { table: "persistring_evt", indexName: "persistring_by_v", tenantId, values: { v: V } }, token);
@@ -252,27 +334,397 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     );
     expect(onPinned).toBe(1);
   });
+
+  // Codex round-3 review (PR #20): retrying a 'failed' backfill preserves its
+  // OLD numeric backfill_shard_idx/backfill_after_pk cursor, but the shard
+  // list it indexes into (backfillShardIds) is recomputed FRESH by the
+  // Worker on every /admin/create-index call. If the active+draining shard
+  // set changes between the original failed attempt and the retry (a shard
+  // fully drains and drops out of the list, here simulated directly), the
+  // stale cursor can point at the WRONG shard in the new list, silently
+  // skipping a shard that still has an unindexed row. handleStartIndexBackfill
+  // must detect the shard-list change and reset the cursor rather than
+  // resuming it blindly.
+  it("resets the backfill cursor (not resuming a stale shard index) when the shard list changed since a failed attempt, so no shard is silently skipped", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_topo_evt");
+
+    // Shard A (catalog-0-shard-0) gets a normal, fully-provenanced row —
+    // its backfill page completes cleanly, advancing the cursor to shard
+    // index 1 before the run below ever fails.
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    await post("/v1/mutate", { op: "insert", table: "idx_topo_evt", tenantId: tenantA, partitionKey: "row-a", values: { v: "alpha" } }, tokenA);
+
+    // Shard B (catalog-1-shard-0) — dataShardIds' position 1 — gets a row
+    // written directly, bypassing provenance (mirrors the
+    // PROVENANCE_MISSING_FOR_INDEX test): the tick that reaches shard index
+    // 1 throws PermanentIndexBackfillError immediately, before advancing
+    // past it, so backfill_shard_idx is left at 1 and backfill_after_pk at ''.
+    const shardB = env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0"));
+    await shardB.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_topo_evt (id, v) VALUES (?, ?)",
+          params: ["row-b-no-prov", "bravo"],
+          requestId: `topo-insert-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+
+    const res = await post("/admin/create-index", { indexName: "idx_topo_by_v", table: "idx_topo_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/create-index-status", { indexName: "idx_topo_by_v" }, AUTH());
+      if (((await statusRes.json()) as { status: string }).status === "failed") break;
+    }
+    const failedStatusRes = await post("/admin/create-index-status", { indexName: "idx_topo_by_v" }, AUTH());
+    expect(((await failedStatusRes.json()) as { status: string }).status).toBe("failed");
+
+    // Simulate the topology changing since the failed attempt: shard A
+    // fully drains and drops out of the active+draining set entirely. The
+    // NEXT /admin/create-index call recomputes dataShardIds as
+    // [catalog-1-shard-0, catalog-2-shard-0, catalog-3-shard-0] — shard B
+    // is now at position 0, not the position-1 the failed attempt's cursor
+    // still points at.
+    await runInDurableObject(env.CATALOG.get(env.CATALOG.idFromName("catalog-0")), async (_i: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM shards WHERE shard_id = ?", "catalog-0-shard-0");
+    });
+
+    // The operator fixes shard B's provenance gap before retrying.
+    const tenantB = tenantForCatalogShard(1, 4);
+    const setOwnerRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-1", shardId: "catalog-1-shard-0", table: "idx_topo_evt", partitionKey: "row-b-no-prov", tenantId: tenantB },
+      AUTH(),
+    );
+    expect(setOwnerRes.status).toBe(200);
+
+    const retry = await post("/admin/create-index", { indexName: "idx_topo_by_v", table: "idx_topo_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_topo_by_v");
+
+    // Shard B's row must be queryable — a stale cursor resuming at the old
+    // position 1 (now catalog-2-shard-0, empty) would have skipped it and
+    // still reached 'ready'.
+    const tokenB = await registerTenant(tenantB);
+    const queryRes = await post("/v1/index-query", { table: "idx_topo_evt", indexName: "idx_topo_by_v", tenantId: tenantB, values: { v: "bravo" } }, tokenB);
+    expect(queryRes.status).toBe(200);
+    const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(queryBody.rows.map((r) => r.id)).toEqual(["row-b-no-prov"]);
+  });
+
+  // Codex round-4 review (PR #20): a scan request that comes back !ok (shard.
+  // ts's /execute has exactly one non-2xx path for a read-only scan -- its
+  // catch-all "SQL execution failed", e.g. the table is missing on this
+  // shard, which /admin/register-table can leave true since (unlike
+  // /admin/create-table) it never pushes DDL to any shard) used to be thrown
+  // as a plain Error, treated as transient by the alarm loop's shared catch,
+  // and retried forever -- heartbeating (never releasing) this index's
+  // topology lock and wedging every other topology operation, exactly the
+  // failure mode PermanentIndexBackfillError exists to avoid for
+  // PROVENANCE_MISSING_FOR_INDEX above.
+  it("gives up (does not retry forever) when a data shard can't scan the table at all, e.g. registered via /admin/register-table but never physically created there", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+
+    // /admin/register-table only writes catalog metadata (table_rules) --
+    // unlike /admin/create-table, it never pushes CREATE TABLE to any shard.
+    const registerRes = await post(
+      "/admin/register-table",
+      { table: "idx_noshard_evt", partitionKeyColumn: "id" },
+      AUTH(),
+    );
+    expect(registerRes.status).toBe(200);
+
+    // Physically create the table on 3 of the 4 data shards, deliberately
+    // skipping catalog-1-shard-0 -- whichever tick reaches it will find no
+    // such table.
+    for (const shardId of ["catalog-0-shard-0", "catalog-2-shard-0", "catalog-3-shard-0"]) {
+      const stub = env.SHARD.get(env.SHARD.idFromName(shardId));
+      const createRes = await stub.fetch(
+        new Request("https://shard.internal/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sql: "CREATE TABLE idx_noshard_evt (id TEXT PRIMARY KEY, v TEXT)",
+            params: [],
+            requestId: `noshard-ddl-${shardId}-${crypto.randomUUID()}`,
+            isMutation: false,
+          }),
+        }),
+      );
+      expect(createRes.ok).toBe(true);
+    }
+
+    const res = await post("/admin/create-index", { indexName: "idx_noshard_by_v", table: "idx_noshard_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
+      if (((await statusRes.json()) as { status: string }).status === "failed") break;
+    }
+    const failedStatusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
+    expect(((await failedStatusRes.json()) as { status: string }).status).toBe("failed");
+
+    // The lock was actually released -- an unrelated topology op succeeds
+    // immediately instead of 409 TOPOLOGY_OPERATION_IN_PROGRESS.
+    await createIndexTestTable("idx_noshard_unrelated_evt");
+    const unrelated = await post(
+      "/admin/create-index",
+      { indexName: "idx_noshard_unrelated_by_v", table: "idx_noshard_unrelated_evt", columns: ["v"] },
+      AUTH(),
+    );
+    expect(unrelated.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_noshard_unrelated_by_v");
+
+    // Once the operator actually creates the missing table, retrying
+    // /admin/create-index resumes and completes normally.
+    const fixRes = await env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0")).fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "CREATE TABLE idx_noshard_evt (id TEXT PRIMARY KEY, v TEXT)",
+          params: [],
+          requestId: `noshard-ddl-fix-${crypto.randomUUID()}`,
+          isMutation: false,
+        }),
+      }),
+    );
+    expect(fixRes.ok).toBe(true);
+    const retry = await post("/admin/create-index", { indexName: "idx_noshard_by_v", table: "idx_noshard_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_noshard_by_v");
+    const finalStatusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
+    expect(((await finalStatusRes.json()) as { status: string }).status).toBe("ready");
+  });
+
+  // Codex round-5 review (PR #20): round 3's fix only reset the backfill
+  // cursor when the SET of shards changed between a failed attempt and its
+  // retry -- but a vbucket migration doesn't change which shards exist, it
+  // moves rows BETWEEN existing ones. If a row migrates from a not-yet-
+  // scanned shard onto a shard the failed attempt had ALREADY finished
+  // scanning, a resumed cursor (or round 3's unchanged-list check, which
+  // sees no list difference here) would never revisit that already-done
+  // shard and silently miss the row -- exactly the class of bug
+  // PermanentIndexBackfillError's whole cursor-preservation design was
+  // trying to avoid, just one level deeper. The fix: always restart a
+  // retried-from-'failed' backfill from shard 0, never resume any cursor.
+  it("re-discovers a row that migrated onto an already-scanned shard during the window between a failed attempt and its retry", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_vbmig_evt");
+
+    // Shard A (catalog-0-shard-0, dataShardIds position 0) gets a normal,
+    // fully-provenanced row -- its page completes cleanly, advancing the
+    // backfill past position 0 before the run below ever fails.
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    await post("/v1/mutate", { op: "insert", table: "idx_vbmig_evt", tenantId: tenantA, partitionKey: "row-a", values: { v: "alpha" } }, tokenA);
+
+    // Shard B (catalog-1-shard-0, position 1) gets a row written directly,
+    // bypassing provenance -- the tick that reaches position 1 throws
+    // PermanentIndexBackfillError immediately, before scanning position 2.
+    const shardB = env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0"));
+    await shardB.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_vbmig_evt (id, v) VALUES (?, ?)",
+          params: ["row-b-no-prov", "bravo"],
+          requestId: `vbmig-insert-b-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+
+    // Shard C (catalog-2-shard-0, position 2) gets a normal, fully-
+    // provenanced row too -- never reached by the run below, since it fails
+    // at position 1 first.
+    const shardC = env.SHARD.get(env.SHARD.idFromName("catalog-2-shard-0"));
+    await shardC.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_vbmig_evt (id, v) VALUES (?, ?)",
+          params: ["row-c", "charlie"],
+          requestId: `vbmig-insert-c-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const tenantC = tenantForCatalogShard(2, 4);
+    const setOwnerCRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-2", shardId: "catalog-2-shard-0", table: "idx_vbmig_evt", partitionKey: "row-c", tenantId: tenantC },
+      AUTH(),
+    );
+    expect(setOwnerCRes.status).toBe(200);
+
+    const res = await post("/admin/create-index", { indexName: "idx_vbmig_by_v", table: "idx_vbmig_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/create-index-status", { indexName: "idx_vbmig_by_v" }, AUTH());
+      if (((await statusRes.json()) as { status: string }).status === "failed") break;
+    }
+    const failedStatusRes = await post("/admin/create-index-status", { indexName: "idx_vbmig_by_v" }, AUTH());
+    expect(((await failedStatusRes.json()) as { status: string }).status).toBe("failed");
+
+    // Simulate a vbucket migration in the window between the failure (whose
+    // lock release just happened) and the retry below: row-c moves from
+    // shard C (never scanned yet) onto shard A (ALREADY fully scanned by
+    // the failed attempt) -- the shard SET stays exactly [A,B,C,D], only
+    // where row-c physically lives changes.
+    await shardC.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "DELETE FROM idx_vbmig_evt WHERE id = ?",
+          params: ["row-c"],
+          requestId: `vbmig-delete-c-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const shardA = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
+    await shardA.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_vbmig_evt (id, v) VALUES (?, ?)",
+          params: ["row-c", "charlie"],
+          requestId: `vbmig-insert-c-on-a-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const setOwnerCOnARes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-0", shardId: "catalog-0-shard-0", table: "idx_vbmig_evt", partitionKey: "row-c", tenantId: tenantA },
+      AUTH(),
+    );
+    expect(setOwnerCOnARes.status).toBe(200);
+
+    // The operator fixes shard B's provenance gap before retrying.
+    const tenantB = tenantForCatalogShard(1, 4);
+    const setOwnerBRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-1", shardId: "catalog-1-shard-0", table: "idx_vbmig_evt", partitionKey: "row-b-no-prov", tenantId: tenantB },
+      AUTH(),
+    );
+    expect(setOwnerBRes.status).toBe(200);
+
+    const retry = await post("/admin/create-index", { indexName: "idx_vbmig_by_v", table: "idx_vbmig_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_vbmig_by_v");
+
+    // row-c must be queryable under tenantA -- a resumed cursor starting
+    // past position 0 (shard A) would never revisit it there and miss the
+    // migrated row entirely, even though the index reaches 'ready'.
+    const queryRes = await post("/v1/index-query", { table: "idx_vbmig_evt", indexName: "idx_vbmig_by_v", tenantId: tenantA, values: { v: "charlie" } }, tokenA);
+    expect(queryRes.status).toBe(200);
+    const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(queryBody.rows.map((r) => r.id)).toEqual(["row-c"]);
+  });
+
+  // Codex round-6 review (PR #20): the page-level batched freshness read (an
+  // earlier "Eng-review fix" for subrequest cost) snapshotted every row's
+  // value ONCE before any writes in the page started. A page can take up to
+  // INDEX_BACKFILL_PAGE_SIZE write round trips; a row mutated after that one
+  // snapshot but before its own turn in the write loop would get a STALE
+  // index_key_json written for it -- permanently, since __cf_indexes is
+  // keyed by that value and the live mutate's own index maintenance has no
+  // way to know a differently-keyed stale entry exists to clean up. This
+  // test proves the fix structurally: each row's freshness read must happen
+  // as its OWN request, interleaved with writes, not clustered together
+  // before any of them.
+  it("refreshes each row's value immediately before its own write, not batched once for the whole page up front", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_stale_evt");
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    await post("/v1/mutate", { op: "insert", table: "idx_stale_evt", tenantId: tenantA, partitionKey: "row-1", values: { v: "alpha" } }, tokenA);
+    await post("/v1/mutate", { op: "insert", table: "idx_stale_evt", tenantId: tenantA, partitionKey: "row-2", values: { v: "beta" } }, tokenA);
+
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    const callLog: Array<{ type: "refresh" | "write" | "other"; pks: string[] }> = [];
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      const inst = instance as unknown as {
+        callShard: (shardId: string, path: string, payload: unknown) => Promise<Response>;
+        __realCallShard?: (shardId: string, path: string, payload: unknown) => Promise<Response>;
+      };
+      inst.__realCallShard = inst.callShard.bind(inst);
+      inst.callShard = async (shardId: string, path: string, payload: unknown) => {
+        const p = payload as { params?: unknown[]; requestId?: string };
+        const pks = (p.params ?? []).filter((x): x is string => x === "row-1" || x === "row-2");
+        if (p.requestId?.includes("-refresh-")) callLog.push({ type: "refresh", pks });
+        else if (p.requestId?.includes("-write-")) callLog.push({ type: "write", pks });
+        return inst.__realCallShard!(shardId, path, payload);
+      };
+    });
+
+    const res = await post("/admin/create-index", { indexName: "idx_stale_by_v", table: "idx_stale_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    // Both rows are well under INDEX_BACKFILL_PAGE_SIZE, on the same shard
+    // (both written by tenantA) -- one tick processes the whole page.
+    await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+      await instance.alarm();
+    });
+
+    // Under the reverted page-level batched read, ONE refresh call would
+    // cover both row-1 and row-2 up front, before either write -- so the
+    // (only) refresh call touching row-2 would appear BEFORE write:row-1.
+    // Under the per-row fix, row-2's dedicated refresh call happens AFTER
+    // row-1 has already been written.
+    const write1Idx = callLog.findIndex((c) => c.type === "write" && c.pks.includes("row-1"));
+    const refresh2Idx = callLog.findIndex((c) => c.type === "refresh" && c.pks.includes("row-2"));
+    expect(write1Idx).toBeGreaterThan(-1);
+    expect(refresh2Idx).toBeGreaterThan(-1);
+    expect(write1Idx).toBeLessThan(refresh2Idx);
+  });
 });
 
-// Codex final-review P1 #1: create-index's backfill previously acquired the
-// topology lock once and never renewed it for the rest of the (synchronous,
-// potentially long) scan-and-write loop — a large table's backfill could run
-// past the lock's 30s TTL, let the lease expire, and keep writing index
-// entries while a concurrent drain (now free to acquire the lock) started
-// moving rows off a shard the backfill hadn't scanned yet. The fix
-// heartbeats the lock once per data shard (and every N rows within a huge
-// shard) and aborts with TOPOLOGY_LOCK_LOST the moment a heartbeat can't
-// confirm the lease.
+// Codex final-review P1 #1 (original synchronous version) / Codex
+// live-deployment finding (this alarm-driven rewrite): backfill must not
+// keep writing index entries once its topology lock is lost — a concurrent
+// drain (now free to acquire the lock) could already be moving rows this
+// backfill hasn't scanned yet off their source shard. The synchronous
+// version heartbeated once per data shard and hard-aborted the HTTP call the
+// moment a heartbeat failed; now that backfill is alarm-driven (see
+// advanceIndexBackfill), the SAME protection is provided by alarm()'s own
+// heartbeatTopologyLockOrPark check, called once before each tick — a failed
+// heartbeat simply skips that tick's mutation (no entries written, no
+// progress made) and keeps re-arming so a later tick notices if the lock
+// situation resolves, rather than ever returning an error to any caller
+// (there IS no caller left waiting by the time a tick runs).
 describe("Worker /admin/create-index backfill heartbeats its topology lock (Codex final-review P1 #1)", () => {
-  it("aborts the backfill with TOPOLOGY_LOCK_LOST — writing no further index entries — the moment a mid-backfill heartbeat reports the lock lost, instead of silently completing", async () => {
+  it("stops writing further index entries the moment a tick's heartbeat reports the lock lost, and resumes once the lock is confirmed again", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("hblost_evt");
 
     // One row per catalog shard's tenant — numShards:1 means dataShardIds is
-    // exactly the 4 catalog-*-shard-0 physical shards (ALL_TEST_SHARD_IDS),
-    // so the backfill loop below iterates 4 shards, each with a heartbeat
-    // check at its start — "long enough to need a heartbeat" without
-    // requiring hundreds of rows.
+    // exactly the 4 catalog-*-shard-0 physical shards (ALL_TEST_SHARD_IDS).
+    // Each shard has exactly 1 row, well under INDEX_BACKFILL_PAGE_SIZE, so
+    // advanceIndexBackfill fully backfills one shard per tick — meaning one
+    // heartbeat check (in alarm()'s dispatcher, before calling
+    // advanceIndexBackfill) gates one shard's worth of progress.
     const catalogIndexOf: Record<string, number> = { "catalog-0-shard-0": 0, "catalog-1-shard-0": 1, "catalog-2-shard-0": 2, "catalog-3-shard-0": 3 };
     for (const shardId of Object.keys(catalogIndexOf)) {
       const tenantId = tenantForCatalogShard(catalogIndexOf[shardId], 4);
@@ -280,20 +732,22 @@ describe("Worker /admin/create-index backfill heartbeats its topology lock (Code
       await post("/v1/mutate", { op: "insert", table: "hblost_evt", tenantId, partitionKey: `row-${shardId}`, values: { v: "x" } }, token);
     }
 
-    // Monkey-patch catalog-0's own topology-lock heartbeat route (same
-    // established pattern as catalog.test.ts's callShard monkey-patches):
-    // let the FIRST heartbeat through to the real handler (so the backfill
-    // genuinely gets underway and indexes at least one shard), then report
-    // LOCK_LOST for every call after — as a real force-release/expiry would.
+    // Monkey-patch catalog-0's handleHeartbeatTopologyLock DIRECTLY (not
+    // routes["/heartbeat-topology-lock"] — heartbeatTopologyLockOrPark calls
+    // this method in-process when running on catalog-0 itself, bypassing the
+    // routes map entirely; see catalog.ts's isCatalogZero doc comment). Let
+    // the FIRST call through (so the backfill genuinely gets underway and
+    // indexes one shard), then report LOCK_LOST for every call after — as a
+    // real force-release/expiry would.
     const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
     await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
       const inst = instance as unknown as {
-        routes: Record<string, (request: Request) => Promise<Response>>;
+        handleHeartbeatTopologyLock: (request: Request) => Promise<Response>;
         __realHeartbeat?: (request: Request) => Promise<Response>;
       };
-      inst.__realHeartbeat = inst.routes["/heartbeat-topology-lock"];
+      inst.__realHeartbeat = inst.handleHeartbeatTopologyLock.bind(inst);
       let calls = 0;
-      inst.routes["/heartbeat-topology-lock"] = async (request: Request) => {
+      inst.handleHeartbeatTopologyLock = async (request: Request) => {
         calls += 1;
         if (calls === 1) return inst.__realHeartbeat!(request);
         return new Response(
@@ -304,14 +758,19 @@ describe("Worker /admin/create-index backfill heartbeats its topology lock (Code
     });
 
     const res = await post("/admin/create-index", { indexName: "hblost_by_v", table: "hblost_evt", columns: ["v"] }, AUTH());
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("TOPOLOGY_LOCK_LOST");
+    expect(res.status).toBe(200); // registration + backfill START always succeeds now
 
-    // The shard whose heartbeat succeeded (the first one iterated) was
-    // actually backfilled; every shard iterated AFTER the lock was reported
-    // lost must have NO index entries — the abort must be immediate, not
-    // "finish the current shard then stop".
+    // Drive several ticks -- backfill must NOT make progress past the first
+    // (heartbeat succeeds) tick once every later heartbeat starts failing.
+    for (let i = 0; i < 5; i += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+    }
+
+    // Exactly the one shard whose heartbeat was let through — never all 4
+    // (that would mean the lock loss was ignored) and never 0 (that would
+    // mean nothing progressed even before the simulated loss).
     let indexedShards = 0;
     for (const shardId of Object.keys(catalogIndexOf)) {
       const rows = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(shardId)), async (_i: unknown, state: DurableObjectState) =>
@@ -319,10 +778,6 @@ describe("Worker /admin/create-index backfill heartbeats its topology lock (Code
       );
       indexedShards += rows.length;
     }
-    // Exactly the one shard whose heartbeat was let through — never all 4
-    // (that would mean the lock loss was ignored) and never 0 (that would
-    // mean the fix aborted too early, before doing any real work — this test
-    // is specifically about a heartbeat firing PARTWAY through).
     expect(indexedShards).toBe(1);
 
     // The index must never have been marked ready — backfill never finished.
@@ -333,25 +788,26 @@ describe("Worker /admin/create-index backfill heartbeats its topology lock (Code
     expect(entry?.status).not.toBe("ready");
 
     // Restore the real heartbeat handler (the same "undo the monkey-patch
-    // before the retry" convention catalog.test.ts uses for callShard) — a
-    // retry must exercise the FIX, not the simulated failure again.
+    // before continuing" convention catalog.test.ts uses for callShard) —
+    // resuming ticks now must exercise the FIX, not the simulated failure
+    // again. The underlying lock itself was never actually touched by the
+    // monkey-patch (only its heartbeat CHECK responses were faked), so it's
+    // still genuinely valid and ticking resumes the SAME backfill from its
+    // persisted cursor rather than needing a fresh /admin/create-index call.
     await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
-      const inst = instance as unknown as { routes: Record<string, (request: Request) => Promise<Response>>; __realHeartbeat: (request: Request) => Promise<Response> };
-      inst.routes["/heartbeat-topology-lock"] = inst.__realHeartbeat;
+      const inst = instance as unknown as { handleHeartbeatTopologyLock: (request: Request) => Promise<Response>; __realHeartbeat: (request: Request) => Promise<Response> };
+      inst.handleHeartbeatTopologyLock = inst.__realHeartbeat;
     });
+    await driveIndexBackfillToCompletion("hblost_by_v");
 
-    // A retry with a fresh, real lock (idempotent registration + backfill)
-    // succeeds normally and indexes every shard's row.
-    const retry = await post("/admin/create-index", { indexName: "hblost_by_v", table: "hblost_evt", columns: ["v"] }, AUTH());
-    expect(retry.status).toBe(200);
-    let indexedAfterRetry = 0;
+    let indexedAfterResume = 0;
     for (const shardId of Object.keys(catalogIndexOf)) {
       const rows = await runInDurableObject(env.SHARD.get(env.SHARD.idFromName(shardId)), async (_i: unknown, state: DurableObjectState) =>
         Array.from(state.storage.sql.exec("SELECT partition_key FROM __cf_indexes WHERE index_name = ?", "hblost_by_v")) as Array<{ partition_key: string }>,
       );
-      indexedAfterRetry += rows.length;
+      indexedAfterResume += rows.length;
     }
-    expect(indexedAfterRetry).toBe(4);
+    expect(indexedAfterResume).toBe(4);
   });
 });
 
@@ -416,6 +872,7 @@ describe("Worker /admin/drop-index (Milestone 2 Chunk 6)", () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     await createIndexTestTable("idx_c6_drop_evt");
     await post("/admin/create-index", { indexName: "idx_c6_drop_by_v", table: "idx_c6_drop_evt", columns: ["v"] }, AUTH());
+    await driveIndexBackfillToCompletion("idx_c6_drop_by_v");
     const tenantId = tenantForCatalogShard(0, 4);
     const token = await registerTenant(tenantId);
 
