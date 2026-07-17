@@ -508,6 +508,141 @@ describe("Worker /admin/create-index (Milestone 2 Chunk 1)", () => {
     const finalStatusRes = await post("/admin/create-index-status", { indexName: "idx_noshard_by_v" }, AUTH());
     expect(((await finalStatusRes.json()) as { status: string }).status).toBe("ready");
   });
+
+  // Codex round-5 review (PR #20): round 3's fix only reset the backfill
+  // cursor when the SET of shards changed between a failed attempt and its
+  // retry -- but a vbucket migration doesn't change which shards exist, it
+  // moves rows BETWEEN existing ones. If a row migrates from a not-yet-
+  // scanned shard onto a shard the failed attempt had ALREADY finished
+  // scanning, a resumed cursor (or round 3's unchanged-list check, which
+  // sees no list difference here) would never revisit that already-done
+  // shard and silently miss the row -- exactly the class of bug
+  // PermanentIndexBackfillError's whole cursor-preservation design was
+  // trying to avoid, just one level deeper. The fix: always restart a
+  // retried-from-'failed' backfill from shard 0, never resume any cursor.
+  it("re-discovers a row that migrated onto an already-scanned shard during the window between a failed attempt and its retry", async () => {
+    await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
+    await createIndexTestTable("idx_vbmig_evt");
+
+    // Shard A (catalog-0-shard-0, dataShardIds position 0) gets a normal,
+    // fully-provenanced row -- its page completes cleanly, advancing the
+    // backfill past position 0 before the run below ever fails.
+    const tenantA = tenantForCatalogShard(0, 4);
+    const tokenA = await registerTenant(tenantA);
+    await post("/v1/mutate", { op: "insert", table: "idx_vbmig_evt", tenantId: tenantA, partitionKey: "row-a", values: { v: "alpha" } }, tokenA);
+
+    // Shard B (catalog-1-shard-0, position 1) gets a row written directly,
+    // bypassing provenance -- the tick that reaches position 1 throws
+    // PermanentIndexBackfillError immediately, before scanning position 2.
+    const shardB = env.SHARD.get(env.SHARD.idFromName("catalog-1-shard-0"));
+    await shardB.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_vbmig_evt (id, v) VALUES (?, ?)",
+          params: ["row-b-no-prov", "bravo"],
+          requestId: `vbmig-insert-b-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+
+    // Shard C (catalog-2-shard-0, position 2) gets a normal, fully-
+    // provenanced row too -- never reached by the run below, since it fails
+    // at position 1 first.
+    const shardC = env.SHARD.get(env.SHARD.idFromName("catalog-2-shard-0"));
+    await shardC.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_vbmig_evt (id, v) VALUES (?, ?)",
+          params: ["row-c", "charlie"],
+          requestId: `vbmig-insert-c-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const tenantC = tenantForCatalogShard(2, 4);
+    const setOwnerCRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-2", shardId: "catalog-2-shard-0", table: "idx_vbmig_evt", partitionKey: "row-c", tenantId: tenantC },
+      AUTH(),
+    );
+    expect(setOwnerCRes.status).toBe(200);
+
+    const res = await post("/admin/create-index", { indexName: "idx_vbmig_by_v", table: "idx_vbmig_evt", columns: ["v"] }, AUTH());
+    expect(res.status).toBe(200);
+    const catalogZero = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+    for (let tick = 0; tick < 10; tick += 1) {
+      await runInDurableObject(catalogZero, async (instance: CatalogDO) => {
+        await instance.alarm();
+      });
+      const statusRes = await post("/admin/create-index-status", { indexName: "idx_vbmig_by_v" }, AUTH());
+      if (((await statusRes.json()) as { status: string }).status === "failed") break;
+    }
+    const failedStatusRes = await post("/admin/create-index-status", { indexName: "idx_vbmig_by_v" }, AUTH());
+    expect(((await failedStatusRes.json()) as { status: string }).status).toBe("failed");
+
+    // Simulate a vbucket migration in the window between the failure (whose
+    // lock release just happened) and the retry below: row-c moves from
+    // shard C (never scanned yet) onto shard A (ALREADY fully scanned by
+    // the failed attempt) -- the shard SET stays exactly [A,B,C,D], only
+    // where row-c physically lives changes.
+    await shardC.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "DELETE FROM idx_vbmig_evt WHERE id = ?",
+          params: ["row-c"],
+          requestId: `vbmig-delete-c-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const shardA = env.SHARD.get(env.SHARD.idFromName("catalog-0-shard-0"));
+    await shardA.fetch(
+      new Request("https://shard.internal/execute", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sql: "INSERT INTO idx_vbmig_evt (id, v) VALUES (?, ?)",
+          params: ["row-c", "charlie"],
+          requestId: `vbmig-insert-c-on-a-${crypto.randomUUID()}`,
+          isMutation: true,
+        }),
+      }),
+    );
+    const setOwnerCOnARes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-0", shardId: "catalog-0-shard-0", table: "idx_vbmig_evt", partitionKey: "row-c", tenantId: tenantA },
+      AUTH(),
+    );
+    expect(setOwnerCOnARes.status).toBe(200);
+
+    // The operator fixes shard B's provenance gap before retrying.
+    const tenantB = tenantForCatalogShard(1, 4);
+    const setOwnerBRes = await post(
+      "/admin/set-row-owner",
+      { catalogShardId: "catalog-1", shardId: "catalog-1-shard-0", table: "idx_vbmig_evt", partitionKey: "row-b-no-prov", tenantId: tenantB },
+      AUTH(),
+    );
+    expect(setOwnerBRes.status).toBe(200);
+
+    const retry = await post("/admin/create-index", { indexName: "idx_vbmig_by_v", table: "idx_vbmig_evt", columns: ["v"] }, AUTH());
+    expect(retry.status).toBe(200);
+    await driveIndexBackfillToCompletion("idx_vbmig_by_v");
+
+    // row-c must be queryable under tenantA -- a resumed cursor starting
+    // past position 0 (shard A) would never revisit it there and miss the
+    // migrated row entirely, even though the index reaches 'ready'.
+    const queryRes = await post("/v1/index-query", { table: "idx_vbmig_evt", indexName: "idx_vbmig_by_v", tenantId: tenantA, values: { v: "charlie" } }, tokenA);
+    expect(queryRes.status).toBe(200);
+    const queryBody = (await queryRes.json()) as { rows: Array<{ id: string; v: string }> };
+    expect(queryBody.rows.map((r) => r.id)).toEqual(["row-c"]);
+  });
 });
 
 // Codex final-review P1 #1 (original synchronous version) / Codex
