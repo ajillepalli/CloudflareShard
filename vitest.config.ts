@@ -1,5 +1,5 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [
@@ -28,5 +28,10 @@ export default defineConfig({
     // Same cumulative-latency reason for setup/teardown hooks (some fan out
     // list-tables + per-shard cleanup).
     hookTimeout: 30000,
+    // The Shardscope SPA smoke tests run under jsdom (see vitest.spa.config.ts
+    // + `npm run test:spa`) — they can't load in this workers-pool/Miniflare
+    // environment, so exclude them here rather than letting this config try
+    // (and fail) to run them.
+    exclude: [...configDefaults.exclude, "**/*.spa.test.ts"],
   },
 });
