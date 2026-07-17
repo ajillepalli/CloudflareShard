@@ -60,6 +60,19 @@ const TOPOLOGY_LOCK_TTL_MS = 30_000;
 // immediately, checked first in checkTenantAuth regardless of which hash a
 // caller's token matches.
 const TENANT_TOKEN_ROTATION_GRACE_MS = 5 * 60_000;
+// Issue #33: /v1/table-scan is the only tenant-facing route that fans out to
+// every shard in a tenant's catalog-shard pool (every other tenant route
+// touches exactly one shard) -- an unbounded caller degrades every OTHER
+// tenant sharing that shard pool, not just their own requests. Token bucket:
+// TABLE_SCAN_RATE_LIMIT_CAPACITY bounds how many calls a tenant can burst
+// before being throttled, TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND bounds
+// their sustained rate afterward. A tenant scanning at or below the refill
+// rate is never limited; one bursting past capacity gets 429s until tokens
+// refill. Chosen generously for a legitimate paginated-scan client (a
+// multi-page scan loop looks like a short burst, not sustained abuse) while
+// still bounding a runaway/malicious loop.
+const TABLE_SCAN_RATE_LIMIT_CAPACITY = 20;
+const TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND = 2;
 // Review Tier 2 #8: cap the backfill work per tick and back off the alarm
 // re-arm when a tick throws, so a large migration resumes from its cursor
 // rather than restarting-and-throwing at 4Hz forever.
@@ -420,6 +433,19 @@ export class CatalogDO extends DurableObject {
     // for a tenant that's never been rotated.
     this.ensureColumn("tenant_auth", "previous_token_hash", "TEXT");
     this.ensureColumn("tenant_auth", "previous_token_expires_at", "TEXT");
+
+    // Issue #33: per-tenant token-bucket state for /v1/table-scan's rate
+    // limit -- the only fan-out-shaped tenant route (every other tenant
+    // route touches exactly one shard). tokens is a float (fractional
+    // refill accrues between calls, not just whole tokens); one row per
+    // tenant that has ever called table-scan, created lazily on first use.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tenant_scan_rate_limit (
+        tenant_id TEXT PRIMARY KEY,
+        tokens REAL NOT NULL,
+        last_refill_at TEXT NOT NULL
+      )
+    `);
 
     // Milestone 2 (Index Service). One row per registered secondary index.
     // No tenant scoping here — matches table_rules/base-table rows, which
@@ -1381,6 +1407,13 @@ export class CatalogDO extends DurableObject {
     const authError = await this.checkTenantAuth(body.tenantId, request);
     if (authError) return authError;
 
+    // Issue #33: gated here, the same choke point auth already runs at --
+    // BEFORE the Worker fans out to every shard in this tenant's pool
+    // (tableScanCore, back in index.ts, only reaches that fan-out once this
+    // whole call succeeds).
+    const rateLimitError = this.checkAndConsumeTableScanRateLimit(body.tenantId);
+    if (rateLimitError) return rateLimitError;
+
     const table = this.one<{ partition_key_column: string; provenance_complete: number; partition_key_unique: number }>(
       "SELECT partition_key_column, provenance_complete, partition_key_unique FROM table_rules WHERE table_name = ?",
       body.table,
@@ -1540,6 +1573,47 @@ export class CatalogDO extends DurableObject {
       },
       401,
     );
+  }
+
+  /** Issue #33: token-bucket rate limit for /v1/table-scan, the only
+   * fan-out-shaped tenant route -- called from handleLookupTableScan, the
+   * same choke point that already gates auth + table-registry validation
+   * before the Worker fans out to every shard. Returns a 429 Response if
+   * the tenant is over their rate, null if the call may proceed (and has
+   * already consumed one token). Lazily creates a full bucket for a
+   * tenant's first-ever table-scan call. */
+  private checkAndConsumeTableScanRateLimit(tenantId: string): Response | null {
+    const now = Date.now();
+    const row = this.one<{ tokens: number; last_refill_at: string }>(
+      "SELECT tokens, last_refill_at FROM tenant_scan_rate_limit WHERE tenant_id = ?",
+      tenantId,
+    );
+    let tokens = TABLE_SCAN_RATE_LIMIT_CAPACITY;
+    if (row) {
+      const elapsedSeconds = Math.max(0, (now - Date.parse(row.last_refill_at)) / 1000);
+      tokens = Math.min(TABLE_SCAN_RATE_LIMIT_CAPACITY, row.tokens + elapsedSeconds * TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND);
+    }
+    if (tokens < 1) {
+      const retryAfterMs = Math.ceil(((1 - tokens) / TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND) * 1000);
+      return json(
+        {
+          error: {
+            code: "RATE_LIMITED",
+            message: `Tenant ${tenantId} is issuing /v1/table-scan calls too quickly.`,
+            fix: `Retry after ${retryAfterMs}ms, or space out table-scan calls to at most ${TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND}/sec sustained.`,
+            retryAfterMs,
+          },
+        },
+        429,
+      );
+    }
+    this.sql.exec(
+      "INSERT OR REPLACE INTO tenant_scan_rate_limit (tenant_id, tokens, last_refill_at) VALUES (?, ?, ?)",
+      tenantId,
+      tokens - 1,
+      new Date(now).toISOString(),
+    );
+    return null;
   }
 
   private async handleRegisterTenant(request: Request): Promise<Response> {

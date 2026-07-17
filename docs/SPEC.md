@@ -689,9 +689,16 @@ map if real usage demands it). No fix to §14's partition-key collision limitati
 tenants sharing a partition key on the same shard — `__cf_row_owners` reflects only the last
 writer either way; this milestone inherits, not worsens, that limitation). Migration-window
 duplicates are inherited, not solved fresh, exactly like `/v1/scatter`'s existing documented
-limitation. No per-tenant rate limiting on this fan-out-shaped route yet (the
-catalog-shard-scoped pool is the v1 blast-radius control). No partial-result mode (`SHARD_UNREACHABLE`
+limitation. No partial-result mode (`SHARD_UNREACHABLE`
 fails the whole request rather than returning `{partial: true, errors: [...]}`).
+
+**Per-tenant rate limiting (issue #33).** A token bucket in `CatalogDO.checkAndConsumeTableScanRateLimit`,
+gated in `handleLookupTableScan` at the same choke point auth already runs at (before the Worker's
+fan-out to every shard in the tenant's pool), bounds one tenant's `/v1/table-scan` call rate --
+`TABLE_SCAN_RATE_LIMIT_CAPACITY` (burst) and `TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND` (sustained),
+both fixed constants. Exceeding it returns 429 `RATE_LIMITED` naming a `retryAfterMs`. Scoped per
+catalog shard (one `tenant_scan_rate_limit` row per tenant, in the same DO that already owns
+`tenant_auth`), not cluster-wide.
 
 POST /v1/scatter (ADMIN_TOKEN — reads across every tenant indiscriminately, so this is an admin operation, not a data-plane one)
 Request:
