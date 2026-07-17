@@ -28,17 +28,7 @@
 
 **Update (2026-07-16):** first real production-scale data point, from running the TPC-C benchmark (issue #16, `examples/tpc-c-benchmark`) against a live Cloudflare deployment (`cloudflare-shard-mvp`) — 8 warehouses, ~4,400 rows, 90s/15-concurrency sustained load, 1094 transactions. Per-type p50 latency: Payment 554ms, Order-Status 137ms, Stock-Level 963ms, New-Order 1829ms, Delivery 4927ms. Nothing in this run points at CoordinatorDO cold-start as a dominant cost specifically — New-Order and Delivery's higher latency is consistent with them simply being genuinely multi-round-trip operations (a header tx plus N lines' worth of retry-guarded stock updates for New-Order; per-district sequential processing for Delivery), not an unexplained tax layered on top. This is still a single, modest-scale, short run, not a real production traffic pattern — not enough to close this TODO, but the first actual evidence to weigh instead of reasoning from the billing model alone.
 
-### CLI/SDK wrapper or write-path consolidation
-
-**What:** Decide whether `/v1/sql`, `/v1/mutate`, and `/v1/tx` should stay three separate raw-HTTP contracts developers learn individually, or whether a CLI/SDK wrapper (or eventual deprecation of raw SQL mutations) is needed to keep the developer experience coherent as the write-path count grows.
-
-**Why:** Both DX-review voices independently flagged three coexisting write paths with different guarantees (raw-SQL trust-based, structured-DSL row-owned, coordinated-tx atomic) as confusing without a unifying interface, and noted the lack of any SDK/CLI feels primitive against competitors (Turso/libSQL, PlanetScale-style tooling) that ship one.
-
-**Context:** Not urgent for Milestone 1's initial ship, but worth revisiting once Milestone 2 (Index Service) adds a fourth structured-mutation consumer (index maintenance) — the case for consolidation gets stronger each time a new path is added rather than reusing the existing ones.
-
-**Effort:** M
-**Priority:** P3
-**Depends on:** None — can be decided independently, informed by real developer feedback post-Milestone-1.
+**Update (2026-07-17):** a second, larger run against the same live deployment — 24 warehouses, ~57,500 rows, 180s/30-concurrency sustained load, 3378 transaction attempts (466 tpmC-equivalent). Per-type p50/p95/p99 (ms): Payment 766/966/1135, Order-Status 164/290/393, Stock-Level 1056/3406/4305, New-Order 1978/2439/2563, Delivery 8533/11145/11434. At this higher concurrency, 37 attempts (1.1%) genuinely failed — almost all `409 TX_ABORTED` on New-Order's cross-shard 2PC (`Prepare failed on shard ...`) plus one `409 TX_PARTICIPANT_LOCKED` on Payment — real cross-shard write contention under concurrent load, not a coordinator cold-start symptom (2PC prepare/commit latency and DO instantiation cost are two different things, and these are outright aborts, not slow successes). Delivery's p50 climbed from 4927ms (first run) to 8533ms at 2x the warehouse count, consistent with its per-district *sequential* processing loop scaling with data volume — still an architectural property of Delivery's own design, not evidence of coordinator overhead specifically. Two real runs in, still nothing isolates CoordinatorDO cold-start as a distinguishable cost from ordinary multi-round-trip 2PC latency — but now there's a genuine, real contention signal (the abort rate) worth watching as concurrency and cross-shard write density grow further, which the first run's lower concurrency never surfaced at all.
 
 ### Automatic split heuristics
 
@@ -54,6 +44,8 @@
 
 **Update (2026-07-16):** first real data point, from the same live TPC-C benchmark run described in the CoordinatorDO TODO above. Row counts across all 16 physical shards after seeding + a 90s sustained mixed-transaction load: 506–581 rows per shard (±7% of the ~545 mean) — no hot or oversized shard, consistent with the hash-based partitioning working as designed at this scale. This is real, but at a scale far below anything split heuristics would need to trigger on — it demonstrates the MEASURING approach (`/admin/shard-stats` per shard) works and gives a real baseline, not evidence either way on when a genuine hot shard would emerge under sustained production load.
 
+**Update (2026-07-17):** second data point, from the larger (24-warehouse, ~57,500-row, 180s/30-concurrency) run described in the CoordinatorDO TODO above. Row counts across the same 16 physical shards: 2997–4140 rows per shard (mean 3597, range −16.7%/+15.1%) — wider spread than the first run's ±7%, but still no single shard standing out as dramatically hot; the pattern groups by *catalog* (all four of catalog-1's shards land ~4100-4140, all four of catalog-3's land ~3000-3014), consistent with which tenants (warehouses) happen to hash to which catalog shard rather than a within-catalog imbalance — an artifact of only 24 discrete warehouse-tenants spread across 4 catalogs (6 per catalog on average, small enough that one catalog getting a slightly larger or more active share of them by chance is expected), not a sign that hash-based partitioning breaks down at higher volume. Total data volume (~57,500 rows, ~3,600/shard) is still well below any scale a real split-heuristic threshold would plausibly trigger on. Two runs in: `/admin/shard-stats` keeps confirming the measuring approach works and keeps finding even distribution at the *shard* level — the open question remains entirely about *when* (what row-count/QPS/latency threshold) to trigger a split, which still has no real answer without a genuinely production-scale, long-running workload to observe.
+
 ### Cross-tenant/cross-shard analytics aggregation
 
 **What:** Support queries like "total orders across all tenants yesterday" without requiring a separate analytics store.
@@ -67,6 +59,16 @@
 **Depends on:** None — a future scope decision, not committed work.
 
 ## Completed
+
+### CLI/SDK wrapper or write-path consolidation
+
+**What:** Decide whether `/v1/sql`, `/v1/mutate`, and `/v1/tx` should stay three separate raw-HTTP contracts developers learn individually, or whether a CLI/SDK wrapper (or eventual deprecation of raw SQL mutations) is needed to keep the developer experience coherent as the write-path count grows.
+
+**Why:** Both DX-review voices independently flagged three coexisting write paths with different guarantees (raw-SQL trust-based, structured-DSL row-owned, coordinated-tx atomic) as confusing without a unifying interface, and noted the lack of any SDK/CLI feels primitive against competitors (Turso/libSQL, PlanetScale-style tooling) that ship one.
+
+**Resolution:** Built the ergonomic layer rather than a consolidation decision — `client/` (issue #22) is a typed TypeScript SDK (`CloudflareShardClient`/`CloudflareShardAdminClient`) and CLI (`cloudflareshard` bin) wrapping the HTTP API, with typed `mutate`/`insert`/`update`/`delete`/`upsert`/`tx`/`indexQuery`/`tableScan` methods and a `CloudflareShardError` normalizing both error body shapes the API uses. This doesn't answer the original "should the three write paths consolidate into one" architectural question — that's still open, genuinely needs real developer feedback to answer well, and stays a future decision — but it closes the more urgent half of this TODO: a developer no longer has to hand-write raw HTTP calls and re-derive request/response shapes from `docs/SPEC.md` to use any of the three paths.
+
+**Completed:** 2026-07-17 (PR #24)
 
 ### Structured tenant read API + physical `tenant_id`
 
