@@ -237,7 +237,12 @@ async function runOperatorOp(fn: () => Promise<unknown>, isRequestError: (err: u
         return json({ error: match[2] }, status);
       }
     }
-    return json({ error: message }, 502);
+    // Unrecognized failure (a runtime/DO/RPC-transport error, not a validated
+    // request error or a structured CloudflareShard error): don't leak internal
+    // detail to the browser. Log it server-side (wrangler tail) and return a
+    // generic 502. (pre-PR Codex integration finding [P2].)
+    console.error("shardscope: operator op failed with an unexpected error:", message);
+    return json({ error: "Operator request failed unexpectedly. Check the Worker logs." }, 502);
   }
 }
 
