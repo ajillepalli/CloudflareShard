@@ -65,6 +65,37 @@ interface LoadDriverStatusResponse {
     txAbortedExpected: number;
     lost: number;
     meterState: "green" | "red";
+    // The HONEST scope figure — as of ./load/correctness.ts's round 7 (see
+    // that file's header comment, "ROUND 7 — EVICTION REMOVED"), this is a
+    // COMPLETE count of every distinct tpcc_stock key this run has
+    // successfully resolved and promoted a write for, not a bounded sample
+    // size. Round 8 (that file's HONEST SCOPE header section) sharpens this
+    // further: it is a live, continuously-updating count over the TRACKED
+    // SET as of the last verify() pass, not an instantaneous claim that
+    // every write this run made is confirmed safe (an ack->resolve->promote
+    // ->verify pipeline window and untrackable tables both mean "keys
+    // written" and "keys tracked/verified" are not the same number). See
+    // CorrectnessTracker.snapshot() doc comment and this file's own
+    // Scoreboard interface doc comment on why `lost` alone must never be
+    // rendered without it.
+    trackedKeyCount: number;
+    // null if verify() has never run this LoadDriver instance's tracker
+    // lifetime, otherwise how many keys the MOST RECENT verify() pass
+    // actually checked. See ./load/correctness.ts's
+    // CorrectnessTracker.snapshot() doc comment.
+    lastVerifyChecked: number | null;
+    // Design round 3, point 3 — computed ONCE, inside
+    // CorrectnessTracker.snapshot() (see its own doc comment for the exact
+    // "epoch matches AND checked>0 AND lost===0" definition), and forwarded
+    // here VERBATIM: this file never re-derives it from the raw pieces
+    // above. That's deliberate — a second reconstruction is a second place
+    // the invariant could drift from the tracker's own, and the tracker is
+    // the one place that actually knows whether the tracked SET has
+    // changed since the last verify() pass (an epoch bump has no
+    // equivalent in this loosely-typed response shape). false means
+    // nothing genuinely backs a green claim right now — see
+    // Scoreboard.verified below.
+    verified: boolean;
   };
 }
 
@@ -222,20 +253,55 @@ export function deriveChecksumStatus(
  * DESIGN.md's invariant scoreboard ("writes N · lost 0 · checksum OK") and
  * this file's header comment on deriveChecksumStatus for why `checksum` is
  * a derived label, not a boolean. When no load is running, `writesAcked`/
- * `writesRetriedIdempotent`/`txAbortedExpected`/`lost` are all forced to 0
- * (meterState "green") rather than showing a PREVIOUS run's stale totals —
- * showing an old "lost 0" as if it were live would itself be a kind of
- * fake-green. `checksum` is deliberately NOT forced to "idle" alongside
- * them: it reflects the cluster's REAL migration state (a topology-op
- * doesn't require Shardscope's own load engine to be running), so it stays
- * truthful even when an operator drives a migration from the Reshard console
- * with no load traffic at all — see deriveChecksumStatus. */
+ * `writesRetriedIdempotent`/`txAbortedExpected`/`lost`/`trackedKeyCount` are
+ * all forced to 0 (meterState "green") rather than showing a PREVIOUS run's
+ * stale totals — showing an old "lost 0" as if it were live would itself be
+ * a kind of fake-green. `checksum` is deliberately NOT forced to "idle"
+ * alongside them: it reflects the cluster's REAL migration state (a
+ * topology-op doesn't require Shardscope's own load engine to be running),
+ * so it stays truthful even when an operator drives a migration from the
+ * Reshard console with no load traffic at all — see deriveChecksumStatus.
+ *
+ * HONEST SCOPE — `trackedKeyCount`: as of ./load/correctness.ts's round 7
+ * (see that file's header comment, "ROUND 7 — EVICTION REMOVED"), `lost` is
+ * a count over EVERY distinct tpcc_stock key this run's CorrectnessTracker
+ * has successfully resolved and promoted a write for — complete over the
+ * TRACKED SET, no longer a bounded/biased sample of it. It is STILL NOT the
+ * same claim as "every write this run made is confirmed safe": only
+ * tpcc_stock rows are individually verifiable at all; only for the load this
+ * tracker instance itself observed this run; and even for a tpcc_stock
+ * write, there is an irreducible ack->resolve->promote->verify pipeline —
+ * this is a LIVE, continuously-updating check over the tracked set AS OF the
+ * last verify() pass, not an instantaneous, zero-window guarantee over every
+ * write the instant it happens (see ./load/correctness.ts's own "ROUND 8"
+ * HONEST SCOPE header section for the precise claim, and why the genuinely
+ * complete, deterministic, zero-window guarantee instead lives in
+ * ./load/reshard.integration.test.ts). A renderer that shows `lost 0` alone,
+ * with no indication of how many keys that verified, still overclaims —
+ * `trackedKeyCount` is carried through here specifically so a renderer (see
+ * public/app.js's renderScoreboard) can show the honest framing — "N keys
+ * continuously verified · lost 0" — instead of a bare, unqualified
+ * "lost 0", and never as "every write is safe". */
 export interface Scoreboard {
   writesAcked: number;
   writesRetriedIdempotent: number;
   txAbortedExpected: number;
   lost: number;
+  trackedKeyCount: number;
   meterState: "green" | "red";
+  // Design round 3, point 3 — copied straight through from
+  // LoadDriverStatusResponse.correctness.verified (see that field's doc
+  // comment): true only when the tracked SET hasn't changed since the last
+  // verify() pass covered it, that pass actually checked >=1 key, and
+  // nothing has ever been proven lost. False means "don't render a
+  // reassuring green right now" — the ONE signal public/app.js's
+  // renderScoreboard needs to render a DISTINCT "not verified" state
+  // instead. `meterState` above stays a pure function of the raw counters
+  // (see meterStateFor's own "the ONE rule this file exists to enforce"
+  // comment in ./load/correctness.ts) and MUST still win whenever `lost >
+  // 0` — see renderScoreboard's own doc comment on why the red check runs
+  // BEFORE the verified gate, never gated behind it.
+  verified: boolean;
   loadRunning: boolean;
   checksum: ChecksumStatus;
 }
@@ -528,7 +594,21 @@ export class TopologyAggregator {
       // is actually being verified — is exactly the kind of stale-as-live
       // theater this scoreboard exists to avoid. Zero/idle is the honest
       // "nothing is running" state.
-      return { writesAcked: 0, writesRetriedIdempotent: 0, txAbortedExpected: 0, lost: 0, meterState: "green", loadRunning: false, checksum };
+      return {
+        writesAcked: 0,
+        writesRetriedIdempotent: 0,
+        txAbortedExpected: 0,
+        lost: 0,
+        trackedKeyCount: 0,
+        meterState: "green",
+        // No live loadStatus to copy `verified` from in this branch — spelled
+        // out explicitly as false (nothing is running, so nothing can
+        // genuinely be "verified right now" regardless of what a previous
+        // run's tracker last computed).
+        verified: false,
+        loadRunning: false,
+        checksum,
+      };
     }
     const c = loadStatus.correctness;
     return {
@@ -536,7 +616,9 @@ export class TopologyAggregator {
       writesRetriedIdempotent: c.writesRetriedIdempotent,
       txAbortedExpected: c.txAbortedExpected,
       lost: c.lost,
+      trackedKeyCount: c.trackedKeyCount,
       meterState: c.meterState,
+      verified: c.verified,
       loadRunning: true,
       checksum,
     };

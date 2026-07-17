@@ -39,7 +39,7 @@ import {
 import { generateSkewedKeys, type VBucketOwnership } from "./skew";
 import type { TokenProvider } from "./token-provider";
 import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
-import { HttpTxExecutor } from "./gateway-client";
+import { HttpTxExecutor, HttpSqlPointReader } from "./gateway-client";
 import {
   CorrectnessTracker,
   TrackingTxExecutor,
@@ -48,8 +48,9 @@ import {
   isExpectedAbort,
   meterStateFor,
   pickTrackedCandidates,
+  type CatalogVBucketMap,
   type CorrectnessCounters,
-  type TrackedWrite,
+  type TrackedCandidate,
   type VBucketMigrationRow,
 } from "./correctness";
 
@@ -68,13 +69,18 @@ const TICK_INTERVAL_MS = 1000;
 // Workers hard-cap subrequests per Worker invocation (an alarm() call is one
 // invocation) well below what an unbounded loop here could otherwise fan
 // out. New-Order is this mix's worst case: 1 tableScan + 1 header tx + up to
-// 15 lines * (~2 calls each: an indexQuery/mutate pair or a 2-mutation tx,
-// plus occasional remote-line compensation) + 1 marker mutate ≈
-// 1 + 1 + 15*2 + 1 = 33 subrequests for ONE transaction. Rounded up
-// generously (compensation/retry paths can add a few more calls) so a batch
-// sized against this constant can never come close to the platform's actual
-// 1000-subrequest ceiling.
-const WORST_CASE_SUBREQUESTS_PER_TRANSACTION = 40;
+// 15 lines * (~2 calls each: an indexQuery/mutate pair or a 2-mutation tx)
+// + 1 marker mutate ≈ 1 + 1 + 15*2 + 1 = 33 subrequests for ONE transaction
+// in the COMMON case. But a remote New-Order line that loses its race on the
+// target stock row triggers compensation (transactions.ts's
+// compensateFailedOrder), which reverses every already-committed line with
+// ONE ADDITIONAL mutate call each — up to 15 more calls, roughly DOUBLING
+// the worst case for a transaction that fails partway through. This constant
+// is sized against that DOUBLED worst case (not just the common-case 33), so
+// a batch sized against it stays safely under the platform's actual
+// 1000-subrequest ceiling even on a tick where every in-flight transaction
+// happens to hit the compensation path.
+const WORST_CASE_SUBREQUESTS_PER_TRANSACTION = 85;
 const MAX_SUBREQUESTS_PER_TICK = 800;
 const MAX_TRANSACTIONS_PER_TICK = Math.max(1, Math.floor(MAX_SUBREQUESTS_PER_TICK / WORST_CASE_SUBREQUESTS_PER_TRANSACTION));
 
@@ -103,12 +109,6 @@ const SKEW_REFRESH_INTERVAL_MS = 5000;
 // diverge later (e.g. verifying more aggressively than the topology poll
 // during a chaos run).
 const VERIFY_INTERVAL_MS = 5000;
-
-// How many tracked keys the correctness verifier keeps per load run — see
-// ./correctness.ts's own DEFAULT_MAX_TRACKED_KEYS for the reasoning; kept as
-// an explicit constant here too since load-driver.ts is what actually
-// decides candidates per catalog before calling into the pure core.
-const MAX_TRACKED_KEYS = 50;
 
 interface LoadDriverConfig {
   mode: LoadMode;
@@ -386,7 +386,7 @@ export class LoadDriver {
     // TICK_INTERVAL_MS for the alarm to fire.
     await this.state.storage.setAlarm(Date.now());
 
-    return json(toStatusJson(s));
+    return json(toStatusJson(s, this.correctnessTracker.snapshot()));
   }
 
   private async handleStop(): Promise<Response> {
@@ -394,12 +394,12 @@ export class LoadDriver {
     s.running = false;
     await this.saveState(s);
     await this.state.storage.deleteAlarm();
-    return json(toStatusJson(s));
+    return json(toStatusJson(s, this.correctnessTracker.snapshot()));
   }
 
   private async handleStatus(): Promise<Response> {
     const s = await this.loadState();
-    return json(toStatusJson(s));
+    return json(toStatusJson(s, this.correctnessTracker.snapshot()));
   }
 
   /** alarm() — fired by the platform per the schedule set in handleStart /
@@ -466,11 +466,33 @@ export class LoadDriver {
     // empty base URL and fails at the network layer, a clear, obvious
     // failure mode rather than a silent no-op.
     const httpExec = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
+    // Shardscope T4 / design round 3, point 2: the PRECISE read-back
+    // adapter (a primary-key point SELECT via the admin-scoped /v1/sql —
+    // see ./correctness.ts's SqlPointReader and ./gateway-client.ts's
+    // HttpSqlPointReader doc comments for why this needs ADMIN_TOKEN rather
+    // than a tenant bearer token). Built once per tick, reused for both the
+    // periodic verify() pass below and TrackingTxExecutor's own optional
+    // idempotent-replay verification.
+    const sqlReader = new HttpSqlPointReader(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
+    const readBack = gatewayReadBack(sqlReader);
     // Shardscope T4: every mutate()/tx() call this tick passes through the
     // correctness tracker on its way to the real gateway — see
     // ./correctness.ts's TrackingTxExecutor. This NEVER changes behavior or
     // error propagation; it only observes.
-    const exec: TxExecutor = new TrackingTxExecutor(httpExec, this.correctnessTracker);
+    //
+    // The 3rd arg resolves a tenantId to its owning catalog shard id, using
+    // THIS tick's already-fetched vbucketMap (see refreshVbucketMapIfNeeded
+    // above — captured by this closure, not re-fetched) and the exact same
+    // catalogShardIdForTenant formula refreshSkewPoolsFromMap/
+    // refreshCorrectnessTrackedSet already use below. Returns null only when
+    // vbucketMap itself is null (the very first tick, or a sustained
+    // admin-API outage) — matching TrackingTxExecutor's own documented
+    // "not yet resolvable" contract, so a candidate observed before the map
+    // has ever been fetched simply isn't tracked this time around rather
+    // than being resolved against a stale/guessed catalog count.
+    const resolveCatalogShardIdForTenant = (tenantId: string): string | null =>
+      vbucketMap ? catalogShardIdForTenant(tenantId, vbucketMap.catalogShardCount) : null;
+    const exec: TxExecutor = new TrackingTxExecutor(httpExec, this.correctnessTracker, resolveCatalogShardIdForTenant, readBack);
 
     const batchSize = Math.min(config.concurrency, MAX_TRANSACTIONS_PER_TICK);
     const outcomes = await runBoundedBatch(batchSize, () => runOneTransaction(exec, cfg, picker, Math.random));
@@ -500,7 +522,24 @@ export class LoadDriver {
     const now = Date.now();
     if (vbucketMap && now - this.lastVerifyAt >= VERIFY_INTERVAL_MS) {
       this.lastVerifyAt = now;
-      await this.correctnessTracker.verify(gatewayReadBack(exec));
+      await this.correctnessTracker.verify(readBack);
+    }
+    // Shardscope T4, design round 4, point 4 (Codex round-5 finding:
+    // "verified stays green after a reshard that changes storage without a
+    // tracked-set change") — invalidate `verified` for as long as THIS
+    // tick's vbucket map shows any migration activity anywhere in the
+    // cluster. Deliberately placed AFTER the verify() call above (not
+    // before): this guarantees that even a verify() pass that happens to run
+    // on a tick where migration is active gets its epoch bumped PAST what it
+    // just covered, before this tick ends — so `verified` reads false for
+    // every tick spent mid-reshard, not just intermittently. Once the
+    // vbucket map reports no migration activity anywhere (post-cutover), no
+    // more bumps happen, and the very next verify() pass genuinely re-earns
+    // `verified: true` over the post-reshard state — see
+    // CorrectnessTracker.notifyClusterChanged's own doc comment for why this
+    // isn't a permanent wedge.
+    if (vbucketMap && hasActiveMigration(vbucketMap)) {
+      this.correctnessTracker.notifyClusterChanged();
     }
     // Persist the raw counters only — meterState/trackedKeyCount are derived
     // (see toStatusJson's use of meterStateFor) rather than stored, so
@@ -570,7 +609,16 @@ export class LoadDriver {
         tenantId,
         table: "tpcc_stock",
         count: SKEW_POOL_SIZE,
-        maxAttempts: Math.min(SKEW_SCAN_MAX_ATTEMPTS, Math.max(cfg.itemCount * 4, SKEW_SCAN_MAX_ATTEMPTS)),
+        // Bounded by SKEW_SCAN_MAX_ATTEMPTS (the hard ceiling — see that
+        // constant's doc comment), but scaled DOWN for a small itemCount:
+        // candidateToKey cycles i_id through 1..itemCount, so once a full
+        // cycle (itemCount attempts) has been scanned, every further attempt
+        // just re-hashes an already-seen partition key — scanning past a
+        // small multiple of itemCount is pure waste, not extra coverage.
+        // (Previously this was `Math.min(MAX, Math.max(itemCount*4, MAX))`,
+        // which always evaluated to MAX regardless of itemCount — a dead
+        // expression that never actually scaled down for a small world.)
+        maxAttempts: Math.min(SKEW_SCAN_MAX_ATTEMPTS, cfg.itemCount * 4),
         candidateToKey: (candidateIndex) => {
           const i_id = 1 + (candidateIndex % cfg.itemCount);
           return { value: i_id, partitionKey: stockKey(w, i_id) };
@@ -587,35 +635,57 @@ export class LoadDriver {
   }
 
   /** Shardscope T4: drains the correctness tracker's pending-candidates
-   * buffer (writes acked this tick that aren't yet tracked) and promotes a
-   * biased subset into the tracked set, one catalog at a time — vbucket ids
+   * buffer (writes acked this tick that aren't yet tracked) and promotes
+   * ALL of them into the tracked set, one catalog at a time — vbucket ids
    * are catalog-local, so this MUST resolve each candidate's catalog before
    * calling ./correctness.ts's pickTrackedCandidates (which itself has no
    * notion of "catalog"). Mirrors refreshSkewPoolsFromMap's own per-warehouse
    * catalog resolution above (same catalogShardIdForTenant formula) — the
    * two features independently need the same lookup, not because they share
-   * any other logic. */
+   * any other logic.
+   *
+   * ROUND 7 (eviction removed from ./correctness.ts): pickTrackedCandidates
+   * no longer caps its result — every drained candidate for every catalog is
+   * promoted, not just a bounded per-catalog subset. It still BIASES the
+   * order (migrating-vbucket candidates first — see its own doc comment),
+   * which matters for what the live topology view highlights, but nothing
+   * here is ever dropped: `tracked` is now the COMPLETE set of every
+   * distinct tpcc_stock key this run has acked a write for (see
+   * ./correctness.ts's header comment, "ROUND 7 — EVICTION REMOVED"). */
   private refreshCorrectnessTrackedSet(config: LoadDriverConfig, vbucketMap: AdminVbucketMapResponse): void {
     const pending = this.correctnessTracker.drainPendingCandidates();
     if (pending.length === 0) return;
 
-    const byCatalog = new Map<string, TrackedWrite[]>();
-    for (const write of pending) {
-      const catalogShardId = catalogShardIdForTenant(write.tenantId, vbucketMap.catalogShardCount);
+    const byCatalog = new Map<string, TrackedCandidate[]>();
+    for (const candidate of pending) {
+      const catalogShardId = catalogShardIdForTenant(candidate.write.tenantId, vbucketMap.catalogShardCount);
       const bucket = byCatalog.get(catalogShardId);
-      if (bucket) bucket.push(write);
-      else byCatalog.set(catalogShardId, [write]);
+      if (bucket) bucket.push(candidate);
+      else byCatalog.set(catalogShardId, [candidate]);
     }
 
-    const picked: TrackedWrite[] = [];
-    for (const [catalogShardId, writes] of byCatalog) {
+    const picked: TrackedCandidate[] = [];
+    for (const [catalogShardId, candidates] of byCatalog) {
       const catalog = vbucketMap.catalogs.find((c) => c.catalogShardId === catalogShardId);
       if (!catalog) continue; // this warehouse's catalog isn't in the live map (shouldn't happen; skip rather than guess)
       const migrationRows: VBucketMigrationRow[] = catalog.map.map((row) => ({ vbucket: row.vbucket, migrationStatus: row.migrationStatus }));
-      picked.push(...pickTrackedCandidates(writes, migrationRows, catalog.totalVBuckets, Math.max(1, Math.floor(MAX_TRACKED_KEYS / byCatalog.size))));
+      const catalogVBucketMap: CatalogVBucketMap = { catalogShardId, totalVBuckets: catalog.totalVBuckets, vbuckets: migrationRows };
+      picked.push(...pickTrackedCandidates(candidates, catalogVBucketMap));
     }
     this.correctnessTracker.promoteToTracked(picked);
   }
+}
+
+/** True iff ANY vbucket in ANY catalog of this tick's live vbucket map is
+ * mid-migration (any non-"none" migrationStatus — backfilling, cutover, or
+ * aborting) — the same "is a reshard active anywhere right now" predicate
+ * ./correctness.ts's migratingVBuckets uses per-catalog, generalized here to
+ * "anywhere in the whole map" since notifyClusterChanged's invalidation
+ * isn't scoped to one catalog (see runTick's own wiring comment for why this
+ * check runs unconditionally on load MODE, mirroring
+ * refreshCorrectnessTrackedSet immediately above it). */
+function hasActiveMigration(vbucketMap: AdminVbucketMapResponse): boolean {
+  return vbucketMap.catalogs.some((c) => c.map.some((row) => row.migrationStatus && row.migrationStatus !== "none"));
 }
 
 function applyOutcome(counters: LoadDriverCounters, outcome: TransactionOutcome): void {
@@ -638,7 +708,28 @@ async function runBoundedBatch(count: number, fn: () => Promise<TransactionOutco
   return Promise.all(Array.from({ length: count }, () => fn()));
 }
 
-function toStatusJson(s: LoadDriverState): Record<string, unknown> {
+/** `trackerSnapshot` (trackedKeyCount / lastVerifyChecked / verified) is
+ * passed in separately (not read off `s`) because it's IN-MEMORY-ONLY state
+ * (see this.correctnessTracker's own field doc comments — the tracked-key
+ * SET, and whether/how much its last verify() pass actually checked, are
+ * deliberately never persisted to `s.correctness`, only the durable counters
+ * are), so every caller reads it fresh off the live `this.correctnessTracker`
+ * instance at request time rather than off whatever was last saved to
+ * storage. These are HONEST scoreboard figures (see ./correctness.ts's own
+ * header comment on why "lost 0" alone overclaims): a bare "lost 0" reads as
+ * a cluster-wide zero-loss guarantee that was actually checked, but this
+ * tracker only ever verifies a bounded, biased SAMPLE of keys, and only on
+ * its own VERIFY_INTERVAL_MS cadence. `verified` is computed ONCE, inside
+ * CorrectnessTracker.snapshot() (design round 3, point 3) — forwarded here
+ * verbatim, never re-derived, so there is exactly one place that decides
+ * "does this green claim genuinely still hold" the same way `meterState`
+ * below is exactly one place that decides "is this red". See
+ * aggregator.ts's Scoreboard.verified / public/app.js's renderScoreboard for
+ * how this is surfaced. */
+function toStatusJson(
+  s: LoadDriverState,
+  trackerSnapshot: { trackedKeyCount: number; lastVerifyChecked: number | null; verified: boolean },
+): Record<string, unknown> {
   return {
     running: s.running,
     config: s.config,
@@ -647,7 +738,13 @@ function toStatusJson(s: LoadDriverState): Record<string, unknown> {
     // `meterState` is derived fresh from `s.correctness` here (never
     // persisted redundantly — see runTick's own comment on this) so there is
     // exactly one place that decides "is this red".
-    correctness: { ...s.correctness, meterState: meterStateFor(s.correctness) },
+    correctness: {
+      ...s.correctness,
+      meterState: meterStateFor(s.correctness),
+      trackedKeyCount: trackerSnapshot.trackedKeyCount,
+      lastVerifyChecked: trackerSnapshot.lastVerifyChecked,
+      verified: trackerSnapshot.verified,
+    },
     startedAt: s.startedAt,
     lastTickAt: s.lastTickAt,
     lastError: s.lastError,

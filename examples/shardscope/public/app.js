@@ -26,8 +26,38 @@
  *                                                        computeLoadScore below)
  *   snapshot.shards[].error                          -> "unavailable" node state
  *   snapshot.scoreboard.writesAcked                  -> topbar "writes N"
- *   snapshot.scoreboard.lost                         -> topbar "lost N" (RED if > 0)
+ *   snapshot.scoreboard.trackedKeyCount              -> topbar "N keys continuously verified"
+ *                                                        (the HONEST scope qualifier — as of
+ *                                                        correctness.ts's round 7 this is a
+ *                                                        COMPLETE count over the TRACKED SET
+ *                                                        (every distinct tpcc_stock key this run
+ *                                                        has resolved+promoted a write for), not a
+ *                                                        bounded sample; see aggregator.ts's
+ *                                                        Scoreboard doc comment and
+ *                                                        correctness.ts's "ROUND 8" HONEST SCOPE
+ *                                                        section: `lost` alone would still
+ *                                                        overclaim — this is a LIVE, ongoing check
+ *                                                        over the tracked set as of the last
+ *                                                        verify() pass, never "every write this
+ *                                                        run made is confirmed safe." The
+ *                                                        deterministic, zero-window, complete
+ *                                                        end-to-end guarantee lives in
+ *                                                        ../src/load/reshard.integration.test.ts,
+ *                                                        not in this live meter)
+ *   snapshot.scoreboard.lost                         -> topbar "· lost N" (RED if > 0)
  *   snapshot.scoreboard.meterState                   -> "green" | "red"
+ *   snapshot.scoreboard.verified                     -> design round 3: false means the tracked
+ *                                                        set has changed (or nothing was ever
+ *                                                        checked) since the last verify() pass —
+ *                                                        renders a DISTINCT amber "not verified"
+ *                                                        state instead of a reassuring green
+ *                                                        `lost 0`. Computed once inside
+ *                                                        ./load/correctness.ts's
+ *                                                        CorrectnessTracker.snapshot() and
+ *                                                        forwarded verbatim through
+ *                                                        aggregator.ts — see renderScoreboard
+ *                                                        below for why a RED `lost > 0` must
+ *                                                        still win regardless of this flag
  *   snapshot.scoreboard.loadRunning                  -> false -> writes/lost render as 0, not stale
  *   snapshot.scoreboard.checksum.{label,state}        -> topbar "checksum <label>"
  *                                                        (see ../src/aggregator.ts's
@@ -234,7 +264,9 @@ function buildSampleSnapshot() {
       writesRetriedIdempotent: 12,
       txAbortedExpected: 340,
       lost: 0,
+      trackedKeyCount: 50,
       meterState: "green",
+      verified: true,
       loadRunning: true,
       checksum: { label: "verifying…", state: "verifying" },
     },
@@ -401,7 +433,7 @@ function renderScoreboard(scoreboard) {
   if (!scoreboard) {
     el.sbWrites.textContent = "writes —";
     el.sbLost.className = "sb-item";
-    el.sbLost.textContent = "lost —";
+    el.sbLost.textContent = "— keys continuously verified · lost —";
     el.sbChecksum.className = "sb-item";
     el.sbChecksum.textContent = "checksum —";
     return;
@@ -415,9 +447,54 @@ function renderScoreboard(scoreboard) {
   // fake-green".
   el.sbWrites.textContent = `writes ${fmtInt(scoreboard.writesAcked)}`;
 
+  // HONEST FRAMING (see aggregator.ts's Scoreboard doc comment and
+  // correctness.ts's "ROUND 8" HONEST SCOPE header section — this is the
+  // round-8 fix for Codex round 7's finding: "the UI's 'complete over every
+  // write' claim overclaims what a LIVE meter can guarantee"): as of
+  // correctness.ts's round 7 ("ROUND 7 — EVICTION REMOVED"), `lost` is a
+  // COMPLETE count over the TRACKED SET — every distinct tpcc_stock key this
+  // run has resolved+promoted a write for — not a bounded, biased sample of
+  // it (that was the pre-round-7 design). It is NOT "every write this run
+  // made is confirmed safe": only tpcc_stock rows are individually
+  // verifiable at all (only this run); and even for a tracked key, there is
+  // an irreducible ack->resolve->promote->verify pipeline, so this is a
+  // LIVE, continuously-updating check over the tracked set as of the last
+  // verify() pass, not an instantaneous zero-window guarantee. The
+  // deterministic, complete, zero-window end-to-end proof instead lives in
+  // ../src/load/reshard.integration.test.ts (writes a known batch, drives a
+  // real reshard, then verifies every one of those keys once, after the
+  // fact). A bare "lost 0" would still imply more than this live meter
+  // actually checked — always pair it with trackedKeyCount and frame it as
+  // an ongoing check, not a settled guarantee: "N keys continuously verified
+  // · lost 0", never "every write is safe".
+  //
+  // Design round 3, point 3: RED must be checked FIRST, independent of
+  // `verified` — `scoreboard.verified` (see aggregator.ts's Scoreboard doc
+  // comment) is only ever a gate on the GREEN case ("is a calm --safe claim
+  // genuinely current"), never a way to suppress a proven loss. `lost > 0`
+  // means verify() (or a disproven idempotent-replay claim) genuinely found
+  // a missing/mismatched row — that is proven, not stale, no matter what
+  // has happened to the tracked set since.
   const isRed = scoreboard.meterState === "red" || scoreboard.lost > 0;
-  el.sbLost.className = "sb-item" + (isRed ? " lost-red" : " safe");
-  el.sbLost.textContent = `lost ${fmtInt(scoreboard.lost)}`;
+  if (isRed) {
+    el.sbLost.className = "sb-item lost-red";
+    el.sbLost.textContent = `${fmtInt(scoreboard.trackedKeyCount)} keys continuously verified · lost ${fmtInt(scoreboard.lost)}`;
+  } else if (!scoreboard.verified) {
+    // `scoreboard.verified === false` means the tracked SET has changed (a
+    // new key promoted, a value refreshed, an eviction) since the last
+    // verify() pass covered it, or no pass with anything to check has ever
+    // run — see ./load/correctness.ts's CorrectnessTracker.snapshot() doc
+    // comment. That state must never render as the same calm --safe green
+    // as "verified, lost 0" — it gets its own, visually distinct amber
+    // treatment (the same .degraded convention this scoreboard already
+    // uses for a stalled-but-not-proven-lost checksum): nothing is PROVEN
+    // lost (handled above), but nothing is PROVEN safe either.
+    el.sbLost.className = "sb-item degraded";
+    el.sbLost.textContent = `${fmtInt(scoreboard.trackedKeyCount)} keys continuously verified · not verified yet`;
+  } else {
+    el.sbLost.className = "sb-item safe";
+    el.sbLost.textContent = `${fmtInt(scoreboard.trackedKeyCount)} keys continuously verified · lost ${fmtInt(scoreboard.lost)}`;
+  }
 
   const checksum = scoreboard.checksum || { label: "—", state: "idle" };
   const checksumClass = checksumClassFor(checksum.state);

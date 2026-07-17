@@ -15,6 +15,7 @@
  */
 import { tenantIdForWarehouse, type MutateCall, type MutateResult, type QueryResult, type TxExecutor } from "./transactions";
 import type { TokenProvider } from "./token-provider";
+import type { SqlPointReader } from "./correctness";
 
 export class GatewayError extends Error {
   readonly status: number;
@@ -100,5 +101,47 @@ export class HttpTxExecutor implements TxExecutor {
       throw new GatewayError("POST", path, res.status, json);
     }
     return json;
+  }
+}
+
+/** Real, admin-token-backed implementation of ./correctness.ts's
+ * SqlPointReader — the precise, primary-key point-SELECT read-back
+ * gatewayReadBack uses (design round 3, point 2: replaces the old windowed
+ * secondary-index scan). Deliberately a SEPARATE class from HttpTxExecutor,
+ * not a method on it: /v1/sql is admin-scoped (see src/index.ts's sqlCore
+ * header comment — the per-tenant SQL guard was structurally unwinnable and
+ * was removed), so this needs the operator's ADMIN_TOKEN, never a tenant
+ * bearer token the way every HttpTxExecutor call does. ./load-driver.ts
+ * constructs one of these per tick, alongside its HttpTxExecutor, and feeds
+ * it to gatewayReadBack for both the periodic verify() pass and (via
+ * TrackingTxExecutor's optional 4th constructor arg) idempotent-replay
+ * verification. */
+export class HttpSqlPointReader implements SqlPointReader {
+  constructor(
+    private readonly baseUrl: string,
+    private readonly adminToken: string,
+  ) {}
+
+  async sqlSelect(args: { table: string; tenantId: string; partitionKey: string; sql: string; params: unknown[] }): Promise<{ rows: Record<string, unknown>[] }> {
+    const res = await fetch(`${this.baseUrl}/v1/sql`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.adminToken}`,
+      },
+      body: JSON.stringify({ sql: args.sql, params: args.params, table: args.table, tenantId: args.tenantId, partitionKey: args.partitionKey }),
+    });
+    const text = await res.text();
+    let json: unknown;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text };
+    }
+    if (!res.ok) {
+      throw new GatewayError("POST", "/v1/sql", res.status, json);
+    }
+    const rows = (json as { result?: { rows?: Record<string, unknown>[] } })?.result?.rows;
+    return { rows: rows ?? [] };
   }
 }

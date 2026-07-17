@@ -133,3 +133,16 @@ describe("aggregator.ts — deriveChecksumStatus: honest checksum labeling", () 
     expect(status.state).toBe("aborting");
   });
 });
+
+// ----------------------------------------------------------------------------
+// Design round 3, point 3 — the "is this genuinely verified right now"
+// invariant used to be reconstructed HERE, in aggregator.ts, from raw
+// trackedKeyCount/lastVerifyChecked figures (deriveScoreboardVerified). That
+// reconstruction is gone: CorrectnessTracker.snapshot().verified is now
+// computed exactly once, inside ./load/correctness.ts (the one place that
+// actually knows whether the tracked SET has changed since the last
+// verify() pass via its own epoch counter), and aggregator.ts's
+// mergeScoreboard just forwards it — see that file's own comment. The
+// boundary-case coverage that used to live here now lives in
+// correctness.test.ts, next to the invariant it's actually testing.
+// ----------------------------------------------------------------------------

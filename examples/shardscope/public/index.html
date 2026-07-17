@@ -55,7 +55,7 @@
            rule, because a lost write IS a health failure. -->
       <span class="sb-item" data-hook="sb-writes" title="Writes acknowledged by the load engine this run (idempotent replays and known/legitimate TPC-C aborts are tracked separately, never folded into this count or into `lost`).">writes —</span>
       <span class="sep">·</span>
-      <span class="sb-item safe" data-hook="sb-lost" title="Read-back verification of tracked keys, biased toward keys on the currently-migrating vBucket during a reshard. A missing or mismatched read-back is the ONLY thing that can make this red.">lost —</span>
+      <span class="sb-item safe" data-hook="sb-lost" title="A LIVE, continuous read-back check over every distinct tpcc_stock key this run has resolved and tracked (complete over the tracked set, not a bounded sample), ordered to prioritize keys on the currently-migrating vBucket during a reshard. This is NOT an instantaneous guarantee over every write this run made — there is an inherent ack-to-verify pipeline window, and only tpcc_stock rows are individually verifiable at all. A missing or mismatched read-back is the ONLY thing that can make this red; the deterministic, complete, zero-window proof of &quot;reshard under load, lost 0&quot; is the end-to-end integration test, not this live meter.">— keys continuously verified · lost —</span>
       <span class="sep">·</span>
       <span class="sb-item safe" data-hook="sb-checksum" title="The migration checksum is a CUTOVER EVENT (computed once, inside cutover), not a continuously-readable invariant — this label reflects the cluster's live migration state, not a fabricated permanent &quot;OK&quot;.">checksum —</span>
     </div>

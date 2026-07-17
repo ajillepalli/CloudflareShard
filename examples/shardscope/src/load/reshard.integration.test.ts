@@ -52,7 +52,7 @@ import {
   tenantForCatalogShard,
 } from "../../../../src/index.test-helpers";
 import { generateSkewedKeys, type SkewedKey, type VBucketOwnership } from "./skew";
-import { CorrectnessTracker, TrackingTxExecutor, gatewayReadBack, type ReadBackFn, type ReadBackResult } from "./correctness";
+import { CorrectnessTracker, TrackingTxExecutor, gatewayReadBack, type ReadBackFn, type ReadBackResult, type SqlPointReader } from "./correctness";
 import { stockKey, tenantIdForWarehouse, type MutateCall, type MutateResult, type QueryResult, type TxExecutor } from "./transactions";
 
 // DO storage persists across `it` blocks within one vitest test FILE (the
@@ -94,6 +94,22 @@ function warehouseForCatalogShard(catalogIndex: number, catalogShardCount: numbe
   for (let w = 1; ; w += 1) {
     if (hashKey(tenantIdForWarehouse(w)) % catalogShardCount === catalogIndex) return w;
   }
+}
+
+/** Which catalog shard governs a given tenant — the SAME formula
+ * ./load-driver.ts's own (deliberately duplicated, per that file's doc
+ * comment) catalogShardIdForTenant uses, which in turn mirrors src/index.ts's
+ * private routing formula: `catalog-${hashKey(tenantId) % catalogShardCount}`.
+ * Duplicated here (a third copy) for the same reason load-driver.ts's is a
+ * second copy rather than an import: this is a separate deployable's test
+ * file, not a shared library. Used below to build the REAL 3rd-arg resolver
+ * TrackingTxExecutor now requires — see correctness.ts's header comment on
+ * why a resolver that always returns null makes verify() check nothing and
+ * report a vacuous lost:0. `catalogShardCount` is always taken from a LIVE
+ * /admin/vbucket-map response (never guessed), so this can't drift from
+ * whatever the test cluster was actually initialized with. */
+function catalogShardIdForTenant(tenantId: string, catalogShardCount: number): string {
+  return `catalog-${hashKey(tenantId) % catalogShardCount}`;
 }
 
 async function setUpStockCluster(numShards: number, totalVBuckets: number): Promise<void> {
@@ -158,6 +174,30 @@ class InProcessTxExecutor implements TxExecutor {
       throw new Error(`POST ${path} -> ${res.status}: ${JSON.stringify(json)}`);
     }
     return json;
+  }
+}
+
+/** In-process analog of ./gateway-client.ts's HttpSqlPointReader (design
+ * round 3, point 2): the SAME admin-scoped /v1/sql primitive gatewayReadBack
+ * now reads through for a PRECISE, primary-key point read-back — just
+ * swapping global `fetch` for `post()` (SELF.fetch), same reasoning as
+ * InProcessTxExecutor above. Uses AUTH() (the admin token), never a tenant
+ * bearer token, matching /v1/sql's real auth requirement (see sqlCore's own
+ * header comment on why the per-tenant SQL path was removed entirely). */
+class InProcessSqlPointReader implements SqlPointReader {
+  async sqlSelect(args: { table: string; tenantId: string; partitionKey: string; sql: string; params: unknown[] }): Promise<{ rows: Record<string, unknown>[] }> {
+    const res = await post(
+      "/v1/sql",
+      { sql: args.sql, params: args.params, table: args.table, tenantId: args.tenantId, partitionKey: args.partitionKey },
+      AUTH(),
+    );
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) {
+      throw new Error(`POST /v1/sql -> ${res.status}: ${JSON.stringify(json)}`);
+    }
+    const rows = (json as { result?: { rows?: Record<string, unknown>[] } })?.result?.rows;
+    return { rows: rows ?? [] };
   }
 }
 
@@ -229,10 +269,21 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
       const vbMapRes = await post("/admin/vbucket-map", {}, AUTH());
       expect(vbMapRes.status).toBe(200);
       const vbMapBody = (await vbMapRes.json()) as {
+        catalogShardCount: number;
         catalogs: Array<{ catalogShardId: string; map: Array<{ vbucket: number; shardId: string }> }>;
       };
       const catalogMap = vbMapBody.catalogs.find((c) => c.catalogShardId === catalogShardId)!.map;
       const ownership: VBucketOwnership[] = catalogMap.map((m) => ({ vbucket: m.vbucket, shardId: m.shardId }));
+
+      // Sanity check: catalogShardIdForTenant's formula (fed the LIVE
+      // catalogShardCount, never guessed) must agree with catalogShardId as
+      // actually resolved above from the gateway's own /v1/sql route decision
+      // (line ~sourceShardId.split). If these ever diverged, the resolver
+      // below would silently resolve every candidate to the WRONG catalog id,
+      // which pickTrackedCandidates would then (correctly) drop as
+      // cross-catalog — this assertion is what would catch that class of bug
+      // here instead of it silently degrading to a vacuous 0-tracked run.
+      expect(catalogShardIdForTenant(tenantId, vbMapBody.catalogShardCount)).toBe(catalogShardId);
 
       const skewed: SkewedKey<number>[] = generateSkewedKeys({
         targetShardId: sourceShardId,
@@ -291,7 +342,16 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
       }
 
       const tracker = new CorrectnessTracker();
-      const tracked = new TrackingTxExecutor(exec, tracker);
+      // Real resolver, not a stub: resolves via the SAME formula/live
+      // catalogShardCount the sanity check above just verified agrees with
+      // this tenant's actual routing — never null in this flow (the vbucket
+      // map is already fetched by this point), so every tracked candidate
+      // resolves to a real catalogShardId. See correctness.ts's header
+      // comment: a resolver that returns null would make trackedWrites()
+      // stay empty and verify() check nothing — the vacuous-pass trap the
+      // assertion right after writeBatch("pre", ...) below exists to catch.
+      const resolveCatalogShardId = (tid: string): string | null => catalogShardIdForTenant(tid, vbMapBody.catalogShardCount);
+      const tracked = new TrackingTxExecutor(exec, tracker, resolveCatalogShardId);
 
       async function writeBatch(phase: string, quantity: number): Promise<void> {
         for (const item of items) {
@@ -342,10 +402,11 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
       await writeBatch("post", 12);
 
       // --- THE PROOF: read every tracked key back through the REAL gateway
-      // (idx_stock_by_item — the same index processOrderLine itself reads),
-      // via CorrectnessTracker.verify(), Shardscope's own loss-detection
-      // core. ---
-      const readBack = pollingReadBack(gatewayReadBack(exec));
+      // via a PRECISE primary-key point SELECT (/v1/sql, admin-scoped — see
+      // InProcessSqlPointReader above and ./correctness.ts's SqlPointReader
+      // doc comment), via CorrectnessTracker.verify(), Shardscope's own
+      // loss-detection core. ---
+      const readBack = pollingReadBack(gatewayReadBack(new InProcessSqlPointReader()));
       const verifyResult = await tracker.verify(readBack);
       const snapshot = tracker.snapshot();
 
@@ -383,6 +444,169 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
         await shardExecute(sourceShardId, `SELECT s_key FROM tpcc_stock WHERE s_key IN (${placeholders})`, items.map((i) => i.partitionKey))
       ).rows;
       expect(sourceLeftovers).toHaveLength(0);
+    },
+    90000,
+  );
+});
+
+// ----------------------------------------------------------------------------
+// ROUND 5 ADDITION — Codex finding #4: notifyClusterChanged() must keep
+// `verified` false for the WHOLE duration of a REAL reshard (not just a
+// simulated epoch bump), returning true only once a fresh verify() pass runs
+// over the post-cutover state. This drives the exact hook load-driver.ts's
+// runTick wires up (see that file's hasActiveMigration/notifyClusterChanged
+// call), just invoked directly here (no LoadDriver DO harness exists in this
+// package) against a REAL /admin/migrate-vbucket cutover — the same
+// distinction this file's header comment draws for the rest of its tests:
+// this proves the OBSERVABLE claim ("not verified across a real reshard"),
+// not just the pure epoch-counter mechanics correctness.test.ts already
+// covers in isolation.
+// ----------------------------------------------------------------------------
+
+describe("Shardscope live-cluster proof: notifyClusterChanged() keeps `verified` false across a REAL reshard, true again only after a fresh post-cutover verify() pass", () => {
+  it(
+    "verified is true before the reshard, goes false the instant migration activity is observed, stays false while the migration is ongoing, and only returns to true after a clean verify() pass over the post-cutover state",
+    async () => {
+      const totalVBuckets = 64;
+      await setUpStockCluster(2, totalVBuckets);
+
+      const warehouseId = warehouseForCatalogShard(0, 4);
+      const tenantId = tenantIdForWarehouse(warehouseId);
+      const authorization = await registerTenant(tenantId);
+      const exec = new InProcessTxExecutor(tenantId, authorization);
+
+      const routeProbe = await post(
+        "/v1/sql",
+        { sql: "SELECT 1 AS one", table: "tpcc_stock", tenantId, partitionKey: stockKey(warehouseId, 1) },
+        AUTH(),
+      );
+      expect(routeProbe.status).toBe(200);
+      const routeProbeBody = (await routeProbe.json()) as { route: { shardId: string } };
+      const sourceShardId = routeProbeBody.route.shardId;
+      const catalogShardId = sourceShardId.split("-shard-")[0];
+      const targetShardId = sourceShardId.endsWith("-shard-0") ? `${catalogShardId}-shard-1` : `${catalogShardId}-shard-0`;
+
+      const vbMapRes = await post("/admin/vbucket-map", {}, AUTH());
+      expect(vbMapRes.status).toBe(200);
+      const vbMapBody = (await vbMapRes.json()) as {
+        catalogShardCount: number;
+        catalogs: Array<{ catalogShardId: string; map: Array<{ vbucket: number; shardId: string }> }>;
+      };
+      const catalogMap = vbMapBody.catalogs.find((c) => c.catalogShardId === catalogShardId)!.map;
+      const ownership: VBucketOwnership[] = catalogMap.map((m) => ({ vbucket: m.vbucket, shardId: m.shardId }));
+      expect(catalogShardIdForTenant(tenantId, vbMapBody.catalogShardCount)).toBe(catalogShardId);
+
+      const skewed: SkewedKey<number>[] = generateSkewedKeys({
+        targetShardId: sourceShardId,
+        vbucketMap: ownership,
+        totalVBuckets,
+        tenantId,
+        table: "tpcc_stock",
+        candidateToKey: (i) => ({ value: i + 1, partitionKey: stockKey(warehouseId, i + 1) }),
+        count: 1500,
+      });
+      expect(skewed.length).toBeGreaterThan(0);
+
+      const byVbucket = new Map<number, SkewedKey<number>[]>();
+      for (const k of skewed) {
+        const arr = byVbucket.get(k.vbucket) ?? [];
+        arr.push(k);
+        byVbucket.set(k.vbucket, arr);
+      }
+      let targetVbucket = -1;
+      let hotKeys: SkewedKey<number>[] = [];
+      for (const [vb, keys] of byVbucket) {
+        if (keys.length > hotKeys.length) {
+          targetVbucket = vb;
+          hotKeys = keys;
+        }
+      }
+      const WRITE_COUNT = 5;
+      expect(hotKeys.length).toBeGreaterThanOrEqual(WRITE_COUNT);
+      const items = hotKeys.slice(0, WRITE_COUNT);
+
+      for (const item of items) {
+        const seedRes = await post(
+          "/v1/mutate",
+          {
+            op: "insert",
+            table: "tpcc_stock",
+            tenantId,
+            partitionKey: item.partitionKey,
+            values: { w_id: warehouseId, i_id: item.value, s_quantity: 100, s_ytd: 0, s_order_cnt: 0, s_remote_cnt: 0, s_data: "seed" },
+            requestId: `seed-verified-${item.partitionKey}-${crypto.randomUUID()}`,
+          },
+          authorization,
+        );
+        expect(seedRes.status).toBe(200);
+      }
+
+      const tracker = new CorrectnessTracker();
+      const resolveCatalogShardId = (tid: string): string | null => catalogShardIdForTenant(tid, vbMapBody.catalogShardCount);
+      const tracked = new TrackingTxExecutor(exec, tracker, resolveCatalogShardId);
+
+      async function writeBatch(phase: string, quantity: number): Promise<void> {
+        for (const item of items) {
+          const result = await tracked.mutate(warehouseId, {
+            op: "update",
+            table: "tpcc_stock",
+            partitionKey: item.partitionKey,
+            values: { s_quantity: quantity, s_ytd: quantity, s_order_cnt: quantity, s_remote_cnt: 0 },
+            requestId: `verified-${phase}-${item.partitionKey}-${crypto.randomUUID()}`,
+          });
+          expect(result.rowsAffected).toBe(1);
+        }
+      }
+
+      await writeBatch("pre", 55);
+      tracker.promoteToTracked(tracker.drainPendingCandidates());
+      expect(tracker.trackedWrites()).toHaveLength(WRITE_COUNT);
+
+      const readBack = pollingReadBack(gatewayReadBack(new InProcessSqlPointReader()));
+
+      // BEFORE the reshard: a clean verify() pass genuinely earns
+      // verified: true.
+      await tracker.verify(readBack);
+      expect(tracker.snapshot().verified).toBe(true);
+      expect(tracker.snapshot().meterState).toBe("green");
+
+      // THE RESHARD starts (a real /admin/migrate-vbucket, same as the main
+      // proof above). Mirrors load-driver.ts's runTick wiring exactly: the
+      // moment migration activity is observed in the live vbucket map, the
+      // invalidation hook is called — verified must go false immediately,
+      // even though NOTHING about the tracked set or its expected values
+      // changed.
+      const migrateRes = await post("/admin/migrate-vbucket", { catalogShardId, vbucket: targetVbucket, targetShardId }, AUTH());
+      expect(migrateRes.status).toBe(200);
+      const migrateBody = (await migrateRes.json()) as { status: string };
+      expect(migrateBody.status).toBe("backfilling");
+      tracker.notifyClusterChanged();
+      expect(tracker.snapshot().verified).toBe(false);
+      expect(tracker.snapshot().lost).toBe(0); // nothing PROVEN lost — just no longer freshly verified
+
+      // Writes DURING the backfill window, mirroring another load-driver
+      // tick that still observes migration activity and re-invalidates
+      // (matches runTick's per-tick call, not a one-shot).
+      await writeBatch("during", 66);
+      tracker.promoteToTracked(tracker.drainPendingCandidates());
+      tracker.notifyClusterChanged();
+      expect(tracker.snapshot().verified).toBe(false);
+
+      // Drive the REAL orchestration to completion.
+      await driveMigrationToCompletion(targetVbucket);
+
+      // Post-cutover, writes routed straight to the new shard.
+      await writeBatch("post", 12);
+      tracker.promoteToTracked(tracker.drainPendingCandidates());
+
+      // No more migration activity is observed post-cutover — the FIRST
+      // fresh verify() pass over the post-reshard state genuinely re-earns
+      // verified: true (never notifyClusterChanged'd again after this).
+      const verifyResult = await tracker.verify(readBack);
+      expect(verifyResult.lostThisPass).toBe(0);
+      expect(tracker.snapshot().lost).toBe(0);
+      expect(tracker.snapshot().meterState).toBe("green");
+      expect(tracker.snapshot().verified).toBe(true);
     },
     90000,
   );
@@ -467,9 +691,18 @@ describe("Shardscope live-cluster proof: a real fault on one shard doesn't touch
       const otherShardId = faultShardId.endsWith("-shard-0") ? `${catalogShardId}-shard-1` : `${catalogShardId}-shard-0`;
 
       const vbMapRes = await post("/admin/vbucket-map", {}, AUTH());
-      const vbMapBody = (await vbMapRes.json()) as { catalogs: Array<{ catalogShardId: string; map: Array<{ vbucket: number; shardId: string }> }> };
+      const vbMapBody = (await vbMapRes.json()) as {
+        catalogShardCount: number;
+        catalogs: Array<{ catalogShardId: string; map: Array<{ vbucket: number; shardId: string }> }>;
+      };
       const catalogMap = vbMapBody.catalogs.find((c) => c.catalogShardId === catalogShardId)!.map;
       const ownership: VBucketOwnership[] = catalogMap.map((m) => ({ vbucket: m.vbucket, shardId: m.shardId }));
+
+      // Sanity check (see the identical check in the reshard-under-load test
+      // above for why this matters): the resolver below MUST resolve to the
+      // same catalogShardId this test already derived from the gateway's own
+      // routing, or the tracked write set would silently end up empty.
+      expect(catalogShardIdForTenant(tenantId, vbMapBody.catalogShardCount)).toBe(catalogShardId);
 
       // One warehouse's stock rows naturally spread across both physical
       // shards by hash — no second tenant needed to get keys on "the other
@@ -515,7 +748,10 @@ describe("Shardscope live-cluster proof: a real fault on one shard doesn't touch
       }
 
       const tracker = new CorrectnessTracker();
-      const tracked = new TrackingTxExecutor(exec, tracker);
+      // Real resolver — see the identical comment in the reshard-under-load
+      // test above; never null here since vbMapBody is already in scope.
+      const resolveCatalogShardId = (tid: string): string | null => catalogShardIdForTenant(tid, vbMapBody.catalogShardCount);
+      const tracked = new TrackingTxExecutor(exec, tracker, resolveCatalogShardId);
 
       // FAULT_INJECTION_ENABLED is off by default cluster-wide (see
       // src/fault-injection.test.ts's header comment) — SELF's worker runs
@@ -563,7 +799,7 @@ describe("Shardscope live-cluster proof: a real fault on one shard doesn't touch
 
       // The concurrent write set to the OTHER shard verifies lost:0 through
       // the real correctness tracker's own gateway read-back.
-      const readBack = pollingReadBack(gatewayReadBack(exec));
+      const readBack = pollingReadBack(gatewayReadBack(new InProcessSqlPointReader()));
       const verifyResult = await tracker.verify(readBack);
       expect(verifyResult.lostThisPass).toBe(0);
       expect(tracker.snapshot().lost).toBe(0);
