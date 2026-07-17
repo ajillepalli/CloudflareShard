@@ -149,6 +149,55 @@ export const MIGRATE_PAGE_SIZE = 500;
 // presence) check meaningful on both sides.
 export const TENANT_SCAN_PAGE_SIZE = 100;
 
+// ---- Demo-only fault injection (Shardscope chaos mode) ----
+// SAFETY: this whole primitive exists to let a demo controller make ONE
+// shard briefly return 503s (simulating a node blip) — see checkFaultInjection
+// below and handleFaultInject's own FAULT_INJECTION_ENABLED check. A hard cap
+// on how long a fault can last, enforced HERE (the last line of defense —
+// even a caller that bypasses the gateway's own clamp, e.g. a raw service
+// binding, still can't get an unbounded fault out of the DO itself). NEVER
+// raise this to allow a "permanent" fault; production must never set
+// FAULT_INJECTION_ENABLED at all (see index.ts's Env.FAULT_INJECTION_ENABLED
+// doc comment).
+//
+// The cap is ABSOLUTE, not per-call: expiry is computed as
+// min(now + clampedMs, firstInjectedAt + FAULT_MAX_MS), so a caller that
+// re-injects in a tight loop can never keep a shard down past
+// firstInjectedAt + FAULT_MAX_MS — see handleFaultInject.
+//
+// While a fault is active the shard is genuinely inert: not only does fetch()
+// return 503, but alarm() ALSO skips all background work (stale-intent sweep,
+// index/mirror job delivery) — see alarm(). A blipped node does no writes to
+// itself or any other shard.
+//
+// Known interactions (BY DESIGN, not bugs, and NOT introduced by this
+// primitive — they are the cluster's real recovery paths for a node that
+// genuinely vanishes for a few seconds):
+//   - Blipping a shard mid-2PC can leave prepared intents on it until the
+//     stale-pending-intent sweep (sweepStalePendingIntents, PENDING_INTENT_TTL_MS)
+//     reclaims them — exactly what would happen if the DO had crashed mid-commit.
+//   - Blipping a shard mid-reshard can PARK a topology operation (its catalog
+//     heartbeat can't reach the shard) until the lock's lease TTL expires or an
+//     operator force-releases it (/admin/force-release-topology-lock).
+// These are the system tolerating a vanished node, not damage this primitive
+// causes; it never itself mutates 2PC/migration state.
+export const FAULT_MAX_MS = 30000;
+
+/** In-memory only — deliberately not persisted to DO storage. This means an
+ * isolate eviction/restart ends an in-progress fault early, which is
+ * fail-safe (the shard becomes reachable again, never the reverse) and, more
+ * importantly, guarantees the fault marker itself never touches `this.sql` —
+ * so injecting/clearing a fault can never be the thing that corrupts stored
+ * rows, indexes, or migration state (safety requirement: non-destructive).
+ *
+ * `firstInjectedAt` anchors the ABSOLUTE outage cap: it is set once when a
+ * fault window opens (no active fault present) and preserved across
+ * re-injections within that window, so expiry can never be pushed past
+ * firstInjectedAt + FAULT_MAX_MS no matter how often /fault-inject is called.
+ * Clearing the fault (expiry or /fault-clear) nulls the whole marker, so a
+ * later, separate fault starts a fresh window from a fresh firstInjectedAt. */
+type FaultMarker = { mode: "unreachable"; expiresAt: number; firstInjectedAt: number };
+
 /** Escapes a SQL identifier's inner double-quotes for interpolation inside a
  * quoted identifier (`"..."`). Callers still wrap the result in quotes. Shared
  * by every place that builds a dynamic table/column reference (review Tier 3
@@ -180,11 +229,17 @@ export class ShardDO extends DurableObject {
    * fresh instance (new isolate) re-runs it on its first request, and
    * nothing ever drops these tables mid-lifetime. */
   private schemaEnsured = false;
+  /** Demo-only fault-injection marker — see FaultMarker's doc comment above
+   * for why this is deliberately in-memory rather than persisted. */
+  private fault: FaultMarker | null = null;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.shardEnv = env;
+    // NOTE: /fault-inject and /fault-clear are intentionally NOT in this map —
+    // handle() short-circuits them BEFORE the map lookup (and before
+    // ensureSchema) so they touch zero this.sql; see handle().
     this.routes = {
       "/stats": this.handleStats.bind(this),
       "/execute": this.handleExecute.bind(this),
@@ -225,6 +280,21 @@ export class ShardDO extends DurableObject {
   }
 
   async alarm(): Promise<void> {
+    // SAFETY (fault injection, demo-only): a faulted shard is a "vanished
+    // node" — it must do NO background work while unreachable. The fetch()
+    // path already 503s, but alarm() fires independently and would otherwise
+    // keep running sweepStalePendingIntents / processIndexPendingJobs /
+    // processMirrorPendingJobs, committing 2PC decisions and writing to OTHER
+    // shards mid-outage. Gate it here too: while a fault is active, skip all
+    // work and just re-arm the alarm for just after expiry so normal
+    // processing resumes then. Nothing is dropped — the queued work is
+    // deferred, exactly as a real blipped node's would be. activeFaultExpiry()
+    // is a pure read (no this.sql), so a faulted alarm tick touches zero SQL.
+    const faultExpiry = this.activeFaultExpiry();
+    if (faultExpiry !== null) {
+      await this.ctx.storage.setAlarm(faultExpiry + 1);
+      return;
+    }
     this.ensureSchema();
     const cutoff = new Date(Date.now() - APPLIED_REQUESTS_TTL_MS).toISOString();
     this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
@@ -1496,18 +1566,130 @@ export class ShardDO extends DurableObject {
   }
 
   private async handle(request: Request): Promise<Response> {
-    this.ensureSchema();
-
     const url = new URL(request.url);
+
     if (request.method.toUpperCase() !== "POST") {
       return json({ error: "Only POST allowed for shard endpoints." }, 405);
     }
+
+    // SAFETY (fault injection, demo-only): the two control routes are handled
+    // FIRST and short-circuit BEFORE ensureSchema() and before the fault gate.
+    // They set/clear an in-memory marker only and deliberately execute ZERO
+    // this.sql statements — so injecting or clearing a fault can never write,
+    // migrate, or materialize any stored state (safety: non-destructive).
+    // They also bypass the fault gate so the fault's own control plane stays
+    // reachable while a fault is active (an operator can always clear early;
+    // the fault never blocks the mechanism that ends it). These routes are
+    // DO-binding-only + gateway-authed — reachable exclusively via this
+    // Worker's own SHARD binding from the FAULT_INJECTION_ENABLED-gated,
+    // requireAdminAuthFromHeader-gated /admin/fault-* handlers in index.ts —
+    // the same trust model every other internal shard route relies on (no
+    // per-route re-auth; the internal binding is the boundary).
+    if (url.pathname === "/fault-inject") return this.handleFaultInject(request);
+    if (url.pathname === "/fault-clear") return this.handleFaultClear();
+
+    // Every OTHER route: reject with 503 while a fault is active, checked
+    // before ensureSchema() and before any handler runs, so there is no code
+    // path where a fault check happens after state has already been touched.
+    // Read-only routes like /stats are denied too — a blipped node answers
+    // nothing. See checkFaultInjection for the no-op-when-disabled behavior.
+    const faultResponse = this.checkFaultInjection();
+    if (faultResponse) return faultResponse;
+
+    this.ensureSchema();
 
     const handler = this.routes[url.pathname];
     if (handler) {
       return handler(request);
     }
     return json({ error: `Unknown shard route: ${url.pathname}` }, 404);
+  }
+
+  /** The active fault's expiry timestamp if a fault is CURRENTLY in effect
+   * (flag exactly "true", marker present, not past expiry), else null. Pure
+   * read — never mutates, executes no this.sql — so it is safe to call from
+   * both fetch() dispatch and alarm(). A normal production deployment (which
+   * never sets FAULT_INJECTION_ENABLED) always gets null here regardless of
+   * what `this.fault` holds, so it has zero fault surface. */
+  private activeFaultExpiry(): number | null {
+    if (this.shardEnv.FAULT_INJECTION_ENABLED !== "true") return null;
+    if (!this.fault) return null;
+    if (Date.now() >= this.fault.expiresAt) return null;
+    return this.fault.expiresAt;
+  }
+
+  /** Returns a 503 Response if a fault is currently active, else null (the
+   * request proceeds normally). Self-heals: a now-expired marker is cleared
+   * (in-memory only, no sql writes) the first time it's observed past its
+   * expiry, so "once expired, resumes normal operation with no further
+   * action" holds even if /fault-clear is never called — and clearing the
+   * marker also resets firstInjectedAt so a later, separate fault opens a
+   * fresh window. */
+  private checkFaultInjection(): Response | null {
+    const expiry = this.activeFaultExpiry();
+    if (expiry === null) {
+      // Only reached when disabled, no marker, or the marker has expired.
+      // Proactively drop a genuinely-expired marker (guarded on real expiry so
+      // we never clear an as-yet-unexpired one when merely disabled).
+      if (this.fault && Date.now() >= this.fault.expiresAt) this.fault = null;
+      return null;
+    }
+    return json(
+      { error: "fault-injected: shard temporarily unreachable", faultExpiresAt: expiry },
+      503,
+    );
+  }
+
+  /** Sets (or refreshes) the active fault. Internal-only route — reachable
+   * exclusively via the SHARD Durable Object binding from this same Worker's
+   * gateway handlers (src/index.ts's /admin/fault-inject), which gate on
+   * FAULT_INJECTION_ENABLED and requireAdminAuthFromHeader before ever
+   * calling here. This method re-checks FAULT_INJECTION_ENABLED anyway
+   * (defense-in-depth, same idiom as the rest of this codebase's admin
+   * surface) so no caller — gateway, RPC, or a future one that forgets the
+   * gate — can ever get a fault set on a ShardDO while the flag is off.
+   *
+   * The outage cap is ABSOLUTE, not per-call: firstInjectedAt is anchored the
+   * first time a window opens (no active fault present) and preserved across
+   * re-injections, and expiry is min(now + clampedMs, firstInjectedAt +
+   * FAULT_MAX_MS). So this is the one and only place a fault's expiry is
+   * computed, and no sequence of calls — however tight the loop — can keep a
+   * shard down past firstInjectedAt + FAULT_MAX_MS or produce a permanent
+   * fault. Touches zero this.sql (marker is in-memory). */
+  private async handleFaultInject(request: Request): Promise<Response> {
+    if (this.shardEnv.FAULT_INJECTION_ENABLED !== "true") {
+      return json({ error: "Fault injection is disabled (FAULT_INJECTION_ENABLED is not \"true\")." }, 403);
+    }
+    const body = (await request.json().catch(() => ({}))) as { mode?: string; durationMs?: number };
+    const mode = body.mode ?? "unreachable";
+    if (mode !== "unreachable") {
+      return json({ error: `Unsupported fault mode: ${mode}` }, 400);
+    }
+    const requestedMs =
+      typeof body.durationMs === "number" && Number.isFinite(body.durationMs) && body.durationMs > 0
+        ? body.durationMs
+        : FAULT_MAX_MS;
+    const clampedMs = Math.min(requestedMs, FAULT_MAX_MS);
+    const now = Date.now();
+    // A fault window is already open only if there's a marker that hasn't
+    // expired yet (activeFaultExpiry applies the flag/expiry checks). If so,
+    // KEEP its original firstInjectedAt so the absolute deadline can't be
+    // pushed out; otherwise this opens a fresh window anchored at now.
+    const windowOpen = this.activeFaultExpiry() !== null;
+    const firstInjectedAt = windowOpen ? this.fault!.firstInjectedAt : now;
+    const absoluteDeadline = firstInjectedAt + FAULT_MAX_MS;
+    const expiresAt = Math.min(now + clampedMs, absoluteDeadline);
+    this.fault = { mode: "unreachable", expiresAt, firstInjectedAt };
+    return json({ ok: true, mode: "unreachable", faultExpiresAt: expiresAt });
+  }
+
+  /** Clears any active fault (and its firstInjectedAt anchor). Always succeeds
+   * (idempotent) regardless of FAULT_INJECTION_ENABLED — clearing can only
+   * ever reduce fault surface, never create it, so there is no safety reason
+   * to gate this one. Touches zero this.sql (marker is in-memory). */
+  private async handleFaultClear(): Promise<Response> {
+    this.fault = null;
+    return json({ ok: true });
   }
 
   private async handleStats(): Promise<Response> {

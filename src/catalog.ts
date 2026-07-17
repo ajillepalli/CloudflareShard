@@ -1769,8 +1769,30 @@ export class CatalogDO extends DurableObject {
     if (!config) {
       return json({ error: "Cluster not initialized. Call /admin/init first." }, 400);
     }
-    const rows = this.many<{ vbucket: number; shard_id: string }>("SELECT vbucket, shard_id FROM vbucket_map ORDER BY vbucket ASC");
-    return json({ totalVBuckets: config.total_vbuckets, map: rows.map((r) => ({ vbucket: r.vbucket, shardId: r.shard_id })) });
+    // Shardscope T1: migration_status/target_shard_id/cutover_started_at are
+    // additive fields (existing consumers — /admin/backfill-provenance,
+    // /admin/set-row-owner — only ever read vbucket/shardId, so those two
+    // stay byte-identical) that let a dashboard render in-flight vbucket
+    // migrations, not just the steady-state map.
+    const rows = this.many<{
+      vbucket: number;
+      shard_id: string;
+      migration_status: string;
+      target_shard_id: string | null;
+      cutover_started_at: string | null;
+    }>(
+      "SELECT vbucket, shard_id, migration_status, target_shard_id, cutover_started_at FROM vbucket_map ORDER BY vbucket ASC",
+    );
+    return json({
+      totalVBuckets: config.total_vbuckets,
+      map: rows.map((r) => ({
+        vbucket: r.vbucket,
+        shardId: r.shard_id,
+        migrationStatus: r.migration_status,
+        targetShardId: r.target_shard_id,
+        cutoverStartedAt: r.cutover_started_at,
+      })),
+    });
   }
 
   private async handleStatus(): Promise<Response> {
