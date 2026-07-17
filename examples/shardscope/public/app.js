@@ -1353,11 +1353,24 @@ function handleChaosAttackClick(evt) {
     })
     .catch((err) => {
       // Covers both "the attack couldn't even fire" (a ChaosPreconditionError
-      // 400 — e.g. no skew load running to derive a hot shard from) and a
-      // topology-lock-busy 409 from a reused ../src/reshard.ts wrapper
+      // 400 — e.g. no skew load running to derive a hot shard from, OR a
+      // concurrent write moving the row mid-attack for double-submit /
+      // mismatched-replay — see ../src/chaos.ts's classifyDoubleSubmit /
+      // classifyMismatchedReplay "pre-PR review Fix 3" concurrent-move guard)
+      // and a topology-lock-busy 409 from a reused ../src/reshard.ts wrapper
       // (drain/split/migrate/abort attacks all route through it) — both
       // already unwrap to a plain, calm message via reshardFetch above, same
-      // as every Reshard console form's own error handling.
+      // as every Reshard console form's own error handling. This is the ONLY
+      // rendering path an inconclusive (concurrent-move) result takes — it
+      // never reaches renderChaosOutcome/the ✓/✗ verdict badge below, so it
+      // can never paint as a fabricated "✗ broke".
+      //
+      // Also hide any STALE result from a previous, different fire: a
+      // precondition/inconclusive message must never sit next to a leftover
+      // ✓/✗ verdict badge from an earlier attack, which would read as a
+      // "broke" verdict for THIS fire even though this fire produced no
+      // outcome at all.
+      if (el.chaosResult) el.chaosResult.hidden = true;
       setChaosError((err && err.message) || `${attack} failed`);
       logLine(`${attack}: could not fire — ${(err && err.message) || err}`, "warn");
     })

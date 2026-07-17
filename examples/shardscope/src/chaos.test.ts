@@ -148,15 +148,15 @@ describe("chaos.ts — classifyMismatchedReplay", () => {
     expect(outcome.note).toMatch(/different 409/);
   });
 
-  it("survived=false when correctly rejected but the row shows unexpected drift (partial application)", () => {
-    const outcome = classifyMismatchedReplay({
-      ...base,
-      secondStatus: 409,
-      secondErrorMessage: "requestId was already used with different sql/params — refusing to replay a mismatched result.",
-      finalQty: 43, // doesn't match the first-write-only expectation
-    });
-    expect(outcome.survived).toBe(false);
-    expect(outcome.note).toMatch(/doesn't match the first write's expected effect/);
+  it("throws ChaosPreconditionError (inconclusive, never survived=false) when correctly rejected but the row shows drift a concurrent write could explain (pre-PR review Fix 3): the src/shard.ts contract guarantees a REJECTED replay never touches the row, so any value other than the expected single-effect result or the untouched original can only be a concurrent write from the skew load, not a partial-application bug", () => {
+    expect(() =>
+      classifyMismatchedReplay({
+        ...base,
+        secondStatus: 409,
+        secondErrorMessage: "requestId was already used with different sql/params — refusing to replay a mismatched result.",
+        finalQty: 43, // neither original(50) nor expected(49) — a third party moved the row
+      }),
+    ).toThrow(ChaosPreconditionError);
   });
 
   it("never classifies a correct rejection as a loss — the exact NOT-a-loss requirement", () => {
@@ -171,6 +171,137 @@ describe("chaos.ts — classifyMismatchedReplay", () => {
     // with (that's ./load/correctness.ts's job, deliberately not
     // duplicated here).
     expect(outcome.survived).toBe(true);
+  });
+});
+
+// ============================================================================
+// pre-PR review Fix 3 — the chaos-under-load false-NEGATIVE regression suite.
+//
+// Both double-submit and mismatched-replay fire WHILE the skew load driver
+// is hammering the same hot row, so a concurrent write can move s_quantity
+// between the attack's read and its paired CAS calls. Before this fix, that
+// showed up as an "unexpected delta"/"drift" bucket that still returned
+// `survived: false` — a fabricated ✗ broke for an attack that actually
+// worked fine; only a THIRD party moved the row underneath it. After this
+// fix, that specific "row moved out from under us" shape throws
+// ChaosPreconditionError (the same calm "can't judge this cleanly right
+// now" path every other precondition in this file uses — src/index.ts's
+// runChaosOp turns it into a calm 400, and public/app.js renders it via
+// setChaosError, never the red ✗ styling).
+//
+// Genuine bugs must still classify as broke: double-submit's delta===2 (a
+// real double-write) and mismatched-replay's silent-accept (a real
+// idempotency-hash bypass) are UNAFFECTED by this fix — see the two
+// "still broke" cases below.
+// ============================================================================
+
+describe("chaos.ts — pre-PR review Fix 3: chaos-under-load concurrent-move is INCONCLUSIVE, never a fake ✗", () => {
+  it("double-submit: a concurrent write moving the row (original=50, final=47, delta=3 — not 0/1/2) throws ChaosPreconditionError, not survived=false", () => {
+    expect(() =>
+      classifyDoubleSubmit({
+        tenantId: "tpcc-w0001",
+        partitionKey: "s-0001-000001",
+        requestId: "req-concurrent-move",
+        originalQty: 50,
+        callAStatus: 409, // both CAS guards failed — the row wasn't at `original` anymore
+        callARowsAffected: 0,
+        callBStatus: 409,
+        callBRowsAffected: 0,
+        finalQty: 47,
+      }),
+    ).toThrow(ChaosPreconditionError);
+  });
+
+  it("double-submit: the inconclusive error message explains the concurrent-move + retry guidance", () => {
+    try {
+      classifyDoubleSubmit({
+        tenantId: "tpcc-w0001",
+        partitionKey: "s-0001-000001",
+        requestId: "req-concurrent-move",
+        originalQty: 50,
+        callAStatus: 409,
+        callARowsAffected: 0,
+        callBStatus: 409,
+        callBRowsAffected: 0,
+        finalQty: 47,
+      });
+      throw new Error("expected classifyDoubleSubmit to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ChaosPreconditionError);
+      expect((err as Error).message).toMatch(/inconclusive/i);
+      expect((err as Error).message).toMatch(/concurrent write/i);
+      expect((err as Error).message).toMatch(/retry/i);
+    }
+  });
+
+  it("double-submit: delta===2 (a REAL double-write) still classifies survived=false — genuinely broke, not masked by the concurrent-move guard", () => {
+    const outcome = classifyDoubleSubmit({
+      tenantId: "tpcc-w0001",
+      partitionKey: "s-0001-000001",
+      requestId: "req-real-double-write",
+      originalQty: 50,
+      callAStatus: 200,
+      callARowsAffected: 1,
+      callBStatus: 200,
+      callBRowsAffected: 1,
+      finalQty: 48, // decremented twice — a genuine double-write
+    });
+    expect(outcome.survived).toBe(false);
+    expect(outcome.note).toMatch(/BOTH submissions applied/);
+  });
+
+  it("mismatched-replay: a concurrent write moving the row after a CORRECT rejection (original=50, final=47 — neither 49 nor 50) throws ChaosPreconditionError, not survived=false", () => {
+    expect(() =>
+      classifyMismatchedReplay({
+        tenantId: "tpcc-w0001",
+        partitionKey: "s-0001-000001",
+        requestId: "req-concurrent-move-replay",
+        originalQty: 50,
+        firstStatus: 200,
+        firstRowsAffected: 1,
+        secondStatus: 409,
+        secondErrorMessage: "requestId was already used with different sql/params — refusing to replay a mismatched result.",
+        finalQty: 47,
+      }),
+    ).toThrow(ChaosPreconditionError);
+  });
+
+  it("mismatched-replay: the inconclusive error message explains the concurrent-move + retry guidance", () => {
+    try {
+      classifyMismatchedReplay({
+        tenantId: "tpcc-w0001",
+        partitionKey: "s-0001-000001",
+        requestId: "req-concurrent-move-replay",
+        originalQty: 50,
+        firstStatus: 200,
+        firstRowsAffected: 1,
+        secondStatus: 409,
+        secondErrorMessage: "requestId was already used with different sql/params — refusing to replay a mismatched result.",
+        finalQty: 47,
+      });
+      throw new Error("expected classifyMismatchedReplay to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ChaosPreconditionError);
+      expect((err as Error).message).toMatch(/inconclusive/i);
+      expect((err as Error).message).toMatch(/concurrent write/i);
+      expect((err as Error).message).toMatch(/retry/i);
+    }
+  });
+
+  it("mismatched-replay: a SILENTLY ACCEPTED replay (a real idempotency-hash bypass) still classifies survived=false — genuinely broke, not masked by the concurrent-move guard", () => {
+    const outcome = classifyMismatchedReplay({
+      tenantId: "tpcc-w0001",
+      partitionKey: "s-0001-000001",
+      requestId: "req-real-bug",
+      originalQty: 50,
+      firstStatus: 200,
+      firstRowsAffected: 1,
+      secondStatus: 200, // accepted instead of rejected
+      secondErrorMessage: null,
+      finalQty: 43, // the mismatched second write actually applied
+    });
+    expect(outcome.survived).toBe(false);
+    expect(outcome.note).toMatch(/ACCEPTED instead of rejected/);
   });
 });
 
@@ -463,8 +594,13 @@ describe("chaos.ts — runBlipShardOfflineAttack surfaces a 403 as a calm precon
       );
     });
     const env = fakeEnv(adminFaultInject);
-    await expect(runBlipShardOfflineAttack(env, {})).rejects.toThrow(ChaosPreconditionError);
-    await expect(runBlipShardOfflineAttack(env, {})).rejects.toThrow(/FAULT_INJECTION_ENABLED/);
+    // durationMs is now a required field on BlipShardOfflineInput (pre-PR
+    // review Fix 3 P3 cleanup — the real route always supplies it via
+    // parseBlipShardOfflineInput's clampBlipDurationMs; a direct caller like
+    // this test must supply its own valid value instead of relying on a dead
+    // `?? DEFAULT` fallback inside runBlipShardOfflineAttack).
+    await expect(runBlipShardOfflineAttack(env, { durationMs: 9000 })).rejects.toThrow(ChaosPreconditionError);
+    await expect(runBlipShardOfflineAttack(env, { durationMs: 9000 })).rejects.toThrow(/FAULT_INJECTION_ENABLED/);
   });
 
   it("an unrelated rejection (e.g. a 500) propagates UNCHANGED — not swallowed into a fabricated ChaosPreconditionError", async () => {
@@ -472,8 +608,8 @@ describe("chaos.ts — runBlipShardOfflineAttack surfaces a 403 as a calm precon
       throw new Error("CloudflareShard RPC error 500: {\"error\":\"internal\"}");
     });
     const env = fakeEnv(adminFaultInject);
-    await expect(runBlipShardOfflineAttack(env, {})).rejects.not.toThrow(ChaosPreconditionError);
-    await expect(runBlipShardOfflineAttack(env, {})).rejects.toThrow(/CloudflareShard RPC error 500/);
+    await expect(runBlipShardOfflineAttack(env, { durationMs: 9000 })).rejects.not.toThrow(ChaosPreconditionError);
+    await expect(runBlipShardOfflineAttack(env, { durationMs: 9000 })).rejects.toThrow(/CloudflareShard RPC error 500/);
   });
 
   it("a successful fire calls adminFaultInject with the resolved target and a duration under the core's 30s cap", async () => {
@@ -485,7 +621,7 @@ describe("chaos.ts — runBlipShardOfflineAttack surfaces a 403 as a calm precon
       }),
     );
     const env = fakeEnv(adminFaultInject);
-    const outcome = await runBlipShardOfflineAttack(env, {});
+    const outcome = await runBlipShardOfflineAttack(env, { durationMs: 9000 });
     expect(adminFaultInject).toHaveBeenCalledWith(
       "test-admin-token",
       expect.objectContaining({ shardId: "shard-1", catalogShardId: "catalog-0", mode: "unreachable" }),

@@ -210,9 +210,32 @@ export interface DoubleSubmitRawResult {
  * demo's ✓/✗: exactly one decrement must have landed (delta === 1), not zero,
  * not two — see this file's header comment for why the response bodies alone
  * (both look like plain success at the /v1/mutate wire format) can't answer
- * this; only the row's actual before/after value can. */
+ * this; only the row's actual before/after value can.
+ *
+ * CONCURRENT-MOVE GUARD (pre-PR review Fix 3): chaos attacks fire WHILE the
+ * skew load driver is hammering the same hot row, so a concurrent write can
+ * change s_quantity between this attack's read and its two paired CAS calls
+ * (`where: {s_quantity: original}`) — both calls' CAS then fail for a reason
+ * that has NOTHING to do with idempotency, and the row settles at some value
+ * this attack can't attribute to itself. delta 0/1/2 are the only outcomes
+ * this attack's own two calls can produce against the ORIGINAL value (zero
+ * landed, exactly one landed, both landed); any other delta means a THIRD
+ * party moved the row mid-attack. Rendering that as "✗ broke" would be a
+ * fabricated finding — this is a genuine false-NEGATIVE, not the false-GREEN
+ * a real double-write (delta===2) still correctly triggers below. Thrown
+ * (not returned as survived:false) the same way every other "can't judge
+ * this attack right now" precondition in this file works (e.g.
+ * pickHotShardTarget) — src/index.ts's runChaosOp turns a
+ * ChaosPreconditionError into a calm 400, never a fake ✗. */
 export function classifyDoubleSubmit(r: DoubleSubmitRawResult): ChaosOutcome {
   const delta = r.finalQty === null ? null : r.originalQty - r.finalQty;
+
+  if (delta !== null && delta !== 0 && delta !== 1 && delta !== 2) {
+    throw new ChaosPreconditionError(
+      `double-submit inconclusive: a concurrent write moved this row during the attack (s_quantity ${r.originalQty} -> ${r.finalQty}, delta ${delta} — not the 0/1/2 this attack's own two calls can produce) — retry, ideally with load paused or on a cold warehouse/item.`,
+    );
+  }
+
   const bothLookAppliedIndividually = r.callAStatus < 300 && r.callBStatus < 300 && r.callARowsAffected === 1 && r.callBRowsAffected === 1;
   const survived = delta === 1;
 
@@ -260,10 +283,35 @@ export interface MismatchedReplayRawResult {
  * comment), not just any 409 (a lock/fence 409 would be a DIFFERENT failure
  * mode, not proof of correct mismatch handling), and (2) the row's final
  * value shows ONLY the first write's effect — a rejection that still let
- * some partial write through would be worse than no protection at all. */
+ * some partial write through would be worse than no protection at all.
+ *
+ * Throws ChaosPreconditionError (never returns survived:false) when a
+ * concurrent write moved the row mid-attack and the correct-rejection signal
+ * alone can't be attributed a clean row value — see the CONCURRENT-MOVE
+ * GUARD comment inside this function (pre-PR review Fix 3). */
 export function classifyMismatchedReplay(r: MismatchedReplayRawResult): ChaosOutcome {
   const rejectedCorrectly = r.secondStatus === 409 && !!r.secondErrorMessage && r.secondErrorMessage.includes(MISMATCH_REJECTION_SUBSTRING);
   const expectedFinalQty = r.originalQty - 1; // only the FIRST write should ever have applied
+
+  // CONCURRENT-MOVE GUARD (pre-PR review Fix 3): same reasoning as
+  // classifyDoubleSubmit's own guard above — the skew load driver can move
+  // this row between this attack's read and its two calls. The 409
+  // rejection itself (rejectedCorrectly) is judged purely off the gateway's
+  // HTTP response and is NOT affected by a concurrent write, so it's still a
+  // trustworthy signal on its own; only the ROW-VALUE half of `survived`
+  // needs the guard. If the replay was correctly rejected but the row
+  // settled somewhere OTHER than the expected single-effect result
+  // (originalQty - 1) or the untouched original (originalQty), a third
+  // party moved the row mid-attack — inconclusive, never a fabricated ✗.
+  // (An INCORRECTLY-rejected or silently-ACCEPTED replay is always a real
+  // finding regardless of what concurrent load did to the row, so this guard
+  // only applies when rejectedCorrectly is already true.)
+  if (rejectedCorrectly && r.finalQty !== expectedFinalQty && r.finalQty !== r.originalQty) {
+    throw new ChaosPreconditionError(
+      `mismatched-replay inconclusive: the replay WAS correctly rejected (409, the expected src/shard.ts contract), but a concurrent write moved this row during the attack (s_quantity ${r.originalQty} -> ${r.finalQty}, expected ${expectedFinalQty}) — retry, ideally with load paused or on a cold warehouse/item.`,
+    );
+  }
+
   const rowUnchangedByReplay = r.finalQty === expectedFinalQty;
   const survived = rejectedCorrectly && rowUnchangedByReplay;
 
@@ -883,7 +931,15 @@ function clampBlipDurationMs(value: unknown): number {
 }
 
 export interface BlipShardOfflineInput extends HotShardOverride {
-  durationMs?: number;
+  /** Required, not optional (pre-PR review Fix 3 P3 cleanup): the only
+   * production caller (src/index.ts's /api/chaos/blip-shard-offline route)
+   * always builds this via parseBlipShardOfflineInput below, whose
+   * clampBlipDurationMs already coerces ANY input (including omitted) into a
+   * valid positive integer — so a `?? DEFAULT` fallback at the call site
+   * would be dead code. Direct callers (e.g. chaos.test.ts) must supply
+   * their own valid value; the type system enforces it instead of a silent
+   * runtime default. */
+  durationMs: number;
 }
 
 export function parseBlipShardOfflineInput(body: unknown): BlipShardOfflineInput {
@@ -1008,7 +1064,7 @@ export function classifyBlipShardOfflineFire(r: BlipShardOfflineRawResult): Chao
 export async function runBlipShardOfflineAttack(env: Env, input: BlipShardOfflineInput): Promise<ChaosOutcome> {
   const [loadStatus, vbucketMap] = await Promise.all([fetchLoadStatus(env), fetchVbucketMap(env)]);
   const target = pickBlipShardTarget(vbucketMap, input);
-  const durationMs = input.durationMs ?? DEFAULT_BLIP_DURATION_MS;
+  const durationMs = input.durationMs;
 
   let injectResult: { ok?: boolean; mode?: string; faultExpiresAt?: number };
   try {
