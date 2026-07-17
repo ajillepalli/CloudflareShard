@@ -632,8 +632,11 @@ call — lives in [`examples/rpc-consumer/`](examples/rpc-consumer/).
   limitation unaffected: it doesn't fix or worsen it (see §14).
 - `/v1/table-scan` supports only `table + tenantId + cursor + limit` — no arbitrary
   column filtering (a future increment can add a structured equality-filter map if real
-  usage demands it), and no per-tenant rate limiting on the fan-out yet (the
-  catalog-shard-scoped pool is the v1 blast-radius control).
+  usage demands it). A per-tenant token bucket (`TABLE_SCAN_RATE_LIMIT_CAPACITY`/
+  `TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND` in `src/catalog.ts`) now bounds how fast one
+  tenant can drive the fan-out, on top of the catalog-shard-scoped pool's existing
+  blast-radius containment — exceeding it returns 429 `RATE_LIMITED` with a
+  `retryAfterMs` hint.
 - `/v1/table-scan` may return the same row twice during an active migration window, for
   the same reason `/v1/scatter` can: a migrating vbucket's rows exist on both source and
   target until cutover completes. It never *loses* a row for this reason.
