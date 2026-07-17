@@ -174,3 +174,10 @@ npm run build        # emits dist/
 # in the repo root: npm run dev
 node scripts/verify-live.mjs
 ```
+
+`verify-live.mjs` calls `/admin/init` with `force: true`, which resets
+cluster topology -- **destructive** against a deployment with real data. It
+only runs against `localhost`/`127.0.0.1` by default; pointing
+`CLOUDFLARESHARD_URL` at anything else requires setting
+`I_UNDERSTAND_THIS_WILL_RESET_CLUSTER_TOPOLOGY=true` explicitly. Never run
+it against a live/production deployment.

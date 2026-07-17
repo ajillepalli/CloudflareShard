@@ -13,6 +13,25 @@ if (!ADMIN_TOKEN) {
   process.exit(1);
 }
 
+// Codex review (P1): this script calls /admin/init with force: true, which
+// resets cluster metadata and the shard/vbucket map -- destructive against
+// any deployment with real data. Pointing CLOUDFLARESHARD_URL at a live
+// Worker (the same env var name/pattern used for both local dev and real
+// deployments) and running this "verification" script would wipe it. Only
+// run the destructive init step against localhost by default; a non-local
+// target needs an explicit, unambiguous opt-in.
+const targetHost = new URL(BASE_URL).hostname;
+const isLocalTarget = targetHost === "127.0.0.1" || targetHost === "localhost" || targetHost === "::1";
+if (!isLocalTarget && process.env.I_UNDERSTAND_THIS_WILL_RESET_CLUSTER_TOPOLOGY !== "true") {
+  console.error(
+    `Refusing to run against non-local target ${BASE_URL}: this script calls /admin/init with force: true, ` +
+      "which resets cluster topology and would destroy real data on a live deployment.\n" +
+      "If you really intend to run this against a disposable/test deployment, set " +
+      "I_UNDERSTAND_THIS_WILL_RESET_CLUSTER_TOPOLOGY=true and re-run.",
+  );
+  process.exit(1);
+}
+
 const admin = new CloudflareShardAdminClient({ baseUrl: BASE_URL, token: ADMIN_TOKEN });
 
 function step(name, fn) {
