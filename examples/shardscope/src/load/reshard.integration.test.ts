@@ -39,12 +39,14 @@
  * migration-test pattern itself does, e.g. driving CatalogDO's alarm via
  * driveMigrationToCompletion).
  */
-import { env, reset } from "cloudflare:test";
+import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { hashKey } from "../../../../src/hash";
+import type { CatalogDO } from "../../../../src/catalog";
 import {
   AUTH,
   createIndexTestTable,
+  driveIndexBackfillToCompletion,
   driveMigrationToCompletion,
   post,
   registerTenant,
@@ -127,6 +129,14 @@ async function setUpStockCluster(numShards: number, totalVBuckets: number): Prom
     AUTH(),
   );
   expect(indexRes.status).toBe(200);
+  // create-index's backfill is alarm-driven and holds the cluster-wide
+  // topology lock (held on catalog-0) until it finishes — see
+  // ../../../../src/index.test-helpers's driveIndexBackfillToCompletion and
+  // main's PR #20 (synchronous backfill → alarm-driven background job). Drain
+  // it to completion here so the /admin/migrate-vbucket reshard below can
+  // acquire that same lock instead of racing the backfill and getting a 409
+  // TOPOLOGY_OPERATION_IN_PROGRESS.
+  await driveIndexBackfillToCompletion(STOCK_INDEX_NAME);
 }
 
 /** In-process analog of ./gateway-client.ts's HttpTxExecutor: the SAME
@@ -225,6 +235,66 @@ function pollingReadBack(inner: ReadBackFn): ReadBackFn {
     }
     return result;
   };
+}
+
+/** Ticks catalog-0's alarm-driven migration orchestration ONE step — the
+ * exact same primitive ../../../../src/index.test-helpers's
+ * driveMigrationToCompletion loops on internally, exposed here standalone so
+ * mutateThroughFence (below) can force one step of REAL progress on demand.
+ * Safe to race with catalog-0's own REAL background alarm (main's PR #20
+ * made backfill/cutover alarm-driven against actual wall-clock time,
+ * MIGRATION_TICK_MS = 250ms in src/catalog.ts): catalog.ts's alarm() opens
+ * with a `migrationTickInFlight` reentrancy guard, so a concurrent
+ * invocation either advances the SAME tick or is a safe, idempotent no-op
+ * that just re-arms the alarm — never interleaves. */
+async function tickMigrationOrchestration(): Promise<void> {
+  const catalogStub = env.CATALOG.get(env.CATALOG.idFromName("catalog-0"));
+  await runInDurableObject(catalogStub, async (instance: CatalogDO) => {
+    await instance.alarm();
+  });
+}
+
+/** Wraps a tracked.mutate() call with the SAME bounded-retry idiom
+ * pollingReadBack/driveMigrationToCompletion use elsewhere in this file.
+ *
+ * WHY this exists: PR #20 (see setUpStockCluster's doc comment) made
+ * create-index backfill — and migration backfill/cutover, which this test
+ * predates and now inherits the same mechanism from — alarm-driven against
+ * REAL wall-clock time instead of synchronous. The "during" writeBatch below
+ * is a sequential loop of WRITE_COUNT awaited /v1/mutate calls; on a loaded
+ * test run that loop can take longer than MIGRATION_TICK_MS (250ms), and
+ * catalog-0's own REAL background alarm can fire mid-loop and carry the
+ * migration from 'backfilling' into 'cutover' — fencing the source — before
+ * the loop finishes. Confirmed by repro: this raced on the very FIRST test
+ * in this file, before any other test had run, so it is NOT a cross-test
+ * fence leak (afterEach's reset() genuinely clears __cf_fenced_vbuckets and
+ * every DO's storage, migration state included, between tests) — it's an
+ * intra-test race against real time that PR #20 introduced.
+ *
+ * The fence itself is real and correctly applied (this is not a bug to
+ * paper over) — the 409's own "fix" text says exactly what to do: "the
+ * fence lifts when the migration's map flip completes, and the retry will
+ * route to the new shard." A plain retry loop would still be racing the
+ * SAME real 250ms alarm and could spin for a while (or, worse, forever if
+ * something stalls it); ticking the orchestration manually here makes the
+ * fence-lift deterministic instead. This does not weaken the test's proof:
+ * the write still genuinely spans the migration lifecycle (it was attempted
+ * while backfilling/cutover was in flight) and still lands — either
+ * mirrored to the target pre-flip, or, if this call is what drives cutover
+ * the rest of the way, directly on the target post-flip — either way
+ * CorrectnessTracker.verify()'s later read-back is what proves lost:0, not
+ * this retry. */
+async function mutateThroughFence(tracked: TrackingTxExecutor, warehouseId: number, call: MutateCall): Promise<MutateResult> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await tracked.mutate(warehouseId, call);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("VBUCKET_FENCED") || attempt >= 25) throw error;
+      await tickMigrationOrchestration();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -355,7 +425,12 @@ describe("Shardscope live-cluster proof: reshard under load, lost 0 (real in-pro
 
       async function writeBatch(phase: string, quantity: number): Promise<void> {
         for (const item of items) {
-          const result = await tracked.mutate(warehouseId, {
+          // mutateThroughFence, not a bare tracked.mutate(): see its doc
+          // comment (near pollingReadBack, above) — this "during" batch can
+          // race catalog-0's REAL alarm-driven cutover (PR #20) into a
+          // genuine VBUCKET_FENCED, and a plain retry would just keep
+          // racing the same real timer.
+          const result = await mutateThroughFence(tracked, warehouseId, {
             op: "update",
             table: "tpcc_stock",
             partitionKey: item.partitionKey,
@@ -547,7 +622,11 @@ describe("Shardscope live-cluster proof: notifyClusterChanged() keeps `verified`
 
       async function writeBatch(phase: string, quantity: number): Promise<void> {
         for (const item of items) {
-          const result = await tracked.mutate(warehouseId, {
+          // mutateThroughFence — see its doc comment near pollingReadBack
+          // above, and the identical comment in the other describe block's
+          // writeBatch: this "during" batch can race catalog-0's REAL
+          // alarm-driven cutover (PR #20) into a genuine VBUCKET_FENCED.
+          const result = await mutateThroughFence(tracked, warehouseId, {
             op: "update",
             table: "tpcc_stock",
             partitionKey: item.partitionKey,
