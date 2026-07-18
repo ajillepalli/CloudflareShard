@@ -54,6 +54,3 @@ Run one real deploy→teardown to verify the button end-to-end, then drop the
 "not yet run" caveat from the root README. The dashboard/app "second Worker
 pointed at the cluster" step stays a documented follow-on (the button can't wire
 a cross-Worker service binding).
-
-The dashboard/app "second Worker pointed at the cluster" step stays a documented
-follow-on (the button can't wire a cross-Worker service binding).
