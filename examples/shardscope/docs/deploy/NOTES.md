@@ -1,9 +1,14 @@
 # Deploy-button prep — status, compatibility, and what's still gated
 
-**What this directory is:** staged, reviewable artifacts for increment ② of the
-dev-conversion track (one-click "Deploy your own CloudflareShard cluster"). It is
-a **design + config draft**, NOT a live deploy path. Nothing here is published or
-deployed. See the full design doc:
+**What this directory is:** the detailed reference for increment ② of the
+dev-conversion track (one-click "Deploy your own CloudflareShard cluster").
+Option 1(a) was chosen — the repo is public and the **live Deploy button is now
+in the repo-root `README.md`** ("Deploy your own cluster"), pointing at
+`github.com/ajillepalli/CloudflareShard` (the button deploys the ROOT core
+Worker). This dir holds the confirm-gated teardown script, the `.env.example`
+secret note, and a button-compatible copy of the cluster `wrangler.toml`. The one
+thing still open: the first real deploy→teardown verification against a live
+account (nobody has clicked it end-to-end yet). Full design doc:
 `~/.gstack/projects/ajillepalli-CloudflareShard/2026-07-17-design-shardscope-deploy-button.md`.
 
 ## Compatibility assessment (verified against the real core)
@@ -29,25 +34,26 @@ directory are drafts of what the public template repo would contain.
   (confirm-gated `wrangler delete`).
 - Honest cost + teardown framing (Workers Paid, DOs billed to the user's account).
 
-## What is GATED — needs your decision / action (I did NOT do these)
-1. **A PUBLIC repo.** The button requires a public github.com/gitlab.com repo.
-   Options: (a) make `ajillepalli/CloudflareShard` public and add the button to
-   its README; (b) create a dedicated public repo (e.g. `cloudflare-shard-deploy`)
-   containing the core Worker code + this config. The button needs the actual
-   Worker CODE, not just config — these drafts don't include `src/` (that's core).
-2. **Core-repo coordination.** The real template = the core Worker's code + a
-   button. Another session is actively landing PRs on the core repo. Adding the
-   button / a deploy config there (or copying core into a new repo) should be
-   coordinated with that work, not dropped in as a surprise.
-3. **A real deploy test.** Clicking the button provisions real DOs on a real
-   account and costs real money. The first end-to-end test (deploy → init →
-   write → teardown) needs your account (or your explicit OK to use one).
+## Resolved
+1. **~~Public repo~~ — DONE.** Option 1(a): `ajillepalli/CloudflareShard` is
+   public; the button is wired into the repo-root README, pointing at the repo
+   (deploys the ROOT core Worker — self-contained, no npm workspaces, `deploy`
+   script present).
+2. **~~Core-repo coordination~~ — handled via PR.** The button is an additive
+   README section landed by normal PR to `main`, not a surprise change.
+
+## Still GATED — needs your account (I did NOT do this)
+3. **A real deploy test.** Clicking the button provisions real Durable Objects on
+   a real account and costs real money (Workers Paid). The first end-to-end run
+   (deploy → set ADMIN_TOKEN → `/admin/init` → write → `teardown.sh`) needs your
+   account, or your explicit OK to use one. The root README carries an honest
+   "not yet run end-to-end" note until this is done.
 
 ## Recommended next step
-Pick 1(a) vs 1(b) above (make-core-public vs dedicated-repo). Then either:
-- You (or an OK'd me) create the public repo from these drafts + the core code,
-  wire `<PUBLIC_REPO_URL>` into the button, and run one real deploy→teardown test; or
-- Keep it as this staged design until the core repo work settles.
+Run one real deploy→teardown to verify the button end-to-end, then drop the
+"not yet run" caveat from the root README. The dashboard/app "second Worker
+pointed at the cluster" step stays a documented follow-on (the button can't wire
+a cross-Worker service binding).
 
 The dashboard/app "second Worker pointed at the cluster" step stays a documented
 follow-on (the button can't wire a cross-Worker service binding).
