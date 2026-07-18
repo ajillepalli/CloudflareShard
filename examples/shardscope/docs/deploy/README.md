@@ -1,16 +1,17 @@
 # Deploy your own CloudflareShard cluster
 
-> **Staged artifact for review — not yet a live deploy path.** This is the
-> proposed README + config for a public "Deploy to Cloudflare" template repo.
-> The button below is inert until a public repo exists and `<PUBLIC_REPO_URL>`
-> is filled in. See [`NOTES.md`](./NOTES.md) for what's still gated (making a
-> repo public, the first real deploy, and core-repo coordination).
+> **The live Deploy button is in the repo-root [`README.md`](../../../../README.md)**
+> ("Deploy your own cluster"). This directory is the detailed reference: the
+> confirm-gated teardown script, the `.env.example` secret note, and a copy of
+> the button-compatible cluster `wrangler.toml`. The one thing still open is the
+> first real deploy→teardown verification against a live account — see
+> [`NOTES.md`](./NOTES.md).
 
 Spin up your own CloudflareShard cluster — the same multi-tenant, sharded,
 transactional database Shardscope demos — in your own Cloudflare account, in a
 few clicks.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=<PUBLIC_REPO_URL>)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
 
 ## What this creates (and what it costs)
 
