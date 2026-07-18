@@ -20,6 +20,42 @@ A concrete MVP for a sharded SQL layer on top of Cloudflare Durable Objects (SQL
   visibility and recovery.
 - Mutation idempotency via requestId, rejecting replay with a mismatched SQL/params pair instead of returning a stale result.
 
+## Deploy your own cluster
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
+
+One click clones this repo into your GitHub and deploys the cluster to **your own
+Cloudflare account**: one Worker plus three SQLite Durable Object classes
+(`CATALOG` control plane, `SHARD` data plane, `COORDINATOR` for 2PC), provisioned
+automatically from the `[[migrations]]` in `wrangler.toml`. There are no KV/D1/R2
+resources — the cluster is self-contained.
+
+**Cost:** Durable Objects require the **Workers Paid** plan, and everything created
+is **billed to your account** (Worker + Durable Object requests/duration/storage).
+This is a real database in your account, not a sandbox. Tear it down when you're
+done.
+
+**After deploy:**
+1. Set the `ADMIN_TOKEN` secret (the setup page prompts for it via `.env.example`)
+   to a strong random value — `openssl rand -hex 32`. It gates the whole `/admin/*`
+   surface; without it the Worker returns `500 ADMIN_TOKEN is not configured`.
+2. Initialize the topology:
+   ```bash
+   curl -X POST https://<your-worker>.workers.dev/admin/init \
+     -H "authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
+     -d '{"numShards": 2, "totalVBuckets": 16}'
+   ```
+3. To build an app against it, download the starter from Shardscope's "Build on it"
+   panel (it service-binds to exactly this Worker), or see `examples/rpc-consumer/`.
+
+**Teardown:** `npx wrangler delete --name <your-worker>` removes the Worker and its
+Durable Objects (and stops billing). Full details + a confirm-gated teardown script:
+[`examples/shardscope/docs/deploy/`](examples/shardscope/docs/deploy/).
+
+> The Deploy button and the cluster config are wired and self-contained, but the
+> end-to-end deploy hasn't been run against a live account yet — if you hit a
+> snag, please open an issue.
+
 ## Project layout
 
 - `src/index.ts`: Gateway worker router and public API.
