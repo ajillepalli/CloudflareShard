@@ -2,6 +2,51 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.8.0.0] - 2026-07-17 — Per-route request logging + Workers Logs observability
+
+Closes issue #35, a partial fix for README's original production-readiness item "Add observability and SLO alerting per shard and per route," untouched since v1.0.0.0. Structured logging (`log()`) existed for individual events, but no uniform per-route latency/status signal existed for every request, and Cloudflare's Workers Logs (durable, searchable request logging) wasn't even enabled.
+
+### Added
+- `wrangler.toml`'s `[observability]` block enabled (`head_sampling_rate = 1` — every request, not a sample).
+- One structured `http.request` event per request (`path`, `method`, `status`, `durationMs`), logged from a single wrapper call site around the Worker's `fetch()` dispatch, covering every outcome (known route, 404, 405, unhandled error) uniformly — extracted the original inline dispatch logic into `handleRequest()` so a future new return path can't silently skip logging. Deliberately excludes headers/body (tenant/admin bearer tokens).
+- README's new "Observability" section documents querying via `wrangler tail --format json` or the dashboard's Workers Logs view.
+
+Explicitly partial: per-shard breakdowns and actual SLO *alerting* (paging on a threshold breach) need separate infrastructure (Logpush to a metrics backend, or an Analytics Engine binding) out of scope here.
+
+## [2.7.0.0] - 2026-07-17 — Per-tenant rate limiting on /v1/table-scan's fan-out
+
+Closes issue #33. `/v1/table-scan` is the only tenant-facing route that fans out to every shard in a tenant's catalog-shard pool — a documented known limitation: an unbounded caller could degrade every other tenant sharing that pool, not just their own requests.
+
+### Added
+- A per-tenant token bucket (`TABLE_SCAN_RATE_LIMIT_CAPACITY` = 20 burst, `TABLE_SCAN_RATE_LIMIT_REFILL_PER_SECOND` = 2 sustained) gated in `CatalogDO.handleLookupTableScan`, the same choke point that already runs auth + table-registry validation before the Worker's shard fan-out. Exceeding it returns 429 `RATE_LIMITED` with a `retryAfterMs` hint. Scoped per catalog shard (one `tenant_scan_rate_limit` row per tenant), not cluster-wide.
+
+## [2.6.0.0] - 2026-07-17 — Tenant token rotation grace period
+
+Closes issue #26. `/admin/register-tenant {rotate: true}` used to invalidate the old token the instant the new one was issued — a documented known limitation: a scheduled rotation with zero overlap window could break an in-flight caller, or one whose config/secret propagation hadn't picked up the freshly-rotated token yet.
+
+### Added
+- The old token now stays valid for a bounded grace period (`TENANT_TOKEN_ROTATION_GRACE_MS`, 5 minutes) after rotation instead of being invalidated immediately. `/admin/revoke-tenant` is deliberately **not** softened by this — it still kills the current token AND any in-grace previous token immediately. Rotating an already-revoked tenant does not resurrect its old (explicitly-killed) token with a fresh grace period.
+
+## [2.5.0.0] - 2026-07-17 — TypeScript SDK + CLI
+
+Closes issue #22. Adds `client/`, a typed, zero-runtime-dependency TypeScript SDK and CLI wrapping CloudflareShard's HTTP API, so developers no longer have to hand-write raw `fetch()`/curl calls and re-derive request/response shapes from `docs/SPEC.md` for the tenant data-plane routes and ~20 admin routes.
+
+### Added
+- `CloudflareShardClient` (tenant data-plane): typed `mutate`/`insert`/`update`/`delete`/`upsert`, `tx`, `indexQuery`, `tableScan`, plus a `tableScanAll()` async-generator that auto-pages through `nextCursor`.
+- `CloudflareShardAdminClient` (extends the above): every `/admin/*` route this SDK covers — `init`, `createTable`, `createIndex` + a `waitForIndexReady()` poll-until-ready/failed helper, `status`, `shardStats`, `splitVbucket`/`migrateVbucket`/`drainShard` and their status routes, and more.
+- `CloudflareShardError`: every non-2xx response throws this instead of a raw fetch response — normalizes both error body shapes the API uses across its routes into one typed shape.
+- CLI (`bin: cloudflareshard`): `init`, `create-table`, `register-table`, `register-tenant`, `create-index`, `create-index-status`, `status`, `shard-stats`, `list-tables`, `list-indexes`, via Node's built-in `util.parseArgs` — no CLI framework dependency, matching this repo's existing zero-dependency examples.
+- README's API quickstart now leads with the SDK/CLI walkthrough; the raw-HTTP walkthrough is preserved below it as the wire-level reference.
+
+### Fixed (found during review, before merge)
+- Four request/response type mismatches against the actual server handlers: `backfillProvenance`'s `catalogShardId` should be optional (full-cluster mode), upsert's `conflictColumns` field was missing from the mutation type, `tx`'s `committed_pending_ack` status value was missing, and `/admin/tx-status`'s actual `{found, status}` discriminated-union shape was replaced with an incorrect `{txId, status}` guess.
+- `migrateVbucketStatus`'s `toShard`/`startedAt` fields typed as non-null strings when the server can return `null` for a vbucket with no active migration.
+- A raw `SyntaxError` could leak instead of the promised `CloudflareShardError` for a non-JSON response body (e.g. a proxy 5xx HTML page).
+- A symlink-resolution bug in the CLI's entrypoint-detection logic that silently no-op'd when installed as a real npm package (`node_modules/.bin` symlink) — verified live by creating an actual filesystem symlink and reproducing the bug.
+- The live-verification script (`client/scripts/verify-live.mjs`) called `/admin/init` with `force: true` unconditionally, which could destructively wipe a real deployed cluster's topology if pointed at a live URL — now guarded to localhost-only by default, requiring an explicit opt-in env var otherwise.
+- An async-index-maintenance race and an IPv6-loopback-hostname bug in the same live-verification script.
+- `revokeTenant`'s response type was missing the `tenantId`/`revoked` fields the server actually returns.
+
 ## [2.4.0.0] - 2026-07-16 — TPC-C-derived benchmark + demo project
 
 Closes issue #16. A teammate asked for a demo project and benchmark using "TPC" data; the originally-suggested TPC-DS (analytics/decision-support) doesn't fit — CloudflareShard has no join/aggregation engine, deliberately (raw cross-tenant SQL was found unsafe and removed during Milestone 4). TPC-C (the OLTP benchmark) fits instead: its transactions exercise exactly what `CoordinatorDO`'s 2PC and the sharded `mutate` path already do.
