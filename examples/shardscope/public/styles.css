@@ -46,6 +46,16 @@
 
 * { box-sizing: border-box; }
 
+/* Many toggled panels below set `display: flex/grid` on a class selector
+ * (e.g. .login-panel, .tour-overlay, .reshard-panel) with no matching
+ * `[hidden]` override — an author rule always beats the UA stylesheet's
+ * default `[hidden] { display: none }` regardless of specificity, so the
+ * native `hidden` attribute those panels are toggled with silently loses
+ * the cascade and the element stays visible. This single !important rule
+ * makes `hidden` authoritative everywhere, instead of patching every
+ * individual selector (and every future one) by hand. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -481,9 +491,6 @@ html, body {
   justify-content: center;
   background: rgba(7, 10, 15, .78);
   backdrop-filter: blur(3px);
-}
-.tour-overlay[hidden] {
-  display: none;
 }
 .tour-card {
   width: min(420px, 88vw);
