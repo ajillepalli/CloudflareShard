@@ -112,4 +112,27 @@ describe("Shardscope SPA — visibility-based live-connection pause", () => {
     const logText = harness.hook("event-log")!.textContent ?? "";
     expect(logText).not.toContain("live connection paused");
   });
+
+  it("a tab that's ALREADY hidden when the live connection opens still arms the pause timer (Codex review round 1 gap)", async () => {
+    // Regression guard: connectLive() used to only react to a FUTURE
+    // visibilitychange event — a stream opened while the tab is already
+    // backgrounded (opened in a background tab, or hidden while the gate
+    // preflight/login was still pending) never fired that event, so no pause
+    // timer was ever armed and the connection could stay open indefinitely.
+    harness = bootApp({
+      search: "",
+      routes: { "/api/load/status": { status: 200 } },
+      documentHiddenAtBoot: true,
+      windowOverrides: { __SHARDSCOPE_VISIBILITY_PAUSE_GRACE_MS_OVERRIDE__: FAST_GRACE_MS },
+    });
+    await harness.flush();
+    expect(harness.eventSources).toHaveLength(1); // connectLive() still opens one
+
+    await sleep(FAST_GRACE_MS * 4);
+    await harness.flush();
+
+    expect(harness.hook("live-chip-label")!.textContent).toBe("paused (tab hidden)");
+    const logText = harness.hook("event-log")!.textContent ?? "";
+    expect(logText).toContain("live connection paused");
+  });
 });
