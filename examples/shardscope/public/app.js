@@ -274,6 +274,17 @@ const HEAT_STOPS = ["#1B4D5C", "#3FA796", "#E0B341", "#E0603A", "#F04A4A"];
 // falling back to the embedded sample so the page still shows something.
 const FALLBACK_TIMEOUT_MS = 6000;
 
+// How long a tab must stay hidden (backgrounded/minimized) before the live
+// connection actually pauses — see the visibility-pause block below. Short
+// enough to meaningfully cut cost from a tab left open unattended for hours,
+// long enough that switching tabs for a few seconds (checking Slack, tabbing
+// to a terminal) never tears the connection down and reconnects it.
+// Overridable via window.__SHARDSCOPE_VISIBILITY_PAUSE_GRACE_MS_OVERRIDE__ —
+// a test-only seam (unset in every real browser) so the SPA test suite can
+// verify pause/resume without a real 30s wait, same spirit as
+// TopologyAggregator's constructor-injected writeTimeoutMs on the server side.
+const VISIBILITY_PAUSE_GRACE_MS = window.__SHARDSCOPE_VISIBILITY_PAUSE_GRACE_MS_OVERRIDE__ ?? 30_000;
+
 const MAX_LOG_LINES = 60;
 // Cap how many migration paths get drawn per tick — a real cluster mid-full
 // reshard could have hundreds of individually-migrating vbuckets, and this is
@@ -3134,6 +3145,8 @@ function handleLogout() {
     es = null;
   }
   clearTimeout(fallbackTimer);
+  clearTimeout(visibilityPauseTimer);
+  pausedForVisibility = false;
   // Best-effort — the panel goes back up regardless of whether this
   // round-trip succeeds; there's no server-side session to leak if it fails.
   fetch("/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
@@ -3193,6 +3206,48 @@ function startLiveFlow() {
 let mode = "connecting"; // connecting | live | sample-fallback | demo
 let fallbackTimer = null;
 let es = null;
+
+// ---- visibility-based pause (cost mitigation for a tab left open unattended) ----
+// The aggregator's alarm loop only runs while >=1 subscriber is connected
+// (see aggregator.ts's runTick), so closing this tab's EventSource when
+// nobody's actually looking stops real subrequests to the admin API — a tab
+// forgotten open for a full day at TICK_INTERVAL_MS (900ms) would otherwise
+// rack up close to the Workers Free plan's daily request cap on its own. A
+// hidden tab's EventSource keeps trying to reconnect at the platform level
+// regardless (browsers don't pause it), so pausing has to be done explicitly
+// here, not left to the browser.
+let visibilityPauseTimer = null;
+let pausedForVisibility = false;
+
+function handleVisibilityChange() {
+  // Demo mode never opens a real connection (see init()'s ?demo=1 branch) —
+  // nothing to pause. Same if we're not actually in a live/reconnecting
+  // state (e.g., still showing the login panel).
+  if (mode === "demo") return;
+
+  if (document.hidden) {
+    // Debounced, not immediate: a quick tab-switch (checking another tab for
+    // a few seconds) shouldn't tear the connection down and force a
+    // reconnect the moment focus returns — only a tab that STAYS hidden for
+    // the full grace period actually pauses.
+    visibilityPauseTimer = setTimeout(() => {
+      if (!document.hidden || !es) return; // came back, or already closed/never opened
+      es.close();
+      es = null;
+      clearTimeout(fallbackTimer);
+      pausedForVisibility = true;
+      setLiveState("warn", "paused (tab hidden)");
+      logLine("live connection paused — tab hidden (reduces cost if left open unattended)", "warn");
+    }, VISIBILITY_PAUSE_GRACE_MS);
+  } else {
+    clearTimeout(visibilityPauseTimer);
+    if (pausedForVisibility) {
+      pausedForVisibility = false;
+      logLine("tab visible again — reconnecting…", "mig");
+      connectLive();
+    }
+  }
+}
 
 function fallbackToSample(reason) {
   if (mode === "live") return; // real data already arrived; ignore a racing timer
@@ -3561,6 +3616,7 @@ function init() {
   if (el.tourBackBtn) el.tourBackBtn.addEventListener("click", tourBack);
   if (el.tourSkipBtn) el.tourSkipBtn.addEventListener("click", endTour);
   document.addEventListener("keydown", handleGlobalKeydown);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
 
   const params = new URLSearchParams(location.search);
   if (params.get("demo") === "1") {
