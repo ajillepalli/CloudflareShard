@@ -7,13 +7,32 @@
  * read-only Topology room since there is no chaos panel here).
  *
  * Font note: DESIGN.md calls for a licensed technical grotesk (General Sans /
- * Neue Haas Grotesk Text) + JetBrains Mono, self-hosted as woff2. This is a
- * no-build-step static bundle with no font assets shipped, so both stacks
- * fall back to system faces below. Per DESIGN.md's anti-slop list, Inter and
- * Space Grotesk are deliberately EXCLUDED from the primary sans stack (the
- * mockup used Space Grotesk only as a flagged placeholder). Swap in real
- * self-hosted woff2 files + @font-face here once they exist.
+ * Neue Haas Grotesk Text) + JetBrains Mono, self-hosted as woff2. General
+ * Sans/Neue Haas are commercial-licensed and can't ship in this public OSS
+ * repo; Archivo (SIL OFL, ./fonts/OFL-archivo.txt) is the self-hostable technical
+ * grotesk actually shipped instead — per DESIGN.md's anti-slop list, Inter
+ * and Space Grotesk stay deliberately EXCLUDED from the primary sans stack.
+ * Both @font-face files below are variable fonts (one file covers the whole
+ * weight range) fetched once from Google Fonts' own CDN and vendored here —
+ * this is a no-build-step static bundle serving them locally, never fetching
+ * from a font CDN at runtime, per DESIGN.md's "offline-capable demo Worker"
+ * requirement.
  */
+
+@font-face {
+  font-family: 'Archivo Variable';
+  src: url('./fonts/archivo-variable.woff2') format('woff2-variations'), url('./fonts/archivo-variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono Variable';
+  src: url('./fonts/jetbrains-mono-variable.woff2') format('woff2-variations'), url('./fonts/jetbrains-mono-variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 :root {
   --bg-base: #0A0E14;
@@ -40,11 +59,21 @@
   --danger: #F04A4A;
   --danger-bright: #FF7A6B;
 
-  --font-mono: 'JetBrains Mono', 'Berkeley Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
-  --font-sans: -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', 'Berkeley Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --font-sans: 'Archivo Variable', 'Archivo', 'Helvetica Neue', Arial, sans-serif;
 }
 
 * { box-sizing: border-box; }
+
+/* Many toggled panels below set `display: flex/grid` on a class selector
+ * (e.g. .login-panel, .tour-overlay, .reshard-panel) with no matching
+ * `[hidden]` override — an author rule always beats the UA stylesheet's
+ * default `[hidden] { display: none }` regardless of specificity, so the
+ * native `hidden` attribute those panels are toggled with silently loses
+ * the cascade and the element stays visible. This single !important rule
+ * makes `hidden` authoritative everywhere, instead of patching every
+ * individual selector (and every future one) by hand. */
+[hidden] { display: none !important; }
 
 html, body {
   margin: 0;
