@@ -651,6 +651,23 @@ export class LoadDriver {
     // before writing anything more.
     const myStartedAt = s.startedAt;
 
+    // Codex review P2 fix (round 15): reset the correctness tracker HERE,
+    // right alongside the durable `running: true`/zeroed-counters save
+    // above, not after the (now potentially long) schema/seed/index-wait
+    // sequence below. Between those two points, `running: true` is already
+    // durable and publicly visible via /api/load/status, but this.correct-
+    // nessTracker still held the PREVIOUS run's tracker — its snapshot()
+    // was being combined with the NEW run's zeroed durable counters, so a
+    // status poll mid-bootstrap could show the previous run's
+    // trackedKeyCount/verified as if they belonged to the run that just
+    // "started". A new run's tracked keys have nothing to do with a
+    // previous run's (possibly a different targetShardId, warehouse set, or
+    // table state entirely) regardless of when during startup they're
+    // reset, so there's no reason not to do it immediately.
+    this.correctnessTracker = new CorrectnessTracker();
+    this.correctnessHydrated = true;
+    this.lastVerifyAt = 0;
+
     if (mode === "skew" && !explicitTargetShardId) {
       let resolvedTargetShardId: string;
       try {
@@ -762,13 +779,6 @@ export class LoadDriver {
     this.lastSkewRefreshAt = 0;
     this.cachedVbucketMap = null;
     this.lastVbucketMapRefreshAt = 0;
-
-    // Fresh correctness tracker for a fresh run — a new run's tracked keys
-    // have nothing to do with a previous run's (possibly a different
-    // targetShardId, warehouse set, or table state entirely).
-    this.correctnessTracker = new CorrectnessTracker();
-    this.correctnessHydrated = true;
-    this.lastVerifyAt = 0;
 
     // Kick off the first tick right away rather than waiting a full
     // TICK_INTERVAL_MS for the alarm to fire.
