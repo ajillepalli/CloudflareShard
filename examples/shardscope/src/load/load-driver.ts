@@ -375,6 +375,23 @@ export class LoadDriver {
       return json({ error: "Invalid JSON body." }, 400);
     }
 
+    // Codex review P2 fix: a run already in progress must never be
+    // reseeded — the block below rewrites tpcc_district/tpcc_customer/
+    // tpcc_item/tpcc_stock rows via plain upserts with NO compare-and-swap
+    // guard against whatever the CURRENT alarm-driven tick is concurrently
+    // mutating (a district's d_ytd, a stock row's s_quantity, ...), so a
+    // duplicate /api/load/start (a second browser tab, a double-click before
+    // the UI's own disable-on-in-flight took effect, a stale client retrying
+    // after a slow response) racing an in-flight run would silently clobber
+    // its data mid-flight — exactly the kind of write the correctness
+    // tracker has no way to distinguish from a genuine loss. A start against
+    // an already-running instance is a no-op: return the current status
+    // rather than starting a second, colliding run.
+    const existing = await this.loadState();
+    if (existing.running) {
+      return json(toStatusJson(existing, this.correctnessTracker.snapshot()));
+    }
+
     const mode = body.mode === "skew" ? "skew" : body.mode === "uniform" ? "uniform" : undefined;
     if (!mode) {
       return json({ error: "Missing or invalid 'mode'. Must be 'uniform' or 'skew'." }, 400);
