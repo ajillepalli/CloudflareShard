@@ -119,6 +119,18 @@ export interface SchemaAdminClient {
   createIndex(indexName: string, table: string, columns: string[]): Promise<unknown>;
 }
 
+// Codex review P2 fix: a trailing-slash baseUrl (e.g. "https://worker.example/"
+// — a common, entirely reasonable way to configure CORE_GATEWAY_BASE_URL)
+// concatenated directly with a leading-slash path produces a DOUBLE slash
+// ("https://worker.example//admin/list-tables"), which the Worker's routes
+// (matched on exact pathname) don't recognize — every schema-bootstrap call
+// 404s and "Start the scenario" can't start. Mirrors
+// examples/tpc-c-benchmark/src/client.mjs's own joinUrl fix for the
+// identical issue (see that file's "Codex review round 12 P3 fix" comment).
+function joinUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}${path}`;
+}
+
 export class HttpSchemaAdminClient implements SchemaAdminClient {
   constructor(
     private readonly baseUrl: string,
@@ -126,7 +138,7 @@ export class HttpSchemaAdminClient implements SchemaAdminClient {
   ) {}
 
   private async post<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await fetch(joinUrl(this.baseUrl, path), {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.adminToken}` },
       body: JSON.stringify(body ?? {}),

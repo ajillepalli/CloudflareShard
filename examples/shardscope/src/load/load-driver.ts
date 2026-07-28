@@ -402,21 +402,6 @@ export class LoadDriver {
     if (!mode) {
       return json({ error: "Missing or invalid 'mode'. Must be 'uniform' or 'skew'." }, 400);
     }
-    // Codex review P2 fix: `targetShardId` is no longer REQUIRED for skew
-    // mode — an explicit one from the caller is still honored below, but an
-    // omitted one is resolved automatically (see resolveDefaultSkewTarget)
-    // rather than rejected. The UI's own picker (public/app.js's
-    // pickScenarioTargetShardId) used to guess a shard id from catalog-0's
-    // vbucket map regardless of which catalog the scenario's actual
-    // warehouse tenant hashes to — on any deployment where that warehouse
-    // ISN'T on catalog-0, the guessed shard id simply doesn't exist in the
-    // catalog LoadDriver's own skew pools actually search (see
-    // refreshSkewPoolsFromMap below, which resolves the warehouse's REAL
-    // catalog via catalogShardIdForTenant), so the skew pool came back empty
-    // and "skew mode" silently ran uniform traffic instead of creating a hot
-    // shard. The server already has everything needed to pick a genuinely
-    // correct target, so it now does — see resolveDefaultSkewTarget.
-
     const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number.isFinite(body.concurrency) ? Number(body.concurrency) : DEFAULT_CONCURRENCY));
 
     // Self-seeding (the default — see the seedReferenceData block below)
@@ -431,23 +416,26 @@ export class LoadDriver {
     const willSelfSeed = body.seedReferenceData !== false;
     const warehouseIds = Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS;
 
-    let targetShardId: string | null = null;
-    if (mode === "skew") {
-      if (typeof body.targetShardId === "string" && body.targetShardId.length > 0) {
-        targetShardId = body.targetShardId;
-      } else {
-        try {
-          targetShardId = await this.resolveDefaultSkewTarget(warehouseIds[0]);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return json({ error: `Couldn't resolve a default skew target: ${message}. Pass 'targetShardId' explicitly instead.` }, 502);
-        }
-      }
-    }
+    // Codex review P2 fix: `targetShardId` is no longer REQUIRED for skew
+    // mode — an explicit one from the caller is honored as-is (synchronously,
+    // no await needed) below; an omitted one is resolved via
+    // resolveDefaultSkewTarget AFTER the running guard is persisted (see that
+    // comment for why the ORDER matters — round 7 finding). The UI's own
+    // picker (public/app.js) used to guess a shard id from catalog-0's
+    // vbucket map regardless of which catalog the scenario's actual
+    // warehouse tenant hashes to — on any deployment where that warehouse
+    // ISN'T on catalog-0, the guessed shard id simply doesn't exist in the
+    // catalog LoadDriver's own skew pools actually search (see
+    // refreshSkewPoolsFromMap below, which resolves the warehouse's REAL
+    // catalog via catalogShardIdForTenant), so the skew pool came back empty
+    // and "skew mode" silently ran uniform traffic instead of creating a hot
+    // shard. The server already has everything needed to pick a genuinely
+    // correct target, so it now does.
+    const explicitTargetShardId = mode === "skew" && typeof body.targetShardId === "string" && body.targetShardId.length > 0 ? body.targetShardId : null;
 
     const config: LoadDriverConfig = {
       mode,
-      targetShardId,
+      targetShardId: explicitTargetShardId,
       concurrency,
       baseUrl: resolveLoadDriverBaseUrl(body.baseUrl, this.env.CORE_GATEWAY_BASE_URL),
       warehouseIds,
@@ -464,13 +452,14 @@ export class LoadDriver {
       itemCount: Number.isFinite(body.itemCount) ? Number(body.itemCount) : willSelfSeed ? SCENARIO_ITEM_COUNT : DEFAULT_ITEM_COUNT,
     };
 
-    // Codex review P2 fix (round 4): mark this run as `running` and persist
-    // its config BEFORE any of the long bootstrap/seed awaits below, not
-    // after. The `existing.running` check above closes the window for a
-    // duplicate start racing an ALREADY-established run, but a naive
-    // "persist running=true only after bootstrap succeeds" still leaves the
-    // exact same TOCTOU gap open for TWO start requests arriving close
-    // together while NEITHER has finished bootstrapping yet: both would read
+    // Codex review P2 fix (round 4; ORDER fixed again in round 7 — see
+    // below): mark this run as `running` and persist its config BEFORE any
+    // of the long bootstrap/seed awaits below, not after. The
+    // `existing.running` check above closes the window for a duplicate
+    // start racing an ALREADY-established run, but a naive "persist
+    // running=true only after bootstrap succeeds" still leaves the exact
+    // same TOCTOU gap open for TWO start requests arriving close together
+    // while NEITHER has finished bootstrapping yet: both would read
     // `running: false`, both would proceed, and the second could duplicate
     // schema-bootstrap calls or land its own seed values over the first's
     // mid-flight run. Persisting `running: true` here closes that window —
@@ -478,6 +467,17 @@ export class LoadDriver {
     // progress and no-ops via the check above. If bootstrap/seed below fails,
     // this is explicitly rolled back (see the catch blocks) so a failed start
     // never leaves the run stuck "running" with nothing actually happening.
+    //
+    // ROUND 7 FINDING: this block must come BEFORE resolveDefaultSkewTarget's
+    // await, not after it — round 6 introduced that await (to resolve an
+    // omitted targetShardId) ABOVE this persist step, which reopened the
+    // exact race round 4 had just closed: two requests could both pass the
+    // `existing.running` check, both start awaiting resolveDefaultSkewTarget
+    // concurrently, and only THEN would either reach this persist step. Every
+    // await between the `existing.running` check and this save is one more
+    // chance for a second request to race through undetected — so this now
+    // runs first, with target resolution folded in immediately after (still
+    // before any bootstrap/seed) rather than before.
     const s = await this.loadState();
     s.running = true;
     s.config = config;
@@ -487,6 +487,21 @@ export class LoadDriver {
     s.lastTickAt = null;
     s.lastError = null;
     await this.saveState(s);
+
+    if (mode === "skew" && !explicitTargetShardId) {
+      try {
+        config.targetShardId = await this.resolveDefaultSkewTarget(warehouseIds[0]);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.running = false;
+        s.config = null;
+        s.lastError = `Couldn't resolve a default skew target: ${message}. Pass 'targetShardId' explicitly instead.`;
+        await this.saveState(s);
+        return json({ error: s.lastError }, 502);
+      }
+      s.config = config;
+      await this.saveState(s);
+    }
 
     // Bootstrap reference data (warehouse/district/customer/item/stock) for
     // every warehouse this run targets — see scenario-seed.ts's header
