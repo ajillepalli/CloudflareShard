@@ -95,6 +95,45 @@ const MAX_SELF_SEED_ITEM_COUNT = 100;
 // site for the full reasoning.
 const MAX_SELF_SEED_WAREHOUSES = 2;
 
+// Codex review P2 fix (round 14): the independent per-field caps above don't
+// compose safely — they can each individually pass while their COMBINATION
+// still blows the budget. Worked example at the SCENARIO_* defaults alone (1
+// warehouse, 6 districts, 10 customers/district, 60 items): 187 seeded rows
+// + 120 index-visibility checks = 307 operations, each costing 2
+// subrequests (a tenant-token resolution plus the actual gateway call — see
+// gateway-client.ts's HttpTxExecutor.post) = 614 subrequests for ONE
+// warehouse at the SHIPPED DEFAULT scenario alone. Two warehouses at those
+// same defaults (previously allowed — MAX_SELF_SEED_WAREHOUSES is 2) would
+// be ~1228, already over a 1000-subrequest budget; one warehouse at the
+// individual MAX_SELF_SEED_* caps (12/20/100) is ~1586 on its own. Rather
+// than keep discovering more under-budgeted combinations one Codex round at
+// a time, this computes the ACTUAL projected subrequest count for the
+// specific request about to run and rejects outright if it's not
+// comfortably under a real Worker's subrequest ceiling — see
+// projectedSelfSeedSubrequests's own doc comment for the exact formula.
+const MAX_SELF_SEED_PROJECTED_SUBREQUESTS = 850;
+
+/** Projects the total subrequest count self-seeding + its own post-seed
+ * verification will make for `warehouseCount` warehouses at the given
+ * per-warehouse district/customer/item counts — see
+ * MAX_SELF_SEED_PROJECTED_SUBREQUESTS's own comment for why this exists and
+ * the worked numbers behind the chosen budget. Per warehouse:
+ *   seeded rows    = 1 (warehouse) + D (districts) + D*C (customers)
+ *                     + I (items) + I (stock, one per item)
+ *   verify checks  = I (item canaries) + D*C (customer canaries)
+ *                     — see verifySeededDataIndexed
+ *   subrequests    = 2 * (seeded rows + verify checks) — each operation is
+ *                     a tenant-token resolution PLUS the actual gateway
+ *                     call (see gateway-client.ts's HttpTxExecutor.post)
+ * Multiplied by `warehouseCount` since seedScenarioReferenceData and
+ * verifySeededDataIndexed both loop over every warehouse in sequence,
+ * inside the SAME request. */
+function projectedSelfSeedSubrequests(warehouseCount: number, districtsPerWarehouse: number, customersPerDistrict: number, itemCount: number): number {
+  const seededRowsPerWarehouse = 1 + districtsPerWarehouse + districtsPerWarehouse * customersPerDistrict + itemCount + itemCount;
+  const verifyChecksPerWarehouse = itemCount + districtsPerWarehouse * customersPerDistrict;
+  return warehouseCount * 2 * (seededRowsPerWarehouse + verifyChecksPerWarehouse);
+}
+
 // How often the alarm fires while running.
 const TICK_INTERVAL_MS = 1000;
 
@@ -550,6 +589,26 @@ export class LoadDriver {
         MAX_SELF_SEED_ITEM_COUNT,
       ),
     };
+
+    // Codex review P2 fix (round 14): the individual per-field caps above
+    // (districts/customers/items/warehouses) don't compose safely on their
+    // own — see MAX_SELF_SEED_PROJECTED_SUBREQUESTS's own comment for the
+    // worked numbers. This checks the ACTUAL combination about to run,
+    // computed from the already-clamped config values, and rejects outright
+    // if self-seeding this specific request would project over budget —
+    // pure, synchronous, no I/O, so it's safe to check before any of the
+    // state-mutating work below.
+    if (willSelfSeed) {
+      const projected = projectedSelfSeedSubrequests(config.warehouseIds.length, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
+      if (projected > MAX_SELF_SEED_PROJECTED_SUBREQUESTS) {
+        return json(
+          {
+            error: `This combination of warehouseIds/districtsPerWarehouse/customersPerDistrict/itemCount would need ~${projected} subrequests to self-seed and verify — over the ${MAX_SELF_SEED_PROJECTED_SUBREQUESTS} budget this feature stays under to avoid exceeding the Worker's own per-invocation limit. Reduce the counts, or pass 'seedReferenceData: false' for a larger, externally-seeded dataset.`,
+          },
+          400,
+        );
+      }
+    }
 
     // Codex review P2 fix (round 4; ORDER fixed again in round 7 — see
     // below): mark this run as `running` and persist its config BEFORE any
