@@ -20,6 +20,17 @@ binding = "SHARD_API"
 service = "cloudflare-shard-mvp"
 entrypoint = "CloudflareShardRpc"
 
+# CORE_GATEWAY_BASE_URL: where load-driver.ts's real HTTP client (not the
+# SHARD_API RPC binding above — see env.d.ts's doc comment on why it needs a
+# genuinely reachable URL) sends its /v1/* calls. This default is the local
+# cloudflare-shard-mvp `wrangler dev` port, matching the same "run both
+# Workers locally" setup [[services]] above already assumes. A real
+# deployment overrides this per-deploy — `wrangler deploy --var
+# CORE_GATEWAY_BASE_URL:<your-core-worker-url>` — rather than committing a
+# deployment-specific URL to this checked-in template.
+[vars]
+CORE_GATEWAY_BASE_URL = "http://127.0.0.1:8787"
+
 # TopologyAggregator: a singleton Durable Object (see src/aggregator.ts) that
 # owns the single shared poll of the admin API on an alarm() tick and fans a
 # merged topology snapshot out to every open SSE subscriber. One DO instance

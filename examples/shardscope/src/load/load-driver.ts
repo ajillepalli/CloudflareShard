@@ -40,6 +40,7 @@ import { generateSkewedKeys, type VBucketOwnership } from "./skew";
 import type { TokenProvider } from "./token-provider";
 import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
 import { HttpTxExecutor, HttpSqlPointReader } from "./gateway-client";
+import { seedScenarioReferenceData, SCENARIO_DISTRICTS_PER_WAREHOUSE, SCENARIO_CUSTOMERS_PER_DISTRICT, SCENARIO_ITEM_COUNT } from "./scenario-seed";
 import {
   CorrectnessTracker,
   TrackingTxExecutor,
@@ -65,6 +66,17 @@ const DEFAULT_ITEM_COUNT = 200;
 
 // How often the alarm fires while running.
 const TICK_INTERVAL_MS = 1000;
+
+// LoadDriver is a single shared singleton (idFromName("singleton") — see this
+// file's header comment), not one instance per viewer, so nothing here can
+// tell "the person who started this forgot about it" apart from "someone's
+// still actively watching it run" — there is no per-viewer signal to key an
+// idle-timeout off, unlike TopologyAggregator's per-subscriber SSE
+// connections. A hard wall-clock cap is the only mechanism that can't be
+// forgotten open: past this duration the run force-stops itself regardless
+// of whether anyone's watching, capping worst-case cost from a demo scenario
+// nobody remembered to stop rather than depending on that never happening.
+export const MAX_LOAD_RUN_DURATION_MS = 15 * 60_000; // 15 minutes
 
 // Workers hard-cap subrequests per Worker invocation (an alarm() call is one
 // invocation) well below what an unbounded loop here could otherwise fan
@@ -119,6 +131,30 @@ interface LoadDriverConfig {
   districtsPerWarehouse: number;
   customersPerDistrict: number;
   itemCount: number;
+}
+
+/** Pure resolution logic for handleStart's `baseUrl`, pulled out so it's
+ * directly unit-testable without standing up a full DO test harness (this
+ * file has none today — see load-driver.test.ts's header comment). An
+ * explicit, non-empty body value always wins; otherwise falls back to the
+ * Worker's own CORE_GATEWAY_BASE_URL env var (env.d.ts's doc comment); `null`
+ * only if neither is a usable string, matching handleStart's pre-existing
+ * "no base URL configured" contract. */
+export function resolveLoadDriverBaseUrl(bodyBaseUrl: unknown, envBaseUrl: unknown): string | null {
+  if (typeof bodyBaseUrl === "string" && bodyBaseUrl.length > 0) return bodyBaseUrl;
+  if (typeof envBaseUrl === "string" && envBaseUrl.length > 0) return envBaseUrl;
+  return null;
+}
+
+/** True iff a run started at `startedAt` should be force-stopped as of `now`
+ * — see MAX_LOAD_RUN_DURATION_MS's doc comment for why this exists (no
+ * per-viewer idle signal to key off, unlike TopologyAggregator's SSE
+ * subscribers, so a hard wall-clock cap is the only mechanism that can't be
+ * forgotten open). `startedAt: null` (never started, or already stopped) is
+ * never over the cap — nothing to expire. */
+export function hasLoadRunExceededMaxDuration(startedAt: number | null, now: number): boolean {
+  if (startedAt === null) return false;
+  return now - startedAt > MAX_LOAD_RUN_DURATION_MS;
 }
 
 interface TypeCounters {
@@ -330,6 +366,7 @@ export class LoadDriver {
       districtsPerWarehouse?: number;
       customersPerDistrict?: number;
       itemCount?: number;
+      seedReferenceData?: boolean;
     };
     try {
       body = (await request.json()) ?? {};
@@ -347,16 +384,58 @@ export class LoadDriver {
 
     const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number.isFinite(body.concurrency) ? Number(body.concurrency) : DEFAULT_CONCURRENCY));
 
+    // Self-seeding (the default — see the seedReferenceData block below)
+    // needs the transaction mix's own districtsPerWarehouse/customersPer
+    // District/itemCount to match what actually gets seeded, not the much
+    // larger benchmark-scale DEFAULT_* constants (10 districts * 100
+    // customers, 200 items) — otherwise New-Order/Payment/Order-Status pick
+    // random district/customer ids the bootstrap never created rows for and
+    // fail almost every attempt. A caller with seedReferenceData: false
+    // (bringing its own already-seeded, real-TPC-C-scale data) still wants
+    // the normal DEFAULT_* fallback.
+    const willSelfSeed = body.seedReferenceData !== false;
     const config: LoadDriverConfig = {
       mode,
       targetShardId: mode === "skew" ? (body.targetShardId as string) : null,
       concurrency,
-      baseUrl: typeof body.baseUrl === "string" && body.baseUrl.length > 0 ? body.baseUrl : null,
+      baseUrl: resolveLoadDriverBaseUrl(body.baseUrl, this.env.CORE_GATEWAY_BASE_URL),
       warehouseIds: Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS,
-      districtsPerWarehouse: Number.isFinite(body.districtsPerWarehouse) ? Number(body.districtsPerWarehouse) : DEFAULT_DISTRICTS_PER_WAREHOUSE,
-      customersPerDistrict: Number.isFinite(body.customersPerDistrict) ? Number(body.customersPerDistrict) : DEFAULT_CUSTOMERS_PER_DISTRICT,
-      itemCount: Number.isFinite(body.itemCount) ? Number(body.itemCount) : DEFAULT_ITEM_COUNT,
+      districtsPerWarehouse: Number.isFinite(body.districtsPerWarehouse)
+        ? Number(body.districtsPerWarehouse)
+        : willSelfSeed
+          ? SCENARIO_DISTRICTS_PER_WAREHOUSE
+          : DEFAULT_DISTRICTS_PER_WAREHOUSE,
+      customersPerDistrict: Number.isFinite(body.customersPerDistrict)
+        ? Number(body.customersPerDistrict)
+        : willSelfSeed
+          ? SCENARIO_CUSTOMERS_PER_DISTRICT
+          : DEFAULT_CUSTOMERS_PER_DISTRICT,
+      itemCount: Number.isFinite(body.itemCount) ? Number(body.itemCount) : willSelfSeed ? SCENARIO_ITEM_COUNT : DEFAULT_ITEM_COUNT,
     };
+
+    // Bootstrap reference data (warehouse/district/customer/item/stock) for
+    // every warehouse this run targets — see scenario-seed.ts's header
+    // comment for why this can't be a separate, external setup step: the
+    // token that seeds a tenant's data and the token that later transacts
+    // against it must be the SAME one (TenantTokenStoreTokenProvider
+    // refuses to rotate a tenant already registered by a different caller),
+    // so LoadDriver has to seed its own data through its own token. Opt out
+    // with `seedReferenceData: false` for a warehouse something else (e.g.
+    // the Node TPC-C harness) already owns and seeded. Runs BEFORE any state
+    // is persisted — a seeding failure means handleStart returns an error
+    // and never marks the run as started, rather than starting a run
+    // guaranteed to fail every transaction.
+    if (willSelfSeed) {
+      const seedExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
+      try {
+        for (const warehouseId of config.warehouseIds) {
+          await seedScenarioReferenceData(seedExecutor, warehouseId, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return json({ error: `Couldn't seed reference data: ${message}` }, 502);
+      }
+    }
 
     const s = await this.loadState();
     s.running = true;
@@ -408,6 +487,21 @@ export class LoadDriver {
   async alarm(): Promise<void> {
     const s = await this.loadState();
     if (!s.running || !s.config) return; // stopped since the alarm was scheduled — go idle
+
+    // Safety cap (see MAX_LOAD_RUN_DURATION_MS's doc comment): force-stop
+    // regardless of who's watching, rather than let a forgotten scenario run
+    // indefinitely. Checked BEFORE running this tick, so the run stops
+    // cleanly at the cap instead of squeezing in one more tick past it.
+    if (hasLoadRunExceededMaxDuration(s.startedAt, Date.now())) {
+      s.running = false;
+      // Not an actual error — reusing lastError as the "why isn't this
+      // running" signal the frontend already has a field for, rather than
+      // adding a second, parallel "stopReason" field for one case.
+      s.lastError = `auto-stopped after ${Math.round(MAX_LOAD_RUN_DURATION_MS / 60_000)} min (safety cap) — start it again to keep watching`;
+      await this.saveState(s);
+      await this.state.storage.deleteAlarm();
+      return;
+    }
 
     try {
       await this.runTick(s);
