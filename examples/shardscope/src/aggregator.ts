@@ -437,26 +437,49 @@ export class TopologyAggregator {
     // the next tick's write() to discover it's gone.
     request.signal.addEventListener("abort", cleanup);
 
-    // Bounded + drop-on-failure, same as every other write to this writer
-    // (see safeWrite) — an unwrapped await here would leave a subscriber that
-    // rejected or stalled on this very first write lingering in
-    // `subscribers` forever if the abort listener above never fires for it.
-    await this.safeWrite(writer, sseEvent("hello", { message: "shardscope aggregator: connected, waiting for first tick" }));
+    // The initial hello/cached-snapshot writes are dispatched AFTER the
+    // Response below is returned, not awaited here — writing to `writer`
+    // before its `readable` side has an attached reader means safeWrite's
+    // write() races against SUBSCRIBER_WRITE_TIMEOUT_MS with nothing yet
+    // consuming the stream to relieve backpressure. Returning the Response
+    // first guarantees a reader is attached before the first byte is ever
+    // written, in every environment, rather than depending on however
+    // quickly (if ever) a given runtime starts pulling an unread
+    // ReadableStream once its Response is merely constructed.
+    //
+    // queueMicrotask, not a bare `void (async () => {...})()`: calling an
+    // async function runs its body SYNCHRONOUSLY up to the first `await` —
+    // so a bare IIFE here would still fire safeWrite's writer.write() before
+    // the `return new Response(...)` statement below ever executes, only
+    // moving where the deadlocking write is AWAITED, not where it's
+    // STARTED. queueMicrotask defers starting it until after this function
+    // returns and the Response construction below has run.
+    //
+    // void is intentional fire-and-forget: safeWrite already bounds itself
+    // to writeTimeoutMs and drops a stalled/rejected writer from
+    // `subscribers` on its own, so nothing here needs to await or handle
+    // its outcome.
+    queueMicrotask(() => {
+      void (async () => {
+        await this.safeWrite(writer, sseEvent("hello", { message: "shardscope aggregator: connected, waiting for first tick" }));
 
-    // Don't make a brand-new subscriber wait a full tick interval for data
-    // that's already sitting in memory.
-    if (this.lastSnapshot) {
-      await this.safeWrite(writer, sseEvent("snapshot", this.lastSnapshot));
-    }
+        // Don't make a brand-new subscriber wait a full tick interval for
+        // data that's already sitting in memory.
+        if (this.lastSnapshot) {
+          await this.safeWrite(writer, sseEvent("snapshot", this.lastSnapshot));
+        }
 
-    if (isFirstSubscriber) {
-      // Fire-and-forget: kick the shared poll loop off right away instead of
-      // waiting for the first alarm to fire, so the first viewer of an idle
-      // dashboard doesn't stare at nothing for a whole TICK_INTERVAL_MS.
-      // runTick() reschedules itself via scheduleNextTick() when it's done,
-      // so this single call is enough to keep the loop alive.
-      void this.runTick();
-    }
+        if (isFirstSubscriber) {
+          // Kick the shared poll loop off right away instead of waiting for
+          // the first alarm to fire, so the first viewer of an idle
+          // dashboard doesn't stare at nothing for a whole
+          // TICK_INTERVAL_MS. runTick() reschedules itself via
+          // scheduleNextTick() when it's done, so this single call is
+          // enough to keep the loop alive.
+          void this.runTick();
+        }
+      })();
+    });
 
     return new Response(readable, {
       status: 200,
