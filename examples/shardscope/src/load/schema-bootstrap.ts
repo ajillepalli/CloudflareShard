@@ -102,7 +102,7 @@ export const TPCC_INDEXES: IndexSchema[] = [
 export interface SchemaAdminClient {
   listTables(): Promise<{ tables?: Array<{ table_name?: string }> }>;
   createTable(table: string, schema: string, partitionKeyColumn: string): Promise<unknown>;
-  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string }> }>;
+  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string; status?: string }> }>;
   createIndex(indexName: string, table: string, columns: string[]): Promise<unknown>;
 }
 
@@ -140,7 +140,7 @@ export class HttpSchemaAdminClient implements SchemaAdminClient {
     return this.post("/admin/create-table", { table, schema, partitionKeyColumn });
   }
 
-  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string }> }> {
+  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string; status?: string }> }> {
     return this.post("/admin/list-indexes", {});
   }
 
@@ -165,14 +165,15 @@ const TOPOLOGY_LOCK_RETRY_DELAY_MS = 500;
  * including on an already-bootstrapped cluster, where restarting a real
  * backfill (each one holding the topology lock, taking real wall-clock time)
  * is both needless and — during live testing — correlated with correctness-
- * meter noise on the traffic that starts moments later. ensureScenarioSchema
- * below now checks /admin/list-indexes first and skips create-index entirely
- * for anything already registered, exactly like the table-existence check;
- * this function's retry loop is now reached only for a genuinely NEW index
- * on this cluster (never on a warm re-click), where a topology-lock
- * collision with some OTHER concurrent operation (a real reshard, another
- * visitor's own scenario start) is the one real reason a create-index call
- * can still transiently fail here. */
+ * meter noise on the traffic that starts moments later. waitForIndexesReady
+ * below now checks /admin/list-indexes's STATUS first and only reaches this
+ * function for an index that's missing or 'failed' — never one already
+ * 'ready' or one still 'building' (see waitForIndexesReady's own comment on
+ * why a 'building' index is left to finish on its own rather than retried).
+ * A topology-lock collision with some OTHER concurrent operation (a real
+ * reshard, another visitor's own scenario start registering a NEW index for
+ * the first time) is the one real reason a create-index call reached from
+ * here can still transiently fail. */
 async function createIndexWithRetry(admin: SchemaAdminClient, idx: IndexSchema): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -189,17 +190,65 @@ async function createIndexWithRetry(admin: SchemaAdminClient, idx: IndexSchema):
   }
 }
 
-/** Ensures every TPC-C table + secondary index this scenario needs exists on
- * the cluster, creating only what's missing. Safe (and fast) to call on
- * every "Start the scenario" click: both table creation and index creation
- * are skipped entirely for anything already registered — see
- * /admin/list-tables (mirrors generate.mjs's createSchema — see that
- * function's own comment on why create-table has no idempotent "IF NOT
- * EXISTS" escape hatch) and /admin/list-indexes (see createIndexWithRetry's
- * own comment on why create-index must NOT be called against an
- * already-built index). Called from load-driver.ts's handleStart, BEFORE
+const INDEX_READY_POLL_ATTEMPTS = 40;
+const INDEX_READY_POLL_DELAY_MS = 500;
+
+/** Codex review P2 fix: /admin/list-indexes reporting an index BY NAME does
+ * not mean it's usable — src/catalog.ts's index_rules.status is 'building'
+ * from the moment it's registered until backfill fully completes (or
+ * 'failed' if backfill gave up), and /v1/index-query rejects reads against
+ * anything that isn't 'ready'. The previous version of this function only
+ * checked existence, so an index left 'building' (a prior run's own bootstrap
+ * still in progress) or 'failed' (a prior backfill that gave up) was treated
+ * as already done — the scenario would start immediately, and every
+ * index-backed transaction (New-Order's stock lookup, Stock-Level, Delivery,
+ * Order-Status) would fail against that specific index until it happened to
+ * finish on its own. This now waits for every required index to actually
+ * report 'ready' before returning, re-triggering create-index for anything
+ * 'failed' (src/index.ts's adminCreateIndexLockedCore resets a 'failed'
+ * index's backfill on retry — see its own SQL's `status IN ('building',
+ * 'failed')` clause) — but deliberately NOT for an index still 'building',
+ * since re-calling create-index on one already in progress would just reset
+ * its backfill cursor back to the start (same clause) for no benefit; a
+ * 'building' index just needs time, handled by polling below. */
+async function waitForIndexesReady(admin: SchemaAdminClient, required: IndexSchema[]): Promise<void> {
+  for (let attempt = 1; attempt <= INDEX_READY_POLL_ATTEMPTS; attempt++) {
+    const { indexes } = await admin.listIndexes();
+    const statusByName = new Map((indexes ?? []).filter((i) => typeof i.indexName === "string").map((i) => [i.indexName as string, i.status]));
+
+    const notReady = required.filter((idx) => statusByName.get(idx.indexName) !== "ready");
+    if (notReady.length === 0) return;
+
+    for (const idx of notReady) {
+      const status = statusByName.get(idx.indexName);
+      if (status === undefined || status === "failed") {
+        await createIndexWithRetry(admin, idx);
+      }
+      // status === "building": no action — just keep polling below.
+    }
+
+    if (attempt < INDEX_READY_POLL_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, INDEX_READY_POLL_DELAY_MS));
+    }
+  }
+  throw new Error(
+    `Timed out waiting for scenario indexes to become ready after ${INDEX_READY_POLL_ATTEMPTS} attempts — check /admin/list-indexes.`,
+  );
+}
+
+/** Ensures every TPC-C table + secondary index this scenario needs exists AND
+ * is ready on the cluster, creating/retrying only what's missing or stuck.
+ * Safe (and fast on a warm cluster) to call on every "Start the scenario"
+ * click: table creation is skipped entirely for anything /admin/list-tables
+ * already reports (mirrors generate.mjs's createSchema — see that function's
+ * own comment on why create-table has no idempotent "IF NOT EXISTS" escape
+ * hatch); index handling is delegated to waitForIndexesReady, which also
+ * skips create-index for anything already 'ready' (see that function's own
+ * comment on why create-index must NOT be called against an already-built
+ * index). Called from load-driver.ts's handleStart, BEFORE
  * seedScenarioReferenceData — seeding a table that doesn't exist yet 502s
- * instead of upserting. */
+ * instead of upserting, and seeding is pointless if the scenario's own
+ * indexes won't be usable yet. */
 export async function ensureScenarioSchema(admin: SchemaAdminClient): Promise<void> {
   const { tables } = await admin.listTables();
   const existingTableNames = new Set((tables ?? []).map((t) => t.table_name).filter((n): n is string => typeof n === "string"));
@@ -208,10 +257,5 @@ export async function ensureScenarioSchema(admin: SchemaAdminClient): Promise<vo
     await admin.createTable(t.table, t.schema, t.partitionKeyColumn);
   }
 
-  const { indexes } = await admin.listIndexes();
-  const existingIndexNames = new Set((indexes ?? []).map((i) => i.indexName).filter((n): n is string => typeof n === "string"));
-  for (const idx of TPCC_INDEXES) {
-    if (existingIndexNames.has(idx.indexName)) continue;
-    await createIndexWithRetry(admin, idx);
-  }
+  await waitForIndexesReady(admin, TPCC_INDEXES);
 }

@@ -22,14 +22,19 @@ entrypoint = "CloudflareShardRpc"
 
 # CORE_GATEWAY_BASE_URL: where load-driver.ts's real HTTP client (not the
 # SHARD_API RPC binding above — see env.d.ts's doc comment on why it needs a
-# genuinely reachable URL) sends its /v1/* calls. This default is the local
-# cloudflare-shard-mvp `wrangler dev` port, matching the same "run both
-# Workers locally" setup [[services]] above already assumes. A real
-# deployment overrides this per-deploy — `wrangler deploy --var
-# CORE_GATEWAY_BASE_URL:<your-core-worker-url>` — rather than committing a
-# deployment-specific URL to this checked-in template.
-[vars]
-CORE_GATEWAY_BASE_URL = "http://127.0.0.1:8787"
+# genuinely reachable URL) sends its /v1/* calls. Deliberately NOT set here
+# (Codex review P2 fix): a committed default of the local wrangler-dev port
+# would silently become the value a REAL deploy falls back to whenever
+# someone forgets the explicit override below, and Cloudflare's runtime has
+# no way to reach 127.0.0.1 — "Start the scenario" would fail confusingly
+# deep inside schema bootstrap/seeding instead of failing clearly. Local dev
+# sets this in .dev.vars instead (gitignored, not committed — see
+# .dev.vars's own ADMIN_TOKEN/SHARDSCOPE_GATE_TOKEN for the same pattern); a
+# real deployment sets its own with `wrangler deploy --var
+# CORE_GATEWAY_BASE_URL:<your-core-worker-url>`. Left genuinely unset,
+# resolveLoadDriverBaseUrl (load-driver.ts) resolves to null and the
+# HttpTxExecutor's first call fails at the network layer with an obvious
+# error, per that function's own doc comment — not a silent localhost no-op.
 
 # TopologyAggregator: a singleton Durable Object (see src/aggregator.ts) that
 # owns the single shared poll of the admin API on an alarm() tick and fans a
