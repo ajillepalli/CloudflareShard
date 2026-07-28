@@ -629,25 +629,9 @@ function renderScoreboard(scoreboard) {
 // mode==="demo" guard elsewhere in this file), so the banner never renders
 // there at all.
 
-let scenarioTargetShardId = null;
 let scenarioActionInFlight = false;
 
-/** Picks a real shard id to skew load traffic toward — vbucket 0 of the
- * first catalog that has any vbuckets, mirroring the same "vbucket 0 is the
- * default" convention refreshVbucketPicker already establishes for
- * Reshard's own pickers. `null` only if the cluster somehow has no
- * catalogs/vbuckets at all (shouldn't happen once cluster.initialized is
- * true — renderInner's empty-state early-return already covers that case
- * before this ever runs — but never crash over it). */
-function pickScenarioTargetShardId(catalogs) {
-  for (const cat of catalogs || []) {
-    const vb0 = (cat.vbuckets || []).find((row) => row.vbucket === 0);
-    if (vb0 && vb0.shardId) return vb0.shardId;
-  }
-  return null;
-}
-
-function renderScenarioControls(catalogs, scoreboard) {
+function renderScenarioControls(scoreboard) {
   if (!el.scenarioStartBanner || !el.scenarioRunningPill) return;
   // Codex review P2 fix: this is a real /api/load/* control surface, so it
   // must only ever show for a genuine live connection — NOT just "not demo".
@@ -664,10 +648,17 @@ function renderScenarioControls(catalogs, scoreboard) {
   const running = !!(scoreboard && scoreboard.loadRunning);
   el.scenarioStartBanner.hidden = running;
   el.scenarioRunningPill.hidden = !running;
-  if (!running) {
-    scenarioTargetShardId = pickScenarioTargetShardId(catalogs);
-    if (el.scenarioStartBtn && !scenarioActionInFlight) el.scenarioStartBtn.disabled = !scenarioTargetShardId;
-  }
+  // Codex review P2 fix: this used to pick a "target shard" client-side
+  // (vbucket 0 of whichever catalog happened to be first in the topology
+  // snapshot) and disable Start until it found one — but that guess had no
+  // relationship to which catalog the scenario's actual warehouse tenant
+  // hashes to, so on any deployment where they differ, skew mode silently
+  // ran uniform traffic instead of creating a real hot shard. The server
+  // now resolves a genuinely correct target itself (see load-driver.ts's
+  // resolveDefaultSkewTarget) when the request omits targetShardId, so the
+  // client no longer needs to guess one — Start just stays enabled whenever
+  // a run isn't already active/in flight.
+  if (!running && el.scenarioStartBtn && !scenarioActionInFlight) el.scenarioStartBtn.disabled = false;
 }
 
 /** Shared error handling for both scenario actions below — a 401 means the
@@ -689,19 +680,24 @@ function handleScenarioActionResponse(res) {
 }
 
 function handleScenarioStartClick() {
-  if (mode !== "live" || scenarioActionInFlight || !scenarioTargetShardId) return;
+  if (mode !== "live" || scenarioActionInFlight) return;
   scenarioActionInFlight = true;
   el.scenarioStartBtn.disabled = true;
   el.scenarioStartBtn.textContent = "starting…";
+  // targetShardId is deliberately omitted — the server resolves a genuinely
+  // correct one from the scenario warehouse's own catalog (see
+  // load-driver.ts's resolveDefaultSkewTarget's doc comment for why the
+  // client can't reliably guess this itself).
   fetch("/api/load/start", {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ mode: "skew", targetShardId: scenarioTargetShardId }),
+    body: JSON.stringify({ mode: "skew" }),
   })
     .then(handleScenarioActionResponse)
-    .then(() => {
-      logLine(`scenario started — real writes now landing on ${scenarioTargetShardId}`, "safe");
+    .then((status) => {
+      const targetShardId = (status && status.config && status.config.targetShardId) || "a live shard";
+      logLine(`scenario started — real writes now landing on ${targetShardId}`, "safe");
     })
     .catch((err) => {
       const msg = (err && err.message) || String(err);
@@ -711,7 +707,7 @@ function handleScenarioStartClick() {
     .finally(() => {
       scenarioActionInFlight = false;
       el.scenarioStartBtn.textContent = "Start the scenario";
-      el.scenarioStartBtn.disabled = !scenarioTargetShardId;
+      el.scenarioStartBtn.disabled = false;
     });
 }
 
@@ -868,7 +864,7 @@ function renderInner(snapshot) {
     return;
   }
   el.emptyState.hidden = true;
-  renderScenarioControls(catalogs, snapshot.scoreboard);
+  renderScenarioControls(snapshot.scoreboard);
 
   // ---- shard id union: vbucket map (owners + targets) UNION shards[] ----
   const shardIds = new Set();
