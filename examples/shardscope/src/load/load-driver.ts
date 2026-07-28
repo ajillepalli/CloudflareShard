@@ -416,26 +416,31 @@ export class LoadDriver {
     const willSelfSeed = body.seedReferenceData !== false;
     const warehouseIds = Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS;
 
-    // Codex review P2 fix: self-seeding's schema bootstrap MUST use
-    // env.CORE_GATEWAY_BASE_URL (see the P1 fix below on why an admin-token
-    // client can never trust a request-supplied baseUrl), but seeding and
-    // real traffic use config.baseUrl, which CAN come from the request body.
-    // If a caller supplies a baseUrl that differs from the trusted gateway
-    // while also requesting self-seeding, tables/indexes would get
-    // bootstrapped on ONE cluster while data gets seeded (and later
-    // verified) against a DIFFERENT one — schema on cluster A, seeding 502s
-    // (or worse, silently "succeeds" against cluster B's own leftover
-    // schema from unrelated prior use) on cluster B. Reject this
-    // combination outright rather than silently splitting the two: a
-    // caller bringing its own baseUrl for a different cluster already has
-    // the documented `seedReferenceData: false` escape hatch (see this
-    // block's own comment below) for a warehouse something else already
-    // seeded there.
-    if (willSelfSeed && typeof body.baseUrl === "string" && body.baseUrl.length > 0 && body.baseUrl !== this.env.CORE_GATEWAY_BASE_URL) {
+    // Codex review P2 fix (round 9: widened from "only when self-seeding"):
+    // the admin-token clients (schema bootstrap, the correctness tracker's
+    // /v1/sql read-back) are now ALWAYS pinned to env.CORE_GATEWAY_BASE_URL
+    // (see the P1 fix below on why an admin-token client can never trust a
+    // request-supplied baseUrl), and resolveDefaultSkewTarget always reads
+    // env.SHARD_API's vbucket map (a fixed RPC service binding, not
+    // influenced by config.baseUrl at all) — but the actual tenant TRAFFIC
+    // (HttpTxExecutor) still uses config.baseUrl, which CAN come from the
+    // request body. A caller supplying a baseUrl that genuinely differs from
+    // the trusted gateway — with OR without self-seeding — would therefore
+    // send real writes to one cluster while the correctness tracker reads
+    // back from (and reports false losses against) a completely different
+    // one, and/or resolve a skew target from the wrong cluster's topology
+    // entirely. There is no longer any combination of options that makes a
+    // genuinely different baseUrl behave correctly, so it's rejected
+    // outright rather than silently splitting the pipeline across two
+    // clusters: a caller bringing its own already-seeded cluster still has
+    // `seedReferenceData: false` (see this block's own comment below) to
+    // skip self-seeding specifically, but must still run against the SAME
+    // gateway this deployment is configured for.
+    if (typeof body.baseUrl === "string" && body.baseUrl.length > 0 && body.baseUrl !== this.env.CORE_GATEWAY_BASE_URL) {
       return json(
         {
           error:
-            "A custom 'baseUrl' can't be combined with self-seeding (the default) — schema bootstrap always targets the deployment's own CORE_GATEWAY_BASE_URL, so a different baseUrl would seed one cluster while bootstrapping another. Either omit 'baseUrl' to use the default gateway, or pass 'seedReferenceData: false' if that cluster already has its own reference data.",
+            "A custom 'baseUrl' pointing at a different cluster isn't supported — schema bootstrap, the correctness tracker's read-back, and skew-target resolution all always target this deployment's own CORE_GATEWAY_BASE_URL, so a different baseUrl would split reads and writes across two clusters. Omit 'baseUrl' to use the default gateway.",
         },
         400,
       );
@@ -605,7 +610,7 @@ export class LoadDriver {
       // ready to start — see verifySeededDataIndexed's own doc comment.
       try {
         for (const warehouseId of config.warehouseIds) {
-          await verifySeededDataIndexed(seedExecutor, warehouseId, config.districtsPerWarehouse);
+          await verifySeededDataIndexed(seedExecutor, warehouseId, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -644,18 +649,31 @@ export class LoadDriver {
     return json(toStatusJson(finalState, this.correctnessTracker.snapshot()));
   }
 
-  /** Codex review P2 fix (round 8): re-reads durable state and returns it
-   * ONLY if it still belongs to the start attempt anchored at `myStartedAt`
-   * — i.e. nothing (a concurrent stop, or an entirely different start) has
-   * touched it since. `startedAt` is set exactly once per start, to a
-   * millisecond timestamp, at the very first save handleStart makes — for
-   * this DO's single-run-at-a-time model that's a sufficient, simple
-   * generation marker. Returns null when superseded; callers must not save
-   * anything in that case (see abortStart / handleStart's own final check
-   * for how each caller responds instead). */
+  /** Codex review P2 fix (round 8; corrected round 9 — see below): re-reads
+   * durable state and returns it ONLY if it still belongs to the start
+   * attempt anchored at `myStartedAt` — i.e. nothing (a concurrent stop, or
+   * an entirely different start) has touched it since. `startedAt` is set
+   * exactly once per start, to a millisecond timestamp, at the very first
+   * save handleStart makes — for this DO's single-run-at-a-time model
+   * that's a sufficient, simple generation marker for detecting a NEWER
+   * start. Returns null when superseded; callers must not save anything in
+   * that case (see abortStart / handleStart's own final check for how each
+   * caller responds instead).
+   *
+   * ROUND 9 CORRECTION: this originally checked `startedAt` alone — but
+   * handleStop() sets `running = false` WITHOUT touching `startedAt` (there
+   * is no new run to anchor a fresh generation to; stopping isn't starting
+   * anything). A stop arriving mid-bootstrap would therefore leave
+   * `startedAt` matching, this check would report "still mine", and the
+   * original start would carry on — finishing schema/seeding work for a run
+   * that was just told to stop, and its final success path would set
+   * `running = true` again, silently resurrecting the exact run the caller
+   * just stopped. Requiring `running === true` too closes this: a stop is
+   * now unambiguously a supersession of any start still in flight, exactly
+   * like a genuinely different start would be. */
   private async reloadIfStillMine(myStartedAt: number): Promise<LoadDriverState | null> {
     const current = await this.loadState();
-    return current.startedAt === myStartedAt ? current : null;
+    return current.startedAt === myStartedAt && current.running ? current : null;
   }
 
   /** Shared response for "this start attempt was superseded by a newer
