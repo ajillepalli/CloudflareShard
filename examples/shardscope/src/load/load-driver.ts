@@ -41,6 +41,7 @@ import type { TokenProvider } from "./token-provider";
 import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
 import { HttpTxExecutor, HttpSqlPointReader } from "./gateway-client";
 import { seedScenarioReferenceData, SCENARIO_DISTRICTS_PER_WAREHOUSE, SCENARIO_CUSTOMERS_PER_DISTRICT, SCENARIO_ITEM_COUNT } from "./scenario-seed";
+import { ensureScenarioSchema, HttpSchemaAdminClient } from "./schema-bootstrap";
 import {
   CorrectnessTracker,
   TrackingTxExecutor,
@@ -426,6 +427,20 @@ export class LoadDriver {
     // and never marks the run as started, rather than starting a run
     // guaranteed to fail every transaction.
     if (willSelfSeed) {
+      // Codex review P2 fix: a genuinely fresh cluster (only /admin/init run
+      // — exactly what a real "Deploy to Cloudflare" visitor's core Worker
+      // starts as) has none of the tpcc_* tables/indexes yet, so seeding
+      // below would 502 on its very first upsert. Ensure the schema exists
+      // FIRST — see schema-bootstrap.ts's own header comment for why this is
+      // safe to call on every start rather than only once.
+      const schemaAdmin = new HttpSchemaAdminClient(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
+      try {
+        await ensureScenarioSchema(schemaAdmin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return json({ error: `Couldn't bootstrap scenario schema: ${message}` }, 502);
+      }
+
       const seedExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
       try {
         for (const warehouseId of config.warehouseIds) {
