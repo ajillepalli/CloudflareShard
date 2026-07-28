@@ -984,6 +984,19 @@ function setLockError(msg) {
  * with the parsed JSON body on 2xx; rejects with an Error carrying the
  * server's message on everything else. */
 function reshardFetch(path, options) {
+  // ?demo=1 never touches /api/* (see startAppRoom/startEdgeRoom's identical
+  // guard) — reshard had no such guard, so every automatic poll on mounting
+  // this room (pollLockStatus, on a timer via startReshardPolling) hit a real
+  // 401 against the static preview, which reshardFetch's own 401 handling
+  // below treats as "the gate session expired" and logs the user out,
+  // bouncing them back to Topology's login panel. Short-circuit here, at the
+  // single choke point every reshard/chaos call goes through, so both the
+  // automatic polling AND every action button (split/migrate/drain/chaos/
+  // abort/lock-release) surface an honest "demo mode" error through each
+  // caller's existing .catch instead of triggering a false logout.
+  if (mode === "demo") {
+    return Promise.reject(new Error("demo mode (?demo=1) — no live cluster; drop the query param against a live cluster to run reshard operations."));
+  }
   return fetch(path, Object.assign({ credentials: "same-origin" }, options)).then((res) => {
     if (res.status === 401) {
       handleLogout();
