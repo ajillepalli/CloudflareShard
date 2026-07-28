@@ -482,6 +482,9 @@ html, body {
   background: rgba(7, 10, 15, .78);
   backdrop-filter: blur(3px);
 }
+.tour-overlay[hidden] {
+  display: none;
+}
 .tour-card {
   width: min(420px, 88vw);
   padding: 20px 22px 18px;
