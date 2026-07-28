@@ -3334,6 +3334,13 @@ function connectLive() {
       logLine("connection lost — reconnecting…", "warn");
     }
   });
+
+  // Covers a tab that's ALREADY hidden the moment this connection opens
+  // (opened in a background tab, or hidden while the gate preflight/login
+  // was still pending) — handleVisibilityChange only reacts to future
+  // visibilitychange events otherwise, so a stream that starts hidden would
+  // never get its pause timer armed and could stay connected indefinitely.
+  handleVisibilityChange();
 }
 
 // ============================================================================
