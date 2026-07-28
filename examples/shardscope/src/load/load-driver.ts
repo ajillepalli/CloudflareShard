@@ -416,6 +416,31 @@ export class LoadDriver {
     const willSelfSeed = body.seedReferenceData !== false;
     const warehouseIds = Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS;
 
+    // Codex review P2 fix: self-seeding's schema bootstrap MUST use
+    // env.CORE_GATEWAY_BASE_URL (see the P1 fix below on why an admin-token
+    // client can never trust a request-supplied baseUrl), but seeding and
+    // real traffic use config.baseUrl, which CAN come from the request body.
+    // If a caller supplies a baseUrl that differs from the trusted gateway
+    // while also requesting self-seeding, tables/indexes would get
+    // bootstrapped on ONE cluster while data gets seeded (and later
+    // verified) against a DIFFERENT one — schema on cluster A, seeding 502s
+    // (or worse, silently "succeeds" against cluster B's own leftover
+    // schema from unrelated prior use) on cluster B. Reject this
+    // combination outright rather than silently splitting the two: a
+    // caller bringing its own baseUrl for a different cluster already has
+    // the documented `seedReferenceData: false` escape hatch (see this
+    // block's own comment below) for a warehouse something else already
+    // seeded there.
+    if (willSelfSeed && typeof body.baseUrl === "string" && body.baseUrl.length > 0 && body.baseUrl !== this.env.CORE_GATEWAY_BASE_URL) {
+      return json(
+        {
+          error:
+            "A custom 'baseUrl' can't be combined with self-seeding (the default) — schema bootstrap always targets the deployment's own CORE_GATEWAY_BASE_URL, so a different baseUrl would seed one cluster while bootstrapping another. Either omit 'baseUrl' to use the default gateway, or pass 'seedReferenceData: false' if that cluster already has its own reference data.",
+        },
+        400,
+      );
+    }
+
     // Codex review P2 fix: `targetShardId` is no longer REQUIRED for skew
     // mode — an explicit one from the caller is honored as-is (synchronously,
     // no await needed) below; an omitted one is resolved via
@@ -487,20 +512,25 @@ export class LoadDriver {
     s.lastTickAt = null;
     s.lastError = null;
     await this.saveState(s);
+    // Codex review P2 fix (round 8): anchors THIS specific start attempt —
+    // see abortStart's and reloadIfStillMine's own doc comments for why
+    // every subsequent save in this method re-checks against this value
+    // before writing anything more.
+    const myStartedAt = s.startedAt;
 
     if (mode === "skew" && !explicitTargetShardId) {
+      let resolvedTargetShardId: string;
       try {
-        config.targetShardId = await this.resolveDefaultSkewTarget(warehouseIds[0]);
+        resolvedTargetShardId = await this.resolveDefaultSkewTarget(warehouseIds[0]);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        s.running = false;
-        s.config = null;
-        s.lastError = `Couldn't resolve a default skew target: ${message}. Pass 'targetShardId' explicitly instead.`;
-        await this.saveState(s);
-        return json({ error: s.lastError }, 502);
+        return this.abortStart(myStartedAt, `Couldn't resolve a default skew target: ${message}. Pass 'targetShardId' explicitly instead.`);
       }
-      s.config = config;
-      await this.saveState(s);
+      config.targetShardId = resolvedTargetShardId;
+      const current = await this.reloadIfStillMine(myStartedAt);
+      if (!current) return this.supersededResponse();
+      current.config = config;
+      await this.saveState(current);
     }
 
     // Bootstrap reference data (warehouse/district/customer/item/stock) for
@@ -512,7 +542,7 @@ export class LoadDriver {
     // so LoadDriver has to seed its own data through its own token. Opt out
     // with `seedReferenceData: false` for a warehouse something else (e.g.
     // the Node TPC-C harness) already owns and seeded. A bootstrap/seed
-    // failure rolls `running` back to false (see each catch block) — the run
+    // failure rolls `running` back to false (see abortStart) — the run
     // never actually starts rather than starting one guaranteed to fail
     // every transaction.
     if (willSelfSeed) {
@@ -532,17 +562,15 @@ export class LoadDriver {
       // exfiltration path for the cluster's admin credential. body.baseUrl
       // is only ever meant to override the TENANT-scoped HttpTxExecutor
       // below (a real but far less sensitive testing/flexibility knob —
-      // still a tenant bearer token, never the admin one).
+      // still a tenant bearer token, never the admin one) — and even that is
+      // rejected above when combined with self-seeding, to avoid bootstrapping
+      // one cluster while seeding another.
       const schemaAdmin = new HttpSchemaAdminClient(this.env.CORE_GATEWAY_BASE_URL, this.env.ADMIN_TOKEN);
       try {
         await ensureScenarioTables(schemaAdmin);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        s.running = false;
-        s.config = null;
-        s.lastError = `Couldn't bootstrap scenario schema: ${message}`;
-        await this.saveState(s);
-        return json({ error: s.lastError }, 502);
+        return this.abortStart(myStartedAt, `Couldn't bootstrap scenario schema: ${message}`);
       }
 
       const seedExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
@@ -552,11 +580,7 @@ export class LoadDriver {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        s.running = false;
-        s.config = null;
-        s.lastError = `Couldn't seed reference data: ${message}`;
-        await this.saveState(s);
-        return json({ error: s.lastError }, 502);
+        return this.abortStart(myStartedAt, `Couldn't seed reference data: ${message}`);
       }
 
       // Codex review P2 fix: indexes are created/verified-ready AFTER
@@ -569,11 +593,7 @@ export class LoadDriver {
         await ensureScenarioIndexesReady(schemaAdmin);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        s.running = false;
-        s.config = null;
-        s.lastError = `Couldn't finish bootstrapping scenario indexes: ${message}`;
-        await this.saveState(s);
-        return json({ error: s.lastError }, 502);
+        return this.abortStart(myStartedAt, `Couldn't finish bootstrapping scenario indexes: ${message}`);
       }
 
       // Codex review P2 fix (round 5): an index rule reporting 'ready' only
@@ -589,13 +609,19 @@ export class LoadDriver {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        s.running = false;
-        s.config = null;
-        s.lastError = `Seeded data didn't become queryable in time: ${message}`;
-        await this.saveState(s);
-        return json({ error: s.lastError }, 502);
+        return this.abortStart(myStartedAt, `Seeded data didn't become queryable in time: ${message}`);
       }
     }
+
+    // Codex review P2 fix (round 8): the long bootstrap sequence above may
+    // have taken long enough for a concurrent /api/load/stop (or an entirely
+    // different /api/load/start) to have already changed durable state — see
+    // reloadIfStillMine's own doc comment. Re-check ONE last time before the
+    // final "declare this run ready" step: setting the alarm now if this
+    // attempt has been superseded would incorrectly resurrect a run someone
+    // already stopped.
+    const finalState = await this.reloadIfStillMine(myStartedAt);
+    if (!finalState) return this.supersededResponse();
 
     // Reset the transient skew cache — a new start may target a different
     // shard than any previously cached pool.
@@ -615,7 +641,48 @@ export class LoadDriver {
     // TICK_INTERVAL_MS for the alarm to fire.
     await this.state.storage.setAlarm(Date.now());
 
-    return json(toStatusJson(s, this.correctnessTracker.snapshot()));
+    return json(toStatusJson(finalState, this.correctnessTracker.snapshot()));
+  }
+
+  /** Codex review P2 fix (round 8): re-reads durable state and returns it
+   * ONLY if it still belongs to the start attempt anchored at `myStartedAt`
+   * — i.e. nothing (a concurrent stop, or an entirely different start) has
+   * touched it since. `startedAt` is set exactly once per start, to a
+   * millisecond timestamp, at the very first save handleStart makes — for
+   * this DO's single-run-at-a-time model that's a sufficient, simple
+   * generation marker. Returns null when superseded; callers must not save
+   * anything in that case (see abortStart / handleStart's own final check
+   * for how each caller responds instead). */
+  private async reloadIfStillMine(myStartedAt: number): Promise<LoadDriverState | null> {
+    const current = await this.loadState();
+    return current.startedAt === myStartedAt ? current : null;
+  }
+
+  /** Shared response for "this start attempt was superseded by a newer
+   * stop/start before it could finish" — deliberately not an error (nothing
+   * about THIS request's own actions failed), but not a fabricated success
+   * either, since whatever is currently running (or not) belongs to someone
+   * else's request now. */
+  private supersededResponse(): Response {
+    return json({ error: "This start was superseded by a newer stop/start before it finished — check current status." }, 409);
+  }
+
+  /** Shared rollback for every bootstrap/seed failure path in handleStart:
+   * rolls this run back to not-running IFF this start attempt is still the
+   * current one (see reloadIfStillMine) — a failure from a start attempt
+   * that's already been superseded must not stomp on whatever newer state
+   * now exists. Always returns the caller's own 502, regardless of whether
+   * the rollback actually wrote anything, since THIS request's own attempt
+   * to start genuinely failed either way. */
+  private async abortStart(myStartedAt: number, errorMessage: string): Promise<Response> {
+    const current = await this.reloadIfStillMine(myStartedAt);
+    if (current) {
+      current.running = false;
+      current.config = null;
+      current.lastError = errorMessage;
+      await this.saveState(current);
+    }
+    return json({ error: errorMessage }, 502);
   }
 
   private async handleStop(): Promise<Response> {
