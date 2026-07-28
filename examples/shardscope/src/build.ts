@@ -579,7 +579,7 @@ function writeUint32LE(view: DataView, offset: number, value: number): void {
  * entry needs the UTF-8 filename flag's language-encoding bit in practice
  * here since every generated path is plain ASCII, but content is encoded as
  * UTF-8 regardless. */
-export function buildZip(files: ScaffoldFile[]): Uint8Array {
+export function buildZip(files: ScaffoldFile[]): Uint8Array<ArrayBuffer> {
   const encoder = new TextEncoder();
   const localParts: Uint8Array[] = [];
   const centralParts: Uint8Array[] = [];
