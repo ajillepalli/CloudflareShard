@@ -115,7 +115,7 @@ export const TPCC_INDEXES: IndexSchema[] = [
 export interface SchemaAdminClient {
   listTables(): Promise<{ tables?: Array<{ table_name?: string }> }>;
   createTable(table: string, schema: string, partitionKeyColumn: string): Promise<unknown>;
-  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string; status?: string }> }>;
+  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string; columns?: string[]; status?: string }> }>;
   createIndex(indexName: string, table: string, columns: string[]): Promise<unknown>;
 }
 
@@ -181,7 +181,7 @@ export class HttpSchemaAdminClient implements SchemaAdminClient {
     return this.post("/admin/create-table", { table, schema, partitionKeyColumn });
   }
 
-  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string; status?: string }> }> {
+  listIndexes(): Promise<{ indexes?: Array<{ indexName?: string; table?: string; columns?: string[]; status?: string }> }> {
     return this.post("/admin/list-indexes", {});
   }
 
@@ -251,17 +251,47 @@ const INDEX_READY_POLL_DELAY_MS = 500;
  * 'failed')` clause) — but deliberately NOT for an index still 'building',
  * since re-calling create-index on one already in progress would just reset
  * its backfill cursor back to the start (same clause) for no benefit; a
- * 'building' index just needs time, handled by polling below. */
+ * 'building' index just needs time, handled by polling below.
+ *
+ * ROUND 16 CORRECTION: matching an existing index by NAME alone isn't
+ * sufficient either — index names are just strings, so a cluster that
+ * (for whatever reason) already has a `ready` index registered under one of
+ * these exact names but for a DIFFERENT table/columns would be treated as
+ * "this scenario's index is ready", skip create-index entirely, and the
+ * scenario's OWN queries against the expected table would then fail against
+ * an index that isn't actually theirs. Now compares table + columns (as a
+ * set, order-independent) against what THIS feature expects before treating
+ * any listed index as a match at all — a name collision with a genuinely
+ * different definition is a real, unrecoverable conflict this function
+ * can't safely auto-remediate (silently retrying create-index under a name
+ * some OTHER table's index already owns risks stepping on it), so it throws
+ * a clear, actionable error immediately rather than polling forever or
+ * quietly using the wrong index. */
+function indexMatches(idx: IndexSchema, listed: { table?: string; columns?: string[] }): boolean {
+  if (listed.table !== idx.table) return false;
+  const listedColumns = new Set(listed.columns ?? []);
+  return listedColumns.size === idx.columns.length && idx.columns.every((c) => listedColumns.has(c));
+}
+
 async function waitForIndexesReady(admin: SchemaAdminClient, required: IndexSchema[]): Promise<void> {
   for (let attempt = 1; attempt <= INDEX_READY_POLL_ATTEMPTS; attempt++) {
     const { indexes } = await admin.listIndexes();
-    const statusByName = new Map((indexes ?? []).filter((i) => typeof i.indexName === "string").map((i) => [i.indexName as string, i.status]));
+    const byName = new Map((indexes ?? []).filter((i) => typeof i.indexName === "string").map((i) => [i.indexName as string, i]));
 
-    const notReady = required.filter((idx) => statusByName.get(idx.indexName) !== "ready");
+    for (const idx of required) {
+      const listed = byName.get(idx.indexName);
+      if (listed && !indexMatches(idx, listed)) {
+        throw new Error(
+          `index '${idx.indexName}' already exists on this cluster registered for table '${listed.table}' (columns: ${JSON.stringify(listed.columns ?? [])}) instead of the expected table '${idx.table}' (columns: ${JSON.stringify(idx.columns)}) — this name collision needs manual resolution (e.g. /admin/drop-index) before the scenario can start.`,
+        );
+      }
+    }
+
+    const notReady = required.filter((idx) => byName.get(idx.indexName)?.status !== "ready");
     if (notReady.length === 0) return;
 
     for (const idx of notReady) {
-      const status = statusByName.get(idx.indexName);
+      const status = byName.get(idx.indexName)?.status;
       if (status === undefined || status === "failed") {
         await createIndexWithRetry(admin, idx);
       }
