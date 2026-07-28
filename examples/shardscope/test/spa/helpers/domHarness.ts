@@ -63,6 +63,13 @@ export interface HarnessOptions {
    * `{status: 200, body: {}}` — permissive so an incidental/background call (e.g. the Reshard room's lock-status
    * poll) never throws or logs an unhandled rejection just because a test didn't anticipate it. */
   routes?: Record<string, RouteResponse | RouteHandler>;
+  /** Properties set on the jsdom `window` BEFORE app.js is evaluated — the same
+   * seam app.js's own VISIBILITY_PAUSE_GRACE_MS reads
+   * (window.__SHARDSCOPE_VISIBILITY_PAUSE_GRACE_MS_OVERRIDE__) so a test can
+   * shrink a real-world timer constant to something fast without a wall-clock
+   * wait, mirroring TopologyAggregator's constructor-injected writeTimeoutMs
+   * on the server side. */
+  windowOverrides?: Record<string, unknown>;
 }
 
 /** A single stubbed `EventSource` instance app.js opened via `new EventSource(url)`
@@ -248,6 +255,13 @@ export function bootApp(options: HarnessOptions = {}): Harness {
         removeEventListener() {},
         dispatchEvent: () => false,
       }) as unknown as MediaQueryList) as unknown as (q: string) => MediaQueryList;
+  }
+
+  // Applied before evaluating app.js below so a const like
+  // VISIBILITY_PAUSE_GRACE_MS that reads its override at module-evaluation
+  // time sees it already in place.
+  for (const [key, value] of Object.entries(options.windowOverrides ?? {})) {
+    (window as unknown as Record<string, unknown>)[key] = value;
   }
 
   // ---- evaluate the real app.js in the jsdom window's realm ----------------
