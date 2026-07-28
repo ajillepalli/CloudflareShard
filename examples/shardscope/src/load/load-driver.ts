@@ -402,9 +402,20 @@ export class LoadDriver {
     if (!mode) {
       return json({ error: "Missing or invalid 'mode'. Must be 'uniform' or 'skew'." }, 400);
     }
-    if (mode === "skew" && !body.targetShardId) {
-      return json({ error: "'targetShardId' is required when mode is 'skew'." }, 400);
-    }
+    // Codex review P2 fix: `targetShardId` is no longer REQUIRED for skew
+    // mode — an explicit one from the caller is still honored below, but an
+    // omitted one is resolved automatically (see resolveDefaultSkewTarget)
+    // rather than rejected. The UI's own picker (public/app.js's
+    // pickScenarioTargetShardId) used to guess a shard id from catalog-0's
+    // vbucket map regardless of which catalog the scenario's actual
+    // warehouse tenant hashes to — on any deployment where that warehouse
+    // ISN'T on catalog-0, the guessed shard id simply doesn't exist in the
+    // catalog LoadDriver's own skew pools actually search (see
+    // refreshSkewPoolsFromMap below, which resolves the warehouse's REAL
+    // catalog via catalogShardIdForTenant), so the skew pool came back empty
+    // and "skew mode" silently ran uniform traffic instead of creating a hot
+    // shard. The server already has everything needed to pick a genuinely
+    // correct target, so it now does — see resolveDefaultSkewTarget.
 
     const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number.isFinite(body.concurrency) ? Number(body.concurrency) : DEFAULT_CONCURRENCY));
 
@@ -418,12 +429,28 @@ export class LoadDriver {
     // (bringing its own already-seeded, real-TPC-C-scale data) still wants
     // the normal DEFAULT_* fallback.
     const willSelfSeed = body.seedReferenceData !== false;
+    const warehouseIds = Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS;
+
+    let targetShardId: string | null = null;
+    if (mode === "skew") {
+      if (typeof body.targetShardId === "string" && body.targetShardId.length > 0) {
+        targetShardId = body.targetShardId;
+      } else {
+        try {
+          targetShardId = await this.resolveDefaultSkewTarget(warehouseIds[0]);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return json({ error: `Couldn't resolve a default skew target: ${message}. Pass 'targetShardId' explicitly instead.` }, 502);
+        }
+      }
+    }
+
     const config: LoadDriverConfig = {
       mode,
-      targetShardId: mode === "skew" ? (body.targetShardId as string) : null,
+      targetShardId,
       concurrency,
       baseUrl: resolveLoadDriverBaseUrl(body.baseUrl, this.env.CORE_GATEWAY_BASE_URL),
-      warehouseIds: Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS,
+      warehouseIds,
       districtsPerWarehouse: Number.isFinite(body.districtsPerWarehouse)
         ? Number(body.districtsPerWarehouse)
         : willSelfSeed
@@ -481,7 +508,17 @@ export class LoadDriver {
       // schema-bootstrap.ts's own header comment for why this is safe to
       // call on every start rather than only once, and for why INDEXES are
       // deliberately handled separately, AFTER seeding, not here.
-      const schemaAdmin = new HttpSchemaAdminClient(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
+      //
+      // Codex review P1 fix: this MUST use env.CORE_GATEWAY_BASE_URL, the
+      // operator-configured trusted endpoint — NEVER config.baseUrl, which
+      // (via resolveLoadDriverBaseUrl) can come straight from this request's
+      // own JSON body. Sending ADMIN_TOKEN to an attacker-supplied baseUrl
+      // would hand any caller of this gated-but-shared endpoint a live
+      // exfiltration path for the cluster's admin credential. body.baseUrl
+      // is only ever meant to override the TENANT-scoped HttpTxExecutor
+      // below (a real but far less sensitive testing/flexibility knob —
+      // still a tenant bearer token, never the admin one).
+      const schemaAdmin = new HttpSchemaAdminClient(this.env.CORE_GATEWAY_BASE_URL, this.env.ADMIN_TOKEN);
       try {
         await ensureScenarioTables(schemaAdmin);
       } catch (err) {
@@ -665,7 +702,12 @@ export class LoadDriver {
     // than a tenant bearer token). Built once per tick, reused for both the
     // periodic verify() pass below and TrackingTxExecutor's own optional
     // idempotent-replay verification.
-    const sqlReader = new HttpSqlPointReader(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
+    //
+    // Codex review P1 fix: env.CORE_GATEWAY_BASE_URL, not config.baseUrl —
+    // see handleStart's identical fix (HttpSchemaAdminClient construction)
+    // for why an admin-token-bearing client must never be pointed at a
+    // request-supplied baseUrl.
+    const sqlReader = new HttpSqlPointReader(this.env.CORE_GATEWAY_BASE_URL, this.env.ADMIN_TOKEN);
     const readBack = gatewayReadBack(sqlReader);
     // Shardscope T4: every mutate()/tx() call this tick passes through the
     // correctness tracker on its way to the real gateway — see
@@ -739,6 +781,35 @@ export class LoadDriver {
     // counters, not two copies that could drift.
     const snap = this.correctnessTracker.snapshot();
     s.correctness = { writesAcked: snap.writesAcked, writesRetriedIdempotent: snap.writesRetriedIdempotent, txAbortedExpected: snap.txAbortedExpected, lost: snap.lost };
+  }
+
+  /** Codex review P2 fix: resolves a genuinely correct default skew target
+   * for `warehouseId` when the caller didn't supply one explicitly — a
+   * real shard id from the SAME catalog `refreshSkewPoolsFromMap` will
+   * later search for this warehouse (via the identical catalogShardIdForTenant
+   * formula), rather than the client-side picker's old guess of "some shard
+   * in catalog-0," which was simply wrong on any deployment where this
+   * warehouse's tenant doesn't hash to catalog-0. Picks the shard currently
+   * owning vbucket 0 in that catalog — any owned vbucket would do; 0 is
+   * just a deterministic, always-present choice. Throws (never returns a
+   * guessed/empty value) if the map is unreachable, the catalog can't be
+   * found, or it has no vbuckets yet — callers surface this as a clear
+   * bootstrap failure rather than silently starting a "skew" run that's
+   * actually uniform. */
+  private async resolveDefaultSkewTarget(warehouseId: number): Promise<string> {
+    const raw = await this.env.SHARD_API.adminVbucketMap(this.env.ADMIN_TOKEN);
+    const vbucketMap = raw as AdminVbucketMapResponse;
+    const tenantId = tenantIdForWarehouse(warehouseId);
+    const catalogShardId = catalogShardIdForTenant(tenantId, vbucketMap.catalogShardCount);
+    const catalog = vbucketMap.catalogs.find((c) => c.catalogShardId === catalogShardId);
+    if (!catalog) {
+      throw new Error(`catalog ${catalogShardId} (owner of warehouse ${warehouseId}'s tenant) not found in the live vbucket map`);
+    }
+    const owner = catalog.map.find((row) => row.vbucket === 0) ?? catalog.map[0];
+    if (!owner) {
+      throw new Error(`catalog ${catalogShardId} has no vbuckets yet`);
+    }
+    return owner.shardId;
   }
 
   /** ONE shared vbucket-map fetch, cached for at most SKEW_REFRESH_INTERVAL_MS
