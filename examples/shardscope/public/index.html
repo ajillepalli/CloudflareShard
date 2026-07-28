@@ -143,6 +143,27 @@
         <div class="empty-state-sub">Waiting for an admin bootstrap. The topology will render as soon as the cluster reports <span class="mono">initialized: true</span>.</div>
       </div>
 
+      <!-- self-service scenario: shown only on the live path (never ?demo=1,
+           which has no real load engine to start) when the cluster is
+           initialized but no load run is active — see app.js's
+           renderScenarioControls(). Walks a first-time visitor into the
+           hero story themselves: real writes, a live reshard, a chaos
+           attack that can't lose data — rather than a canned animation. -->
+      <div class="scenario-banner" data-hook="scenario-start-banner" hidden>
+        <div class="scenario-banner-text">
+          <div class="scenario-banner-title">see it in action</div>
+          <div class="scenario-banner-sub" data-hook="scenario-start-sub">
+            Starts a real write load against one shard, so there's something to reshard and a real hot shard for the Chaos panel to attack — watch <span class="mono">lost</span> stay 0 the whole time.
+          </div>
+        </div>
+        <button class="scenario-start-btn" type="button" data-hook="scenario-start-btn">Start the scenario</button>
+      </div>
+      <div class="scenario-running-pill" data-hook="scenario-running-pill" hidden>
+        <span class="dot-live live"></span>
+        <span data-hook="scenario-running-label">scenario running</span>
+        <button class="scenario-stop-btn" type="button" data-hook="scenario-stop-btn">Stop</button>
+      </div>
+
       <!-- login panel: shown only on the live path, when /api/load/status
            preflights to 401 (see src/gate.ts, app.js's authPreflight()).
            ?demo=1 and the no-live-cluster sample fallback never call
