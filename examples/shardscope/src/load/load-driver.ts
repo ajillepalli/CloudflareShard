@@ -41,7 +41,7 @@ import type { TokenProvider } from "./token-provider";
 import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
 import { HttpTxExecutor, HttpSqlPointReader } from "./gateway-client";
 import { seedScenarioReferenceData, SCENARIO_DISTRICTS_PER_WAREHOUSE, SCENARIO_CUSTOMERS_PER_DISTRICT, SCENARIO_ITEM_COUNT } from "./scenario-seed";
-import { ensureScenarioSchema, HttpSchemaAdminClient } from "./schema-bootstrap";
+import { ensureScenarioTables, ensureScenarioIndexesReady, HttpSchemaAdminClient } from "./schema-bootstrap";
 import {
   CorrectnessTracker,
   TrackingTxExecutor,
@@ -431,44 +431,20 @@ export class LoadDriver {
       itemCount: Number.isFinite(body.itemCount) ? Number(body.itemCount) : willSelfSeed ? SCENARIO_ITEM_COUNT : DEFAULT_ITEM_COUNT,
     };
 
-    // Bootstrap reference data (warehouse/district/customer/item/stock) for
-    // every warehouse this run targets — see scenario-seed.ts's header
-    // comment for why this can't be a separate, external setup step: the
-    // token that seeds a tenant's data and the token that later transacts
-    // against it must be the SAME one (TenantTokenStoreTokenProvider
-    // refuses to rotate a tenant already registered by a different caller),
-    // so LoadDriver has to seed its own data through its own token. Opt out
-    // with `seedReferenceData: false` for a warehouse something else (e.g.
-    // the Node TPC-C harness) already owns and seeded. Runs BEFORE any state
-    // is persisted — a seeding failure means handleStart returns an error
-    // and never marks the run as started, rather than starting a run
-    // guaranteed to fail every transaction.
-    if (willSelfSeed) {
-      // Codex review P2 fix: a genuinely fresh cluster (only /admin/init run
-      // — exactly what a real "Deploy to Cloudflare" visitor's core Worker
-      // starts as) has none of the tpcc_* tables/indexes yet, so seeding
-      // below would 502 on its very first upsert. Ensure the schema exists
-      // FIRST — see schema-bootstrap.ts's own header comment for why this is
-      // safe to call on every start rather than only once.
-      const schemaAdmin = new HttpSchemaAdminClient(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
-      try {
-        await ensureScenarioSchema(schemaAdmin);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return json({ error: `Couldn't bootstrap scenario schema: ${message}` }, 502);
-      }
-
-      const seedExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
-      try {
-        for (const warehouseId of config.warehouseIds) {
-          await seedScenarioReferenceData(seedExecutor, warehouseId, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return json({ error: `Couldn't seed reference data: ${message}` }, 502);
-      }
-    }
-
+    // Codex review P2 fix (round 4): mark this run as `running` and persist
+    // its config BEFORE any of the long bootstrap/seed awaits below, not
+    // after. The `existing.running` check above closes the window for a
+    // duplicate start racing an ALREADY-established run, but a naive
+    // "persist running=true only after bootstrap succeeds" still leaves the
+    // exact same TOCTOU gap open for TWO start requests arriving close
+    // together while NEITHER has finished bootstrapping yet: both would read
+    // `running: false`, both would proceed, and the second could duplicate
+    // schema-bootstrap calls or land its own seed values over the first's
+    // mid-flight run. Persisting `running: true` here closes that window —
+    // any request that reads state after this point sees a run already in
+    // progress and no-ops via the check above. If bootstrap/seed below fails,
+    // this is explicitly rolled back (see the catch blocks) so a failed start
+    // never leaves the run stuck "running" with nothing actually happening.
     const s = await this.loadState();
     s.running = true;
     s.config = config;
@@ -478,6 +454,70 @@ export class LoadDriver {
     s.lastTickAt = null;
     s.lastError = null;
     await this.saveState(s);
+
+    // Bootstrap reference data (warehouse/district/customer/item/stock) for
+    // every warehouse this run targets — see scenario-seed.ts's header
+    // comment for why this can't be a separate, external setup step: the
+    // token that seeds a tenant's data and the token that later transacts
+    // against it must be the SAME one (TenantTokenStoreTokenProvider
+    // refuses to rotate a tenant already registered by a different caller),
+    // so LoadDriver has to seed its own data through its own token. Opt out
+    // with `seedReferenceData: false` for a warehouse something else (e.g.
+    // the Node TPC-C harness) already owns and seeded. A bootstrap/seed
+    // failure rolls `running` back to false (see each catch block) — the run
+    // never actually starts rather than starting one guaranteed to fail
+    // every transaction.
+    if (willSelfSeed) {
+      // Codex review P2 fix: a genuinely fresh cluster (only /admin/init run
+      // — exactly what a real "Deploy to Cloudflare" visitor's core Worker
+      // starts as) has none of the tpcc_* tables yet, so seeding below would
+      // 502 on its very first upsert. Ensure the TABLES exist FIRST — see
+      // schema-bootstrap.ts's own header comment for why this is safe to
+      // call on every start rather than only once, and for why INDEXES are
+      // deliberately handled separately, AFTER seeding, not here.
+      const schemaAdmin = new HttpSchemaAdminClient(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
+      try {
+        await ensureScenarioTables(schemaAdmin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.running = false;
+        s.config = null;
+        s.lastError = `Couldn't bootstrap scenario schema: ${message}`;
+        await this.saveState(s);
+        return json({ error: s.lastError }, 502);
+      }
+
+      const seedExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
+      try {
+        for (const warehouseId of config.warehouseIds) {
+          await seedScenarioReferenceData(seedExecutor, warehouseId, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.running = false;
+        s.config = null;
+        s.lastError = `Couldn't seed reference data: ${message}`;
+        await this.saveState(s);
+        return json({ error: s.lastError }, 502);
+      }
+
+      // Codex review P2 fix: indexes are created/verified-ready AFTER
+      // seeding, never before — see ensureScenarioIndexesReady's own doc
+      // comment for exactly why (an index created before its rows exist only
+      // picks them up via /v1/mutate's asynchronous index-maintenance path,
+      // which the seeding calls above don't wait for; creating it after
+      // seeding means its own backfill scan picks up every seeded row).
+      try {
+        await ensureScenarioIndexesReady(schemaAdmin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.running = false;
+        s.config = null;
+        s.lastError = `Couldn't finish bootstrapping scenario indexes: ${message}`;
+        await this.saveState(s);
+        return json({ error: s.lastError }, 502);
+      }
+    }
 
     // Reset the transient skew cache — a new start may target a different
     // shard than any previously cached pool.
