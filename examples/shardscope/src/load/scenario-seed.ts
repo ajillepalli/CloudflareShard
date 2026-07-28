@@ -122,7 +122,30 @@ export async function seedScenarioReferenceData(
     values: { w_id: w, w_name: `WH${w}`, w_tax: randomPrice(0.0, 0.2), w_ytd: 300000.0 },
   });
 
+  // Codex review P2 fix: re-running "Start the scenario" against a warehouse
+  // that already has orders from a PREVIOUS run must never regress
+  // d_next_o_id below its current value. The old code unconditionally reset
+  // it to customersPerDistrict + 1 on every reseed, while leaving that prior
+  // run's tpcc_orders/tpcc_order_line/tpcc_new_order rows in place — the next
+  // New-Order then reused an already-existing o_id, its header tx's insert
+  // collided with that pre-existing order row, and New-Order stayed wedged
+  // for that district (every attempt failing) until the process restarted.
+  // Reading the district's CURRENT d_next_o_id first and keeping the higher
+  // of (existing, customersPerDistrict + 1) fixes this without needing to
+  // clean up prior orders: a fresh district gets the same baseline as
+  // before, an already-seeded one just keeps counting forward from where it
+  // left off, exactly like a real warehouse would.
+  const existingDistrictScan = await executor.tableScan(w, "tpcc_district", districtsPerWarehouse);
+  const existingNextOId = new Map<number, number>();
+  for (const row of (existingDistrictScan.rows ?? []) as unknown as Array<{ d_id?: number; d_next_o_id?: number }>) {
+    if (typeof row.d_id === "number" && typeof row.d_next_o_id === "number") {
+      existingNextOId.set(row.d_id, row.d_next_o_id);
+    }
+  }
+
   for (let d = 1; d <= districtsPerWarehouse; d++) {
+    const baselineNextOId = customersPerDistrict + 1;
+    const currentNextOId = existingNextOId.get(d);
     await executor.mutate(w, {
       op: "upsert",
       table: "tpcc_district",
@@ -136,9 +159,10 @@ export async function seedScenarioReferenceData(
         // Past customersPerDistrict so New-Order's first real order in this
         // district starts numbering right after the seeded customers,
         // matching generate.mjs's own baseline convention (see that file's
-        // d_next_o_id comment) even though this bootstrap seeds no
-        // pre-existing orders itself.
-        d_next_o_id: customersPerDistrict + 1,
+        // d_next_o_id comment) — but never REGRESSING a district that
+        // already has real orders from a previous run (see this function's
+        // own comment above).
+        d_next_o_id: currentNextOId !== undefined ? Math.max(currentNextOId, baselineNextOId) : baselineNextOId,
       },
     });
 
