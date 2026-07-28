@@ -287,9 +287,15 @@ export interface Env {
    * just an endpoint, no different from a config file's API base URL — so
    * POST /api/load/start never needs the BROWSER to know or supply a
    * deployment-specific URL; the server fills it in from here whenever the
-   * caller doesn't pass an explicit override. Defaults to the local core
-   * Worker's dev port (wrangler.toml's [vars]); a real deployment sets its
-   * own with `wrangler deploy --var CORE_GATEWAY_BASE_URL:<url>` rather
-   * than committing a deployment-specific value to this template. */
+   * caller doesn't pass an explicit override. Deliberately NOT defaulted in
+   * the committed wrangler.toml (Codex review P2 fix — a local dev URL as
+   * the checked-in default would silently become what a real deploy falls
+   * back to if the operator forgets to override it, and Cloudflare's runtime
+   * can't reach 127.0.0.1): local dev sets it in .dev.vars (gitignored, same
+   * pattern as ADMIN_TOKEN/SHARDSCOPE_GATE_TOKEN above); a real deployment
+   * sets its own with `wrangler deploy --var CORE_GATEWAY_BASE_URL:<url>`.
+   * Left genuinely unset, resolveLoadDriverBaseUrl (load-driver.ts) resolves
+   * to null and the first real call fails at the network layer with an
+   * obvious error, per that function's own doc comment. */
   CORE_GATEWAY_BASE_URL: string;
 }
