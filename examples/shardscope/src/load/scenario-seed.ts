@@ -221,8 +221,8 @@ const SEED_INDEX_VISIBILITY_RETRY_DELAY_MS = 250;
  * "no customer" failure even though seeding genuinely succeeded.
  *
  * ROUND 9 CORRECTION: an earlier version of this function canary-checked
- * only item 1 and customer 1, on the (wrong) assumption that "index
- * maintenance for one write request's whole batch of rows completes
+ * only item 1 and (district 1, customer 1), on the (wrong) assumption that
+ * "index maintenance for one write request's whole batch of rows completes
  * together" — that's not actually true here: seedScenarioReferenceData sends
  * one SEPARATE /v1/mutate call per row, not one batched request, so each
  * row's index maintenance is dispatched independently and can complete in
@@ -230,7 +230,16 @@ const SEED_INDEX_VISIBILITY_RETRY_DELAY_MS = 250;
  * verifies EVERY seeded item and EVERY seeded customer (not just canaries),
  * polling only the ones not yet confirmed each pass (same shape as
  * schema-bootstrap.ts's waitForIndexesReady) — throws (never silently
- * proceeds) if any of them never catches up. */
+ * proceeds) if any of them never catches up.
+ *
+ * ROUND 10 CORRECTION: round 9's fix still only checked customers in
+ * DISTRICT 1 — the same independent-async-maintenance reasoning above
+ * applies across districts too, not just across customer ids within one
+ * district, so a customer in district 2 could remain unindexed even after
+ * every district-1 customer settled. Now checks every (district, customer)
+ * pair across all `districtsPerWarehouse` districts, since the transaction
+ * mix picks a random district for every Payment/Order-Status/New-Order
+ * attempt, not just district 1. */
 export async function verifySeededDataIndexed(
   executor: TxExecutor,
   warehouseId: number,
@@ -239,12 +248,15 @@ export async function verifySeededDataIndexed(
   itemCount: number,
 ): Promise<void> {
   const w = warehouseId;
-  const d = Math.min(1, districtsPerWarehouse) || 1;
 
   const pendingItems = new Set<number>();
   for (let i = 1; i <= itemCount; i++) pendingItems.add(i);
-  const pendingCustomers = new Set<number>();
-  for (let c = 1; c <= customersPerDistrict; c++) pendingCustomers.add(c);
+  // Keyed by "d_id:c_id" — every (district, customer) pair this warehouse
+  // seeded, not just district 1's.
+  const pendingCustomers = new Set<string>();
+  for (let d = 1; d <= districtsPerWarehouse; d++) {
+    for (let c = 1; c <= customersPerDistrict; c++) pendingCustomers.add(`${d}:${c}`);
+  }
 
   for (let attempt = 1; ; attempt++) {
     await Promise.all([
@@ -252,9 +264,10 @@ export async function verifySeededDataIndexed(
         const res = await executor.indexQuery(w, "tpcc_stock", "idx_stock_by_item", { i_id });
         if ((res.rows ?? []).length > 0) pendingItems.delete(i_id);
       }),
-      ...[...pendingCustomers].map(async (c_id) => {
-        const res = await executor.indexQuery(w, "tpcc_customer", "idx_customer_by_id", { d_id: d, c_id });
-        if ((res.rows ?? []).length > 0) pendingCustomers.delete(c_id);
+      ...[...pendingCustomers].map(async (key) => {
+        const [d_id, c_id] = key.split(":").map(Number);
+        const res = await executor.indexQuery(w, "tpcc_customer", "idx_customer_by_id", { d_id, c_id });
+        if ((res.rows ?? []).length > 0) pendingCustomers.delete(key);
       }),
     ]);
     if (pendingItems.size === 0 && pendingCustomers.size === 0) return;
