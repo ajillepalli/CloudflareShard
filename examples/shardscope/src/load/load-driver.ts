@@ -889,13 +889,25 @@ export class LoadDriver {
    * later search for this warehouse (via the identical catalogShardIdForTenant
    * formula), rather than the client-side picker's old guess of "some shard
    * in catalog-0," which was simply wrong on any deployment where this
-   * warehouse's tenant doesn't hash to catalog-0. Picks the shard currently
-   * owning vbucket 0 in that catalog — any owned vbucket would do; 0 is
-   * just a deterministic, always-present choice. Throws (never returns a
-   * guessed/empty value) if the map is unreachable, the catalog can't be
-   * found, or it has no vbuckets yet — callers surface this as a clear
-   * bootstrap failure rather than silently starting a "skew" run that's
-   * actually uniform. */
+   * warehouse's tenant doesn't hash to catalog-0.
+   *
+   * ROUND 11 CORRECTION: picking "whichever shard happens to own vbucket 0"
+   * (any owned vbucket, 0 just being a deterministic choice) was still
+   * wrong — vbucket 0 has no relationship to which shard any of THIS
+   * warehouse's actual seeded tpcc_stock keys (item ids 1..itemCount) route
+   * to. On a deployment with many more vbuckets than seeded items,
+   * refreshSkewPoolsFromMap's own search (generateSkewedKeys, bounded by
+   * SKEW_SCAN_MAX_ATTEMPTS) could easily find ZERO of them landing on
+   * vbucket 0's owner, leaving the skew pool empty and — via
+   * SkewKeyPicker's own documented uniform fallback — silently running
+   * uniform traffic instead of the promised hot shard. Item 1's stock key is
+   * ALWAYS seeded (seedScenarioReferenceData seeds items 1..itemCount
+   * unconditionally for any itemCount >= 1), so hashing THAT SPECIFIC key
+   * with the exact same formula CloudflareShard's own routing uses
+   * (src/hash.ts's hashKey — see skew.ts's own header comment) and looking
+   * up its CURRENT owning shard guarantees the resolved target is a shard
+   * that will genuinely receive at least one of this run's real writes —
+   * not a blind guess that might own none of them. */
   private async resolveDefaultSkewTarget(warehouseId: number): Promise<string> {
     const raw = await this.env.SHARD_API.adminVbucketMap(this.env.ADMIN_TOKEN);
     const vbucketMap = raw as AdminVbucketMapResponse;
@@ -905,9 +917,18 @@ export class LoadDriver {
     if (!catalog) {
       throw new Error(`catalog ${catalogShardId} (owner of warehouse ${warehouseId}'s tenant) not found in the live vbucket map`);
     }
-    const owner = catalog.map.find((row) => row.vbucket === 0) ?? catalog.map[0];
-    if (!owner) {
+    if (catalog.totalVBuckets <= 0) {
       throw new Error(`catalog ${catalogShardId} has no vbuckets yet`);
+    }
+    // Item 1's stock key is always seeded — the same routing formula
+    // production writes use (hashKey(`${tenantId}:${table}:${partitionKey}`)
+    // % totalVBuckets — see skew.ts's own header comment) tells us exactly
+    // which vbucket it lands on; the catalog map tells us who currently owns
+    // that vbucket.
+    const canaryVbucket = hashKey(`${tenantId}:tpcc_stock:${stockKey(warehouseId, 1)}`) % catalog.totalVBuckets;
+    const owner = catalog.map.find((row) => row.vbucket === canaryVbucket);
+    if (!owner) {
+      throw new Error(`catalog ${catalogShardId}'s vbucket map has no owner recorded for vbucket ${canaryVbucket} (warehouse ${warehouseId}'s item-1 stock key)`);
     }
     return owner.shardId;
   }

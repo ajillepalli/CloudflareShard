@@ -47,7 +47,7 @@
  * not to chase a specific "lost: 0" number, but because the original sizing
  * was creating artificial contention no real deployment would produce.
  */
-import type { TxExecutor } from "./transactions";
+import { runPool, type TxExecutor } from "./transactions";
 
 export const SCENARIO_DISTRICTS_PER_WAREHOUSE = 6;
 export const SCENARIO_CUSTOMERS_PER_DISTRICT = 10;
@@ -239,7 +239,23 @@ const SEED_INDEX_VISIBILITY_RETRY_DELAY_MS = 250;
  * every district-1 customer settled. Now checks every (district, customer)
  * pair across all `districtsPerWarehouse` districts, since the transaction
  * mix picks a random district for every Payment/Order-Status/New-Order
- * attempt, not just district 1. */
+ * attempt, not just district 1.
+ *
+ * ROUND 11 CORRECTION: firing every pending check in ONE unbounded
+ * Promise.all is fine at this feature's own default scale (60 items + 60
+ * customers = 120 checks) but not in general — a caller supplying larger
+ * custom counts (e.g. customersPerDistrict: 100, itemCount: 200 with the
+ * default 6 districts is 800 checks) could exceed the Worker's
+ * per-invocation subrequest budget in a single pass (each indexQuery is
+ * itself 2 subrequests — a tenant-token resolution plus the actual HTTP
+ * call — see gateway-client.ts's HttpTxExecutor.post), failing the whole
+ * start instead of merely taking a few extra polling passes. Now runs
+ * through runPool (the same bounded-concurrency helper transactions.ts
+ * already uses for its own per-order line pools) instead of a raw
+ * Promise.all, capping how many checks are ever in flight at once
+ * regardless of how many are pending. */
+const SEED_INDEX_VISIBILITY_CONCURRENCY = 20;
+
 export async function verifySeededDataIndexed(
   executor: TxExecutor,
   warehouseId: number,
@@ -259,17 +275,18 @@ export async function verifySeededDataIndexed(
   }
 
   for (let attempt = 1; ; attempt++) {
-    await Promise.all([
-      ...[...pendingItems].map(async (i_id) => {
+    const checks: Array<() => Promise<void>> = [
+      ...[...pendingItems].map((i_id) => async () => {
         const res = await executor.indexQuery(w, "tpcc_stock", "idx_stock_by_item", { i_id });
         if ((res.rows ?? []).length > 0) pendingItems.delete(i_id);
       }),
-      ...[...pendingCustomers].map(async (key) => {
+      ...[...pendingCustomers].map((key) => async () => {
         const [d_id, c_id] = key.split(":").map(Number);
         const res = await executor.indexQuery(w, "tpcc_customer", "idx_customer_by_id", { d_id, c_id });
         if ((res.rows ?? []).length > 0) pendingCustomers.delete(key);
       }),
-    ]);
+    ];
+    await runPool(checks, SEED_INDEX_VISIBILITY_CONCURRENCY, (check) => check());
     if (pendingItems.size === 0 && pendingCustomers.size === 0) return;
     if (attempt >= SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS) {
       throw new Error(
