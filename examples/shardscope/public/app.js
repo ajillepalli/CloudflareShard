@@ -649,7 +649,14 @@ function pickScenarioTargetShardId(catalogs) {
 
 function renderScenarioControls(catalogs, scoreboard) {
   if (!el.scenarioStartBanner || !el.scenarioRunningPill) return;
-  if (mode === "demo") {
+  // Codex review P2 fix: this is a real /api/load/* control surface, so it
+  // must only ever show for a genuine live connection — NOT just "not demo".
+  // sample-fallback's embedded snapshot (see buildSampleSnapshot) sets
+  // scoreboard.loadRunning: true for its own illustrative purposes, which
+  // would otherwise make this render a real-looking "scenario running" pill
+  // whose Stop button calls a real /api/load/stop — breaking sample
+  // fallback's own documented "never touches live /api/*" contract.
+  if (mode !== "live") {
     el.scenarioStartBanner.hidden = true;
     el.scenarioRunningPill.hidden = true;
     return;
@@ -682,7 +689,7 @@ function handleScenarioActionResponse(res) {
 }
 
 function handleScenarioStartClick() {
-  if (mode === "demo" || scenarioActionInFlight || !scenarioTargetShardId) return;
+  if (mode !== "live" || scenarioActionInFlight || !scenarioTargetShardId) return;
   scenarioActionInFlight = true;
   el.scenarioStartBtn.disabled = true;
   el.scenarioStartBtn.textContent = "starting…";
@@ -709,7 +716,7 @@ function handleScenarioStartClick() {
 }
 
 function handleScenarioStopClick() {
-  if (mode === "demo" || scenarioActionInFlight) return;
+  if (mode !== "live" || scenarioActionInFlight) return;
   scenarioActionInFlight = true;
   el.scenarioStopBtn.disabled = true;
   fetch("/api/load/stop", { method: "POST", credentials: "same-origin" })
