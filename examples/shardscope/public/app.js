@@ -858,6 +858,13 @@ function renderInner(snapshot) {
     el.arcLayer.querySelectorAll("path.migration-path").forEach((p) => p.remove());
     el.canvasSub.textContent = "";
     setCanvasStatus("not initialized");
+    // Codex review P3 fix: this branch returns before renderScenarioControls
+    // below ever runs, so a scenario banner/pill left visible from a PRIOR
+    // snapshot (cluster now reports uninitialized — e.g. a reset cluster)
+    // would otherwise keep showing over the empty state with no way to
+    // dismiss it short of a reload.
+    if (el.scenarioStartBanner) el.scenarioStartBanner.hidden = true;
+    if (el.scenarioRunningPill) el.scenarioRunningPill.hidden = true;
     return;
   }
   el.emptyState.hidden = true;
@@ -3275,6 +3282,12 @@ function handleLogout() {
   mode = "connecting";
   showSampleBadge(false);
   clearBanner();
+  // Codex review P3 fix: nothing re-renders the scenario controls on
+  // logout, so a banner/pill left visible from before the session expired
+  // would otherwise keep showing over the login panel even though a click
+  // now just no-ops (mode !== "live").
+  if (el.scenarioStartBanner) el.scenarioStartBanner.hidden = true;
+  if (el.scenarioRunningPill) el.scenarioRunningPill.hidden = true;
   el.nodesLayer.innerHTML = "";
   el.arcLayer.querySelectorAll("path.migration-path").forEach((p) => p.remove());
   el.canvasSub.textContent = "";

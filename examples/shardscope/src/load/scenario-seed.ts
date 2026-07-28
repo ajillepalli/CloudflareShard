@@ -203,3 +203,46 @@ export async function seedScenarioReferenceData(
     });
   }
 }
+
+const SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS = 20;
+const SEED_INDEX_VISIBILITY_RETRY_DELAY_MS = 250;
+
+/** Codex review P2 fix: schema-bootstrap.ts's ensureScenarioIndexesReady
+ * only proves the INDEX RULE itself is 'ready' — a rule can be 'ready'
+ * because SOME earlier run already built it (e.g. warehouse 1's own prior
+ * "Start the scenario"), while THIS call's freshly-upserted rows (a new
+ * warehouseId, or an expanded itemCount/customersPerDistrict on a re-seed)
+ * haven't reached it yet: /v1/mutate's index maintenance for those specific
+ * rows is dispatched via the gateway's own ctx.waitUntil (see
+ * src/index.ts's mutateCore) and isn't guaranteed done by the time this
+ * function's own upserts return. Without this check, the very first ticks
+ * could query idx_stock_by_item/idx_customer_by_id for a row that was just
+ * seeded but isn't index-visible yet, reporting a spurious "no stock row"/
+ * "no customer" failure even though seeding genuinely succeeded.
+ *
+ * Canary-verifies exactly one row per relevant index (item 1's stock row,
+ * district 1/customer 1) — cheap, and sufficient: index maintenance for one
+ * write request's whole batch of rows completes together, not row-by-row, so
+ * one representative row from THIS seeding call settling is a reliable
+ * signal the rest have too. Bounded retry with a short delay; throws (never
+ * silently proceeds) if visibility never catches up — callers already
+ * surface a bootstrap failure as a 502 rather than starting a run guaranteed
+ * to fail its first several transactions. */
+export async function verifySeededDataIndexed(executor: TxExecutor, warehouseId: number, districtsPerWarehouse: number): Promise<void> {
+  const w = warehouseId;
+  for (let attempt = 1; ; attempt++) {
+    const [stockRes, customerRes] = await Promise.all([
+      executor.indexQuery(w, "tpcc_stock", "idx_stock_by_item", { i_id: 1 }),
+      executor.indexQuery(w, "tpcc_customer", "idx_customer_by_id", { d_id: Math.min(1, districtsPerWarehouse), c_id: 1 }),
+    ]);
+    const stockVisible = (stockRes.rows ?? []).length > 0;
+    const customerVisible = (customerRes.rows ?? []).length > 0;
+    if (stockVisible && customerVisible) return;
+    if (attempt >= SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS) {
+      throw new Error(
+        `warehouse ${w}'s seeded data never became visible through idx_stock_by_item/idx_customer_by_id after ${SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS} attempts (stockVisible=${stockVisible}, customerVisible=${customerVisible})`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, SEED_INDEX_VISIBILITY_RETRY_DELAY_MS));
+  }
+}
