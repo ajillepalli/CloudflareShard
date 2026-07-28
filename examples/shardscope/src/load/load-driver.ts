@@ -40,7 +40,13 @@ import { generateSkewedKeys, type VBucketOwnership } from "./skew";
 import type { TokenProvider } from "./token-provider";
 import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
 import { HttpTxExecutor, HttpSqlPointReader } from "./gateway-client";
-import { seedScenarioReferenceData, SCENARIO_DISTRICTS_PER_WAREHOUSE, SCENARIO_CUSTOMERS_PER_DISTRICT, SCENARIO_ITEM_COUNT } from "./scenario-seed";
+import {
+  seedScenarioReferenceData,
+  verifySeededDataIndexed,
+  SCENARIO_DISTRICTS_PER_WAREHOUSE,
+  SCENARIO_CUSTOMERS_PER_DISTRICT,
+  SCENARIO_ITEM_COUNT,
+} from "./scenario-seed";
 import { ensureScenarioTables, ensureScenarioIndexesReady, HttpSchemaAdminClient } from "./schema-bootstrap";
 import {
   CorrectnessTracker,
@@ -514,6 +520,26 @@ export class LoadDriver {
         s.running = false;
         s.config = null;
         s.lastError = `Couldn't finish bootstrapping scenario indexes: ${message}`;
+        await this.saveState(s);
+        return json({ error: s.lastError }, 502);
+      }
+
+      // Codex review P2 fix (round 5): an index rule reporting 'ready' only
+      // proves SOME prior data reached it — not THIS call's own freshly-
+      // seeded rows (e.g. a new warehouseId, or expanded itemCount, seeded
+      // onto an already-'ready' index from an earlier run). Canary-verify
+      // each warehouse's own seeded data is actually visible through the
+      // indexes the transaction mix depends on before declaring the run
+      // ready to start — see verifySeededDataIndexed's own doc comment.
+      try {
+        for (const warehouseId of config.warehouseIds) {
+          await verifySeededDataIndexed(seedExecutor, warehouseId, config.districtsPerWarehouse);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.running = false;
+        s.config = null;
+        s.lastError = `Seeded data didn't become queryable in time: ${message}`;
         await this.saveState(s);
         return json({ error: s.lastError }, 502);
       }
