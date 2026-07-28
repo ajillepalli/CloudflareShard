@@ -17,6 +17,26 @@ import { tenantIdForWarehouse, type MutateCall, type MutateResult, type QueryRes
 import type { TokenProvider } from "./token-provider";
 import type { SqlPointReader } from "./correctness";
 
+// Codex review P2 fix (mirrors schema-bootstrap.ts's identical fix — see
+// that file's own comment): a trailing-slash baseUrl concatenated directly
+// with a leading-slash path produces a double slash the Worker's exact-
+// pathname routes don't recognize. Same fix as
+// examples/tpc-c-benchmark/src/client.mjs's own joinUrl (see that file's
+// "Codex review round 12 P3 fix" comment) — this file already documents
+// itself as mirroring client.mjs's TenantClient, so this brings the URL
+// handling in line too.
+//
+// Codex review P2 fix (round 13, mirrors schema-bootstrap.ts's identical
+// fix — see that file's own comment for the full story): accepts
+// `string | null | undefined`, not just `string` — HttpSqlPointReader can
+// genuinely be constructed with CORE_GATEWAY_BASE_URL undefined (it's
+// deliberately left unset in the committed wrangler.toml). Guarding here,
+// not just at each construction site, closes the whole class of bug rather
+// than relying on every future caller to remember `?? ""`.
+function joinUrl(baseUrl: string | null | undefined, path: string): string {
+  return `${(baseUrl ?? "").replace(/\/+$/, "")}${path}`;
+}
+
 export class GatewayError extends Error {
   readonly status: number;
   readonly code?: string;
@@ -82,7 +102,7 @@ export class HttpTxExecutor implements TxExecutor {
     // which is exactly the documented "pending T5" behavior (see this
     // file's header comment).
     const token = await this.tokenProvider.getTenantToken(warehouseId);
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await fetch(joinUrl(this.baseUrl, path), {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -123,7 +143,7 @@ export class HttpSqlPointReader implements SqlPointReader {
   ) {}
 
   async sqlSelect(args: { table: string; tenantId: string; partitionKey: string; sql: string; params: unknown[] }): Promise<{ rows: Record<string, unknown>[] }> {
-    const res = await fetch(`${this.baseUrl}/v1/sql`, {
+    const res = await fetch(joinUrl(this.baseUrl, "/v1/sql"), {
       method: "POST",
       headers: {
         "content-type": "application/json",
