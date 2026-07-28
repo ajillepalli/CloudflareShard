@@ -1,21 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { bootApp, type Harness } from "./helpers/domHarness";
-
-/** Enters the Reshard room (the chaos panel lives inside it) and lets its
- * entry-triggered /api/reshard/lock-status poll settle, matching the same
- * sequencing room-switching.spa.test.ts already exercises. */
-async function enterReshardRoom(harness: Harness) {
-  harness.hook("rail-reshard")!.click();
-  await harness.flush();
-}
-
-/** Leaves the Reshard room so its setInterval poll (app.js's
- * startReshardPolling, RESHARD_POLL_INTERVAL_MS = 1500) is cleared before the
- * test ends — the same "navigate away rather than rely on window.close()"
- * discipline room-switching.spa.test.ts documents. */
-function leaveReshardRoom(harness: Harness) {
-  harness.hook("rail-topology")!.click();
-}
+import type { Harness } from "./helpers/domHarness";
+import { enterReshardRoomLive, leaveReshardRoom } from "./helpers/liveReshardBoot";
 
 describe("Shardscope SPA — Chaos 'Break It' panel", () => {
   let harness: Harness | null = null;
@@ -26,24 +11,21 @@ describe("Shardscope SPA — Chaos 'Break It' panel", () => {
   });
 
   it("clicking an attack button fires the matching POST /api/chaos/<attack> and renders the verdict via textContent", async () => {
-    harness = bootApp({
-      routes: {
-        "/api/reshard/lock-status": { status: 200, body: { held: false } },
-        "/api/chaos/double-submit": {
-          status: 200,
-          body: {
-            attack: "double-submit",
-            did: "fired the SAME requestId twice, concurrently, as a tpcc_stock update",
-            expected: "requestId-based idempotency dedupes the second submission",
-            observed: "exactly one decrement landed; the duplicate was deduped",
-            survived: true,
-            note: "the T4 scoreboard's lost stayed 0 throughout",
-          },
+    harness = await enterReshardRoomLive({
+      "/api/reshard/lock-status": { status: 200, body: { held: false } },
+      "/api/chaos/double-submit": {
+        status: 200,
+        body: {
+          attack: "double-submit",
+          did: "fired the SAME requestId twice, concurrently, as a tpcc_stock update",
+          expected: "requestId-based idempotency dedupes the second submission",
+          observed: "exactly one decrement landed; the duplicate was deduped",
+          survived: true,
+          note: "the T4 scoreboard's lost stayed 0 throughout",
         },
       },
     });
 
-    await enterReshardRoom(harness);
     harness.hook("chaos-btn-double-submit")!.click();
     await harness.flush();
 
@@ -74,22 +56,19 @@ describe("Shardscope SPA — Chaos 'Break It' panel", () => {
       "abort-migration",
       "blip-shard-offline",
     ];
-    harness = bootApp({
-      routes: {
-        "/api/reshard/lock-status": { status: 200, body: { held: false } },
-        // Every /api/chaos/* attack in this test returns the same generic
-        // "survived" outcome — this test only cares which route each button
-        // wires to, not the render, which the previous test already covers.
-        ...Object.fromEntries(
-          attacks.map((attack) => [
-            `/api/chaos/${attack}`,
-            { status: 200, body: { attack, did: "x", expected: "y", observed: "z", survived: true, note: "" } },
-          ]),
-        ),
-      },
+    harness = await enterReshardRoomLive({
+      "/api/reshard/lock-status": { status: 200, body: { held: false } },
+      // Every /api/chaos/* attack in this test returns the same generic
+      // "survived" outcome — this test only cares which route each button
+      // wires to, not the render, which the previous test already covers.
+      ...Object.fromEntries(
+        attacks.map((attack) => [
+          `/api/chaos/${attack}`,
+          { status: 200, body: { attack, did: "x", expected: "y", observed: "z", survived: true, note: "" } },
+        ]),
+      ),
     });
 
-    await enterReshardRoom(harness);
     for (const attack of attacks) {
       harness.hook(`chaos-btn-${attack}`)!.click();
       await harness.flush();
@@ -105,24 +84,21 @@ describe("Shardscope SPA — Chaos 'Break It' panel", () => {
   });
 
   it("renders a survived:false outcome as a real '✗ broke' verdict, not as inconclusive (a real finding must never be softened)", async () => {
-    harness = bootApp({
-      routes: {
-        "/api/reshard/lock-status": { status: 200, body: { held: false } },
-        "/api/chaos/mismatched-replay": {
-          status: 200,
-          body: {
-            attack: "mismatched-replay",
-            did: "reused requestId for a second, different update",
-            expected: "the gateway rejects the replay with 409",
-            observed: "the replay was silently accepted and applied",
-            survived: false,
-            note: "a real bug, not a precondition failure",
-          },
+    harness = await enterReshardRoomLive({
+      "/api/reshard/lock-status": { status: 200, body: { held: false } },
+      "/api/chaos/mismatched-replay": {
+        status: 200,
+        body: {
+          attack: "mismatched-replay",
+          did: "reused requestId for a second, different update",
+          expected: "the gateway rejects the replay with 409",
+          observed: "the replay was silently accepted and applied",
+          survived: false,
+          note: "a real bug, not a precondition failure",
         },
       },
     });
 
-    await enterReshardRoom(harness);
     harness.hook("chaos-btn-mismatched-replay")!.click();
     await harness.flush();
 
@@ -138,24 +114,21 @@ describe("Shardscope SPA — Chaos 'Break It' panel", () => {
   it("XSS guard: HTML in the outcome's fields renders as literal text, never as parsed markup", async () => {
     const maliciousNote = '<img src=x onerror="window.__xss_fired = true">';
     const maliciousObserved = "<script>window.__xss_fired = true;</script>";
-    harness = bootApp({
-      routes: {
-        "/api/reshard/lock-status": { status: 200, body: { held: false } },
-        "/api/chaos/drain-hot-node": {
-          status: 200,
-          body: {
-            attack: "drain-hot-node",
-            did: "called reshard drain on the hot shard",
-            expected: "the cluster evacuates every vBucket off this shard",
-            observed: maliciousObserved,
-            survived: true,
-            note: maliciousNote,
-          },
+    harness = await enterReshardRoomLive({
+      "/api/reshard/lock-status": { status: 200, body: { held: false } },
+      "/api/chaos/drain-hot-node": {
+        status: 200,
+        body: {
+          attack: "drain-hot-node",
+          did: "called reshard drain on the hot shard",
+          expected: "the cluster evacuates every vBucket off this shard",
+          observed: maliciousObserved,
+          survived: true,
+          note: maliciousNote,
         },
       },
     });
 
-    await enterReshardRoom(harness);
     harness.hook("chaos-btn-drain-hot-node")!.click();
     await harness.flush();
 
@@ -180,14 +153,11 @@ describe("Shardscope SPA — Chaos 'Break It' panel", () => {
     // reshardFetch's own unwrap logic in app.js, which turns that into a
     // rejected Error carrying the message verbatim.
     const preconditionMessage = "no skew load running to derive a hot shard from — start load first";
-    harness = bootApp({
-      routes: {
-        "/api/reshard/lock-status": { status: 200, body: { held: false } },
-        "/api/chaos/split-hot-vbucket": { status: 400, body: { error: preconditionMessage } },
-      },
+    harness = await enterReshardRoomLive({
+      "/api/reshard/lock-status": { status: 200, body: { held: false } },
+      "/api/chaos/split-hot-vbucket": { status: 400, body: { error: preconditionMessage } },
     });
 
-    await enterReshardRoom(harness);
     harness.hook("chaos-btn-split-hot-vbucket")!.click();
     await harness.flush();
 
@@ -209,17 +179,13 @@ describe("Shardscope SPA — Chaos 'Break It' panel", () => {
     // Regression guard for the exact race app.js's handleChaosAttackClick
     // comments call out: a precondition message must never sit next to a
     // leftover ✓/✗ badge from an earlier, different fire.
-    harness = bootApp({
-      routes: {
-        "/api/reshard/lock-status": { status: 200, body: { held: false } },
-        "/api/chaos/double-submit": {
-          status: 200,
-          body: { attack: "double-submit", did: "x", expected: "y", observed: "z", survived: true, note: "" },
-        },
+    harness = await enterReshardRoomLive({
+      "/api/reshard/lock-status": { status: 200, body: { held: false } },
+      "/api/chaos/double-submit": {
+        status: 200,
+        body: { attack: "double-submit", did: "x", expected: "y", observed: "z", survived: true, note: "" },
       },
     });
-
-    await enterReshardRoom(harness);
 
     // First fire: a real, rendered "survived" verdict.
     harness.hook("chaos-btn-double-submit")!.click();
