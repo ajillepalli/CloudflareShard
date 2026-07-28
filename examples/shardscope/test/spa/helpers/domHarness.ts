@@ -63,6 +63,14 @@ export interface HarnessOptions {
    * `{status: 200, body: {}}` — permissive so an incidental/background call (e.g. the Reshard room's lock-status
    * poll) never throws or logs an unhandled rejection just because a test didn't anticipate it. */
   routes?: Record<string, RouteResponse | RouteHandler>;
+  /** Sets `document.hidden` to this value BEFORE app.js is evaluated (jsdom's
+   * `document.hidden` has no native setter, so this uses the same
+   * Object.defineProperty override a test would use, applied at boot time) —
+   * simulates a tab that's already backgrounded the moment the page loads
+   * (opened in a background tab, hidden while auth was still pending),
+   * distinct from toggling visibility AFTER boot via a test's own
+   * Object.defineProperty + dispatchEvent("visibilitychange") call. */
+  documentHiddenAtBoot?: boolean;
   /** Properties set on the jsdom `window` BEFORE app.js is evaluated — the same
    * seam app.js's own VISIBILITY_PAUSE_GRACE_MS reads
    * (window.__SHARDSCOPE_VISIBILITY_PAUSE_GRACE_MS_OVERRIDE__) so a test can
@@ -262,6 +270,9 @@ export function bootApp(options: HarnessOptions = {}): Harness {
   // time sees it already in place.
   for (const [key, value] of Object.entries(options.windowOverrides ?? {})) {
     (window as unknown as Record<string, unknown>)[key] = value;
+  }
+  if (options.documentHiddenAtBoot !== undefined) {
+    Object.defineProperty(window.document, "hidden", { value: options.documentHiddenAtBoot, configurable: true });
   }
 
   // ---- evaluate the real app.js in the jsdom window's realm ----------------
