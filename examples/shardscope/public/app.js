@@ -92,6 +92,12 @@ const el = {
   canvasSub: hook("canvas-sub"),
   statusBanner: hook("status-banner"),
   emptyState: hook("empty-state"),
+  scenarioStartBanner: hook("scenario-start-banner"),
+  scenarioStartSub: hook("scenario-start-sub"),
+  scenarioStartBtn: hook("scenario-start-btn"),
+  scenarioRunningPill: hook("scenario-running-pill"),
+  scenarioRunningLabel: hook("scenario-running-label"),
+  scenarioStopBtn: hook("scenario-stop-btn"),
   arcLayer: hook("arc-layer"),
   nodesLayer: hook("nodes-layer"),
   liveChip: hook("live-chip"),
@@ -612,6 +618,114 @@ function renderScoreboard(scoreboard) {
   el.sbChecksum.className = "sb-item" + (checksumClass ? " " + checksumClass : "");
   el.sbChecksum.textContent = `checksum ${checksum.label}`;
 }
+
+// ---- self-service scenario (Topology room's "Start the scenario" prompt) --
+// Live-mode-only walkthrough: starts a real load run (skew mode, so a real
+// hot shard emerges for the Reshard/Chaos rooms to act on) so a first-time
+// visitor to a freshly-initialized live deployment sees the actual hero
+// story — real writes, a live reshard, a chaos attack that can't lose data —
+// rather than a static, empty topology. ?demo=1 has no real load engine to
+// start (same reasoning as startAppRoom/startEdgeRoom's identical
+// mode==="demo" guard elsewhere in this file), so the banner never renders
+// there at all.
+
+let scenarioTargetShardId = null;
+let scenarioActionInFlight = false;
+
+/** Picks a real shard id to skew load traffic toward — vbucket 0 of the
+ * first catalog that has any vbuckets, mirroring the same "vbucket 0 is the
+ * default" convention refreshVbucketPicker already establishes for
+ * Reshard's own pickers. `null` only if the cluster somehow has no
+ * catalogs/vbuckets at all (shouldn't happen once cluster.initialized is
+ * true — renderInner's empty-state early-return already covers that case
+ * before this ever runs — but never crash over it). */
+function pickScenarioTargetShardId(catalogs) {
+  for (const cat of catalogs || []) {
+    const vb0 = (cat.vbuckets || []).find((row) => row.vbucket === 0);
+    if (vb0 && vb0.shardId) return vb0.shardId;
+  }
+  return null;
+}
+
+function renderScenarioControls(catalogs, scoreboard) {
+  if (!el.scenarioStartBanner || !el.scenarioRunningPill) return;
+  if (mode === "demo") {
+    el.scenarioStartBanner.hidden = true;
+    el.scenarioRunningPill.hidden = true;
+    return;
+  }
+  const running = !!(scoreboard && scoreboard.loadRunning);
+  el.scenarioStartBanner.hidden = running;
+  el.scenarioRunningPill.hidden = !running;
+  if (!running) {
+    scenarioTargetShardId = pickScenarioTargetShardId(catalogs);
+    if (el.scenarioStartBtn && !scenarioActionInFlight) el.scenarioStartBtn.disabled = !scenarioTargetShardId;
+  }
+}
+
+/** Shared error handling for both scenario actions below — a 401 means the
+ * gate session expired mid-visit, same as every other /api/* caller in this
+ * file (see reshardFetch's identical branch). */
+function handleScenarioActionResponse(res) {
+  if (res.status === 401) {
+    handleLogout();
+    throw new Error("session expired — please log in again");
+  }
+  return res.json().catch(() => ({})).then((body) => {
+    if (!res.ok) {
+      const errField = body && body.error;
+      const message = (errField && (errField.message || errField)) || `request failed (${res.status})`;
+      throw new Error(typeof message === "string" ? message : JSON.stringify(message));
+    }
+    return body;
+  });
+}
+
+function handleScenarioStartClick() {
+  if (mode === "demo" || scenarioActionInFlight || !scenarioTargetShardId) return;
+  scenarioActionInFlight = true;
+  el.scenarioStartBtn.disabled = true;
+  el.scenarioStartBtn.textContent = "starting…";
+  fetch("/api/load/start", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "skew", targetShardId: scenarioTargetShardId }),
+  })
+    .then(handleScenarioActionResponse)
+    .then(() => {
+      logLine(`scenario started — real writes now landing on ${scenarioTargetShardId}`, "safe");
+    })
+    .catch((err) => {
+      const msg = (err && err.message) || String(err);
+      showBanner(`couldn't start the scenario: ${msg}`, "warn");
+      logLine(`scenario start failed: ${msg}`, "warn");
+    })
+    .finally(() => {
+      scenarioActionInFlight = false;
+      el.scenarioStartBtn.textContent = "Start the scenario";
+      el.scenarioStartBtn.disabled = !scenarioTargetShardId;
+    });
+}
+
+function handleScenarioStopClick() {
+  if (mode === "demo" || scenarioActionInFlight) return;
+  scenarioActionInFlight = true;
+  el.scenarioStopBtn.disabled = true;
+  fetch("/api/load/stop", { method: "POST", credentials: "same-origin" })
+    .then(handleScenarioActionResponse)
+    .then(() => {
+      logLine("scenario stopped", "mig");
+    })
+    .catch((err) => {
+      const msg = (err && err.message) || String(err);
+      showBanner(`couldn't stop the scenario: ${msg}`, "warn");
+    })
+    .finally(() => {
+      scenarioActionInFlight = false;
+      el.scenarioStopBtn.disabled = false;
+    });
+}
 /** state: 'connecting' | 'live' | 'warn' | 'demo' */
 function setLiveState(state, label) {
   const isLive = state === "live";
@@ -740,6 +854,7 @@ function renderInner(snapshot) {
     return;
   }
   el.emptyState.hidden = true;
+  renderScenarioControls(catalogs, snapshot.scoreboard);
 
   // ---- shard id union: vbucket map (owners + targets) UNION shards[] ----
   const shardIds = new Set();
@@ -3465,7 +3580,7 @@ const TOUR_STEPS = [
     room: "topology",
     title: "Topology — the living canvas",
     caption:
-      "Every shard and vBucket, drawn live. Node color is heat (load); cyan arcs are vBuckets migrating between shards right now.",
+      "Every shard and vBucket, drawn live. Node color is heat (load); cyan arcs are vBuckets migrating between shards right now. On a live cluster, click “Start the scenario” to bring in real writes and a real hot shard before you continue.",
   },
   {
     room: "reshard",
@@ -3619,6 +3734,8 @@ function init() {
   // ---- Share + guided tour wiring ----
   if (el.shareBtn) el.shareBtn.addEventListener("click", handleShareClick);
   if (el.tourStartBtn) el.tourStartBtn.addEventListener("click", () => startTour());
+  if (el.scenarioStartBtn) el.scenarioStartBtn.addEventListener("click", handleScenarioStartClick);
+  if (el.scenarioStopBtn) el.scenarioStopBtn.addEventListener("click", handleScenarioStopClick);
   if (el.tourNextBtn) el.tourNextBtn.addEventListener("click", tourNext);
   if (el.tourBackBtn) el.tourBackBtn.addEventListener("click", tourBack);
   if (el.tourSkipBtn) el.tourSkipBtn.addEventListener("click", endTour);
