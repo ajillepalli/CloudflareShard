@@ -13,12 +13,12 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.2",
-    "@cloudflare/workers-types": "^4.20260610.0",
+    "@cloudflare/workers-types": "^5.20260728.1",
     "@types/jsdom": "^28.0.3",
     "jsdom": "^29.1.1",
     "typescript": "^5.9.2",
     "vitest": "^4.1.10",
-    "wrangler": "^4.24.0"
+    "wrangler": "^4.114.0"
   },
   "allowScripts": {
     "esbuild@0.28.1": true,
