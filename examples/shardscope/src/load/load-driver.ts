@@ -71,6 +71,25 @@ const DEFAULT_DISTRICTS_PER_WAREHOUSE = 10;
 const DEFAULT_CUSTOMERS_PER_DISTRICT = 100;
 const DEFAULT_ITEM_COUNT = 200;
 
+// Codex review P2 fix (round 12): self-seeding's whole bootstrap sequence
+// (one /v1/mutate per seeded row, then verifySeededDataIndexed's own
+// per-row index-visibility checks) runs synchronously inside ONE
+// /api/load/start invocation, before the first alarm is ever scheduled —
+// unlike a real benchmark harness (examples/tpc-c-benchmark), which seeds
+// across many separate script invocations over minutes. A caller passing
+// DEFAULT_*-scale custom counts (10 districts * 100 customers, 200 items)
+// with self-seeding still on would multiply the row count (and therefore
+// subrequest count — each row is a token resolution + an HTTP call) by
+// roughly 10-30x over the SCENARIO_* defaults this whole feature was sized
+// around, risking the Worker's own per-invocation subrequest budget before
+// bootstrap even finishes. These caps bound self-seeding specifically —
+// well above the SCENARIO_* defaults (room for real customization) but well
+// below DEFAULT_*'s benchmark scale (which is exactly what
+// `seedReferenceData: false` exists for, seeding externally instead).
+const MAX_SELF_SEED_DISTRICTS_PER_WAREHOUSE = 12;
+const MAX_SELF_SEED_CUSTOMERS_PER_DISTRICT = 20;
+const MAX_SELF_SEED_ITEM_COUNT = 100;
+
 // How often the alarm fires while running.
 const TICK_INTERVAL_MS = 1000;
 
@@ -436,7 +455,17 @@ export class LoadDriver {
     // `seedReferenceData: false` (see this block's own comment below) to
     // skip self-seeding specifically, but must still run against the SAME
     // gateway this deployment is configured for.
-    if (typeof body.baseUrl === "string" && body.baseUrl.length > 0 && body.baseUrl !== this.env.CORE_GATEWAY_BASE_URL) {
+    //
+    // Codex review P2 fix (round 12): compare with trailing slashes stripped
+    // — gateway-client.ts's/schema-bootstrap.ts's joinUrl already treats
+    // "https://gw.example" and "https://gw.example/" as the exact same
+    // endpoint (a deliberate fix in an earlier round), so this rejection
+    // must agree: an exact string comparison would otherwise reject a
+    // caller who supplies the functionally-identical URL with a trailing
+    // slash, even though it's not actually a different cluster at all.
+    const normalizedRequestBaseUrl = typeof body.baseUrl === "string" ? body.baseUrl.replace(/\/+$/, "") : "";
+    const normalizedTrustedBaseUrl = this.env.CORE_GATEWAY_BASE_URL.replace(/\/+$/, "");
+    if (normalizedRequestBaseUrl.length > 0 && normalizedRequestBaseUrl !== normalizedTrustedBaseUrl) {
       return json(
         {
           error:
@@ -463,23 +492,31 @@ export class LoadDriver {
     // correct target, so it now does.
     const explicitTargetShardId = mode === "skew" && typeof body.targetShardId === "string" && body.targetShardId.length > 0 ? body.targetShardId : null;
 
+    // Codex review P2 fix (round 12): clamps a caller-supplied count to
+    // MAX_SELF_SEED_* only while self-seeding — see those constants' own
+    // comment for why. A non-self-seeding run (seedReferenceData: false)
+    // never runs this Worker's own synchronous per-row seed loop at all, so
+    // DEFAULT_*'s full benchmark scale is fine there.
+    const clampIfSelfSeeding = (value: number, max: number): number => (willSelfSeed ? Math.min(value, max) : value);
+
     const config: LoadDriverConfig = {
       mode,
       targetShardId: explicitTargetShardId,
       concurrency,
       baseUrl: resolveLoadDriverBaseUrl(body.baseUrl, this.env.CORE_GATEWAY_BASE_URL),
       warehouseIds,
-      districtsPerWarehouse: Number.isFinite(body.districtsPerWarehouse)
-        ? Number(body.districtsPerWarehouse)
-        : willSelfSeed
-          ? SCENARIO_DISTRICTS_PER_WAREHOUSE
-          : DEFAULT_DISTRICTS_PER_WAREHOUSE,
-      customersPerDistrict: Number.isFinite(body.customersPerDistrict)
-        ? Number(body.customersPerDistrict)
-        : willSelfSeed
-          ? SCENARIO_CUSTOMERS_PER_DISTRICT
-          : DEFAULT_CUSTOMERS_PER_DISTRICT,
-      itemCount: Number.isFinite(body.itemCount) ? Number(body.itemCount) : willSelfSeed ? SCENARIO_ITEM_COUNT : DEFAULT_ITEM_COUNT,
+      districtsPerWarehouse: clampIfSelfSeeding(
+        Number.isFinite(body.districtsPerWarehouse) ? Number(body.districtsPerWarehouse) : willSelfSeed ? SCENARIO_DISTRICTS_PER_WAREHOUSE : DEFAULT_DISTRICTS_PER_WAREHOUSE,
+        MAX_SELF_SEED_DISTRICTS_PER_WAREHOUSE,
+      ),
+      customersPerDistrict: clampIfSelfSeeding(
+        Number.isFinite(body.customersPerDistrict) ? Number(body.customersPerDistrict) : willSelfSeed ? SCENARIO_CUSTOMERS_PER_DISTRICT : DEFAULT_CUSTOMERS_PER_DISTRICT,
+        MAX_SELF_SEED_CUSTOMERS_PER_DISTRICT,
+      ),
+      itemCount: clampIfSelfSeeding(
+        Number.isFinite(body.itemCount) ? Number(body.itemCount) : willSelfSeed ? SCENARIO_ITEM_COUNT : DEFAULT_ITEM_COUNT,
+        MAX_SELF_SEED_ITEM_COUNT,
+      ),
     };
 
     // Codex review P2 fix (round 4; ORDER fixed again in round 7 — see
