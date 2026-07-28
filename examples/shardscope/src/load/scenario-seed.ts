@@ -220,27 +220,47 @@ const SEED_INDEX_VISIBILITY_RETRY_DELAY_MS = 250;
  * seeded but isn't index-visible yet, reporting a spurious "no stock row"/
  * "no customer" failure even though seeding genuinely succeeded.
  *
- * Canary-verifies exactly one row per relevant index (item 1's stock row,
- * district 1/customer 1) — cheap, and sufficient: index maintenance for one
- * write request's whole batch of rows completes together, not row-by-row, so
- * one representative row from THIS seeding call settling is a reliable
- * signal the rest have too. Bounded retry with a short delay; throws (never
- * silently proceeds) if visibility never catches up — callers already
- * surface a bootstrap failure as a 502 rather than starting a run guaranteed
- * to fail its first several transactions. */
-export async function verifySeededDataIndexed(executor: TxExecutor, warehouseId: number, districtsPerWarehouse: number): Promise<void> {
+ * ROUND 9 CORRECTION: an earlier version of this function canary-checked
+ * only item 1 and customer 1, on the (wrong) assumption that "index
+ * maintenance for one write request's whole batch of rows completes
+ * together" — that's not actually true here: seedScenarioReferenceData sends
+ * one SEPARATE /v1/mutate call per row, not one batched request, so each
+ * row's index maintenance is dispatched independently and can complete in
+ * any order. Item 1 becoming visible says nothing about item 60. This now
+ * verifies EVERY seeded item and EVERY seeded customer (not just canaries),
+ * polling only the ones not yet confirmed each pass (same shape as
+ * schema-bootstrap.ts's waitForIndexesReady) — throws (never silently
+ * proceeds) if any of them never catches up. */
+export async function verifySeededDataIndexed(
+  executor: TxExecutor,
+  warehouseId: number,
+  districtsPerWarehouse: number,
+  customersPerDistrict: number,
+  itemCount: number,
+): Promise<void> {
   const w = warehouseId;
+  const d = Math.min(1, districtsPerWarehouse) || 1;
+
+  const pendingItems = new Set<number>();
+  for (let i = 1; i <= itemCount; i++) pendingItems.add(i);
+  const pendingCustomers = new Set<number>();
+  for (let c = 1; c <= customersPerDistrict; c++) pendingCustomers.add(c);
+
   for (let attempt = 1; ; attempt++) {
-    const [stockRes, customerRes] = await Promise.all([
-      executor.indexQuery(w, "tpcc_stock", "idx_stock_by_item", { i_id: 1 }),
-      executor.indexQuery(w, "tpcc_customer", "idx_customer_by_id", { d_id: Math.min(1, districtsPerWarehouse), c_id: 1 }),
+    await Promise.all([
+      ...[...pendingItems].map(async (i_id) => {
+        const res = await executor.indexQuery(w, "tpcc_stock", "idx_stock_by_item", { i_id });
+        if ((res.rows ?? []).length > 0) pendingItems.delete(i_id);
+      }),
+      ...[...pendingCustomers].map(async (c_id) => {
+        const res = await executor.indexQuery(w, "tpcc_customer", "idx_customer_by_id", { d_id: d, c_id });
+        if ((res.rows ?? []).length > 0) pendingCustomers.delete(c_id);
+      }),
     ]);
-    const stockVisible = (stockRes.rows ?? []).length > 0;
-    const customerVisible = (customerRes.rows ?? []).length > 0;
-    if (stockVisible && customerVisible) return;
+    if (pendingItems.size === 0 && pendingCustomers.size === 0) return;
     if (attempt >= SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS) {
       throw new Error(
-        `warehouse ${w}'s seeded data never became visible through idx_stock_by_item/idx_customer_by_id after ${SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS} attempts (stockVisible=${stockVisible}, customerVisible=${customerVisible})`,
+        `warehouse ${w}'s seeded data never became fully visible through idx_stock_by_item/idx_customer_by_id after ${SEED_INDEX_VISIBILITY_RETRY_ATTEMPTS} attempts (${pendingItems.size} item(s), ${pendingCustomers.size} customer(s) still not indexed)`,
       );
     }
     await new Promise((resolve) => setTimeout(resolve, SEED_INDEX_VISIBILITY_RETRY_DELAY_MS));
