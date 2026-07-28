@@ -1,5 +1,6 @@
-/** schema-bootstrap.ts — ensures the TPC-C tables + secondary indexes exist
- * before "Start the scenario" seeds any data into them.
+/** schema-bootstrap.ts — ensures the TPC-C tables exist before "Start the
+ * scenario" seeds any data into them, and the secondary indexes exist
+ * (and are ready) afterward.
  *
  * WHY THIS EXISTS (Codex review finding on the initial version of this
  * feature): scenario-seed.ts's seedScenarioReferenceData assumed the 9
@@ -11,6 +12,18 @@
  * mutate() 502'd (no such table), so "Start the scenario" could not start at
  * all — directly contradicting this feature's own "fully self-contained, no
  * external setup step" claim.
+ *
+ * TABLES BEFORE SEED, INDEXES AFTER (Codex review P2 fix, round 2): tables
+ * must exist before seeding (an upsert into a nonexistent table 502s), but
+ * indexes must NOT be created until AFTER seeding — see
+ * ensureScenarioIndexesReady's own doc comment for exactly why (an index
+ * created before its rows exist only picks them up via /v1/mutate's
+ * asynchronous, best-effort maintenance path, which the seeding call's HTTP
+ * response doesn't wait for). load-driver.ts's handleStart therefore calls
+ * ensureScenarioTables, then seedScenarioReferenceData, then
+ * ensureScenarioIndexesReady, in that exact order — mirroring
+ * examples/tpc-c-benchmark/src/generate.mjs's own proven-correct sequence
+ * (seed every warehouse, THEN create every index).
  *
  * Table/index definitions here are a deliberate, byte-for-byte duplicate of
  * examples/tpc-c-benchmark/src/schema.mjs's TABLES/INDEXES (see that file's
@@ -161,7 +174,7 @@ const TOPOLOGY_LOCK_RETRY_DELAY_MS = 500;
  * unconditionally calls /start-index-backfill again, re-scanning every
  * shard's rows. generate.mjs gets away with this because it's a one-time
  * setup script run against a cluster with no existing traffic; THIS feature
- * calls ensureScenarioSchema on every single "Start the scenario" click,
+ * calls ensureScenarioIndexesReady on every single "Start the scenario" click,
  * including on an already-bootstrapped cluster, where restarting a real
  * backfill (each one holding the topology lock, taking real wall-clock time)
  * is both needless and — during live testing — correlated with correctness-
@@ -236,26 +249,46 @@ async function waitForIndexesReady(admin: SchemaAdminClient, required: IndexSche
   );
 }
 
-/** Ensures every TPC-C table + secondary index this scenario needs exists AND
- * is ready on the cluster, creating/retrying only what's missing or stuck.
- * Safe (and fast on a warm cluster) to call on every "Start the scenario"
- * click: table creation is skipped entirely for anything /admin/list-tables
- * already reports (mirrors generate.mjs's createSchema — see that function's
+/** Ensures every TPC-C TABLE this scenario needs exists — creating only
+ * what's missing (mirrors generate.mjs's createSchema — see that function's
  * own comment on why create-table has no idempotent "IF NOT EXISTS" escape
- * hatch); index handling is delegated to waitForIndexesReady, which also
- * skips create-index for anything already 'ready' (see that function's own
- * comment on why create-index must NOT be called against an already-built
- * index). Called from load-driver.ts's handleStart, BEFORE
+ * hatch). Deliberately does NOT touch indexes — see this file's header
+ * comment (Codex review P2 fix) on why index creation must happen AFTER
+ * seeding, not before: call ensureScenarioIndexesReady once seeding
+ * completes, not here. Called from load-driver.ts's handleStart, BEFORE
  * seedScenarioReferenceData — seeding a table that doesn't exist yet 502s
- * instead of upserting, and seeding is pointless if the scenario's own
- * indexes won't be usable yet. */
-export async function ensureScenarioSchema(admin: SchemaAdminClient): Promise<void> {
+ * instead of upserting. */
+export async function ensureScenarioTables(admin: SchemaAdminClient): Promise<void> {
   const { tables } = await admin.listTables();
   const existingTableNames = new Set((tables ?? []).map((t) => t.table_name).filter((n): n is string => typeof n === "string"));
   for (const t of TPCC_TABLES) {
     if (existingTableNames.has(t.table)) continue;
     await admin.createTable(t.table, t.schema, t.partitionKeyColumn);
   }
+}
 
+/** Ensures every TPC-C secondary index this scenario needs exists AND is
+ * ready — creating/retrying only what's missing or stuck (see
+ * waitForIndexesReady's own comment for the full status-handling logic).
+ *
+ * MUST be called AFTER seedScenarioReferenceData, never before (Codex review
+ * P2 fix — this file's original version called this before seeding, mirrored
+ * from ensureScenarioTables's own "safe to call anytime" table logic, which
+ * doesn't actually apply here): /admin/create-index's own backfill scans
+ * every row that exists on the table AT THE TIME IT'S CALLED. Creating an
+ * index BEFORE seeding means the freshly-seeded rows only ever get indexed
+ * via /v1/mutate's own asynchronous, best-effort index-maintenance path
+ * (dispatched via ctx.waitUntil — see src/index.ts's mutateCore), which the
+ * seeding call's HTTP response does NOT wait for; the very first ticks
+ * (scheduled immediately after handleStart returns) could then query an
+ * index for a row that was seeded but isn't queryable through it yet.
+ * Calling this AFTER seeding instead means a freshly-registered index's own
+ * synchronous-relative-to-readiness backfill scan picks up every seeded row
+ * as a matter of course — the same reason generate.mjs itself seeds every
+ * warehouse BEFORE calling createIndex (see that file's own "Creating N
+ * secondary indexes (after all warehouses seeded)..." comment). An
+ * ALREADY-'ready' index (a warm re-click) is unaffected either way — this
+ * function skips it entirely, same as ensureScenarioTables does for tables. */
+export async function ensureScenarioIndexesReady(admin: SchemaAdminClient): Promise<void> {
   await waitForIndexesReady(admin, TPCC_INDEXES);
 }
