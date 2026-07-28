@@ -64,15 +64,19 @@ describe("Shardscope SPA — room switching", () => {
     expect(harness.hook("rail-topology")!.classList.contains("active")).toBe(true);
     expect(harness.hook("rail-app")!.classList.contains("active")).toBe(false);
 
-    // Reshard — entering it fires a real /api/reshard/lock-status poll
-    // (app.js's setActiveRoom -> pollLockStatus()); flush so that settles
-    // before asserting, and so its setInterval poll is the only thing
-    // ticking (cleared automatically the moment we navigate away below).
+    // Reshard — entering it triggers app.js's setActiveRoom -> pollLockStatus(),
+    // which goes through reshardFetch(); this harness boots in ?demo=1 mode (the
+    // default), and reshardFetch short-circuits with an honest "demo mode" error
+    // there instead of firing a real request (see reshard-console.spa.test.ts,
+    // which boots live mode specifically to exercise the real wire behavior).
+    // Flush so that settles before asserting, and so its setInterval poll is the
+    // only thing ticking (cleared automatically the moment we navigate away below).
     harness.hook("rail-reshard")!.click();
     await harness.flush();
     assertOnlyRoomVisible(harness, "reshard");
     expect(harness.hook("rail-reshard")!.classList.contains("active")).toBe(true);
-    expect(harness.calls.some((c) => c.pathname === "/api/reshard/lock-status")).toBe(true);
+    expect(harness.calls.some((c) => c.pathname === "/api/reshard/lock-status")).toBe(false);
+    expect(harness.hook("lock-error")!.textContent).toContain("demo mode");
 
     // Edge
     harness.hook("rail-edge")!.click();
