@@ -127,8 +127,24 @@ export interface SchemaAdminClient {
 // 404s and "Start the scenario" can't start. Mirrors
 // examples/tpc-c-benchmark/src/client.mjs's own joinUrl fix for the
 // identical issue (see that file's "Codex review round 12 P3 fix" comment).
-function joinUrl(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}${path}`;
+//
+// Codex review P2 fix (round 13): accepts `string | null | undefined`, not
+// just `string` — CORE_GATEWAY_BASE_URL is deliberately left unset in the
+// committed wrangler.toml (see that file's own P2 fix comment), so
+// HttpSchemaAdminClient can genuinely be constructed with `undefined` as its
+// baseUrl. The FIRST fix for this (load-driver.ts's own `?? ""` guard on its
+// baseUrl-comparison check) only covered that ONE call site — the
+// HttpSchemaAdminClient CONSTRUCTION site a few lines later passed the same
+// possibly-undefined value straight through, and this function's own
+// `.replace()` threw the identical TypeError one call later. Guarding HERE,
+// at the one place every caller's baseUrl ultimately flows through, closes
+// the whole class of "missed another call site" bug rather than relying on
+// every future caller to remember `?? ""` individually. An empty/missing
+// baseUrl still fails — just at the network layer (an unparseable/relative
+// fetch URL), a clear, obvious failure surfaced as a 502 bootstrap error,
+// never an unhandled TypeError.
+function joinUrl(baseUrl: string | null | undefined, path: string): string {
+  return `${(baseUrl ?? "").replace(/\/+$/, "")}${path}`;
 }
 
 export class HttpSchemaAdminClient implements SchemaAdminClient {

@@ -25,8 +25,16 @@ import type { SqlPointReader } from "./correctness";
 // "Codex review round 12 P3 fix" comment) — this file already documents
 // itself as mirroring client.mjs's TenantClient, so this brings the URL
 // handling in line too.
-function joinUrl(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}${path}`;
+//
+// Codex review P2 fix (round 13, mirrors schema-bootstrap.ts's identical
+// fix — see that file's own comment for the full story): accepts
+// `string | null | undefined`, not just `string` — HttpSqlPointReader can
+// genuinely be constructed with CORE_GATEWAY_BASE_URL undefined (it's
+// deliberately left unset in the committed wrangler.toml). Guarding here,
+// not just at each construction site, closes the whole class of bug rather
+// than relying on every future caller to remember `?? ""`.
+function joinUrl(baseUrl: string | null | undefined, path: string): string {
+  return `${(baseUrl ?? "").replace(/\/+$/, "")}${path}`;
 }
 
 export class GatewayError extends Error {
