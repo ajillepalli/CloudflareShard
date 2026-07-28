@@ -145,8 +145,11 @@ function round2(n: number): number {
 
 /** Runs `fn` over `items` with at most `limit` calls in flight at once,
  * preserving input order in the result array. Direct port of
- * transactions.mjs/client.mjs's runPool. */
-async function runPool<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+ * transactions.mjs/client.mjs's runPool. Exported (Codex review P2 fix) so
+ * ./scenario-seed.ts's verifySeededDataIndexed can reuse the same
+ * bounded-concurrency shape instead of firing every pending check in one
+ * unbounded Promise.all — see that function's own doc comment. */
+export async function runPool<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
   async function worker(): Promise<void> {

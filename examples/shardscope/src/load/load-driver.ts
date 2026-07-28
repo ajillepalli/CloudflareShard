@@ -41,6 +41,14 @@ import type { TokenProvider } from "./token-provider";
 import { TenantTokenStoreTokenProvider } from "./tenant-token-store";
 import { HttpTxExecutor, HttpSqlPointReader } from "./gateway-client";
 import {
+  seedScenarioReferenceData,
+  verifySeededDataIndexed,
+  SCENARIO_DISTRICTS_PER_WAREHOUSE,
+  SCENARIO_CUSTOMERS_PER_DISTRICT,
+  SCENARIO_ITEM_COUNT,
+} from "./scenario-seed";
+import { ensureScenarioTables, ensureScenarioIndexesReady, HttpSchemaAdminClient } from "./schema-bootstrap";
+import {
   CorrectnessTracker,
   TrackingTxExecutor,
   emptyCorrectnessCounters,
@@ -63,8 +71,82 @@ const DEFAULT_DISTRICTS_PER_WAREHOUSE = 10;
 const DEFAULT_CUSTOMERS_PER_DISTRICT = 100;
 const DEFAULT_ITEM_COUNT = 200;
 
+// Codex review P2 fix (round 12): self-seeding's whole bootstrap sequence
+// (one /v1/mutate per seeded row, then verifySeededDataIndexed's own
+// per-row index-visibility checks) runs synchronously inside ONE
+// /api/load/start invocation, before the first alarm is ever scheduled —
+// unlike a real benchmark harness (examples/tpc-c-benchmark), which seeds
+// across many separate script invocations over minutes. A caller passing
+// DEFAULT_*-scale custom counts (10 districts * 100 customers, 200 items)
+// with self-seeding still on would multiply the row count (and therefore
+// subrequest count — each row is a token resolution + an HTTP call) by
+// roughly 10-30x over the SCENARIO_* defaults this whole feature was sized
+// around, risking the Worker's own per-invocation subrequest budget before
+// bootstrap even finishes. These caps bound self-seeding specifically —
+// well above the SCENARIO_* defaults (room for real customization) but well
+// below DEFAULT_*'s benchmark scale (which is exactly what
+// `seedReferenceData: false` exists for, seeding externally instead).
+const MAX_SELF_SEED_DISTRICTS_PER_WAREHOUSE = 12;
+const MAX_SELF_SEED_CUSTOMERS_PER_DISTRICT = 20;
+const MAX_SELF_SEED_ITEM_COUNT = 100;
+// Codex review P2 fix (round 13): the caps above bound ONE warehouse's own
+// row count; this bounds how many warehouses self-seeding loops over in the
+// same synchronous request — see the rejection's own comment at its call
+// site for the full reasoning.
+const MAX_SELF_SEED_WAREHOUSES = 2;
+
+// Codex review P2 fix (round 14): the independent per-field caps above don't
+// compose safely — they can each individually pass while their COMBINATION
+// still blows the budget. Worked example at the SCENARIO_* defaults alone (1
+// warehouse, 6 districts, 10 customers/district, 60 items): 187 seeded rows
+// + 120 index-visibility checks = 307 operations, each costing 2
+// subrequests (a tenant-token resolution plus the actual gateway call — see
+// gateway-client.ts's HttpTxExecutor.post) = 614 subrequests for ONE
+// warehouse at the SHIPPED DEFAULT scenario alone. Two warehouses at those
+// same defaults (previously allowed — MAX_SELF_SEED_WAREHOUSES is 2) would
+// be ~1228, already over a 1000-subrequest budget; one warehouse at the
+// individual MAX_SELF_SEED_* caps (12/20/100) is ~1586 on its own. Rather
+// than keep discovering more under-budgeted combinations one Codex round at
+// a time, this computes the ACTUAL projected subrequest count for the
+// specific request about to run and rejects outright if it's not
+// comfortably under a real Worker's subrequest ceiling — see
+// projectedSelfSeedSubrequests's own doc comment for the exact formula.
+const MAX_SELF_SEED_PROJECTED_SUBREQUESTS = 850;
+
+/** Projects the total subrequest count self-seeding + its own post-seed
+ * verification will make for `warehouseCount` warehouses at the given
+ * per-warehouse district/customer/item counts — see
+ * MAX_SELF_SEED_PROJECTED_SUBREQUESTS's own comment for why this exists and
+ * the worked numbers behind the chosen budget. Per warehouse:
+ *   seeded rows    = 1 (warehouse) + D (districts) + D*C (customers)
+ *                     + I (items) + I (stock, one per item)
+ *   verify checks  = I (item canaries) + D*C (customer canaries)
+ *                     — see verifySeededDataIndexed
+ *   subrequests    = 2 * (seeded rows + verify checks) — each operation is
+ *                     a tenant-token resolution PLUS the actual gateway
+ *                     call (see gateway-client.ts's HttpTxExecutor.post)
+ * Multiplied by `warehouseCount` since seedScenarioReferenceData and
+ * verifySeededDataIndexed both loop over every warehouse in sequence,
+ * inside the SAME request. */
+function projectedSelfSeedSubrequests(warehouseCount: number, districtsPerWarehouse: number, customersPerDistrict: number, itemCount: number): number {
+  const seededRowsPerWarehouse = 1 + districtsPerWarehouse + districtsPerWarehouse * customersPerDistrict + itemCount + itemCount;
+  const verifyChecksPerWarehouse = itemCount + districtsPerWarehouse * customersPerDistrict;
+  return warehouseCount * 2 * (seededRowsPerWarehouse + verifyChecksPerWarehouse);
+}
+
 // How often the alarm fires while running.
 const TICK_INTERVAL_MS = 1000;
+
+// LoadDriver is a single shared singleton (idFromName("singleton") — see this
+// file's header comment), not one instance per viewer, so nothing here can
+// tell "the person who started this forgot about it" apart from "someone's
+// still actively watching it run" — there is no per-viewer signal to key an
+// idle-timeout off, unlike TopologyAggregator's per-subscriber SSE
+// connections. A hard wall-clock cap is the only mechanism that can't be
+// forgotten open: past this duration the run force-stops itself regardless
+// of whether anyone's watching, capping worst-case cost from a demo scenario
+// nobody remembered to stop rather than depending on that never happening.
+export const MAX_LOAD_RUN_DURATION_MS = 15 * 60_000; // 15 minutes
 
 // Workers hard-cap subrequests per Worker invocation (an alarm() call is one
 // invocation) well below what an unbounded loop here could otherwise fan
@@ -119,6 +201,30 @@ interface LoadDriverConfig {
   districtsPerWarehouse: number;
   customersPerDistrict: number;
   itemCount: number;
+}
+
+/** Pure resolution logic for handleStart's `baseUrl`, pulled out so it's
+ * directly unit-testable without standing up a full DO test harness (this
+ * file has none today — see load-driver.test.ts's header comment). An
+ * explicit, non-empty body value always wins; otherwise falls back to the
+ * Worker's own CORE_GATEWAY_BASE_URL env var (env.d.ts's doc comment); `null`
+ * only if neither is a usable string, matching handleStart's pre-existing
+ * "no base URL configured" contract. */
+export function resolveLoadDriverBaseUrl(bodyBaseUrl: unknown, envBaseUrl: unknown): string | null {
+  if (typeof bodyBaseUrl === "string" && bodyBaseUrl.length > 0) return bodyBaseUrl;
+  if (typeof envBaseUrl === "string" && envBaseUrl.length > 0) return envBaseUrl;
+  return null;
+}
+
+/** True iff a run started at `startedAt` should be force-stopped as of `now`
+ * — see MAX_LOAD_RUN_DURATION_MS's doc comment for why this exists (no
+ * per-viewer idle signal to key off, unlike TopologyAggregator's SSE
+ * subscribers, so a hard wall-clock cap is the only mechanism that can't be
+ * forgotten open). `startedAt: null` (never started, or already stopped) is
+ * never over the cap — nothing to expire. */
+export function hasLoadRunExceededMaxDuration(startedAt: number | null, now: number): boolean {
+  if (startedAt === null) return false;
+  return now - startedAt > MAX_LOAD_RUN_DURATION_MS;
 }
 
 interface TypeCounters {
@@ -330,6 +436,7 @@ export class LoadDriver {
       districtsPerWarehouse?: number;
       customersPerDistrict?: number;
       itemCount?: number;
+      seedReferenceData?: boolean;
     };
     try {
       body = (await request.json()) ?? {};
@@ -337,27 +444,198 @@ export class LoadDriver {
       return json({ error: "Invalid JSON body." }, 400);
     }
 
+    // Codex review P2 fix: a run already in progress must never be
+    // reseeded — the block below rewrites tpcc_district/tpcc_customer/
+    // tpcc_item/tpcc_stock rows via plain upserts with NO compare-and-swap
+    // guard against whatever the CURRENT alarm-driven tick is concurrently
+    // mutating (a district's d_ytd, a stock row's s_quantity, ...), so a
+    // duplicate /api/load/start (a second browser tab, a double-click before
+    // the UI's own disable-on-in-flight took effect, a stale client retrying
+    // after a slow response) racing an in-flight run would silently clobber
+    // its data mid-flight — exactly the kind of write the correctness
+    // tracker has no way to distinguish from a genuine loss. A start against
+    // an already-running instance is a no-op: return the current status
+    // rather than starting a second, colliding run.
+    const existing = await this.loadState();
+    if (existing.running) {
+      return json(toStatusJson(existing, this.correctnessTracker.snapshot()));
+    }
+
     const mode = body.mode === "skew" ? "skew" : body.mode === "uniform" ? "uniform" : undefined;
     if (!mode) {
       return json({ error: "Missing or invalid 'mode'. Must be 'uniform' or 'skew'." }, 400);
     }
-    if (mode === "skew" && !body.targetShardId) {
-      return json({ error: "'targetShardId' is required when mode is 'skew'." }, 400);
+    const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number.isFinite(body.concurrency) ? Number(body.concurrency) : DEFAULT_CONCURRENCY));
+
+    // Self-seeding (the default — see the seedReferenceData block below)
+    // needs the transaction mix's own districtsPerWarehouse/customersPer
+    // District/itemCount to match what actually gets seeded, not the much
+    // larger benchmark-scale DEFAULT_* constants (10 districts * 100
+    // customers, 200 items) — otherwise New-Order/Payment/Order-Status pick
+    // random district/customer ids the bootstrap never created rows for and
+    // fail almost every attempt. A caller with seedReferenceData: false
+    // (bringing its own already-seeded, real-TPC-C-scale data) still wants
+    // the normal DEFAULT_* fallback.
+    const willSelfSeed = body.seedReferenceData !== false;
+    const warehouseIds = Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS;
+
+    // Codex review P2 fix (round 13): round 12's MAX_SELF_SEED_* caps bound
+    // ONE warehouse's own row/subrequest count, but seedScenarioReferenceData
+    // and verifySeededDataIndexed both loop over EVERY warehouse in
+    // `warehouseIds`, synchronously, inside this same request — even at the
+    // SCENARIO_* defaults, one warehouse is already ~188 seed calls + 120
+    // index checks (each itself 2 subrequests: a tenant-token resolution
+    // plus the actual HTTP call), so just TWO warehouses would already
+    // exceed a Worker's 1000-subrequest budget before the first alarm ever
+    // fires. Self-seeding is capped to a small, fixed number of warehouses;
+    // a caller wanting a genuinely multi-warehouse scenario already has
+    // `seedReferenceData: false` to bring its own externally-seeded data
+    // (examples/tpc-c-benchmark's own Node harness seeds across many
+    // separate script invocations for exactly this reason, not one request).
+    if (willSelfSeed && warehouseIds.length > MAX_SELF_SEED_WAREHOUSES) {
+      return json(
+        {
+          error: `Self-seeding supports at most ${MAX_SELF_SEED_WAREHOUSES} warehouse(s) per start (got ${warehouseIds.length}) — seeding more synchronously in one request risks the Worker's own subrequest budget. Pass 'seedReferenceData: false' for a larger, externally-seeded warehouse set.`,
+        },
+        400,
+      );
     }
 
-    const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number.isFinite(body.concurrency) ? Number(body.concurrency) : DEFAULT_CONCURRENCY));
+    // Codex review P2 fix (round 9: widened from "only when self-seeding"):
+    // the admin-token clients (schema bootstrap, the correctness tracker's
+    // /v1/sql read-back) are now ALWAYS pinned to env.CORE_GATEWAY_BASE_URL
+    // (see the P1 fix below on why an admin-token client can never trust a
+    // request-supplied baseUrl), and resolveDefaultSkewTarget always reads
+    // env.SHARD_API's vbucket map (a fixed RPC service binding, not
+    // influenced by config.baseUrl at all) — but the actual tenant TRAFFIC
+    // (HttpTxExecutor) still uses config.baseUrl, which CAN come from the
+    // request body. A caller supplying a baseUrl that genuinely differs from
+    // the trusted gateway — with OR without self-seeding — would therefore
+    // send real writes to one cluster while the correctness tracker reads
+    // back from (and reports false losses against) a completely different
+    // one, and/or resolve a skew target from the wrong cluster's topology
+    // entirely. There is no longer any combination of options that makes a
+    // genuinely different baseUrl behave correctly, so it's rejected
+    // outright rather than silently splitting the pipeline across two
+    // clusters: a caller bringing its own already-seeded cluster still has
+    // `seedReferenceData: false` (see this block's own comment below) to
+    // skip self-seeding specifically, but must still run against the SAME
+    // gateway this deployment is configured for.
+    //
+    // Codex review P2 fix (round 12): compare with trailing slashes stripped
+    // — gateway-client.ts's/schema-bootstrap.ts's joinUrl already treats
+    // "https://gw.example" and "https://gw.example/" as the exact same
+    // endpoint (a deliberate fix in an earlier round), so this rejection
+    // must agree: an exact string comparison would otherwise reject a
+    // caller who supplies the functionally-identical URL with a trailing
+    // slash, even though it's not actually a different cluster at all.
+    // Codex review P2 fix (round 13): CORE_GATEWAY_BASE_URL is deliberately
+    // left unset in the committed wrangler.toml (see that file's own P2 fix
+    // comment) — `.replace()` on `undefined` throws a TypeError, crashing
+    // this whole request even for a caller who never supplied a baseUrl at
+    // all. Guard with `?? ""` before normalizing either side.
+    const normalizedRequestBaseUrl = typeof body.baseUrl === "string" ? body.baseUrl.replace(/\/+$/, "") : "";
+    const normalizedTrustedBaseUrl = (this.env.CORE_GATEWAY_BASE_URL ?? "").replace(/\/+$/, "");
+    if (normalizedRequestBaseUrl.length > 0 && normalizedRequestBaseUrl !== normalizedTrustedBaseUrl) {
+      return json(
+        {
+          error:
+            "A custom 'baseUrl' pointing at a different cluster isn't supported — schema bootstrap, the correctness tracker's read-back, and skew-target resolution all always target this deployment's own CORE_GATEWAY_BASE_URL, so a different baseUrl would split reads and writes across two clusters. Omit 'baseUrl' to use the default gateway.",
+        },
+        400,
+      );
+    }
+
+    // Codex review P2 fix: `targetShardId` is no longer REQUIRED for skew
+    // mode — an explicit one from the caller is honored as-is (synchronously,
+    // no await needed) below; an omitted one is resolved via
+    // resolveDefaultSkewTarget AFTER the running guard is persisted (see that
+    // comment for why the ORDER matters — round 7 finding). The UI's own
+    // picker (public/app.js) used to guess a shard id from catalog-0's
+    // vbucket map regardless of which catalog the scenario's actual
+    // warehouse tenant hashes to — on any deployment where that warehouse
+    // ISN'T on catalog-0, the guessed shard id simply doesn't exist in the
+    // catalog LoadDriver's own skew pools actually search (see
+    // refreshSkewPoolsFromMap below, which resolves the warehouse's REAL
+    // catalog via catalogShardIdForTenant), so the skew pool came back empty
+    // and "skew mode" silently ran uniform traffic instead of creating a hot
+    // shard. The server already has everything needed to pick a genuinely
+    // correct target, so it now does.
+    const explicitTargetShardId = mode === "skew" && typeof body.targetShardId === "string" && body.targetShardId.length > 0 ? body.targetShardId : null;
+
+    // Codex review P2 fix (round 12): clamps a caller-supplied count to
+    // MAX_SELF_SEED_* only while self-seeding — see those constants' own
+    // comment for why. A non-self-seeding run (seedReferenceData: false)
+    // never runs this Worker's own synchronous per-row seed loop at all, so
+    // DEFAULT_*'s full benchmark scale is fine there.
+    const clampIfSelfSeeding = (value: number, max: number): number => (willSelfSeed ? Math.min(value, max) : value);
 
     const config: LoadDriverConfig = {
       mode,
-      targetShardId: mode === "skew" ? (body.targetShardId as string) : null,
+      targetShardId: explicitTargetShardId,
       concurrency,
-      baseUrl: typeof body.baseUrl === "string" && body.baseUrl.length > 0 ? body.baseUrl : null,
-      warehouseIds: Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS,
-      districtsPerWarehouse: Number.isFinite(body.districtsPerWarehouse) ? Number(body.districtsPerWarehouse) : DEFAULT_DISTRICTS_PER_WAREHOUSE,
-      customersPerDistrict: Number.isFinite(body.customersPerDistrict) ? Number(body.customersPerDistrict) : DEFAULT_CUSTOMERS_PER_DISTRICT,
-      itemCount: Number.isFinite(body.itemCount) ? Number(body.itemCount) : DEFAULT_ITEM_COUNT,
+      baseUrl: resolveLoadDriverBaseUrl(body.baseUrl, this.env.CORE_GATEWAY_BASE_URL),
+      warehouseIds,
+      districtsPerWarehouse: clampIfSelfSeeding(
+        Number.isFinite(body.districtsPerWarehouse) ? Number(body.districtsPerWarehouse) : willSelfSeed ? SCENARIO_DISTRICTS_PER_WAREHOUSE : DEFAULT_DISTRICTS_PER_WAREHOUSE,
+        MAX_SELF_SEED_DISTRICTS_PER_WAREHOUSE,
+      ),
+      customersPerDistrict: clampIfSelfSeeding(
+        Number.isFinite(body.customersPerDistrict) ? Number(body.customersPerDistrict) : willSelfSeed ? SCENARIO_CUSTOMERS_PER_DISTRICT : DEFAULT_CUSTOMERS_PER_DISTRICT,
+        MAX_SELF_SEED_CUSTOMERS_PER_DISTRICT,
+      ),
+      itemCount: clampIfSelfSeeding(
+        Number.isFinite(body.itemCount) ? Number(body.itemCount) : willSelfSeed ? SCENARIO_ITEM_COUNT : DEFAULT_ITEM_COUNT,
+        MAX_SELF_SEED_ITEM_COUNT,
+      ),
     };
 
+    // Codex review P2 fix (round 14): the individual per-field caps above
+    // (districts/customers/items/warehouses) don't compose safely on their
+    // own — see MAX_SELF_SEED_PROJECTED_SUBREQUESTS's own comment for the
+    // worked numbers. This checks the ACTUAL combination about to run,
+    // computed from the already-clamped config values, and rejects outright
+    // if self-seeding this specific request would project over budget —
+    // pure, synchronous, no I/O, so it's safe to check before any of the
+    // state-mutating work below.
+    if (willSelfSeed) {
+      const projected = projectedSelfSeedSubrequests(config.warehouseIds.length, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
+      if (projected > MAX_SELF_SEED_PROJECTED_SUBREQUESTS) {
+        return json(
+          {
+            error: `This combination of warehouseIds/districtsPerWarehouse/customersPerDistrict/itemCount would need ~${projected} subrequests to self-seed and verify — over the ${MAX_SELF_SEED_PROJECTED_SUBREQUESTS} budget this feature stays under to avoid exceeding the Worker's own per-invocation limit. Reduce the counts, or pass 'seedReferenceData: false' for a larger, externally-seeded dataset.`,
+          },
+          400,
+        );
+      }
+    }
+
+    // Codex review P2 fix (round 4; ORDER fixed again in round 7 — see
+    // below): mark this run as `running` and persist its config BEFORE any
+    // of the long bootstrap/seed awaits below, not after. The
+    // `existing.running` check above closes the window for a duplicate
+    // start racing an ALREADY-established run, but a naive "persist
+    // running=true only after bootstrap succeeds" still leaves the exact
+    // same TOCTOU gap open for TWO start requests arriving close together
+    // while NEITHER has finished bootstrapping yet: both would read
+    // `running: false`, both would proceed, and the second could duplicate
+    // schema-bootstrap calls or land its own seed values over the first's
+    // mid-flight run. Persisting `running: true` here closes that window —
+    // any request that reads state after this point sees a run already in
+    // progress and no-ops via the check above. If bootstrap/seed below fails,
+    // this is explicitly rolled back (see the catch blocks) so a failed start
+    // never leaves the run stuck "running" with nothing actually happening.
+    //
+    // ROUND 7 FINDING: this block must come BEFORE resolveDefaultSkewTarget's
+    // await, not after it — round 6 introduced that await (to resolve an
+    // omitted targetShardId) ABOVE this persist step, which reopened the
+    // exact race round 4 had just closed: two requests could both pass the
+    // `existing.running` check, both start awaiting resolveDefaultSkewTarget
+    // concurrently, and only THEN would either reach this persist step. Every
+    // await between the `existing.running` check and this save is one more
+    // chance for a second request to race through undetected — so this now
+    // runs first, with target resolution folded in immediately after (still
+    // before any bootstrap/seed) rather than before.
     const s = await this.loadState();
     s.running = true;
     s.config = config;
@@ -367,6 +645,133 @@ export class LoadDriver {
     s.lastTickAt = null;
     s.lastError = null;
     await this.saveState(s);
+    // Codex review P2 fix (round 8): anchors THIS specific start attempt —
+    // see abortStart's and reloadIfStillMine's own doc comments for why
+    // every subsequent save in this method re-checks against this value
+    // before writing anything more.
+    const myStartedAt = s.startedAt;
+
+    // Codex review P2 fix (round 15): reset the correctness tracker HERE,
+    // right alongside the durable `running: true`/zeroed-counters save
+    // above, not after the (now potentially long) schema/seed/index-wait
+    // sequence below. Between those two points, `running: true` is already
+    // durable and publicly visible via /api/load/status, but this.correct-
+    // nessTracker still held the PREVIOUS run's tracker — its snapshot()
+    // was being combined with the NEW run's zeroed durable counters, so a
+    // status poll mid-bootstrap could show the previous run's
+    // trackedKeyCount/verified as if they belonged to the run that just
+    // "started". A new run's tracked keys have nothing to do with a
+    // previous run's (possibly a different targetShardId, warehouse set, or
+    // table state entirely) regardless of when during startup they're
+    // reset, so there's no reason not to do it immediately.
+    this.correctnessTracker = new CorrectnessTracker();
+    this.correctnessHydrated = true;
+    this.lastVerifyAt = 0;
+
+    if (mode === "skew" && !explicitTargetShardId) {
+      let resolvedTargetShardId: string;
+      try {
+        resolvedTargetShardId = await this.resolveDefaultSkewTarget(warehouseIds[0]);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return this.abortStart(myStartedAt, `Couldn't resolve a default skew target: ${message}. Pass 'targetShardId' explicitly instead.`);
+      }
+      config.targetShardId = resolvedTargetShardId;
+      const current = await this.reloadIfStillMine(myStartedAt);
+      if (!current) return this.supersededResponse();
+      current.config = config;
+      await this.saveState(current);
+    }
+
+    // Bootstrap reference data (warehouse/district/customer/item/stock) for
+    // every warehouse this run targets — see scenario-seed.ts's header
+    // comment for why this can't be a separate, external setup step: the
+    // token that seeds a tenant's data and the token that later transacts
+    // against it must be the SAME one (TenantTokenStoreTokenProvider
+    // refuses to rotate a tenant already registered by a different caller),
+    // so LoadDriver has to seed its own data through its own token. Opt out
+    // with `seedReferenceData: false` for a warehouse something else (e.g.
+    // the Node TPC-C harness) already owns and seeded. A bootstrap/seed
+    // failure rolls `running` back to false (see abortStart) — the run
+    // never actually starts rather than starting one guaranteed to fail
+    // every transaction.
+    if (willSelfSeed) {
+      // Codex review P2 fix: a genuinely fresh cluster (only /admin/init run
+      // — exactly what a real "Deploy to Cloudflare" visitor's core Worker
+      // starts as) has none of the tpcc_* tables yet, so seeding below would
+      // 502 on its very first upsert. Ensure the TABLES exist FIRST — see
+      // schema-bootstrap.ts's own header comment for why this is safe to
+      // call on every start rather than only once, and for why INDEXES are
+      // deliberately handled separately, AFTER seeding, not here.
+      //
+      // Codex review P1 fix: this MUST use env.CORE_GATEWAY_BASE_URL, the
+      // operator-configured trusted endpoint — NEVER config.baseUrl, which
+      // (via resolveLoadDriverBaseUrl) can come straight from this request's
+      // own JSON body. Sending ADMIN_TOKEN to an attacker-supplied baseUrl
+      // would hand any caller of this gated-but-shared endpoint a live
+      // exfiltration path for the cluster's admin credential. body.baseUrl
+      // is only ever meant to override the TENANT-scoped HttpTxExecutor
+      // below (a real but far less sensitive testing/flexibility knob —
+      // still a tenant bearer token, never the admin one) — and even that is
+      // rejected above when combined with self-seeding, to avoid bootstrapping
+      // one cluster while seeding another.
+      const schemaAdmin = new HttpSchemaAdminClient(this.env.CORE_GATEWAY_BASE_URL, this.env.ADMIN_TOKEN);
+      try {
+        await ensureScenarioTables(schemaAdmin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return this.abortStart(myStartedAt, `Couldn't bootstrap scenario schema: ${message}`);
+      }
+
+      const seedExecutor = new HttpTxExecutor(config.baseUrl ?? "", this.tokenProvider);
+      try {
+        for (const warehouseId of config.warehouseIds) {
+          await seedScenarioReferenceData(seedExecutor, warehouseId, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return this.abortStart(myStartedAt, `Couldn't seed reference data: ${message}`);
+      }
+
+      // Codex review P2 fix: indexes are created/verified-ready AFTER
+      // seeding, never before — see ensureScenarioIndexesReady's own doc
+      // comment for exactly why (an index created before its rows exist only
+      // picks them up via /v1/mutate's asynchronous index-maintenance path,
+      // which the seeding calls above don't wait for; creating it after
+      // seeding means its own backfill scan picks up every seeded row).
+      try {
+        await ensureScenarioIndexesReady(schemaAdmin);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return this.abortStart(myStartedAt, `Couldn't finish bootstrapping scenario indexes: ${message}`);
+      }
+
+      // Codex review P2 fix (round 5): an index rule reporting 'ready' only
+      // proves SOME prior data reached it — not THIS call's own freshly-
+      // seeded rows (e.g. a new warehouseId, or expanded itemCount, seeded
+      // onto an already-'ready' index from an earlier run). Canary-verify
+      // each warehouse's own seeded data is actually visible through the
+      // indexes the transaction mix depends on before declaring the run
+      // ready to start — see verifySeededDataIndexed's own doc comment.
+      try {
+        for (const warehouseId of config.warehouseIds) {
+          await verifySeededDataIndexed(seedExecutor, warehouseId, config.districtsPerWarehouse, config.customersPerDistrict, config.itemCount);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return this.abortStart(myStartedAt, `Seeded data didn't become queryable in time: ${message}`);
+      }
+    }
+
+    // Codex review P2 fix (round 8): the long bootstrap sequence above may
+    // have taken long enough for a concurrent /api/load/stop (or an entirely
+    // different /api/load/start) to have already changed durable state — see
+    // reloadIfStillMine's own doc comment. Re-check ONE last time before the
+    // final "declare this run ready" step: setting the alarm now if this
+    // attempt has been superseded would incorrectly resurrect a run someone
+    // already stopped.
+    const finalState = await this.reloadIfStillMine(myStartedAt);
+    if (!finalState) return this.supersededResponse();
 
     // Reset the transient skew cache — a new start may target a different
     // shard than any previously cached pool.
@@ -375,18 +780,65 @@ export class LoadDriver {
     this.cachedVbucketMap = null;
     this.lastVbucketMapRefreshAt = 0;
 
-    // Fresh correctness tracker for a fresh run — a new run's tracked keys
-    // have nothing to do with a previous run's (possibly a different
-    // targetShardId, warehouse set, or table state entirely).
-    this.correctnessTracker = new CorrectnessTracker();
-    this.correctnessHydrated = true;
-    this.lastVerifyAt = 0;
-
     // Kick off the first tick right away rather than waiting a full
     // TICK_INTERVAL_MS for the alarm to fire.
     await this.state.storage.setAlarm(Date.now());
 
-    return json(toStatusJson(s, this.correctnessTracker.snapshot()));
+    return json(toStatusJson(finalState, this.correctnessTracker.snapshot()));
+  }
+
+  /** Codex review P2 fix (round 8; corrected round 9 — see below): re-reads
+   * durable state and returns it ONLY if it still belongs to the start
+   * attempt anchored at `myStartedAt` — i.e. nothing (a concurrent stop, or
+   * an entirely different start) has touched it since. `startedAt` is set
+   * exactly once per start, to a millisecond timestamp, at the very first
+   * save handleStart makes — for this DO's single-run-at-a-time model
+   * that's a sufficient, simple generation marker for detecting a NEWER
+   * start. Returns null when superseded; callers must not save anything in
+   * that case (see abortStart / handleStart's own final check for how each
+   * caller responds instead).
+   *
+   * ROUND 9 CORRECTION: this originally checked `startedAt` alone — but
+   * handleStop() sets `running = false` WITHOUT touching `startedAt` (there
+   * is no new run to anchor a fresh generation to; stopping isn't starting
+   * anything). A stop arriving mid-bootstrap would therefore leave
+   * `startedAt` matching, this check would report "still mine", and the
+   * original start would carry on — finishing schema/seeding work for a run
+   * that was just told to stop, and its final success path would set
+   * `running = true` again, silently resurrecting the exact run the caller
+   * just stopped. Requiring `running === true` too closes this: a stop is
+   * now unambiguously a supersession of any start still in flight, exactly
+   * like a genuinely different start would be. */
+  private async reloadIfStillMine(myStartedAt: number): Promise<LoadDriverState | null> {
+    const current = await this.loadState();
+    return current.startedAt === myStartedAt && current.running ? current : null;
+  }
+
+  /** Shared response for "this start attempt was superseded by a newer
+   * stop/start before it could finish" — deliberately not an error (nothing
+   * about THIS request's own actions failed), but not a fabricated success
+   * either, since whatever is currently running (or not) belongs to someone
+   * else's request now. */
+  private supersededResponse(): Response {
+    return json({ error: "This start was superseded by a newer stop/start before it finished — check current status." }, 409);
+  }
+
+  /** Shared rollback for every bootstrap/seed failure path in handleStart:
+   * rolls this run back to not-running IFF this start attempt is still the
+   * current one (see reloadIfStillMine) — a failure from a start attempt
+   * that's already been superseded must not stomp on whatever newer state
+   * now exists. Always returns the caller's own 502, regardless of whether
+   * the rollback actually wrote anything, since THIS request's own attempt
+   * to start genuinely failed either way. */
+  private async abortStart(myStartedAt: number, errorMessage: string): Promise<Response> {
+    const current = await this.reloadIfStillMine(myStartedAt);
+    if (current) {
+      current.running = false;
+      current.config = null;
+      current.lastError = errorMessage;
+      await this.saveState(current);
+    }
+    return json({ error: errorMessage }, 502);
   }
 
   private async handleStop(): Promise<Response> {
@@ -408,6 +860,21 @@ export class LoadDriver {
   async alarm(): Promise<void> {
     const s = await this.loadState();
     if (!s.running || !s.config) return; // stopped since the alarm was scheduled — go idle
+
+    // Safety cap (see MAX_LOAD_RUN_DURATION_MS's doc comment): force-stop
+    // regardless of who's watching, rather than let a forgotten scenario run
+    // indefinitely. Checked BEFORE running this tick, so the run stops
+    // cleanly at the cap instead of squeezing in one more tick past it.
+    if (hasLoadRunExceededMaxDuration(s.startedAt, Date.now())) {
+      s.running = false;
+      // Not an actual error — reusing lastError as the "why isn't this
+      // running" signal the frontend already has a field for, rather than
+      // adding a second, parallel "stopReason" field for one case.
+      s.lastError = `auto-stopped after ${Math.round(MAX_LOAD_RUN_DURATION_MS / 60_000)} min (safety cap) — start it again to keep watching`;
+      await this.saveState(s);
+      await this.state.storage.deleteAlarm();
+      return;
+    }
 
     try {
       await this.runTick(s);
@@ -473,7 +940,12 @@ export class LoadDriver {
     // than a tenant bearer token). Built once per tick, reused for both the
     // periodic verify() pass below and TrackingTxExecutor's own optional
     // idempotent-replay verification.
-    const sqlReader = new HttpSqlPointReader(config.baseUrl ?? "", this.env.ADMIN_TOKEN);
+    //
+    // Codex review P1 fix: env.CORE_GATEWAY_BASE_URL, not config.baseUrl —
+    // see handleStart's identical fix (HttpSchemaAdminClient construction)
+    // for why an admin-token-bearing client must never be pointed at a
+    // request-supplied baseUrl.
+    const sqlReader = new HttpSqlPointReader(this.env.CORE_GATEWAY_BASE_URL, this.env.ADMIN_TOKEN);
     const readBack = gatewayReadBack(sqlReader);
     // Shardscope T4: every mutate()/tx() call this tick passes through the
     // correctness tracker on its way to the real gateway — see
@@ -547,6 +1019,56 @@ export class LoadDriver {
     // counters, not two copies that could drift.
     const snap = this.correctnessTracker.snapshot();
     s.correctness = { writesAcked: snap.writesAcked, writesRetriedIdempotent: snap.writesRetriedIdempotent, txAbortedExpected: snap.txAbortedExpected, lost: snap.lost };
+  }
+
+  /** Codex review P2 fix: resolves a genuinely correct default skew target
+   * for `warehouseId` when the caller didn't supply one explicitly — a
+   * real shard id from the SAME catalog `refreshSkewPoolsFromMap` will
+   * later search for this warehouse (via the identical catalogShardIdForTenant
+   * formula), rather than the client-side picker's old guess of "some shard
+   * in catalog-0," which was simply wrong on any deployment where this
+   * warehouse's tenant doesn't hash to catalog-0.
+   *
+   * ROUND 11 CORRECTION: picking "whichever shard happens to own vbucket 0"
+   * (any owned vbucket, 0 just being a deterministic choice) was still
+   * wrong — vbucket 0 has no relationship to which shard any of THIS
+   * warehouse's actual seeded tpcc_stock keys (item ids 1..itemCount) route
+   * to. On a deployment with many more vbuckets than seeded items,
+   * refreshSkewPoolsFromMap's own search (generateSkewedKeys, bounded by
+   * SKEW_SCAN_MAX_ATTEMPTS) could easily find ZERO of them landing on
+   * vbucket 0's owner, leaving the skew pool empty and — via
+   * SkewKeyPicker's own documented uniform fallback — silently running
+   * uniform traffic instead of the promised hot shard. Item 1's stock key is
+   * ALWAYS seeded (seedScenarioReferenceData seeds items 1..itemCount
+   * unconditionally for any itemCount >= 1), so hashing THAT SPECIFIC key
+   * with the exact same formula CloudflareShard's own routing uses
+   * (src/hash.ts's hashKey — see skew.ts's own header comment) and looking
+   * up its CURRENT owning shard guarantees the resolved target is a shard
+   * that will genuinely receive at least one of this run's real writes —
+   * not a blind guess that might own none of them. */
+  private async resolveDefaultSkewTarget(warehouseId: number): Promise<string> {
+    const raw = await this.env.SHARD_API.adminVbucketMap(this.env.ADMIN_TOKEN);
+    const vbucketMap = raw as AdminVbucketMapResponse;
+    const tenantId = tenantIdForWarehouse(warehouseId);
+    const catalogShardId = catalogShardIdForTenant(tenantId, vbucketMap.catalogShardCount);
+    const catalog = vbucketMap.catalogs.find((c) => c.catalogShardId === catalogShardId);
+    if (!catalog) {
+      throw new Error(`catalog ${catalogShardId} (owner of warehouse ${warehouseId}'s tenant) not found in the live vbucket map`);
+    }
+    if (catalog.totalVBuckets <= 0) {
+      throw new Error(`catalog ${catalogShardId} has no vbuckets yet`);
+    }
+    // Item 1's stock key is always seeded — the same routing formula
+    // production writes use (hashKey(`${tenantId}:${table}:${partitionKey}`)
+    // % totalVBuckets — see skew.ts's own header comment) tells us exactly
+    // which vbucket it lands on; the catalog map tells us who currently owns
+    // that vbucket.
+    const canaryVbucket = hashKey(`${tenantId}:tpcc_stock:${stockKey(warehouseId, 1)}`) % catalog.totalVBuckets;
+    const owner = catalog.map.find((row) => row.vbucket === canaryVbucket);
+    if (!owner) {
+      throw new Error(`catalog ${catalogShardId}'s vbucket map has no owner recorded for vbucket ${canaryVbucket} (warehouse ${warehouseId}'s item-1 stock key)`);
+    }
+    return owner.shardId;
   }
 
   /** ONE shared vbucket-map fetch, cached for at most SKEW_REFRESH_INTERVAL_MS

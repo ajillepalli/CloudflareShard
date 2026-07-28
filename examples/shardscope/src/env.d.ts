@@ -277,4 +277,25 @@ export interface Env {
    * a session artifact derived from it (e.g. a cookie set after a login
    * step), never the raw token itself. */
   SHARDSCOPE_GATE_TOKEN: string;
+
+  /** The CloudflareShard gateway's own public base URL — where
+   * load-driver.ts's HttpTxExecutor sends its real /v1/mutate,/tx,/index-
+   * query,/table-scan calls (see gateway-client.ts's header comment: it's a
+   * REAL external-HTTP client simulating a real tenant app, not a caller of
+   * SHARD_API's privileged RPC binding, so it needs a real reachable URL,
+   * not a service binding). A plain (non-secret) var, not a secret — it's
+   * just an endpoint, no different from a config file's API base URL — so
+   * POST /api/load/start never needs the BROWSER to know or supply a
+   * deployment-specific URL; the server fills it in from here whenever the
+   * caller doesn't pass an explicit override. Deliberately NOT defaulted in
+   * the committed wrangler.toml (Codex review P2 fix — a local dev URL as
+   * the checked-in default would silently become what a real deploy falls
+   * back to if the operator forgets to override it, and Cloudflare's runtime
+   * can't reach 127.0.0.1): local dev sets it in .dev.vars (gitignored, same
+   * pattern as ADMIN_TOKEN/SHARDSCOPE_GATE_TOKEN above); a real deployment
+   * sets its own with `wrangler deploy --var CORE_GATEWAY_BASE_URL:<url>`.
+   * Left genuinely unset, resolveLoadDriverBaseUrl (load-driver.ts) resolves
+   * to null and the first real call fails at the network layer with an
+   * obvious error, per that function's own doc comment. */
+  CORE_GATEWAY_BASE_URL: string;
 }

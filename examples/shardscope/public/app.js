@@ -92,6 +92,12 @@ const el = {
   canvasSub: hook("canvas-sub"),
   statusBanner: hook("status-banner"),
   emptyState: hook("empty-state"),
+  scenarioStartBanner: hook("scenario-start-banner"),
+  scenarioStartSub: hook("scenario-start-sub"),
+  scenarioStartBtn: hook("scenario-start-btn"),
+  scenarioRunningPill: hook("scenario-running-pill"),
+  scenarioRunningLabel: hook("scenario-running-label"),
+  scenarioStopBtn: hook("scenario-stop-btn"),
   arcLayer: hook("arc-layer"),
   nodesLayer: hook("nodes-layer"),
   liveChip: hook("live-chip"),
@@ -612,6 +618,117 @@ function renderScoreboard(scoreboard) {
   el.sbChecksum.className = "sb-item" + (checksumClass ? " " + checksumClass : "");
   el.sbChecksum.textContent = `checksum ${checksum.label}`;
 }
+
+// ---- self-service scenario (Topology room's "Start the scenario" prompt) --
+// Live-mode-only walkthrough: starts a real load run (skew mode, so a real
+// hot shard emerges for the Reshard/Chaos rooms to act on) so a first-time
+// visitor to a freshly-initialized live deployment sees the actual hero
+// story — real writes, a live reshard, a chaos attack that can't lose data —
+// rather than a static, empty topology. ?demo=1 has no real load engine to
+// start (same reasoning as startAppRoom/startEdgeRoom's identical
+// mode==="demo" guard elsewhere in this file), so the banner never renders
+// there at all.
+
+let scenarioActionInFlight = false;
+
+function renderScenarioControls(scoreboard) {
+  if (!el.scenarioStartBanner || !el.scenarioRunningPill) return;
+  // Codex review P2 fix: this is a real /api/load/* control surface, so it
+  // must only ever show for a genuine live connection — NOT just "not demo".
+  // sample-fallback's embedded snapshot (see buildSampleSnapshot) sets
+  // scoreboard.loadRunning: true for its own illustrative purposes, which
+  // would otherwise make this render a real-looking "scenario running" pill
+  // whose Stop button calls a real /api/load/stop — breaking sample
+  // fallback's own documented "never touches live /api/*" contract.
+  if (mode !== "live") {
+    el.scenarioStartBanner.hidden = true;
+    el.scenarioRunningPill.hidden = true;
+    return;
+  }
+  const running = !!(scoreboard && scoreboard.loadRunning);
+  el.scenarioStartBanner.hidden = running;
+  el.scenarioRunningPill.hidden = !running;
+  // Codex review P2 fix: this used to pick a "target shard" client-side
+  // (vbucket 0 of whichever catalog happened to be first in the topology
+  // snapshot) and disable Start until it found one — but that guess had no
+  // relationship to which catalog the scenario's actual warehouse tenant
+  // hashes to, so on any deployment where they differ, skew mode silently
+  // ran uniform traffic instead of creating a real hot shard. The server
+  // now resolves a genuinely correct target itself (see load-driver.ts's
+  // resolveDefaultSkewTarget) when the request omits targetShardId, so the
+  // client no longer needs to guess one — Start just stays enabled whenever
+  // a run isn't already active/in flight.
+  if (!running && el.scenarioStartBtn && !scenarioActionInFlight) el.scenarioStartBtn.disabled = false;
+}
+
+/** Shared error handling for both scenario actions below — a 401 means the
+ * gate session expired mid-visit, same as every other /api/* caller in this
+ * file (see reshardFetch's identical branch). */
+function handleScenarioActionResponse(res) {
+  if (res.status === 401) {
+    handleLogout();
+    throw new Error("session expired — please log in again");
+  }
+  return res.json().catch(() => ({})).then((body) => {
+    if (!res.ok) {
+      const errField = body && body.error;
+      const message = (errField && (errField.message || errField)) || `request failed (${res.status})`;
+      throw new Error(typeof message === "string" ? message : JSON.stringify(message));
+    }
+    return body;
+  });
+}
+
+function handleScenarioStartClick() {
+  if (mode !== "live" || scenarioActionInFlight) return;
+  scenarioActionInFlight = true;
+  el.scenarioStartBtn.disabled = true;
+  el.scenarioStartBtn.textContent = "starting…";
+  // targetShardId is deliberately omitted — the server resolves a genuinely
+  // correct one from the scenario warehouse's own catalog (see
+  // load-driver.ts's resolveDefaultSkewTarget's doc comment for why the
+  // client can't reliably guess this itself).
+  fetch("/api/load/start", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "skew" }),
+  })
+    .then(handleScenarioActionResponse)
+    .then((status) => {
+      const targetShardId = (status && status.config && status.config.targetShardId) || "a live shard";
+      logLine(`scenario started — real writes now landing on ${targetShardId}`, "safe");
+    })
+    .catch((err) => {
+      const msg = (err && err.message) || String(err);
+      showBanner(`couldn't start the scenario: ${msg}`, "warn");
+      logLine(`scenario start failed: ${msg}`, "warn");
+    })
+    .finally(() => {
+      scenarioActionInFlight = false;
+      el.scenarioStartBtn.textContent = "Start the scenario";
+      el.scenarioStartBtn.disabled = false;
+    });
+}
+
+function handleScenarioStopClick() {
+  if (mode !== "live" || scenarioActionInFlight) return;
+  scenarioActionInFlight = true;
+  el.scenarioStopBtn.disabled = true;
+  fetch("/api/load/stop", { method: "POST", credentials: "same-origin" })
+    .then(handleScenarioActionResponse)
+    .then(() => {
+      logLine("scenario stopped", "mig");
+    })
+    .catch((err) => {
+      const msg = (err && err.message) || String(err);
+      showBanner(`couldn't stop the scenario: ${msg}`, "warn");
+    })
+    .finally(() => {
+      scenarioActionInFlight = false;
+      el.scenarioStopBtn.disabled = false;
+    });
+}
 /** state: 'connecting' | 'live' | 'warn' | 'demo' */
 function setLiveState(state, label) {
   const isLive = state === "live";
@@ -737,9 +854,17 @@ function renderInner(snapshot) {
     el.arcLayer.querySelectorAll("path.migration-path").forEach((p) => p.remove());
     el.canvasSub.textContent = "";
     setCanvasStatus("not initialized");
+    // Codex review P3 fix: this branch returns before renderScenarioControls
+    // below ever runs, so a scenario banner/pill left visible from a PRIOR
+    // snapshot (cluster now reports uninitialized — e.g. a reset cluster)
+    // would otherwise keep showing over the empty state with no way to
+    // dismiss it short of a reload.
+    if (el.scenarioStartBanner) el.scenarioStartBanner.hidden = true;
+    if (el.scenarioRunningPill) el.scenarioRunningPill.hidden = true;
     return;
   }
   el.emptyState.hidden = true;
+  renderScenarioControls(snapshot.scoreboard);
 
   // ---- shard id union: vbucket map (owners + targets) UNION shards[] ----
   const shardIds = new Set();
@@ -3153,6 +3278,12 @@ function handleLogout() {
   mode = "connecting";
   showSampleBadge(false);
   clearBanner();
+  // Codex review P3 fix: nothing re-renders the scenario controls on
+  // logout, so a banner/pill left visible from before the session expired
+  // would otherwise keep showing over the login panel even though a click
+  // now just no-ops (mode !== "live").
+  if (el.scenarioStartBanner) el.scenarioStartBanner.hidden = true;
+  if (el.scenarioRunningPill) el.scenarioRunningPill.hidden = true;
   el.nodesLayer.innerHTML = "";
   el.arcLayer.querySelectorAll("path.migration-path").forEach((p) => p.remove());
   el.canvasSub.textContent = "";
@@ -3465,7 +3596,7 @@ const TOUR_STEPS = [
     room: "topology",
     title: "Topology — the living canvas",
     caption:
-      "Every shard and vBucket, drawn live. Node color is heat (load); cyan arcs are vBuckets migrating between shards right now.",
+      "Every shard and vBucket, drawn live. Node color is heat (load); cyan arcs are vBuckets migrating between shards right now. On a live cluster, click “Start the scenario” to bring in real writes and a real hot shard before you continue.",
   },
   {
     room: "reshard",
@@ -3619,6 +3750,8 @@ function init() {
   // ---- Share + guided tour wiring ----
   if (el.shareBtn) el.shareBtn.addEventListener("click", handleShareClick);
   if (el.tourStartBtn) el.tourStartBtn.addEventListener("click", () => startTour());
+  if (el.scenarioStartBtn) el.scenarioStartBtn.addEventListener("click", handleScenarioStartClick);
+  if (el.scenarioStopBtn) el.scenarioStopBtn.addEventListener("click", handleScenarioStopClick);
   if (el.tourNextBtn) el.tourNextBtn.addEventListener("click", tourNext);
   if (el.tourBackBtn) el.tourBackBtn.addEventListener("click", tourBack);
   if (el.tourSkipBtn) el.tourSkipBtn.addEventListener("click", endTour);
