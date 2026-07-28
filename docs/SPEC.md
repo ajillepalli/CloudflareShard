@@ -56,6 +56,23 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
   - Catalog maps vbucket -> shardId.
   - Rebalance changes only mapping entries, not hash function.
 
+- Catalog shard partitioning (the control plane is itself sharded):
+  - The cluster is partitioned across a fixed, well-known set of catalog
+    shards (`catalog-0`, `catalog-1`, ... — count controlled by the
+    `CATALOG_SHARD_COUNT` var, default 4).
+  - A tenant's catalog shard is computed by hashing `tenantId` — there's no
+    lookup step, which avoids the bootstrapping problem of sharding the
+    metadata store itself.
+  - Cluster-wide admin operations (`/admin/init`, `/admin/register-table`,
+    `/admin/create-table`, `/admin/status`) fan out to every catalog shard;
+    shard-scoped operations (`/admin/split-vbucket`, `/admin/drain-shard`)
+    require an explicit `catalogShardId` since vBucket/shard identifiers are
+    local to one catalog shard.
+  - `/admin/audit-log` fans out to every catalog shard and merges each
+    shard's last 100 admin actions (`/init`, `/register-table`,
+    `/split-vbucket`, `/drain-shard`) into one list sorted newest-first,
+    tagged with the `catalogShardId` that logged each entry.
+
 ## 5) Catalog Schema
 
 Table: cluster_config
@@ -245,6 +262,22 @@ Response:
 - ok boolean
 - numShards
 - totalVBuckets
+
+POST /admin/status (ADMIN_TOKEN)
+Response:
+- initialized boolean (true only if EVERY catalog shard reports itself initialized)
+- catalogShardCount number
+- shards { total, active, draining } (summed across every catalog shard)
+- catalogs: array of `{catalogShardId, initialized, totalVBuckets?, metadataVersion?, initializedAt?, shards?: {total, active, draining}}`
+  — the raw per-catalog-shard status merged in; every field but `catalogShardId`/`initialized`
+  is absent for a catalog shard that hasn't been `/admin/init`'d yet
+
+Fans out to every catalog shard's own `/status` (`fanOutToAllCatalogs`) and merges: the
+top-level `initialized` is the AND of every catalog shard's own flag, and the top-level `shards`
+totals sum each catalog's `active`/`draining`/`total` shard counts. Like every other fan-out
+admin route, it fails closed — if any catalog shard's `/status` call itself fails, the whole
+request fails with that catalog shard's own status code and body (`{error, catalogShardId,
+details}`) rather than returning a partial cluster-wide view.
 
 POST /admin/register-table
 Request:
@@ -487,10 +520,54 @@ POST /admin/drain-shard-status     {catalogShardId, shardId}
   -> 200 {shardId, vbucketsRemaining, ringsRemaining, status}
      status: active | migrating-vbuckets | evacuating-rings | complete
 
+POST /admin/shard-stats (ADMIN_TOKEN)     {shardId}
+  -> 200 {ok, tables:[{table, rowCount}], idempotencyTableSize, pendingIntentCount,
+     indexPendingJobCount, indexEntryCount, rowOwnerCount}
+  -> 400 {error:"Missing shardId"}
+
+Forwards straight to the named `ShardDO`'s own `/stats` — one shard only, no catalog involved
+and no fan-out. `tables` lists every non-internal table's row count; the bookkeeping tables
+(`applied_requests`, `pending_intents`, `index_pending_jobs`, `__cf_indexes`,
+`__cf_row_owners`) are excluded from `tables` but each surfaced individually as
+`idempotencyTableSize`, `pendingIntentCount` (distinct in-flight 2PC tx ids), `indexPendingJobCount`
+(the async index-maintenance retry backlog), `indexEntryCount`, and `rowOwnerCount`.
+**`shardId` is never checked against the live topology first** — unlike `/admin/fault-inject`'s
+`rejectIfUnknownShard` guard, this route calls `env.SHARD.idFromName(shardId)` directly; a
+typo'd or never-existed `shardId` silently materializes (cold-starts) a brand-new, empty
+`ShardDO` rather than 404ing, so the response is indistinguishable from a genuinely empty real
+shard. This is the per-shard measurement primitive `TODOS.md`'s "Automatic split heuristics"
+entry uses to compare row counts across shards for hot-shard evidence.
+
+POST /admin/topology-lock-status (ADMIN_TOKEN)   (no request body)
+  -> 200 {held:false}
+  -> 200 {held:true, operationId, operationType, acquiredAt, heartbeatAt, expiresAt, expired}
+
+POST /admin/force-release-topology-lock (ADMIN_TOKEN)   {operationId}
+  -> 200 {ok:true, released}   (released:false is an idempotent no-op, not an error — the
+     given operationId simply didn't match whoever currently holds the lock, or nothing is held)
+  -> 400 {error:{code:"MISSING_FIELDS", message:"Missing operationId.",
+     fix:"Read /admin/topology-lock-status to find the current holder's operationId."}}
+
+Both forward straight to catalog-0 specifically, never fanned out across catalog shards: the
+durable, TTL'd (`TOPOLOGY_LOCK_TTL_MS` = 30s) topology-operation lock mentioned in the README's
+"What this prototype demonstrates" section is a single cluster-wide singleton living in
+catalog-0's own `topology_lock` table, since it serializes drain/split/migrate/create-index/
+drop-index across the whole cluster rather than one catalog shard's slice of it. Every
+topology-changing operation above acquires this lock internally (`/acquire-topology-lock`)
+before mutating and heartbeats it once per orchestration tick (`/heartbeat-topology-lock`);
+`force-release` is the same class of manual escape hatch as `/admin/tx-force-abort` for a stuck
+2PC transaction — for an operation that crashed, or is still heartbeating but needs to be
+forcibly cleared, without ever releasing its lease on its own. An operator who doesn't know the
+exact `operationId` reads it from `/admin/topology-lock-status` first. Unlike most other
+`CatalogDO`-routed admin operations, `/topology-lock-status` and `/release-topology-lock` are
+NOT in `CatalogDO`'s own `ADMIN_GATED_ROUTES` double-check list — the Worker's structural
+`/admin/*` gate (`requireAdminAuth`, applied once to every `/admin/*` path before routing) is
+these two routes' only auth check, not defense-in-depth layered on top of a second one.
+
 POST /admin/register-tenant (ADMIN_TOKEN)
 Request:
 - tenantId string
-- rotate boolean (optional — issues a new token for an already-registered tenant; the old token stays valid for a bounded grace period, `TENANT_TOKEN_ROTATION_GRACE_MS` — see README's "Tenant authorization" section — rather than being invalidated immediately)
+- rotate boolean (optional — issues a new token for an already-registered tenant; the old token stays valid for a bounded grace period, `TENANT_TOKEN_ROTATION_GRACE_MS` (5 minutes) — see §14 — rather than being invalidated immediately)
 
 Response:
 - ok
@@ -912,7 +989,8 @@ Emit structured logs and counters for:
 
 - Require authenticated principal at Gateway — implemented via `tenant_auth` bearer tokens (`/admin/register-tenant`), checked in `CatalogDO.handleRoute` before any routing info is returned. `ADMIN_TOKEN` is accepted there as a universal bypass (the operator may route as any tenant), used by the admin-only `/v1/sql`.
 - Verify tenantId belongs to principal before route — implemented: the caller's bearer token is hashed and compared against the claimed `tenantId`'s stored hash; missing/wrong/revoked tokens are all rejected with 401.
-- This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary — see README.md's "Tenant authorization" section for the operator/tenant distinction this milestone's distribution model assumes.
+- This is a per-deployment authorization boundary (isolating apps/environments within one self-hosted deployment), not a multi-customer-SaaS boundary. In this project's current self-hosted distribution model, the deploying developer holds both the operator role (`ADMIN_TOKEN`) and every tenant role (`tenant_auth` tokens) — but the two are kept structurally distinct in the code so a future hosted layer (a genuinely separate operator) could be added without a rewrite.
+- Token rotation: `POST /admin/register-tenant {"tenantId": "...", "rotate": true}` issues a new token for an already-registered tenant. The new token works immediately; the old one keeps working for a bounded grace period (`TENANT_TOKEN_ROTATION_GRACE_MS`, 5 minutes) instead of being invalidated the instant the new one is issued, so a rotation doesn't break an in-flight caller or one that hasn't yet picked up the new token. `POST /admin/revoke-tenant` is not softened by this grace period — it still invalidates the current token AND any still-in-grace previous token immediately.
 - **Raw `/v1/sql` is ADMIN-ONLY (Milestone 3), reads AND writes.** The trust-based tenant SQL path was removed rather than continue an unwinnable guard. Two things forced it: (1) the per-tenant write guard (denylist → allowlist against a passthrough SQL string) leaked six times — mixed case, inter-token comments, `schema.` qualifiers, a spaced+quoted internal name, double-quoted internal identifiers; and (2) there is **no safe tenant `SELECT` over arbitrary SQL**, because base rows carry no physical `tenant_id` column — the shard cannot add a `WHERE tenant_id = ?` predicate to an arbitrary query, so a partition-scoped raw read could return another tenant's rows that hash into the same vbucket. `/v1/sql` now requires `ADMIN_TOKEN` (operator/debugging); tenants write via `/v1/mutate` + `/v1/tx` (which force the partition-key predicate structurally) and read via `/v1/index-query` (exact-tuple lookups) and `/v1/table-scan` (Milestone 4 — lists a tenant's own rows, mechanically constructed and filtered by `tenant_id` via the `__cf_row_owners` join rather than a physical `tenant_id` column on the base row; see §7 and §6). This closes the general-read gap without needing the physical-`tenant_id` schema change originally assumed necessary — `TODOS.md`'s Completed section records why the join approach was chosen over adding that column. Even for the operator, a `/v1/sql` mutation whose write TARGET is an internal bookkeeping table is rejected 403 (internal reads and cross-table access are allowed — admin is trusted).
 - **`/v1/table-scan`'s isolation depends on `__cf_row_owners.tenant_id`, not a physical column on the base row.** Every query `/tenant-scan-page` runs filters `WHERE ro.tenant_id = ?` before joining to the base table — but that filter alone is not sufficient when two tenants' rows share a literal partition-key value on the same shard (§14's pre-existing collision: `__cf_row_owners`'s primary key is `(table_name, partition_key)`, no tenant in the key, so the last writer's attribution wins): the join would then attribute both rows to whichever tenant currently owns that key. The actual mechanism that closes this is `table_rules.partition_key_unique`, computed by `checkPartitionKeyUnique` (`index.ts`) at `/admin/create-table`, `/admin/set-partition-key-column`, and `/admin/register-table` time and failing closed to 0 on any ambiguity — `/v1/table-scan` rejects 409 `PARTITION_KEY_NOT_UNIQUE` for any table where the flag isn't 1, so a tenant's scan against a table with a verified-unique partition key can never join into another tenant's row for a colliding value in the first place. (`/admin/set-partition-key-column` and `/admin/register-table` verify this across EVERY active shard via `checkPartitionKeyUniqueAcrossShards`, not just one representative shard as `/admin/create-table` does — see §5 — since only `/admin/create-table`'s own just-completed DDL push actually guarantees per-shard schema uniformity.) This is the same class of leak that motivated removing raw `/v1/sql`, closed by rejecting the unsafe case rather than by another guard.
 - Enforce SQL policy allowlist in production (MVP currently permissive).
