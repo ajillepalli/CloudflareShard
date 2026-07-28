@@ -89,6 +89,11 @@ const DEFAULT_ITEM_COUNT = 200;
 const MAX_SELF_SEED_DISTRICTS_PER_WAREHOUSE = 12;
 const MAX_SELF_SEED_CUSTOMERS_PER_DISTRICT = 20;
 const MAX_SELF_SEED_ITEM_COUNT = 100;
+// Codex review P2 fix (round 13): the caps above bound ONE warehouse's own
+// row count; this bounds how many warehouses self-seeding loops over in the
+// same synchronous request — see the rejection's own comment at its call
+// site for the full reasoning.
+const MAX_SELF_SEED_WAREHOUSES = 2;
 
 // How often the alarm fires while running.
 const TICK_INTERVAL_MS = 1000;
@@ -435,6 +440,28 @@ export class LoadDriver {
     const willSelfSeed = body.seedReferenceData !== false;
     const warehouseIds = Array.isArray(body.warehouseIds) && body.warehouseIds.length > 0 ? body.warehouseIds : DEFAULT_WAREHOUSE_IDS;
 
+    // Codex review P2 fix (round 13): round 12's MAX_SELF_SEED_* caps bound
+    // ONE warehouse's own row/subrequest count, but seedScenarioReferenceData
+    // and verifySeededDataIndexed both loop over EVERY warehouse in
+    // `warehouseIds`, synchronously, inside this same request — even at the
+    // SCENARIO_* defaults, one warehouse is already ~188 seed calls + 120
+    // index checks (each itself 2 subrequests: a tenant-token resolution
+    // plus the actual HTTP call), so just TWO warehouses would already
+    // exceed a Worker's 1000-subrequest budget before the first alarm ever
+    // fires. Self-seeding is capped to a small, fixed number of warehouses;
+    // a caller wanting a genuinely multi-warehouse scenario already has
+    // `seedReferenceData: false` to bring its own externally-seeded data
+    // (examples/tpc-c-benchmark's own Node harness seeds across many
+    // separate script invocations for exactly this reason, not one request).
+    if (willSelfSeed && warehouseIds.length > MAX_SELF_SEED_WAREHOUSES) {
+      return json(
+        {
+          error: `Self-seeding supports at most ${MAX_SELF_SEED_WAREHOUSES} warehouse(s) per start (got ${warehouseIds.length}) — seeding more synchronously in one request risks the Worker's own subrequest budget. Pass 'seedReferenceData: false' for a larger, externally-seeded warehouse set.`,
+        },
+        400,
+      );
+    }
+
     // Codex review P2 fix (round 9: widened from "only when self-seeding"):
     // the admin-token clients (schema bootstrap, the correctness tracker's
     // /v1/sql read-back) are now ALWAYS pinned to env.CORE_GATEWAY_BASE_URL
@@ -463,8 +490,13 @@ export class LoadDriver {
     // must agree: an exact string comparison would otherwise reject a
     // caller who supplies the functionally-identical URL with a trailing
     // slash, even though it's not actually a different cluster at all.
+    // Codex review P2 fix (round 13): CORE_GATEWAY_BASE_URL is deliberately
+    // left unset in the committed wrangler.toml (see that file's own P2 fix
+    // comment) — `.replace()` on `undefined` throws a TypeError, crashing
+    // this whole request even for a caller who never supplied a baseUrl at
+    // all. Guard with `?? ""` before normalizing either side.
     const normalizedRequestBaseUrl = typeof body.baseUrl === "string" ? body.baseUrl.replace(/\/+$/, "") : "";
-    const normalizedTrustedBaseUrl = this.env.CORE_GATEWAY_BASE_URL.replace(/\/+$/, "");
+    const normalizedTrustedBaseUrl = (this.env.CORE_GATEWAY_BASE_URL ?? "").replace(/\/+$/, "");
     if (normalizedRequestBaseUrl.length > 0 && normalizedRequestBaseUrl !== normalizedTrustedBaseUrl) {
       return json(
         {
