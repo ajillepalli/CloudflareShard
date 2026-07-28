@@ -153,6 +153,7 @@ const el = {
   edgeHeroCaption: hook("edge-hero-caption"),
   edgeRemeasureBtn: hook("edge-remeasure-btn"),
   edgeMapSvg: hook("edge-map-svg"),
+  edgeLegendYou: hook("edge-legend-you"),
 
   // ---- Playground room ----
   railPlay: hook("rail-play"),
@@ -1617,6 +1618,10 @@ function setEdgeLive(state) {
  * (never estimated, never a default/guessed position). */
 function renderEdgeMap(youPoint) {
   if (!el.edgeMapSvg) return;
+  // The legend's "You" entry names a dot that only exists when youPoint is
+  // set (see below) — showing it unconditionally (e.g. in demo mode, which
+  // always calls this with null) would point at a dot that was never drawn.
+  if (el.edgeLegendYou) el.edgeLegendYou.hidden = !youPoint;
   const parts = [];
   for (const region of ILLUSTRATIVE_REGIONS) {
     const { x, y } = projectLatLon(region.lat, region.lon);
