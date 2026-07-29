@@ -719,6 +719,153 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     expect(checkBody.rows).toHaveLength(1);
     expect(checkBody.rows[0].v).toBe("b");
   });
+
+  describe("WHERE-guard mismatch (P0 fix — shardscope's lost>0 root cause)", () => {
+    async function seedRow(stub: Awaited<ReturnType<typeof freshShard>>, id: string, v: number) {
+      await createTable(stub, "CREATE TABLE IF NOT EXISTS stock (id TEXT PRIMARY KEY, v INTEGER)");
+      await stub.fetch(
+        post("/execute", { sql: "INSERT INTO stock (id, v) VALUES (?, ?)", params: [id, v], requestId: `req-seed-${id}`, isMutation: true }),
+      );
+    }
+
+    it("a base-row UPDATE intent whose where clause matches 0 rows fails prepare with TX_PARTICIPANT_GUARD_MISMATCH, instead of silently succeeding", async () => {
+      const stub = await freshShard();
+      await seedRow(stub, "s-1", 5);
+
+      // A stale compare-and-swap: this UPDATE's WHERE clause expects v = 999,
+      // which the row (v = 5) does not actually hold — exactly the shape a
+      // client-computed CAS guard produces when it read stale data.
+      const prepareRes = await stub.fetch(
+        post("/prepare", {
+          coordinatorTxId: "tx-guard-1",
+          intents: [
+            {
+              sql: "UPDATE stock SET v = ? WHERE id = ? AND v = ?",
+              params: [6, "s-1", 999],
+              tenantId: "t1",
+              table: "stock",
+              partitionKey: "s-1",
+              vbucket: 0,
+              op: "update",
+            },
+          ],
+        }),
+      );
+      expect(prepareRes.status).toBe(409);
+      const body = (await prepareRes.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe("TX_PARTICIPANT_GUARD_MISMATCH");
+      expect(body.error.message).toContain("stock:s-1");
+
+      // The real row must be completely untouched — prepare only ever
+      // validated-then-rolled-back, same guarantee as any other prepare.
+      const checkRes = await stub.fetch(
+        post("/execute", { sql: "SELECT v FROM stock WHERE id = ?", params: ["s-1"], requestId: "req-check-guard-1", isMutation: false }),
+      );
+      const checkBody = (await checkRes.json()) as { rows: Array<{ v: number }> };
+      expect(checkBody.rows[0].v).toBe(5);
+    });
+
+    it("a matching WHERE guard still prepares and commits normally (no false positive)", async () => {
+      const stub = await freshShard();
+      await seedRow(stub, "s-2", 5);
+
+      const prepareRes = await stub.fetch(
+        post("/prepare", {
+          coordinatorTxId: "tx-guard-2",
+          intents: [
+            {
+              sql: "UPDATE stock SET v = ? WHERE id = ? AND v = ?",
+              params: [6, "s-2", 5],
+              tenantId: "t1",
+              table: "stock",
+              partitionKey: "s-2",
+              vbucket: 0,
+              op: "update",
+            },
+          ],
+        }),
+      );
+      expect(prepareRes.status).toBe(200);
+      const commitRes = await stub.fetch(post("/commit", { coordinatorTxId: "tx-guard-2" }));
+      expect(commitRes.status).toBe(200);
+
+      const checkRes = await stub.fetch(
+        post("/execute", { sql: "SELECT v FROM stock WHERE id = ?", params: ["s-2"], requestId: "req-check-guard-2", isMutation: false }),
+      );
+      const checkBody = (await checkRes.json()) as { rows: Array<{ v: number }> };
+      expect(checkBody.rows[0].v).toBe(6);
+    });
+
+    it("a failed guard-mismatch prepare releases its row lock immediately — a retry with fresh values doesn't hit a spurious TX_PARTICIPANT_LOCKED", async () => {
+      const stub = await freshShard();
+      await seedRow(stub, "s-3", 5);
+
+      const staleRes = await stub.fetch(
+        post("/prepare", {
+          coordinatorTxId: "tx-guard-3a",
+          intents: [
+            {
+              sql: "UPDATE stock SET v = ? WHERE id = ? AND v = ?",
+              params: [6, "s-3", 999],
+              tenantId: "t1",
+              table: "stock",
+              partitionKey: "s-3",
+              vbucket: 0,
+              op: "update",
+            },
+          ],
+        }),
+      );
+      expect(staleRes.status).toBe(409);
+
+      // Same row, a fresh coordinatorTxId, now with the CORRECT current
+      // value — must not be blocked by a lock the failed attempt above left
+      // behind.
+      const retryRes = await stub.fetch(
+        post("/prepare", {
+          coordinatorTxId: "tx-guard-3b",
+          intents: [
+            {
+              sql: "UPDATE stock SET v = ? WHERE id = ? AND v = ?",
+              params: [6, "s-3", 5],
+              tenantId: "t1",
+              table: "stock",
+              partitionKey: "s-3",
+              vbucket: 0,
+              op: "update",
+            },
+          ],
+        }),
+      );
+      expect(retryRes.status).toBe(200);
+    });
+
+    it("does NOT flag a synthetic index-maintenance intent (no vbucket) that matches 0 rows — only base-row op+vbucket intents are guarded", async () => {
+      const stub = await freshShard();
+      await createTable(stub, "CREATE TABLE IF NOT EXISTS idx_synth (id TEXT PRIMARY KEY)");
+
+      const prepareRes = await stub.fetch(
+        post("/prepare", {
+          coordinatorTxId: "tx-guard-4",
+          intents: [
+            {
+              // op is "update" but vbucket is deliberately omitted — matches
+              // how a synthetic __cf_indexes-maintenance intent looks (see
+              // PrepareIntent's own doc comment) — must NOT be gated even
+              // though it affects 0 rows.
+              sql: "UPDATE idx_synth SET id = id WHERE id = ?",
+              params: ["nonexistent"],
+              tenantId: "t1",
+              table: "__cf_indexes:some_index",
+              partitionKey: "nonexistent",
+              op: "update",
+            },
+          ],
+        }),
+      );
+      expect(prepareRes.status).toBe(200);
+    });
+  });
 });
 
 describe("ShardDO /invalidate-request", () => {
