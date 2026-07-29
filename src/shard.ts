@@ -212,6 +212,20 @@ function escapeIdent(name: string): string {
  * purpose" from a genuine SQL execution error. */
 class PrepareValidationRollback extends Error {}
 
+/** Deliberate sentinel thrown inside handlePrepare's validation transactionSync
+ * the instant a base-row UPDATE/DELETE intent's WHERE guard matches 0 rows —
+ * stops the loop and forces an immediate rollback, rather than letting later
+ * intents in the same batch keep executing against a row that never actually
+ * changed (a later intent depending on that change could throw its own,
+ * unrelated error, which would otherwise mask this as the wrong failure
+ * class — see handlePrepare's own doc comment on the guard-mismatch check).
+ * Carries the mismatched intent so the catch block can report which row. */
+class PrepareGuardMismatch extends Error {
+  constructor(readonly intent: PrepareIntent) {
+    super();
+  }
+}
+
 /** Deliberate sentinel thrown inside handleProbePartitionKeyCollation's probe
  * transactionSync to force a rollback unconditionally — same pattern as
  * PrepareValidationRollback above, applied to a read-only-in-spirit
@@ -2476,39 +2490,47 @@ export class ShardDO extends DurableObject {
     // sweepStalePendingIntents and /abort both key off pending_intents, not
     // row_locks). Locks and intents must commit atomically together, exactly
     // as they did before this fix — see the record step below.
-    let guardMismatch: PrepareIntent | null = null;
     try {
       this.ctx.storage.transactionSync(() => {
         for (const intent of intents) {
           this.sql.exec(intent.sql, ...(intent.params ?? []));
-          if ((intent.op === "update" || intent.op === "delete") && intent.vbucket !== undefined && !guardMismatch) {
+          if ((intent.op === "update" || intent.op === "delete") && intent.vbucket !== undefined) {
             const changed = this.one<{ n: number }>("SELECT changes() AS n")?.n ?? 0;
-            if (changed === 0) guardMismatch = intent;
+            // Codex review P2 fix: stop and roll back IMMEDIATELY on the
+            // first mismatch found, rather than continuing to execute the
+            // rest of the batch. A later intent in this same batch can
+            // depend on the row this one was supposed to touch (e.g. a
+            // DELETE whose guard didn't match, followed by an INSERT
+            // reusing that same primary key) — letting the loop continue
+            // risks THAT intent throwing its own error (a unique-constraint
+            // violation, here), which the catch block below would then
+            // misclassify as PREPARE_VALIDATION_FAILED (400) instead of the
+            // real, retryable TX_PARTICIPANT_GUARD_MISMATCH (409) reason.
+            if (changed === 0) throw new PrepareGuardMismatch(intent);
           }
         }
         throw new PrepareValidationRollback();
       });
     } catch (error) {
+      if (error instanceof PrepareGuardMismatch) {
+        const mismatched = error.intent;
+        log("shard.prepare_guard_mismatch", { coordinatorTxId, table: mismatched.table, partitionKey: mismatched.partitionKey });
+        return json(
+          {
+            error: {
+              code: "TX_PARTICIPANT_GUARD_MISMATCH",
+              message: `Row ${mismatched.table}:${mismatched.partitionKey} changed concurrently — its WHERE guard no longer matched any row.`,
+              fix: "Re-read the row's current state and retry with fresh values.",
+            },
+          },
+          409,
+        );
+      }
       if (!(error instanceof PrepareValidationRollback)) {
         const message = error instanceof Error ? error.message : String(error);
         log("shard.prepare_validation_failed", { coordinatorTxId, message });
         return json({ error: { code: "PREPARE_VALIDATION_FAILED", message, fix: "Check the compiled SQL/params." } }, 400);
       }
-    }
-
-    if (guardMismatch) {
-      const mismatched: PrepareIntent = guardMismatch;
-      log("shard.prepare_guard_mismatch", { coordinatorTxId, table: mismatched.table, partitionKey: mismatched.partitionKey });
-      return json(
-        {
-          error: {
-            code: "TX_PARTICIPANT_GUARD_MISMATCH",
-            message: `Row ${mismatched.table}:${mismatched.partitionKey} changed concurrently — its WHERE guard no longer matched any row.`,
-            fix: "Re-read the row's current state and retry with fresh values.",
-          },
-        },
-        409,
-      );
     }
 
     // Record — lock acquisition and pending_intents rows commit atomically
