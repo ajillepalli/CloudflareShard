@@ -620,19 +620,117 @@ function renderScoreboard(scoreboard) {
 }
 
 // ---- self-service scenario (Topology room's "Start the scenario" prompt) --
-// Live-mode-only walkthrough: starts a real load run (skew mode, so a real
-// hot shard emerges for the Reshard/Chaos rooms to act on) so a first-time
-// visitor to a freshly-initialized live deployment sees the actual hero
-// story — real writes, a live reshard, a chaos attack that can't lose data —
-// rather than a static, empty topology. ?demo=1 has no real load engine to
-// start (same reasoning as startAppRoom/startEdgeRoom's identical
-// mode==="demo" guard elsewhere in this file), so the banner never renders
-// there at all.
+// Two independent implementations share the same banner/pill/buttons:
+//   - LIVE mode: starts a real load run (skew mode, so a real hot shard
+//     emerges for the Reshard/Chaos rooms to act on) via /api/load/start —
+//     real writes against a real cluster.
+//   - DEMO mode (?demo=1): a purely client-side simulation (see
+//     startDemoScenario below) — no network call, no live cluster, ever.
+//     ?demo=1's whole reason to exist is "safe to link publicly, zero cost,
+//     zero abuse surface, no risk to the deployer's Cloudflare bill" (see
+//     README's live-demo link and this file's showBanner/fallbackToSample
+//     callers) — that contract is absolute, so this simulation must NEVER
+//     become a real fetch() call under any condition. It exists purely to
+//     make the "SAMPLE DATA" topology feel alive for a visitor who has no
+//     gate token, mirroring what a real "Start the scenario" run looks like
+//     (writes climbing, one shard visibly hotter, lost staying 0) without
+//     touching anything real.
 
 let scenarioActionInFlight = false;
 
+/** DEMO-MODE SIMULATION STATE — entirely local, never sent anywhere. */
+let demoScenarioRunning = false;
+let demoScenarioTimer = null;
+let demoScenarioState = null;
+// Overridable via window.__SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__ — same
+// test-only seam as VISIBILITY_PAUSE_GRACE_MS above, so the SPA suite can
+// verify multiple ticks without a real multi-second wait per test.
+const DEMO_SCENARIO_TICK_MS = window.__SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__ ?? 1200;
+// buildSampleSnapshot's own shard-3 already has the highest pendingIntentCount
+// of any sample shard (see that function) — reusing it as the simulated hot
+// shard means the heat ramp (computeLoadScore, normalized across shards)
+// highlights the SAME shard a reader would already expect from the static
+// snapshot, rather than a random pick that contradicts what they saw first.
+const DEMO_SCENARIO_TARGET_SHARD = "shard-3";
+
+function startDemoScenario() {
+  if (demoScenarioRunning) return;
+  demoScenarioRunning = true;
+  // Codex review P2 fix: seed from the ALREADY-VISIBLE static baseline
+  // (buildSampleSnapshot's own writesAcked/trackedKeyCount), not zero — the
+  // page has been showing writes 48,213 / 50 keys since boot, so starting
+  // the counters over from 0 would make them visibly jump BACKWARDS the
+  // instant Start is clicked, undermining the "watch it climb" premise this
+  // whole feature exists for.
+  const baseline = buildSampleSnapshot().scoreboard;
+  demoScenarioState = {
+    tick: 0,
+    writesAcked: baseline.writesAcked,
+    trackedKeyCount: baseline.trackedKeyCount,
+    trackedKeyCap: baseline.trackedKeyCount + 15,
+  };
+  logLine(`scenario started (sample data — simulated load against ${DEMO_SCENARIO_TARGET_SHARD}, no live cluster involved)`, "safe");
+  runDemoScenarioTick();
+  demoScenarioTimer = window.setInterval(runDemoScenarioTick, DEMO_SCENARIO_TICK_MS);
+}
+
+function stopDemoScenario() {
+  if (!demoScenarioRunning) return;
+  demoScenarioRunning = false;
+  window.clearInterval(demoScenarioTimer);
+  demoScenarioTimer = null;
+  demoScenarioState = null;
+  logLine("scenario stopped", "mig");
+  render(buildSampleSnapshot());
+}
+
+/** One simulated "tick" — builds a fresh sample snapshot (so the static
+ * topology/table shape never drifts from buildSampleSnapshot's own source
+ * of truth) and overlays the evolving counters on top, then renders it
+ * exactly the way a real live "snapshot" SSE frame would be. `lost` is
+ * always 0 here — this is a scripted illustration of the honest claim the
+ * real correctness meter makes, not a live proof of it (see
+ * ./load/correctness.ts's HONEST SCOPE header comment for what the real
+ * meter does and doesn't guarantee — this simulation makes no independent
+ * claim at all, it just shows what a healthy run looks like). */
+function runDemoScenarioTick() {
+  const s = demoScenarioState;
+  if (!s) return;
+  s.tick += 1;
+  s.writesAcked += 15 + Math.floor(Math.random() * 20);
+  if (s.trackedKeyCount < s.trackedKeyCap) s.trackedKeyCount += 1;
+
+  const snapshot = buildSampleSnapshot();
+  snapshot.scoreboard.writesAcked = s.writesAcked;
+  snapshot.scoreboard.trackedKeyCount = s.trackedKeyCount;
+  snapshot.scoreboard.lost = 0;
+  snapshot.scoreboard.loadRunning = true;
+  snapshot.scoreboard.verified = s.trackedKeyCount > 0;
+  snapshot.scoreboard.checksum = s.tick > 3 ? { label: "verified", state: "verified" } : { label: "verifying…", state: "verifying" };
+  const hotShard = snapshot.shards.find((sh) => sh.shardId === DEMO_SCENARIO_TARGET_SHARD);
+  if (hotShard && hotShard.stats) hotShard.stats.pendingIntentCount = 5 + (s.tick % 7);
+
+  render(snapshot);
+  if (s.tick % 3 === 0) logLine(`snapshot @ ${new Date().toLocaleTimeString()}`, "safe");
+}
+
+// index.html's static copy for the banner subtext describes the LIVE
+// behavior ("Starts a real write load...") — accurate for mode==="live",
+// but would misrepresent the demo simulation as touching a real cluster.
+// Swapped in by renderScenarioControls's demo branch below; never touched
+// for live mode, which keeps index.html's own copy untouched.
+const DEMO_SCENARIO_SUB_TEXT =
+  "Simulates a write load against one shard — entirely in your browser, no live cluster involved — so you can watch lost stay 0 the whole time.";
+
 function renderScenarioControls(scoreboard) {
   if (!el.scenarioStartBanner || !el.scenarioRunningPill) return;
+  if (mode === "demo") {
+    if (el.scenarioStartSub) el.scenarioStartSub.textContent = DEMO_SCENARIO_SUB_TEXT;
+    el.scenarioStartBanner.hidden = demoScenarioRunning;
+    el.scenarioRunningPill.hidden = !demoScenarioRunning;
+    if (!demoScenarioRunning && el.scenarioStartBtn) el.scenarioStartBtn.disabled = false;
+    return;
+  }
   // Codex review P2 fix: this is a real /api/load/* control surface, so it
   // must only ever show for a genuine live connection — NOT just "not demo".
   // sample-fallback's embedded snapshot (see buildSampleSnapshot) sets
@@ -680,6 +778,10 @@ function handleScenarioActionResponse(res) {
 }
 
 function handleScenarioStartClick() {
+  if (mode === "demo") {
+    startDemoScenario();
+    return;
+  }
   if (mode !== "live" || scenarioActionInFlight) return;
   scenarioActionInFlight = true;
   el.scenarioStartBtn.disabled = true;
@@ -712,6 +814,10 @@ function handleScenarioStartClick() {
 }
 
 function handleScenarioStopClick() {
+  if (mode === "demo") {
+    stopDemoScenario();
+    return;
+  }
   if (mode !== "live" || scenarioActionInFlight) return;
   scenarioActionInFlight = true;
   el.scenarioStopBtn.disabled = true;
