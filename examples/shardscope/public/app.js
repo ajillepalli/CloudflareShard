@@ -702,9 +702,18 @@ function runDemoScenarioTick() {
   if (s.tick % 3 === 0) logLine(`snapshot @ ${new Date().toLocaleTimeString()}`, "safe");
 }
 
+// index.html's static copy for the banner subtext describes the LIVE
+// behavior ("Starts a real write load...") — accurate for mode==="live",
+// but would misrepresent the demo simulation as touching a real cluster.
+// Swapped in by renderScenarioControls's demo branch below; never touched
+// for live mode, which keeps index.html's own copy untouched.
+const DEMO_SCENARIO_SUB_TEXT =
+  "Simulates a write load against one shard — entirely in your browser, no live cluster involved — so you can watch lost stay 0 the whole time.";
+
 function renderScenarioControls(scoreboard) {
   if (!el.scenarioStartBanner || !el.scenarioRunningPill) return;
   if (mode === "demo") {
+    if (el.scenarioStartSub) el.scenarioStartSub.textContent = DEMO_SCENARIO_SUB_TEXT;
     el.scenarioStartBanner.hidden = demoScenarioRunning;
     el.scenarioRunningPill.hidden = !demoScenarioRunning;
     if (!demoScenarioRunning && el.scenarioStartBtn) el.scenarioStartBtn.disabled = false;

@@ -232,6 +232,20 @@ describe("Shardscope SPA — demo-mode scenario simulation (?demo=1, client-side
     expect(harness.calls).toHaveLength(0);
   });
 
+  it("Codex-found: the banner subtext is swapped to honest demo copy — never claims 'real' writes or a live cluster", async () => {
+    // index.html's static copy ("Starts a real write load against one
+    // shard...") describes the LIVE feature — before renderScenarioControls's
+    // demo branch overwrites it, a demo visitor would be told the button
+    // touches a real cluster when it's actually a local-only simulation.
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+
+    const subText = harness.hook("scenario-start-sub")!.textContent!;
+    expect(subText).not.toContain("real write load");
+    expect(subText.toLowerCase()).toContain("simulat");
+    expect(subText.toLowerCase()).toContain("no live cluster");
+  });
+
   it("ticks climb writesAcked and keep lost at 0, without ever calling fetch", async () => {
     harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
     await harness.flush();
