@@ -2427,38 +2427,11 @@ export class ShardDO extends DurableObject {
       }
     }
 
-    // Acquire the locks FIRST, before validating each intent's guard below —
-    // this closes a TOCTOU window a prior version of this function had: with
-    // locks acquired only AFTER validation, a concurrent transaction on the
-    // same row(s) could interleave between "I confirmed this WHERE guard
-    // currently matches" and "I actually reserved the row", re-opening
-    // exactly the race the guard check exists to catch. Once locked here, no
-    // OTHER transaction can prepare or commit against these rows until this
-    // transaction's own abort/commit releases them (see the lock-conflict
-    // check above), so the guard check below stays authoritative for as long
-    // as this transaction lives. OR IGNORE: a batch may legitimately contain
-    // multiple mutations against the same row (e.g. insert then update in one
-    // /v1/tx call — nothing caps mutation count, only distinct participant
-    // keys); the pre-check loop above already guarantees any existing lock on
-    // this key belongs to this same coordinatorTxId, so re-acquiring it here
-    // is a safe no-op rather than a PRIMARY KEY violation.
-    const now = new Date().toISOString();
-    this.ctx.storage.transactionSync(() => {
-      for (const lockKeyValue of lockKeys) {
-        this.sql.exec(
-          "INSERT OR IGNORE INTO row_locks (lock_key, coordinator_tx_id, acquired_at) VALUES (?, ?, ?)",
-          lockKeyValue,
-          coordinatorTxId,
-          now,
-        );
-      }
-    });
-
     // Validate the whole batch together: execute every intent's SQL inside
     // one transactionSync, then force a rollback via a sentinel throw —
     // nothing here is ever visible to a concurrent /execute SELECT. This
-    // proves the batch applies cleanly as a unit before any intent is
-    // durably recorded.
+    // proves the batch applies cleanly as a unit before any lock is durably
+    // recorded.
     //
     // GUARD-MISMATCH CHECK (P0 fix — see this repo's shardscope demo's
     // `lost>0` investigation): a base-row UPDATE/DELETE intent (identified
@@ -2486,6 +2459,23 @@ export class ShardDO extends DurableObject {
     // coordinator.ts's `failedPrepare` handling — already correct, needs no
     // change here) and the client sees a real error it can retry against
     // fresh state, rather than a false "committed".
+    //
+    // NO TOCTOU GAP DESPITE CHECKING BEFORE LOCKING: this function has no
+    // `await` between this validation pass and the record step below that
+    // actually acquires the locks — both run as one uninterrupted synchronous
+    // JS execution burst, and a Durable Object's input gate never interleaves
+    // another request into the SAME instance mid-burst (only at a genuine
+    // await/yield point, and there isn't one here). So nothing else can
+    // touch these rows between "guard confirmed to match" and "locks
+    // acquired, intents recorded" — an earlier version of this fix tried to
+    // acquire locks in their own transactionSync BEFORE validation to guard
+    // against this non-existent race, which just split the durable lock
+    // write from the durable intent write across two separate transactions —
+    // a genuine regression (Codex review: an interruption between the two
+    // could leave an orphaned lock no recovery path could ever see, since
+    // sweepStalePendingIntents and /abort both key off pending_intents, not
+    // row_locks). Locks and intents must commit atomically together, exactly
+    // as they did before this fix — see the record step below.
     let guardMismatch: PrepareIntent | null = null;
     try {
       this.ctx.storage.transactionSync(() => {
@@ -2502,7 +2492,6 @@ export class ShardDO extends DurableObject {
       if (!(error instanceof PrepareValidationRollback)) {
         const message = error instanceof Error ? error.message : String(error);
         log("shard.prepare_validation_failed", { coordinatorTxId, message });
-        this.releaseLocksForCoordinatorTx(coordinatorTxId);
         return json({ error: { code: "PREPARE_VALIDATION_FAILED", message, fix: "Check the compiled SQL/params." } }, 400);
       }
     }
@@ -2510,7 +2499,6 @@ export class ShardDO extends DurableObject {
     if (guardMismatch) {
       const mismatched: PrepareIntent = guardMismatch;
       log("shard.prepare_guard_mismatch", { coordinatorTxId, table: mismatched.table, partitionKey: mismatched.partitionKey });
-      this.releaseLocksForCoordinatorTx(coordinatorTxId);
       return json(
         {
           error: {
@@ -2523,11 +2511,25 @@ export class ShardDO extends DurableObject {
       );
     }
 
-    // Record — the durable side effect of a successful prepare. Locks are
-    // already held (acquired above, before validation); this just records
-    // the intents themselves as 'prepared'.
+    // Record — lock acquisition and pending_intents rows commit atomically
+    // together, in this separate transactionSync (the validation pass above
+    // already rolled back everything it did; this is prepare's actual
+    // durable side effect).
+    const now = new Date().toISOString();
     this.ctx.storage.transactionSync(() => {
       intents.forEach((intent, i) => {
+        // OR IGNORE: a batch may legitimately contain multiple mutations
+        // against the same row (e.g. insert then update in one /v1/tx call —
+        // nothing caps mutation count, only distinct participant keys). The
+        // pre-check loop above already guarantees any existing lock on this
+        // key belongs to this same coordinatorTxId, so re-acquiring it here
+        // is a safe no-op rather than a PRIMARY KEY violation.
+        this.sql.exec(
+          "INSERT OR IGNORE INTO row_locks (lock_key, coordinator_tx_id, acquired_at) VALUES (?, ?, ?)",
+          lockKeys[i],
+          coordinatorTxId,
+          now,
+        );
         this.sql.exec(
           `
           INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, tenant_id, table_name, partition_key, vbucket, op, mirror_target_shard_id)
@@ -2550,18 +2552,6 @@ export class ShardDO extends DurableObject {
     });
 
     return json({ ok: true, prepared: intents.length });
-  }
-
-  /** Releases every row lock this shard acquired for coordinatorTxId —
-   * used when prepare fails AFTER already acquiring locks (a validation
-   * error or a WHERE-guard mismatch), so a failed prepare never leaves a
-   * stale lock behind for another transaction to wait out. Mirrors
-   * handleAbort's own lock cleanup below (a prepare that never reached lock
-   * acquisition has nothing to release). */
-  private releaseLocksForCoordinatorTx(coordinatorTxId: string): void {
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", coordinatorTxId);
-    });
   }
 
   private async handleCommit(request: Request): Promise<Response> {
