@@ -41,24 +41,30 @@ slice of data, drawn as it changes in real time. Along the top is an
 covering writes made, writes lost, and a checksum status (more on both
 below).
 
-Click **"Start the scenario."** This kicks off real background load — actual
-write traffic hitting the (sample or live) cluster — and, after a few
-seconds, a real reshard: data gets moved from one shard to another while
-that traffic keeps flowing. Watch the topology canvas: you'll see vbuckets
-(small units of data — think "a labeled group of folders," the actual unit
-CloudflareShard moves around, smaller than a whole shard) shift ownership
-live, and the scoreboard keep counting. This is the "wow, it's actually
-doing something" moment — nothing here is a canned animation.
+Click **"Start the scenario."** This kicks off background write load against
+one shard, so it visibly heats up while the scoreboard keeps counting — watch
+the writes number climb and one node in the topology canvas glow hotter than
+the rest. (In sample mode this is a local simulation running entirely in your
+browser — see the FAQ below; in live mode it's a real `/api/load/start` call
+driving real writes.) This is the "wow, it's actually doing something"
+moment — nothing here is a canned animation, but a reshard doesn't happen on
+its own: that's the next room, and it's a deliberate, human-triggered step,
+not something the scenario auto-schedules.
 
 ### 2. The payoff: Reshard, and "Chaos — Break It"
 
-The Reshard room is where a human operator would drive this in real life:
-buttons to **split**, **migrate**, or **drain** a shard on demand. Try one —
-it's a real operation against the (sample or live) cluster, not a mockup.
+**These two rooms are the one part of the site that only works against a
+real, live cluster** — they're visible and clickable in sample mode too, but
+clicking any of their buttons there returns an honest "demo mode — no live
+cluster" message instead of doing anything, rather than being hidden or
+faked. If you're on a live deployment (see the FAQ for the difference), this
+is where the hot shard from step 1 actually gets resolved: buttons to
+**split**, **migrate**, or **drain** a shard on demand, each one a real
+operation against the running cluster.
 
 The real point of this room is the **"Chaos — Break It"** panel folded into
-it. Each button fires a genuine attack at the running cluster while load is
-still going:
+it. On a live cluster, each button fires a genuine attack at the running
+cluster while load is still going:
 
 - **double-submit** — sends the exact same write twice at once, testing
   whether the system applies it once or twice.
@@ -129,11 +135,14 @@ re-checking.
 ## FAQ
 
 **Is this real, or a recorded video?**
-It's real and live. In live mode, every click hits an actual Cloudflare-hosted
-cluster: real writes, real reshards, real attacks. The `?demo=1` link above
-uses realistic embedded sample data instead — clearly labeled "SAMPLE DATA"
-in the UI — so anyone can explore the same interactions for free without
-touching real infrastructure.
+It's real, not a recording — but which parts are "real" depends on the mode.
+In live mode, every click hits an actual Cloudflare-hosted cluster: real
+writes, real reshards, real attacks. The `?demo=1` link above — clearly
+labeled "SAMPLE DATA" in the UI — never touches real infrastructure: the
+Topology room's "Start the scenario" runs a local simulation in your browser
+(same visual story, zero network calls), while the Reshard and Chaos rooms
+are live-only and will tell you so honestly if you click their buttons in
+sample mode, rather than faking a result.
 
 **What happens if I break something?**
 Nothing, in sample mode — `?demo=1` never touches real infrastructure, so
