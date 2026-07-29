@@ -1,10 +1,26 @@
-# CloudflareShard MVP
+<h1 align="center">CloudflareShard</h1>
+
+<p align="center">
+  <a href="https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1"><strong>Live demo</strong></a> ·
+  <a href="#deploy-your-own"><strong>Deploy your own</strong></a> ·
+  <a href="docs/guides/end-user.md"><strong>Docs</strong></a>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /></a>
+  <a href="https://developers.cloudflare.com/durable-objects/"><img alt="Built on Durable Objects" src="https://img.shields.io/badge/built%20on-Workers%20%2B%20Durable%20Objects-f38020.svg" /></a>
+</p>
 
 A self-hosted, sharded SQL layer built entirely on Cloudflare Workers + Durable
 Objects (SQLite-backed) — no external database, no KV/D1/R2. One logical SQL
 endpoint, tenant-scoped writes, cross-shard 2PC transactions, secondary
 indexes, and online resharding (split/drain with a zero-downtime,
 checksum-verified cutover).
+
+Sharding is the primitive everything else — routing, transactions, secondary
+indexes, resharding — sits on top of the same vBucket map.
+
+## See it live
 
 **[Try the live demo](https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1)**
 — a real dashboard (Shardscope) that visualizes topology, drives live load,
@@ -21,36 +37,37 @@ with the [end-user guide](docs/guides/end-user.md).
 - **Evaluating the technology/architecture bet?** → [Investor guide](docs/guides/investor.md)
 - **Just exploring?** → [End-user guide](docs/guides/end-user.md)
 
-## Prerequisites
-
-- Node.js 20+
-- Cloudflare account + Wrangler authentication
-
-## Setup
+## Run it locally
 
 ```powershell
 git clone https://github.com/ajillepalli/CloudflareShard.git
 cd CloudflareShard
 npm install
-```
-
-## Run locally
-
-```powershell
 npm run dev
 ```
 
-## Deploy
+Needs Node.js 20+ and a Cloudflare account with Wrangler authenticated.
 
-```powershell
-npm run deploy
-```
+## Deploy your own
 
-Want to deploy your **own** cluster to your own Cloudflare account with a
-single click instead? See [Deploy your own cluster](docs/REFERENCE.md#deploy-your-own-cluster)
-in the reference doc.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
 
-## Quick API example
+One click clones this repo into your GitHub and deploys the cluster — one
+Worker plus three SQLite Durable Object classes (`CATALOG` control plane,
+`SHARD` data plane, `COORDINATOR` for 2PC) — into **your own Cloudflare
+account**. No KV/D1/R2 resources; the cluster is self-contained.
+
+Or from a clone: `npm run deploy`.
+
+**Cost:** Durable Objects require the **Workers Paid** plan, and everything
+created is billed to your account. This is a real database, not a sandbox —
+tear it down (`npx wrangler delete --name <your-worker>`) when you're done.
+
+Set the `ADMIN_TOKEN` secret and call `/admin/init` to bring the topology up
+before your first write. Full deploy/init/teardown walkthrough:
+[docs/REFERENCE.md § Deploy your own cluster](docs/REFERENCE.md#deploy-your-own-cluster).
+
+## Use it from your app
 
 `client/` is a typed TypeScript SDK + CLI wrapping the whole HTTP API —
 recommended over hand-writing `fetch()`/`curl` calls. Full reference:
@@ -75,6 +92,14 @@ await tenant.insert("events", "t1", "e1", { user_id: "user-1", body: "hello" });
 For the full walkthrough (transactions, resharding, the CLI, and screenshots
 of a real live run) see [`docs/REFERENCE.md`](docs/REFERENCE.md#full-api-walkthrough).
 
+## Checks
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run — backend suite (workerd)
+npm run test:spa    # vitest run --config vitest.spa.config.ts — Shardscope SPA suite (jsdom)
+```
+
 ## Learn more
 
 - **[docs/REFERENCE.md](docs/REFERENCE.md)** — deploy-your-own-cluster details, the
@@ -96,4 +121,5 @@ of a real live run) see [`docs/REFERENCE.md`](docs/REFERENCE.md#full-api-walkthr
 
 ## License
 
-Apache-2.0 — see `LICENSE`.
+[Apache-2.0](LICENSE). CloudflareShard is an independent project, not
+affiliated with or endorsed by Cloudflare, Inc.
