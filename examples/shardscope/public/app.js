@@ -656,7 +656,19 @@ const DEMO_SCENARIO_TARGET_SHARD = "shard-3";
 function startDemoScenario() {
   if (demoScenarioRunning) return;
   demoScenarioRunning = true;
-  demoScenarioState = { tick: 0, writesAcked: 0, trackedKeyCount: 0 };
+  // Codex review P2 fix: seed from the ALREADY-VISIBLE static baseline
+  // (buildSampleSnapshot's own writesAcked/trackedKeyCount), not zero — the
+  // page has been showing writes 48,213 / 50 keys since boot, so starting
+  // the counters over from 0 would make them visibly jump BACKWARDS the
+  // instant Start is clicked, undermining the "watch it climb" premise this
+  // whole feature exists for.
+  const baseline = buildSampleSnapshot().scoreboard;
+  demoScenarioState = {
+    tick: 0,
+    writesAcked: baseline.writesAcked,
+    trackedKeyCount: baseline.trackedKeyCount,
+    trackedKeyCap: baseline.trackedKeyCount + 15,
+  };
   logLine(`scenario started (sample data — simulated load against ${DEMO_SCENARIO_TARGET_SHARD}, no live cluster involved)`, "safe");
   runDemoScenarioTick();
   demoScenarioTimer = window.setInterval(runDemoScenarioTick, DEMO_SCENARIO_TICK_MS);
@@ -686,7 +698,7 @@ function runDemoScenarioTick() {
   if (!s) return;
   s.tick += 1;
   s.writesAcked += 15 + Math.floor(Math.random() * 20);
-  if (s.trackedKeyCount < 15) s.trackedKeyCount += 1;
+  if (s.trackedKeyCount < s.trackedKeyCap) s.trackedKeyCount += 1;
 
   const snapshot = buildSampleSnapshot();
   snapshot.scoreboard.writesAcked = s.writesAcked;
