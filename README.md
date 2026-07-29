@@ -1,9 +1,12 @@
-<h1 align="center">CloudflareShard</h1>
+<p align="center">
+  <img src="docs/images/logo.png" alt="CloudflareShard" width="600" />
+</p>
 
 <p align="center">
   <a href="https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1"><strong>Live demo</strong></a> ·
   <a href="#deploy-your-own"><strong>Deploy your own</strong></a> ·
-  <a href="docs/guides/end-user.md"><strong>Docs</strong></a>
+  <a href="docs/guides/end-user.md"><strong>Docs</strong></a> ·
+  <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
 </p>
 
 <p align="center">
