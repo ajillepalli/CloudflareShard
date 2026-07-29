@@ -219,7 +219,7 @@ rely on scan results for anything migration-sensitive.
 ### Deploy a cluster
 
 Don't hand-roll this — the README's
-[Deploy your own cluster](../../README.md#deploy-your-own-cluster) section
+[Deploy your own cluster](../REFERENCE.md#deploy-your-own-cluster) section
 has the one-click Deploy-to-Cloudflare flow, the `ADMIN_TOKEN` secret setup,
 and cost/teardown details (Durable Objects require Workers Paid, and
 everything is billed to your own account). Follow that, then come back here

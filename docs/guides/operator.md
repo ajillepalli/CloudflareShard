@@ -20,7 +20,7 @@ than re-deriving them.
 Deploy mechanics (the "Deploy to Cloudflare" button, what it provisions, the
 `/admin/init` call, pointing a second Worker at it via service binding) are
 covered in the README's
-[**"Deploy your own cluster"**](../../README.md#deploy-your-own-cluster)
+[**"Deploy your own cluster"**](../REFERENCE.md#deploy-your-own-cluster)
 section and in
 [`examples/shardscope/docs/deploy/README.md`](../../examples/shardscope/docs/deploy/README.md).
 Don't duplicate that here — go straight to hardening once the cluster
@@ -173,7 +173,7 @@ progress: `{shardId, vbucketsRemaining, ringsRemaining, status}` where
 
 ### 2.2 Logs: what's already there, and what to watch for
 
-The README's [**Observability**](../../README.md#observability) section
+The reference doc's [**Observability**](../REFERENCE.md#observability) section
 covers the mechanics — `wrangler tail --format json`, or the dashboard's
 Workers Logs view (`[observability]` in `wrangler.toml` is set to
 `head_sampling_rate = 1`, i.e. every request is logged, not sampled). Don't
