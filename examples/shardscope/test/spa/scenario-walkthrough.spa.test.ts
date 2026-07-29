@@ -261,6 +261,23 @@ describe("Shardscope SPA — demo-mode scenario simulation (?demo=1, client-side
     expect(harness.calls).toHaveLength(0);
   });
 
+  it("Codex-found: writes never jump BACKWARDS the instant Start is clicked — the simulation seeds from the visible baseline, not zero", async () => {
+    // buildSampleSnapshot's own writesAcked is 48213 — the page has shown
+    // that number since boot. Seeding the simulation at 0 would make the
+    // very first tick replace "writes 48,213" with "writes ~15-34", visibly
+    // counting backwards before it starts climbing.
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+    const baselineWritesNum = Number(harness.hook("sb-writes")!.textContent!.replace(/[^\d]/g, ""));
+    expect(baselineWritesNum).toBeGreaterThan(1000); // sanity: this IS the large static baseline, not near-zero
+
+    (harness.hook("scenario-start-btn") as HTMLButtonElement).click();
+    await harness.flush();
+
+    const firstTickWritesNum = Number(harness.hook("sb-writes")!.textContent!.replace(/[^\d]/g, ""));
+    expect(firstTickWritesNum).toBeGreaterThanOrEqual(baselineWritesNum);
+  });
+
   it("Stop: reverts to the Start banner, logs 'scenario stopped', and resets the scoreboard to the static baseline", async () => {
     harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
     await harness.flush();
