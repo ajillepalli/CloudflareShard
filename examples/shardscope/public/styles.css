@@ -590,10 +590,17 @@ html, body {
 
 /* ============ GUIDED TOUR OVERLAY ============
    Full-viewport modal, same visual family as .login-panel/.login-card
-   (dark backdrop + a single centered panel) — deliberately quiet, technical,
-   no bubble radius per DESIGN.md. position: fixed (not absolute like
-   .login-panel, which is scoped to .canvas-wrap) so it sits above every
-   room, not just Topology. */
+   (a single centered panel) — deliberately quiet, technical, no bubble
+   radius per DESIGN.md. position: fixed (not absolute like .login-panel,
+   which is scoped to .canvas-wrap) so it sits above every room, not just
+   Topology.
+   Deliberately NO background dim/blur behind the card: the tour's whole
+   point is narrating over the REAL, live screen underneath it (its own
+   copy says "watch the topology canvas... this is the wow, it's actually
+   doing something moment") — a heavy scrim or blur defeats that by hiding
+   the very thing being narrated. The card is its own fully opaque panel
+   (background/border/shadow below), so it stays perfectly readable without
+   needing to darken everything behind it. */
 .tour-overlay {
   position: fixed;
   inset: 0;
@@ -601,8 +608,6 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(7, 10, 15, .78);
-  backdrop-filter: blur(3px);
 }
 .tour-card {
   width: min(420px, 88vw);
