@@ -20,9 +20,39 @@ Room 1 (`data-hook="app-wrap"` in `public/index.html`, the "App room" section of
 
 - **Multi-tenant view:** a warehouse/tenant picker (1/2/3 — whitelisted, same demo tenants the Playground room uses) drives two live reads through `POST /api/play/table-scan` (`src/play.ts`'s `playTableScan`): the first 5 `tpcc_customer` rows and the first 5 `tpcc_stock` rows for that tenant, rendered as small tables, not a JSON dump. Switching tenant re-queries live.
 - **One honest 2PC action:** "Restock" fires a real `POST /api/play/tx` (`playTx`) — a same-tenant, multi-row (2-3 rows, well under `/v1/tx`'s real 8-participant cap) transactional update against the stock rows just displayed, guarded by an optimistic-concurrency `where` clause per row. It is explicitly labeled as **not** a full TPC-C order and **not** a cross-tenant transaction — see the panel's own help text.
-- **"How little code" callout:** two copy-accurate client snippets (a `/v1/table-scan` read, a `/v1/tx` write) matching the real CloudflareShard API shapes documented in the project root's `README.md` ("Tenant-scoped table scan" / "Cross-shard atomic transaction") — rendered as escaped text, never executed.
+- **"How little code" callout:** two copy-accurate client snippets (a `/v1/table-scan` read, a `/v1/tx` write) matching the real CloudflareShard API shapes documented in [`docs/REFERENCE.md`'s "Full API walkthrough"](../../docs/REFERENCE.md#full-api-walkthrough) — rendered as escaped text, never executed.
 
 No new backend was needed: the room reuses `/api/play/table-scan` and `/api/play/tx` verbatim, the same gate-protected, whitelisted, tenant-scoped routes the Playground room already exercises.
+
+## Demo mode (`?demo=1`)
+
+The deployed instance is linked publicly from the project root's `README.md`
+as **[the live demo](https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1)**,
+appending `?demo=1`. This is a deliberately separate mode from the gated live
+view above — no `SHARDSCOPE_GATE_TOKEN` needed, and it **never touches
+`/api/*`**: `mode = "demo"` skips the login flow entirely and renders a
+static, clearly-labeled ("SAMPLE DATA" badge) embedded snapshot instead of
+opening a live SSE connection.
+
+Two of the five rooms behave differently in demo mode, and both are honest
+about it rather than faking a result:
+
+- **Topology's "Start the scenario"** runs a real feature there too — but as
+  a purely client-side simulation (see `public/app.js`'s
+  `startDemoScenario`/`runDemoScenarioTick`), not a real `/api/load/start`
+  call. It builds evolving sample snapshots locally (writes climbing, one
+  shard heating up, checksum going verified, `lost` staying 0) and feeds them
+  through the same render pipeline a live snapshot would use. A dedicated
+  test (`test/spa/scenario-walkthrough.spa.test.ts`) asserts zero real
+  `fetch()` calls across the whole start/tick/stop cycle.
+- **Reshard, Chaos, and Playground are live-only.** Their buttons are still
+  visible and clickable in demo mode, but every call routes through a single
+  choke point (`reshardFetch`/`playFetch`) that short-circuits with an
+  honest `"demo mode (?demo=1) — no live cluster..."` message before any
+  network call, rather than being hidden or faking success.
+
+See [`docs/guides/end-user.md`](../../docs/guides/end-user.md) for the
+visitor-facing explanation of this split.
 
 ## Two-tier auth model
 
