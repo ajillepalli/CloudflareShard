@@ -8,10 +8,11 @@ checksum-verified cutover).
 
 **[Try the live demo](https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1)**
 — a real dashboard (Shardscope) that visualizes topology, drives live load,
-splits/drains/migrates shards under fire, and runs real chaos attacks while a
-correctness meter proves nothing was lost. Sample-data mode: free, safe, no
-login needed. New here? Start with the
-[end-user guide](docs/guides/end-user.md).
+splits/drains/migrates shards under fire, and runs chaos attacks while a
+correctness meter proves nothing was lost. Sample-data mode simulates the
+topology/load walkthrough client-side — free, safe, no login needed; driving
+a real reshard or chaos attack needs your own live cluster. New here? Start
+with the [end-user guide](docs/guides/end-user.md).
 
 ## Who this is for
 

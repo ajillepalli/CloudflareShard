@@ -2,6 +2,54 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.13.0.0] - 2026-07-29 — Catch-up: 15 PRs shipped without a version bump
+
+None of `examples/shardscope`'s evolution since v2.8.0.0 had been changelogged (PRs #38-#52) — caught up here in five grouped entries below, same pattern as the earlier v2.8.0.0 catch-up. The most important of these is the P0 fix in v2.9.0.0.
+
+## [2.9.0.0] - 2026-07-29 — P0: `/v1/tx` silently no-op'd a stale WHERE guard instead of aborting
+
+Closes a real correctness bug found while live-verifying shardscope's scenario walkthrough against real deployed infrastructure: under sustained hot-row contention, 100% of correctness-tracked keys reported `lost > 0`.
+
+**Root cause:** `handlePrepare`'s validation pass only checked that each intent's SQL executed without throwing. A `WHERE` clause matching 0 rows is valid, non-throwing SQL — not an error — so a stale client-side compare-and-swap (a `where`-guarded UPDATE/DELETE inside `/v1/tx`, used for optimistic concurrency) sailed through prepare, got recorded as `'prepared'`, and `/commit` applied it as a silent no-op while still reporting the whole transaction `committed: true`. Any caller relying on that guard for real protection got none under contention — common on a hot row, not rare.
+
+### Fixed
+- `handlePrepare` (`src/shard.ts`) now fails prepare with a new `409 TX_PARTICIPANT_GUARD_MISMATCH` when a base-row UPDATE/DELETE intent affects 0 rows, aborting the whole transaction via the coordinator's existing abort-on-failed-prepare path (`TX_ABORTED`) instead of a silent partial no-op.
+- The guard-mismatch check short-circuits immediately on the first mismatch found in a batch, rather than continuing to execute later intents against rows a prior mismatch left unexpectedly unchanged (a later intent depending on the un-applied change could otherwise throw its own, unrelated error and mask the real failure reason).
+- `docs/SPEC.md` §10 now documents this behavior.
+
+Live-verified after the fix: the same scenario that previously went to 100% `lost` before this fix held `lost 0` through 2,602 writes — more than double the previous run's total before it went red.
+
+## [2.10.0.0] - 2026-07-28/29 — Shardscope: self-service "Start the scenario" walkthrough (live + demo)
+
+A first-time visitor to shardscope — gated live cluster or the public `?demo=1` sample-data link — now gets a real hero story instead of a static, empty topology.
+
+### Added
+- **Live mode** (#46, #47): a "Start the scenario" banner drives real skewed write load via `/api/load/start`, so a real hot shard emerges for the Reshard/Chaos rooms to act on. Went through 17 Codex review rounds (one P1: admin-token leak via a request-supplied `baseUrl`), landing a self-contained scenario that self-seeds its own reference data and bootstraps its own schema against a genuinely fresh cluster.
+- **Demo mode** (#52): a purely client-side simulation — zero real `fetch()` calls, ever (test-enforced) — mirrors the same visual story (writes climbing, one shard heating up, checksum going verified, `lost` staying 0) so `?demo=1` visitors see the dashboard "feel alive" without touching real infrastructure or costing the deployer anything.
+
+## [2.11.0.0] - 2026-07-28 — Docs: lean README quickstart + /docs perspective guides
+
+### Added
+- `README.md` split into a pure quickstart (#41 first pass, #49 the full split): one-liner, live demo link, setup/run/deploy, minimal API example, links out.
+- `docs/REFERENCE.md`: everything else that was cluttering the README — deploy-your-own-cluster details, the full API walkthrough, catalog sharding, tenant authorization, RPC access, known limitations, observability.
+- `docs/guides/`: four perspective-specific guides — end-user, infrastructure-builder, operator, and investor (explicit that this is a solo technology demonstration, not a company).
+
+## [2.12.0.0] - 2026-07-28/29 — Shardscope: reliability, visual, and UX fixes
+
+A grouped catch-up of smaller shardscope fixes shipped alongside the work above:
+
+### Fixed
+- #44: the topology aggregator's SSE stream could deadlock against its own write timeout on every connection.
+- #45: the live SSE connection now pauses when the browser tab is hidden, instead of polling a backgrounded tab indefinitely.
+- #50: event log entries squashed/overlapped instead of scrolling once they overflowed the visible panel (`.log-line` was missing `flex-shrink: 0`).
+- #51: the "Topology" nav-rail label had only ~8px of total rendering margin — fragile to font-fallback/zoom/OS-rendering differences; widened the rail 64px → 72px.
+- #42: unbroke the demo UI and self-hosted real webfonts (closing a previously-flagged font gap).
+- #43: bumped `wrangler`/`@cloudflare/workers-types`, unblocking local shardscope dev.
+
+### Added
+- #38: shareable deep-links (`?room=`) and a demo-safe guided tour.
+- #39, #40: a one-click "Deploy to Cloudflare" button — deploys the self-contained core Worker + three Durable Object classes into the user's own account, with a staged template and honest cost/init/teardown documentation.
+
 ## [2.8.0.0] - 2026-07-17 — Per-route request logging + Workers Logs observability
 
 Closes issue #35, a partial fix for README's original production-readiness item "Add observability and SLO alerting per shard and per route," untouched since v1.0.0.0. Structured logging (`log()`) existed for individual events, but no uniform per-route latency/status signal existed for every request, and Cloudflare's Workers Logs (durable, searchable request logging) wasn't even enabled.
