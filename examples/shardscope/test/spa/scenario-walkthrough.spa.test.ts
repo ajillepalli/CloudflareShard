@@ -57,15 +57,16 @@ describe("Shardscope SPA — self-service scenario controls (Topology room)", ()
     harness = null;
   });
 
-  it("?demo=1 (mode !== live) never shows the banner or pill, even though the embedded sample sets loadRunning:true", async () => {
-    // Default harness boot takes the ?demo=1 path — buildSampleSnapshot()'s
+  it("?demo=1 shows the Start banner (not the running pill) on boot, ignoring the embedded sample's own loadRunning:true", async () => {
+    // Default harness boot takes the ?demo=1 path. buildSampleSnapshot()'s
     // scoreboard.loadRunning is true for illustrative purposes only (see
-    // renderScenarioControls's own P2-fix comment); this proves the mode
-    // gate — not just the running flag — controls visibility.
+    // runDemoScenarioTick's own comment) — renderScenarioControls's demo
+    // branch ignores that field entirely and derives `running` from the
+    // independent demoScenarioRunning flag instead, which starts false.
     harness = bootApp();
     await harness.flush();
 
-    expect((harness.hook("scenario-start-banner") as HTMLElement).hidden).toBe(true);
+    expect((harness.hook("scenario-start-banner") as HTMLElement).hidden).toBe(false);
     expect((harness.hook("scenario-running-pill") as HTMLElement).hidden).toBe(true);
   });
 
@@ -201,5 +202,115 @@ describe("Shardscope SPA — self-service scenario controls (Topology room)", ()
 
     expect((harness.hook("scenario-start-banner") as HTMLElement).hidden).toBe(true);
     expect((harness.hook("scenario-running-pill") as HTMLElement).hidden).toBe(true);
+  });
+});
+
+describe("Shardscope SPA — demo-mode scenario simulation (?demo=1, client-side only)", () => {
+  let harness: Harness | null = null;
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const FAST_TICK_MS = 5;
+
+  afterEach(() => {
+    harness?.cleanup();
+    harness = null;
+  });
+
+  it("Start: shows the running pill, logs a sample-data-labeled start line, and never fires a real fetch", async () => {
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+
+    (harness.hook("scenario-start-btn") as HTMLButtonElement).click();
+    await harness.flush();
+
+    expect((harness.hook("scenario-start-banner") as HTMLElement).hidden).toBe(true);
+    expect((harness.hook("scenario-running-pill") as HTMLElement).hidden).toBe(false);
+    const logText = harness.hook("event-log")!.textContent;
+    expect(logText).toContain("scenario started");
+    expect(logText).toContain("sample data");
+    expect(logText).toContain("simulated");
+    // The whole point of ?demo=1: this must NEVER become a real network call.
+    expect(harness.calls).toHaveLength(0);
+  });
+
+  it("Codex-found: the banner subtext is swapped to honest demo copy — never claims 'real' writes or a live cluster", async () => {
+    // index.html's static copy ("Starts a real write load against one
+    // shard...") describes the LIVE feature — before renderScenarioControls's
+    // demo branch overwrites it, a demo visitor would be told the button
+    // touches a real cluster when it's actually a local-only simulation.
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+
+    const subText = harness.hook("scenario-start-sub")!.textContent!;
+    expect(subText).not.toContain("real write load");
+    expect(subText.toLowerCase()).toContain("simulat");
+    expect(subText.toLowerCase()).toContain("no live cluster");
+  });
+
+  it("ticks climb writesAcked and keep lost at 0, without ever calling fetch", async () => {
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+    const baselineWrites = harness.hook("sb-writes")!.textContent;
+
+    (harness.hook("scenario-start-btn") as HTMLButtonElement).click();
+    await harness.flush();
+    await sleep(FAST_TICK_MS * 6);
+    await harness.flush();
+
+    expect(harness.hook("sb-writes")!.textContent).not.toBe(baselineWrites);
+    expect(harness.hook("sb-lost")!.textContent).toContain("lost 0");
+    expect(harness.calls).toHaveLength(0);
+  });
+
+  it("Codex-found: writes never jump BACKWARDS the instant Start is clicked — the simulation seeds from the visible baseline, not zero", async () => {
+    // buildSampleSnapshot's own writesAcked is 48213 — the page has shown
+    // that number since boot. Seeding the simulation at 0 would make the
+    // very first tick replace "writes 48,213" with "writes ~15-34", visibly
+    // counting backwards before it starts climbing.
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+    const baselineWritesNum = Number(harness.hook("sb-writes")!.textContent!.replace(/[^\d]/g, ""));
+    expect(baselineWritesNum).toBeGreaterThan(1000); // sanity: this IS the large static baseline, not near-zero
+
+    (harness.hook("scenario-start-btn") as HTMLButtonElement).click();
+    await harness.flush();
+
+    const firstTickWritesNum = Number(harness.hook("sb-writes")!.textContent!.replace(/[^\d]/g, ""));
+    expect(firstTickWritesNum).toBeGreaterThanOrEqual(baselineWritesNum);
+  });
+
+  it("Stop: reverts to the Start banner, logs 'scenario stopped', and resets the scoreboard to the static baseline", async () => {
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+    const baselineWrites = harness.hook("sb-writes")!.textContent;
+
+    (harness.hook("scenario-start-btn") as HTMLButtonElement).click();
+    await harness.flush();
+    await sleep(FAST_TICK_MS * 6);
+    await harness.flush();
+    expect(harness.hook("sb-writes")!.textContent).not.toBe(baselineWrites);
+
+    (harness.hook("scenario-stop-btn") as HTMLButtonElement).click();
+    await harness.flush();
+
+    expect((harness.hook("scenario-start-banner") as HTMLElement).hidden).toBe(false);
+    expect((harness.hook("scenario-running-pill") as HTMLElement).hidden).toBe(true);
+    expect(harness.hook("event-log")!.textContent).toContain("scenario stopped");
+    expect(harness.hook("sb-writes")!.textContent).toBe(baselineWrites);
+    expect(harness.calls).toHaveLength(0);
+  });
+
+  it("a second Start click while already running does not restart the simulation or duplicate the start log line", async () => {
+    harness = bootApp({ windowOverrides: { __SHARDSCOPE_DEMO_SCENARIO_TICK_MS_OVERRIDE__: FAST_TICK_MS } });
+    await harness.flush();
+
+    const startBtn = harness.hook("scenario-start-btn") as HTMLButtonElement;
+    startBtn.click();
+    await harness.flush();
+    startBtn.click();
+    startBtn.click();
+    await harness.flush();
+
+    const startCount = (harness.hook("event-log")!.textContent!.match(/scenario started/g) ?? []).length;
+    expect(startCount).toBe(1);
   });
 });
