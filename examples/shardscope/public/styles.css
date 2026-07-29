@@ -979,6 +979,16 @@ html, body {
   gap: 5px;
 }
 .log-line {
+  /* flex-shrink: 0 is load-bearing: .log-box is a flex container
+     (column-reverse) relying on its OWN overflow-y: auto to scroll once
+     content exceeds its height. Without this, every .log-line's default
+     flex-shrink: 1 lets the flexbox algorithm shrink each line's height to
+     cram the whole growing event log into the box's fixed size instead of
+     overflowing it -- once enough lines accumulate (e.g. over the ~minute a
+     visitor spends in the guided tour, at roughly one live snapshot per
+     second), every line gets crushed to a few px tall and the text renders
+     squashed/overlapping instead of scrolling. */
+  flex-shrink: 0;
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.55;
