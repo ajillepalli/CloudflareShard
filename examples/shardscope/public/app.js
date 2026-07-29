@@ -843,7 +843,21 @@ function setLiveState(state, label) {
   el.liveChipLabel.textContent = label || state;
   el.liveDot.className = "dot-live" + (isLive ? " live" : isWarnish ? " stale" : "");
 }
+/** Whether the log's current newest entry (its last DOM child -- .log-box is
+ * column-reverse, so that's the one rendered at the top) is actually within
+ * the visible scrollport right now. Geometry-based (compares real
+ * getBoundingClientRect() positions) rather than assuming which scrollTop
+ * value means "caught up". Empty log counts as caught up. */
+function isLogCaughtUpToNewest() {
+  const newest = el.eventLog.lastElementChild;
+  if (!newest) return true;
+  const boxTop = el.eventLog.getBoundingClientRect().top;
+  const newestTop = newest.getBoundingClientRect().top;
+  return newestTop >= boxTop - 1;
+}
+
 function logLine(text, cls) {
+  const wasCaughtUp = isLogCaughtUpToNewest();
   const div = document.createElement("div");
   div.className = "log-line" + (cls ? " " + cls : "");
   const t = document.createElement("span");
@@ -857,6 +871,14 @@ function logLine(text, cls) {
   while (el.eventLog.childElementCount > MAX_LOG_LINES) {
     el.eventLog.removeChild(el.eventLog.firstChild);
   }
+  // User-found: column-reverse + overflow-y:auto does NOT keep the
+  // scrollport pinned to the newest entry as the log grows past its
+  // visible height on its own -- without this, the box stays scrolled at
+  // wherever it started and silently falls further behind every new line
+  // instead of tracking the live feed. Only auto-follow readers who were
+  // already caught up (see isLogCaughtUpToNewest) -- someone who scrolled
+  // up to read history shouldn't get yanked back by the next line landing.
+  if (wasCaughtUp) div.scrollIntoView({ block: "nearest" });
 }
 
 // ============================================================================
@@ -2087,6 +2109,19 @@ let lastMutateSentBody = null;
  * genuine network failure or an expired gate session (401), which route into
  * the same handleLogout() flow every other /api/* caller in this file uses. */
 function playFetch(path, body) {
+  // GitHub #53: ?demo=1 never touches /api/* (see reshardFetch's identical
+  // guard, added for the same reason in commit 3d8ef92) -- playFetch had no
+  // such guard, so submitting anything in the Playground room hit a real
+  // 401 against the static preview, which the 401 handling below treats as
+  // "the gate session expired" and logs the user out, bouncing them back to
+  // Topology's login panel in what's supposed to be a login-free demo mode.
+  // Every caller already has a .catch() (see handlePlayMutateSubmit etc.,
+  // which render err.message via renderPlayResult's networkError field), so
+  // rejecting here surfaces cleanly through existing handling with no
+  // caller changes needed.
+  if (mode === "demo") {
+    return Promise.reject(new Error("demo mode (?demo=1) — no live cluster; drop the query param against a live cluster to run Playground calls."));
+  }
   return fetch(path, {
     method: "POST",
     credentials: "same-origin",

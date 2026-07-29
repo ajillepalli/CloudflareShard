@@ -251,6 +251,15 @@ export function bootApp(options: HarnessOptions = {}): Harness {
     (window.URL as unknown as { createObjectURL: (b: unknown) => string }).createObjectURL = () => "blob:stub-url";
     (window.URL as unknown as { revokeObjectURL: (u: string) => void }).revokeObjectURL = () => {};
   }
+  // jsdom doesn't implement Element.prototype.scrollIntoView at all (throws
+  // "is not a function" if called) — stubbed as a no-op so logLine()'s
+  // auto-follow-the-newest-entry call can run end to end in tests without
+  // that unrelated jsdom gap surfacing as a false failure. Real browsers all
+  // implement this; there is nothing to assert about scroll position here
+  // anyway, since jsdom performs no real layout.
+  if (!("scrollIntoView" in window.Element.prototype)) {
+    (window.Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = () => {};
+  }
   if (!("matchMedia" in window)) {
     (window as unknown as { matchMedia: (q: string) => MediaQueryList }).matchMedia = ((query: string) =>
       ({
