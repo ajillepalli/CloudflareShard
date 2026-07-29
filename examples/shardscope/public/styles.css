@@ -261,8 +261,16 @@ html, body {
 
 /* ============ LEFT RAIL ============ */
 .rail {
-  flex: 0 0 64px;
-  width: 64px;
+  /* 72px, not 64px: the longest label ("TOPOLOGY", uppercase + .06em
+     letter-spacing) measures ~55px at a 64px rail width -- only ~8px of
+     total slack. That's tight enough that a fallback system font (while
+     the self-hosted webfont is still loading), a non-100% browser zoom, or
+     a different OS's font-rendering metrics can push it past the edge and
+     visibly clip/overflow. 72px gives every label (App/Topology/Reshard/
+     Edge/Play) comfortable margin under realistic conditions, not just
+     this environment's exact font-loading timing. */
+  flex: 0 0 72px;
+  width: 72px;
   border-right: 1px solid var(--border);
   background: var(--bg-base);
   display: flex;
@@ -287,6 +295,11 @@ html, body {
   letter-spacing: .06em;
   text-transform: uppercase;
   color: inherit;
+  /* Defense in depth alongside .rail's widened 72px column: if a label
+     ever DOES run out of room again (a longer future label, a wider
+     fallback font), fail as a single overflowing line, not a silent wrap
+     to two cramped lines that reads as broken in a different way. */
+  white-space: nowrap;
 }
 .rail-item.active { color: var(--safe); }
 .rail-item.active::before {
