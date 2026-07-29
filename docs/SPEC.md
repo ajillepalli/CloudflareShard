@@ -831,6 +831,24 @@ This prevents duplicate writes after network retries and stops a reused requestI
     separate transaction; `/commit` re-executes for real; `/abort` has nothing to undo,
     since prepare never left anything applied. These are DO-binding-only, called from
     `CoordinatorDO`, never directly by the Worker.
+  - **Optimistic-concurrency (`where`-guarded) mutations inside `/v1/tx` (shipped).** A base-row
+    UPDATE/DELETE intent's optional `where` clause is a real compare-and-swap guard, not a
+    best-effort filter: if executing the intent during `/prepare`'s validation pass affects
+    zero rows — the guarded row no longer matches the caller's expected prior state — that
+    participant's prepare fails with 409 `TX_PARTICIPANT_GUARD_MISMATCH`
+    (`{error: {code: "TX_PARTICIPANT_GUARD_MISMATCH", message: "Row <table>:<partitionKey>
+    changed concurrently — its WHERE guard no longer matched any row.", fix: "Re-read the
+    row's current state and retry with fresh values."}}`), and the coordinator aborts the
+    whole transaction via its existing failed-prepare path (same as `TX_PARTICIPANT_LOCKED`)
+    — the client gets a real, retryable error instead of a false `committed` for a write that
+    silently never applied. This check stops at the FIRST guard mismatch found in a batch
+    (rather than continuing to execute later intents against rows a prior mismatch left
+    unexpectedly unchanged), and only applies to base-row intents (`op` + `vbucket` set on the
+    intent — never true for a synthetic index-maintenance intent piggybacked onto the same
+    transaction). Before this, a zero-row `where` match was valid, non-throwing SQL from
+    `/prepare`'s perspective — not an error — so a stale CAS attempt sailed through prepare
+    and `/commit` applied it as a silent no-op while still reporting the transaction
+    committed, with no way for the caller to know its own write never landed.
   - **CoordinatorDO (Milestone 1 Chunk 3 — shipped).** One `CoordinatorDO` instance per
     transaction (`env.COORDINATOR.idFromName(txId)`, no sharding — see the cost-model
     decision in the milestone plan: Cloudflare DO billing has no per-instantiation cost, so

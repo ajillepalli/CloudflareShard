@@ -19,7 +19,7 @@ than re-deriving them.
 
 Deploy mechanics (the "Deploy to Cloudflare" button, what it provisions, the
 `/admin/init` call, pointing a second Worker at it via service binding) are
-covered in the README's
+covered in the reference doc's
 [**"Deploy your own cluster"**](../REFERENCE.md#deploy-your-own-cluster)
 section and in
 [`examples/shardscope/docs/deploy/README.md`](../../examples/shardscope/docs/deploy/README.md).
@@ -36,9 +36,9 @@ migrate), tenant registration/revocation, raw SQL, and cross-tenant scatter
 reads. Treat it like a database root password, because functionally it is
 one.
 
-- Generate it with `openssl rand -hex 32` (this is what the README and the
-  deploy-button `.env.example` recommend) — don't hand-type something
-  memorable.
+- Generate it with `openssl rand -hex 32` (this is what the reference doc,
+  `docs/REFERENCE.md`, and the deploy-button `.env.example` recommend) —
+  don't hand-type something memorable.
 - Store it in a secrets manager, not in a chat message, ticket, or shell
   history file.
 - If the Worker returns `500 ADMIN_TOKEN is not configured`, the secret was
