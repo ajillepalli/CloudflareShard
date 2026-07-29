@@ -865,6 +865,47 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
       );
       expect(prepareRes.status).toBe(200);
     });
+
+    it("Codex round-2 fix: a mismatch short-circuits immediately — a later intent that would otherwise throw its own error (e.g. a unique-constraint violation on a reused key) never masks the real TX_PARTICIPANT_GUARD_MISMATCH reason", async () => {
+      const stub = await freshShard();
+      await seedRow(stub, "s-5", 5);
+
+      const prepareRes = await stub.fetch(
+        post("/prepare", {
+          coordinatorTxId: "tx-guard-5",
+          intents: [
+            // Stale guard — v is 5, not 999 — matches 0 rows.
+            {
+              sql: "DELETE FROM stock WHERE id = ? AND v = ?",
+              params: ["s-5", 999],
+              tenantId: "t1",
+              table: "stock",
+              partitionKey: "s-5",
+              vbucket: 0,
+              op: "delete",
+            },
+            // If the loop kept going after the guard mismatch above, this
+            // INSERT would reuse the still-live "s-5" primary key and throw
+            // a UNIQUE constraint error — the exact way a later intent could
+            // mask the real abort reason as PREPARE_VALIDATION_FAILED (400)
+            // instead of the correct, retryable TX_PARTICIPANT_GUARD_MISMATCH
+            // (409).
+            {
+              sql: "INSERT INTO stock (id, v) VALUES (?, ?)",
+              params: ["s-5", 10],
+              tenantId: "t1",
+              table: "stock",
+              partitionKey: "s-5",
+              vbucket: 0,
+              op: "insert",
+            },
+          ],
+        }),
+      );
+      expect(prepareRes.status).toBe(409);
+      const body = (await prepareRes.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("TX_PARTICIPANT_GUARD_MISMATCH");
+    });
   });
 });
 
