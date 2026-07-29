@@ -273,7 +273,7 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     expect(postIndexBody.status).toBe("committed");
   });
 
-  it("eng-review fix: an update via /v1/tx whose where clause doesn't match leaves the index entry unchanged", async () => {
+  it("eng-review fix, UPDATED (P0 fix — see shard.ts's TX_PARTICIPANT_GUARD_MISMATCH): an update via /v1/tx whose where clause doesn't match now aborts the whole transaction, leaving the base row and its index entry untouched", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(
       "/admin/create-table",
@@ -293,10 +293,17 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     await pollIndexRows("idx_c3_zerorow_by_v", (r) => r.length === 1);
 
     // where.status doesn't match ("open" !== "closed") — the compiled UPDATE
-    // affects 0 rows on the base shard. Before the fix, the tx-piggyback
-    // pre-read ignored `where` entirely, so it would still see beforeRow
-    // (v: "alpha") and piggyback a delta that rewrote the index entry to
-    // "beta" even though the base row was never actually touched by this tx.
+    // would affect 0 rows on the base shard. Originally (before the
+    // TX_PARTICIPANT_GUARD_MISMATCH fix) this "succeeded" as a silent no-op:
+    // the tx-piggyback pre-read ignored `where` entirely, so it would still
+    // see beforeRow (v: "alpha") and piggyback a delta that rewrote the
+    // index entry to "beta" even though the base row was never actually
+    // touched — that index-corruption bug is what this test originally
+    // guarded against. Now shard.ts's handlePrepare catches the 0-row WHERE
+    // match itself and fails prepare, so the coordinator aborts the WHOLE
+    // transaction (409) before any piggybacked index delta is ever computed
+    // — a stronger guarantee that subsumes the original assertion (nothing
+    // committed at all, so the index obviously can't have been corrupted).
     const res = await post(
       "/v1/tx",
       {
@@ -305,7 +312,9 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
       },
       token,
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(409);
+    const resBody = (await res.json()) as { error: { code: string } };
+    expect(resBody.error.code).toBe("TX_ABORTED");
 
     const checkRes = await post(
       "/v1/sql",
