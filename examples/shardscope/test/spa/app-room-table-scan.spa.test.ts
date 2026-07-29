@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { bootApp, type Harness } from "./helpers/domHarness";
+import { liveSnapshotFixture } from "./helpers/liveReshardBoot";
 
 describe("Shardscope SPA — App room", () => {
   let harness: Harness | null = null;
@@ -10,15 +11,17 @@ describe("Shardscope SPA — App room", () => {
   });
 
   it("switching tenant fires /api/play/table-scan and renders rows via textContent, escaping any HTML in them (XSS regression guard)", async () => {
-    // ?demo=1 deliberately skips the App room's *initial-entry* read (see
-    // app.js's startAppRoom: "mode === 'demo' -> render an honest 'no live
-    // read' state instead of firing a request") — but a tenant switch
-    // (handleAppWarehouseChange -> loadAppData) is NOT gated by mode, so
-    // it's the reliable way to exercise the real table-scan read path
-    // without needing to fake the live/gate flow.
+    // GitHub #53: playFetch (every /api/play/* call, including table-scan)
+    // is now demo-mode-gated, same as reshardFetch -- a tenant switch
+    // (handleAppWarehouseChange -> loadAppData) used to be the one App-room
+    // path NOT gated by mode (a real gap this test previously relied on to
+    // exercise a live read without booting live), but that gap is exactly
+    // what #53 closed. Boot live here instead.
     const maliciousCredit = '<img src=x onerror="window.__xss_fired = true">';
     harness = bootApp({
+      search: "",
       routes: {
+        "/api/load/status": { status: 200 },
         "/api/play/table-scan": ({ body }) => {
           const { table } = body as { table: string };
           if (table === "tpcc_customer") {
@@ -34,17 +37,23 @@ describe("Shardscope SPA — App room", () => {
         },
       },
     });
-
-    harness.hook("rail-app")!.click(); // enters the App room (demo mode: renders "demo mode" placeholders, no fetch yet)
     await harness.flush();
-    expect(harness.calls.some((c) => c.pathname === "/api/play/table-scan")).toBe(false);
+    harness.dispatchServerEvent("snapshot", liveSnapshotFixture());
+    await harness.flush();
+
+    harness.hook("rail-app")!.click(); // enters the App room — live mode fires an initial scan for the default warehouse
+    await harness.flush();
 
     const warehouseSelect = harness.hook("app-warehouse") as HTMLSelectElement;
     warehouseSelect.value = "2";
     warehouseSelect.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
     await harness.flush();
 
-    const scanCalls = harness.calls.filter((c) => c.pathname === "/api/play/table-scan");
+    // Isolate the SWITCH's own calls (warehouseId: 2) from the room-entry
+    // scan already fired for the default warehouse above.
+    const scanCalls = harness.calls.filter(
+      (c) => c.pathname === "/api/play/table-scan" && (c.body as { warehouseId?: number }).warehouseId === 2,
+    );
     expect(scanCalls).toHaveLength(2);
     expect(scanCalls).toContainEqual({
       pathname: "/api/play/table-scan",
