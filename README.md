@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1"><strong>Live demo</strong></a> ·
+  <a href="https://cloudflare-shard-shardscope.ajill.workers.dev/?demo=1"><strong>Live demo</strong></a> ·
   <a href="#deploy-your-own"><strong>Deploy your own</strong></a> ·
   <a href="docs/guides/end-user.md"><strong>Docs</strong></a> ·
   <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
@@ -25,7 +25,7 @@ indexes, resharding) sits on top of the same vBucket map.
 
 ## See it live
 
-**[Try the live demo](https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1).**
+**[Try the live demo](https://cloudflare-shard-shardscope.ajill.workers.dev/?demo=1).**
 It's a real dashboard (Shardscope) that visualizes topology, drives live load,
 splits/drains/migrates shards under fire, and runs chaos attacks while a
 correctness meter proves nothing was lost. Sample-data mode simulates the
