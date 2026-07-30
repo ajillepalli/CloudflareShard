@@ -27,7 +27,7 @@ No new backend was needed: the room reuses `/api/play/table-scan` and `/api/play
 ## Demo mode (`?demo=1`)
 
 The deployed instance is linked publicly from the project root's `README.md`
-as **[the live demo](https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1)**,
+as **[the live demo](https://cloudflare-shard-shardscope.ajill.workers.dev/?demo=1)**,
 appending `?demo=1`. This is a deliberately separate mode from the gated live
 view above — no `SHARDSCOPE_GATE_TOKEN` needed, and it **never touches
 `/api/*`**: `mode = "demo"` skips the login flow entirely and renders a

@@ -1,7 +1,7 @@
 # Shardscope: a visitor's guide
 
 **Live demo (free, no login, no risk):**
-**[cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1](https://cloudflare-shard-shardscope.ananth-jillepalli.workers.dev/?demo=1)**
+**[cloudflare-shard-shardscope.ajill.workers.dev/?demo=1](https://cloudflare-shard-shardscope.ajill.workers.dev/?demo=1)**
 
 Shardscope is a dashboard that watches — and pokes at — a real database while
 it's running. This page explains what you're looking at, what to click, and
