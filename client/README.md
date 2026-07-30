@@ -1,6 +1,6 @@
 # cloudflare-shard-client
 
-Typed TypeScript SDK and CLI for [CloudflareShard](../README.md)'s HTTP API —
+Typed TypeScript SDK and CLI for [CloudflareShard](../README.md)'s HTTP API:
 tenant data-plane (`mutate`/`tx`/`index-query`/`table-scan`) and admin routes
 (`init`/`create-table`/`create-index`/`status`/`shard-stats` and more), so you
 don't have to hand-write `fetch()` calls or re-derive the request/response
@@ -11,7 +11,7 @@ Zero runtime dependencies, ESM-only, targets Node 20+ (uses the global
 
 ## Install
 
-Not yet published to npm — for now, use it from within this repo:
+Not yet published to npm. For now, use it from within this repo:
 
 ```bash
 cd client
@@ -24,14 +24,14 @@ npm run build
 CloudflareShard's HTTP API has two auth tiers, and this SDK mirrors that with
 two client classes:
 
-- **`CloudflareShardAdminClient`** — every `/admin/*` route (`init`,
+- **`CloudflareShardAdminClient`**: every `/admin/*` route (`init`,
   `createTable`, `createIndex`, `status`, `shardStats`, `splitVbucket`, ...).
   Construct with `ADMIN_TOKEN`.
-- **`CloudflareShardClient`** — the tenant data-plane (`mutate`, `tx`,
+- **`CloudflareShardClient`**: the tenant data-plane (`mutate`, `tx`,
   `indexQuery`, `tableScan`). Construct with a tenant's bearer token (from
   `registerTenant()`). `CloudflareShardAdminClient` extends this, so an admin
   client has both, but a tenant token cannot call `/admin/*` routes (the
-  server rejects it with 401) — keep the two separate in your own code the
+  server rejects it with 401). Keep the two separate in your own code the
   same way the API itself does.
 
 ## Quickstart
@@ -104,7 +104,7 @@ try {
 
 `mutate()`/`insert()`/`update()`/`delete()`/`upsert()` and `tx()` all accept
 an optional `requestId` and generate one with `crypto.randomUUID()` if you
-don't supply it — matching `/v1/mutate`'s own server-side default, and
+don't supply it, matching `/v1/mutate`'s own server-side default, and
 filling in the value `/v1/tx` requires (it 400s without one, since it's the
 whole transaction's idempotency key). Pass your own `requestId` explicitly
 only when *you* need retry-safe resubmission of the exact same write.
@@ -150,15 +150,15 @@ human-readable error on stderr for anything that fails.
 `list-tables`, `list-indexes`.
 
 Not yet wrapped: `/v1/sql`, `/v1/scatter` (admin-only, raw-SQL escape
-hatches — deliberately not given a typed wrapper, matching their
+hatches, deliberately not given a typed wrapper, matching their
 trust-based/debugging role in the API itself), and the remaining
-lower-traffic admin routes (`audit-log`, `holds-topology-lock`, etc.) — open
+lower-traffic admin routes (`audit-log`, `holds-topology-lock`, etc.). Open
 an issue or send a PR if you need one of those typed.
 
 ## Types
 
 Every request/response shape lives in `src/types.ts`, hand-mirrored from the
-Worker's actual handlers (not generated) — see that file's header comment.
+Worker's actual handlers (not generated). See that file's header comment.
 If you add or change a route in the main Worker (`src/index.ts`,
 `src/catalog.ts`, `src/shard.ts` at the repo root), update the matching type
 here too.
@@ -167,7 +167,7 @@ here too.
 
 ```bash
 npm run typecheck   # tsc --noEmit, covers src/ and test/
-npm test            # vitest — mocked-fetch unit tests, no network
+npm test            # vitest: mocked-fetch unit tests, no network
 npm run build        # emits dist/
 
 # Full end-to-end check against a real server (not part of `npm test`):

@@ -1,8 +1,8 @@
 # Reference
 
 Practical, how-to detail that doesn't belong in the README's quickstart. For the
-formal protocol/architecture spec — every route's exact request/response shape,
-schemas, the routing algorithm, transaction semantics — see [`SPEC.md`](SPEC.md).
+formal protocol/architecture spec (every route's exact request/response shape,
+schemas, the routing algorithm, transaction semantics), see [`SPEC.md`](SPEC.md).
 
 ## What this MVP demonstrates
 
@@ -11,7 +11,7 @@ schemas, the routing algorithm, transaction semantics — see [`SPEC.md`](SPEC.m
 - Shard DOs as single-threaded SQLite execution nodes.
 - Deterministic single-shard routing via `tenantId` + `table` + `partitionKey`.
 - Scatter read endpoint for fan-out SELECT.
-- Online vBucket migration: dual-write backfill with a fenced, checksum-verified cutover —
+- Online vBucket migration: dual-write backfill with a fenced, checksum-verified cutover.
   `/admin/split-vbucket` performs a real data move, and `/admin/drain-shard` fully evacuates a
   shard (vbuckets first, then secondary-index placement rings via deterministic substitution,
   protected by a per-index write fence so no index entry is stranded on a shard mid-evacuation).
@@ -33,7 +33,7 @@ One click clones this repo into your GitHub and deploys the cluster to **your ow
 Cloudflare account**: one Worker plus three SQLite Durable Object classes
 (`CATALOG` control plane, `SHARD` data plane, `COORDINATOR` for 2PC), provisioned
 automatically from the `[[migrations]]` in `wrangler.toml`. There are no KV/D1/R2
-resources — the cluster is self-contained.
+resources; the cluster is self-contained.
 
 **Cost:** Durable Objects require the **Workers Paid** plan, and everything created
 is **billed to your account** (Worker + Durable Object requests/duration/storage).
@@ -42,7 +42,7 @@ done.
 
 **After deploy:**
 1. Set the `ADMIN_TOKEN` secret (the setup page prompts for it via `.env.example`)
-   to a strong random value — `openssl rand -hex 32`. It gates the whole `/admin/*`
+   to a strong random value: `openssl rand -hex 32`. It gates the whole `/admin/*`
    surface; without it the Worker returns `500 ADMIN_TOKEN is not configured`.
 2. Initialize the topology:
    ```bash
@@ -63,16 +63,16 @@ Durable Objects (and stops billing). Full details + a confirm-gated teardown scr
 - `src/catalog.ts`: Catalog durable object (metadata, routing, map changes).
 - `src/shard.ts`: Shard durable object (SQLite execution + idempotency).
 - `docs/SPEC.md`: Concrete architecture and protocol spec.
-- `client/`: Typed TypeScript SDK + CLI for the HTTP API — see `client/README.md`. Recommended over hand-writing raw HTTP calls.
+- `client/`: Typed TypeScript SDK + CLI for the HTTP API, see `client/README.md`. Recommended over hand-writing raw HTTP calls.
 - `examples/rpc-consumer/`: Demo Worker calling the tenant data path over a Durable Object RPC / service binding instead of HTTP.
 - `examples/tpc-c-benchmark/`: TPC-C-derived OLTP benchmark and demo project.
-- `examples/shardscope/`: Live mission-control dashboard — topology visualization, operator reshard controls, and a chaos/load-testing panel. See `examples/shardscope/README.md`.
+- `examples/shardscope/`: Live mission-control dashboard, topology visualization, operator reshard controls, and a chaos/load-testing panel. See `examples/shardscope/README.md`.
 
 ## Full API walkthrough
 
 `client/` is a typed TypeScript SDK + CLI wrapping this whole HTTP API, so you
 don't have to hand-write `fetch()`/`curl` calls or re-derive request/response
-shapes yourself — this is the recommended way to talk to a cluster. See
+shapes yourself. This is the recommended way to talk to a cluster. See
 `client/README.md` for the full reference.
 
 ```ts
@@ -114,7 +114,7 @@ await admin.migrateVbucketStatus({ catalogShardId: "catalog-0", vbucket: 42 });
 ```
 
 The admin-only cross-tenant fan-out `/v1/scatter` deliberately has no SDK
-wrapper (see `client/README.md`'s "What's covered" section for why) — call it
+wrapper (see `client/README.md`'s "What's covered" section for why). Call it
 directly over HTTP using `ADMIN_TOKEN`; its request/response shape is in
 [`SPEC.md` §7](SPEC.md#7-public-http-api-gateway-worker).
 
@@ -132,8 +132,8 @@ node client/dist/cli.js status
 **Proof this runs for real:** the screenshots below are unedited terminal
 output from an actual live deployment, not fabricated example data.
 
-![Terminal output showing steps 1-3 of the quickstart — cluster init, table registration, and schema creation — each returning HTTP 200 with real JSON responses](images/quickstart-cluster-init.png)
-*Cluster init, table registration, and schema creation — each returning HTTP 200.*
+![Terminal output showing steps 1-3 of the quickstart: cluster init, table registration, and schema creation, each returning HTTP 200 with real JSON responses](images/quickstart-cluster-init.png)
+*Cluster init, table registration, and schema creation: each returning HTTP 200.*
 
 ![Terminal output from a live run: table-scan on a brand-new table returns provenance.complete: false, then a backfill-provenance call reports 0 orphaned/ambiguous rows, then the same table-scan call returns provenance.complete: true](images/tenant-table-scan-live.png)
 *A table-scan on a brand-new table starts `provenance.complete: false`; a `backfill-provenance` run reports zero orphaned rows; the same scan then reports `provenance.complete: true`.*
@@ -142,7 +142,7 @@ output from an actual live deployment, not fabricated example data.
 
 The control plane is itself sharded: the cluster is partitioned across a fixed,
 well-known set of catalog shards, and a tenant's catalog shard is chosen by
-hashing `tenantId` — no lookup step, so the metadata store never needs to
+hashing `tenantId`. No lookup step, so the metadata store never needs to
 shard itself recursively. Cluster-wide admin operations fan out to every
 catalog shard; shard-scoped operations (split, drain) require an explicit
 `catalogShardId`. Draining a shard is a full evacuation (vbuckets, then
@@ -165,39 +165,39 @@ for the full trust model, including token rotation and revocation semantics.
 ## RPC / Worker service-binding access (additive, not a replacement)
 
 Every route above is also reachable without HTTP, from a Worker in the same
-Cloudflare account, via a service binding to `CloudflareShardRpc` — a
-`WorkerEntrypoint` export in `src/index.ts` with one method per route. Tenant
+Cloudflare account, via a service binding to `CloudflareShardRpc` (a
+`WorkerEntrypoint` export in `src/index.ts` with one method per route). Tenant
 methods (`mutate`, `tableScan`, `indexQuery`, `tx`) take the tenant token as an
-explicit argument; admin/topology methods take `ADMIN_TOKEN` the same way —
-holding the binding alone is never sufficient authorization for either kind of
-method. A full working example — a second Worker, wired via service binding,
-with a real integration test proving the round trip over the actual binding —
+explicit argument; admin/topology methods take `ADMIN_TOKEN` the same way.
+Holding the binding alone is never sufficient authorization for either kind of
+method. A full working example (a second Worker, wired via service binding,
+with a real integration test proving the round trip over the actual binding)
 lives in [`examples/rpc-consumer/`](../examples/rpc-consumer/README.md).
 
 ## Known limitations
 
-- No SQL parser or policy sandboxing yet — raw `/v1/sql` is an admin-only
+- No SQL parser or policy sandboxing yet. Raw `/v1/sql` is an admin-only
   escape hatch (see [`SPEC.md` §2](SPEC.md#2-non-goals-mvp) and
   [§15](SPEC.md#15-migration-path-to-production)).
 - `/v1/tx` transactions are capped at 8 distinct participant rows.
 - `/v1/scatter` and `/v1/table-scan` can return duplicate (never missing) rows
-  during an active vbucket-migration window — see
+  during an active vbucket-migration window. See
   [`SPEC.md` §11](SPEC.md#11-rebalancing-split-and-drain-milestone-3--shipped).
-- `/v1/table-scan` supports only `table + tenantId + cursor + limit` — no
+- `/v1/table-scan` supports only `table + tenantId + cursor + limit`, no
   arbitrary column filtering.
 - Row provenance and the partition-key trust model inherit one collision case
   documented in [`SPEC.md` §14](SPEC.md#14-security-and-multi-tenancy): two
   tenants sharing a partition key on the same shard.
 
 (Automatic split heuristics, unique-index support, and cross-tenant analytics
-aggregation are tracked as open roadmap items — see
-[`TODOS.md`](../TODOS.md), not listed here as limitations.)
+aggregation are tracked as open roadmap items. See
+[`TODOS.md`](../TODOS.md); they're not listed here as limitations.)
 
 ## Observability
 
 Every request logs a structured `http.request` event
 (`{path, method, status, durationMs}`) from the Worker's single `fetch()`
-entrypoint, regardless of which route or outcome — plus whatever
+entrypoint, regardless of which route or outcome, plus whatever
 event-specific `log()` calls the handler itself makes along the way (e.g.
 `catalog.admin_action`). Query them:
 
@@ -210,8 +210,8 @@ npx wrangler tail --format json | Select-String '"event":"http.request"' | Selec
 ```
 
 Or use the Cloudflare dashboard's **Workers Logs** view (Workers & Pages →
-`cloudflare-shard-mvp` → Logs) for durable, searchable/filterable history —
-enabled via `wrangler.toml`'s `[observability]` block (`head_sampling_rate = 1`,
+`cloudflare-shard-mvp` → Logs) for durable, searchable/filterable history.
+Enabled via `wrangler.toml`'s `[observability]` block (`head_sampling_rate = 1`,
 i.e. every request, not a sample).
 
 For a deeper operational runbook (health monitoring, incident response,
