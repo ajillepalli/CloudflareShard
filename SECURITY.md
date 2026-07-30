@@ -1,6 +1,6 @@
 # Security policy
 
-CloudflareShard is a multi-tenant data plane — a leak across tenants or an
+CloudflareShard is a multi-tenant data plane. A leak across tenants or an
 authentication bypass is the worst-case outcome, so security reports get
 priority over everything else in the queue.
 
@@ -24,16 +24,16 @@ unless you would rather stay anonymous.
 
 In scope:
 
-- authentication and token handling — `ADMIN_TOKEN`'s universal-bypass
+- authentication and token handling: `ADMIN_TOKEN`'s universal-bypass
   behavior, tenant `tenant_auth` bearer tokens, and token rotation/revocation
   (`/admin/register-tenant`, `/admin/revoke-tenant`)
-- cross-tenant isolation — one tenant reading or mutating another tenant's
+- cross-tenant isolation: one tenant reading or mutating another tenant's
   rows, including via `/v1/table-scan`'s `__cf_row_owners` join or a
   partition-key collision across tenants
 - the `/v1/sql` and `/v1/scatter` admin-only boundary, and the SQL-safety
   allowlist behind the read-only console (internal-table access, CTE-header
   classifier bypasses, and similar parsing gaps)
-- Shardscope's two-tier auth — `SHARDSCOPE_GATE_TOKEN` (who can operate the
+- Shardscope's two-tier auth: `SHARDSCOPE_GATE_TOKEN` (who can operate the
   dashboard) versus `ADMIN_TOKEN` (what the dashboard is allowed to do to the
   cluster it's bound to)
 - privilege escalation through any admin-only route becoming reachable
@@ -43,7 +43,7 @@ Out of scope:
 
 - anything requiring a compromised Cloudflare account or `wrangler`
   credentials
-- rate limits or cost exposure on a deployment you control — tune or accept
+- rate limits or cost exposure on a deployment you control. Tune or accept
   that yourself
 - Shardscope's `?demo=1` sample mode, which is intended to be publicly
   reachable, never touches `/api/*`, and is documented as such
@@ -64,7 +64,7 @@ Out of scope:
   cluster-wide admin secret when only that tenant is affected.
 - **Shardscope's `SHARDSCOPE_GATE_TOKEN`** gates every `/api/*` route on the
   dashboard itself, separate from the `ADMIN_TOKEN` it holds to talk to the
-  cluster — rotating one does not rotate the other.
+  cluster. Rotating one does not rotate the other.
 
 ## Supported versions
 
