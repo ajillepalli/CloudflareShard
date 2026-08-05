@@ -507,6 +507,21 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
     await runInDurableObject(bucket, async (instance, state) => {
       state.storage.sql.exec("UPDATE manifest_reservations SET retention_deadline_ms = 0 WHERE tx_id = ?", route.reservation.tx_id);
+      const columns = state.storage.sql
+        .exec<{ name: string }>("PRAGMA table_info(manifest_reservations)")
+        .toArray()
+        .map((column) => column.name);
+      const original = state.storage.sql
+        .exec<Record<string, SqlStorageValue>>("SELECT * FROM manifest_reservations WHERE tx_id = ?", route.reservation.tx_id)
+        .one();
+      const placeholders = columns.map(() => "?").join(", ");
+      for (let index = 0; index < 129; index += 1) {
+        const values = columns.map((column) => column === "tx_id" ? `retention-backlog-${index}` : original[column]);
+        state.storage.sql.exec(
+          `INSERT INTO manifest_reservations (${columns.join(", ")}) VALUES (${placeholders})`,
+          ...values,
+        );
+      }
       for (let index = 0; index < 129; index += 1) {
         state.storage.sql.exec(
           `INSERT INTO manifest_page_cursors
@@ -524,10 +539,16 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       expect(state.storage.sql.exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM manifest_page_cursors",
       ).one().count).toBe(1);
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_reservations",
+      ).one().count).toBe(2);
       expect(await state.storage.getAlarm()).not.toBeNull();
       await instance.alarm?.();
       expect(state.storage.sql.exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM manifest_page_cursors",
+      ).one().count).toBe(0);
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_reservations",
       ).one().count).toBe(0);
     });
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
@@ -864,6 +885,15 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       intent,
     });
     if (!finalized.ok) throw new Error(finalized.error.message);
+    const fleetCatalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${route.reservation.fleet_id}`);
+    const futureConfigDay = new Date(
+      Date.parse(`${route.reservation.reservation_utc_day}T00:00:00.000Z`) + 2 * 86_400_000,
+    ).toISOString().slice(0, 10);
+    await fleetCatalog.appendPartitionConfig({
+      fleet_id: route.reservation.fleet_id,
+      effective_from_day: futureConfigDay,
+      partition_count: 16,
+    });
 
     const routedBucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
     await runInDurableObject(routedBucket, async (_instance, state) => {
@@ -907,7 +937,6 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     if (!("status" in completed) || completed.status !== "complete") {
       throw new Error("Fleet close did not complete.");
     }
-    const fleetCatalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${route.reservation.fleet_id}`);
     const coverageState = await fleetCatalog.coverageState(route.reservation.fleet_id);
     if (coverageState.reservation_required_since_ms === null) throw new Error("Expected a V2 coverage boundary.");
     const coverageStart = new Date(coverageState.reservation_required_since_ms).toISOString();

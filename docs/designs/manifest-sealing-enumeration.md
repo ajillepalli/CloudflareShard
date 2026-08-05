@@ -390,6 +390,8 @@ bucket has an unresolved reservation, quarantine, unexpired finalized record, or
 seal evidence required by the supported recovery window. Retirement requires a
 bucket-issued empty/retention-safe certificate and is itself retained in catalog
 history long enough to validate every supported cursor and cutoff.
+Activation-history GC excludes every activation that a BUILDING snapshot's
+fence can still select, even if that bucket retires while the snapshot is paged.
 
 Every seal receipt records the bucket's conflict/resolution root for audit.
 Unresolved quarantine is rechecked by each local page and blocks enumeration;
@@ -430,6 +432,8 @@ keys are removed in bounded alarm batches only after the 35-day recovery window;
 the newest chain head is retained. Per-transaction route assignments have a
 separate one-hour crash-recovery lease and are released on every terminal or
 quarantined path rather than scaling with the data-retention horizon.
+Any bounded batch that leaves due cursor, record, or history work re-arms the
+same logical alarm immediately.
 Catalog propagation of a new
 retention epoch may be asynchronous because fleet enumeration always checks the
 bucket before paging. A caller cannot materialize buckets to manufacture expired

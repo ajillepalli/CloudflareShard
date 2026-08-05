@@ -1188,7 +1188,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private async reconcileV2BridgeReservation(row: TxRow): Promise<Response> {
     const state = this.stateOf(row);
-    if (row.state_model_version !== 2 || state !== "commit_pending_manifest") return this.resume(row);
+    if (row.state_model_version !== 2 || state !== "commit_pending_manifest") {
+      return protocolResponse(transactionError(
+        "TX_VERSION_UNSUPPORTED",
+        `State ${state} cannot enter the V1-to-V2 bridge.`,
+      ));
+    }
     if (row.manifest_finalize_request_json) return this.reconcileFinalize(row);
     if (!row.redo_envelope_json || !row.manifest_registration_json) {
       throw new TransactionContractViolation(

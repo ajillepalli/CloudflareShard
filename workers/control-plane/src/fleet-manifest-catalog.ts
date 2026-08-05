@@ -267,7 +267,8 @@ export class FleetManifestCatalogStore {
         partition_config_hash TEXT NOT NULL,
         activation_key TEXT NOT NULL,
         entry_hash TEXT NOT NULL,
-        deactivation_sequence INTEGER
+        deactivation_sequence INTEGER,
+        deactivated_at_ms INTEGER
       );
       CREATE TABLE IF NOT EXISTS catalog_snapshots (
         generation INTEGER PRIMARY KEY,
@@ -383,6 +384,17 @@ export class FleetManifestCatalogStore {
     if (!activationKeyColumns.some((column) => column.name === "created_at_ms")) {
       this.storage.sql.exec("ALTER TABLE catalog_activation_keys ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0");
     }
+    const activationHistoryColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
+      "PRAGMA table_info(catalog_bucket_activation_history)",
+    ).toArray();
+    if (!activationHistoryColumns.some((column) => column.name === "deactivated_at_ms")) {
+      this.storage.sql.exec("ALTER TABLE catalog_bucket_activation_history ADD COLUMN deactivated_at_ms INTEGER");
+    }
+    this.storage.sql.exec(
+      `UPDATE catalog_bucket_activation_history SET deactivated_at_ms = ?
+        WHERE deactivation_sequence IS NOT NULL AND deactivated_at_ms IS NULL`,
+      Date.now(),
+    );
     this.storage.sql.exec(
       "INSERT OR IGNORE INTO _fleet_catalog_schema_migrations (id, applied_at) VALUES (1, ?)",
       new Date().toISOString(),
@@ -1067,8 +1079,9 @@ export class FleetManifestCatalogStore {
         input.partition,
       );
       this.storage.sql.exec(
-        "UPDATE catalog_bucket_activation_history SET deactivation_sequence = ? WHERE activation_sequence = ?",
+        "UPDATE catalog_bucket_activation_history SET deactivation_sequence = ?, deactivated_at_ms = ? WHERE activation_sequence = ?",
         sequence,
+        nowMs,
         row.activation_sequence,
       );
       return { ok: true, status: "retired", retirement_sequence: sequence };
@@ -1625,11 +1638,19 @@ export class FleetManifestCatalogStore {
         .exec<{ activation_sequence: number }>(
           `SELECT h.activation_sequence FROM catalog_bucket_activation_history AS h
             WHERE h.deactivation_sequence IS NOT NULL
+              AND h.deactivated_at_ms IS NOT NULL AND h.deactivated_at_ms <= ?
               AND NOT EXISTS (
                 SELECT 1 FROM catalog_snapshot_entries AS s
                  WHERE s.activation_sequence = h.activation_sequence
               )
+              AND NOT EXISTS (
+                SELECT 1 FROM catalog_snapshots AS s
+                 WHERE s.status = 'BUILDING'
+                   AND h.activation_sequence <= s.fence_sequence
+                   AND h.deactivation_sequence > s.fence_sequence
+              )
             ORDER BY h.activation_sequence LIMIT ?`,
+          cutoffMs,
           limit * MAX_CATALOG_PAGE_SIZE,
         )
         .toArray();

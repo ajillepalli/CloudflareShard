@@ -575,6 +575,34 @@ describe("CoordinatorDO /begin (2PC orchestration)", () => {
     expect(await status.json()).toMatchObject({ error: { code: "TX_VERSION_UNSUPPORTED" } });
   });
 
+  it("returns a typed error for a model-2 commit_decided row that cannot enter the V1 bridge", async () => {
+    const txId = `tx-v2-invalid-bridge-state-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await coordinator.fetch(post("/tx-status", { txId: "schema-warmup" }));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash,
+           created_at, updated_at, protocol_version, state_model_version, epoch,
+           decision, fleet_id, coordinator_id)
+         VALUES (?, 'commit_decided', '[]', '[]', 'invalid-bridge-state', ?, ?,
+                 1, 2, 1, 'commit', 'fleet-v2', ?)`,
+        txId,
+        now,
+        now,
+        txId,
+      );
+      const mutable = instance as unknown as {
+        loadTx(txId: string): unknown;
+        resume(row: unknown): Promise<Response>;
+      };
+      const response = await mutable.resume(mutable.loadTx(txId));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ error: { code: "TX_VERSION_UNSUPPORTED" } });
+    });
+  });
+
   it("two different txIds land on two different CoordinatorDO instances and don't interfere", async () => {
     const txA = `tx-iso-a-${crypto.randomUUID()}`;
     const txB = `tx-iso-b-${crypto.randomUUID()}`;

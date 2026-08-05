@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file.
 - The V1/V2 boundary now serializes above every admitted legacy decision, terminal route assignments use a one-hour recovery lease, and journal/catalog history is garbage-collected in bounded 35-day batches while preserving hash-chain heads.
 - Finalize/cancel races now materialize repairable canonical records while remaining quarantined, and disjoint old-window retention no longer invalidates active newer-window cursors.
 - Future-skewed V1 decisions now retry instead of quarantining, identical reserve replays preserve quarantine evidence, and multi-batch cursor cleanup re-arms itself.
+- Building snapshots now fence activation-history GC, multi-batch record retention self-rearms, invalid bridge states return typed errors, and enumeration validates the cutoff day's config rather than the fleet config root.
 
 This work is locally verified only. Production deployment, restore execution, and live performance/SLO qualification remain separate gates.
 

@@ -220,6 +220,7 @@ describe("FleetManifestCatalogStore", () => {
       expect(oldSnapshot.status).toBe("pending");
       const certificate = "a".repeat(64);
       await expect(catalog.retireBucket({ fleet_id: FLEET, reservation_day: DAY, partition: 4, retirement_certificate_hash: certificate })).resolves.toMatchObject({ status: "retired" });
+      catalog.purgeHistory(Date.now() + CATALOG_HISTORY_RETENTION_MS + 1);
       const reactivated = await catalog.activateBucket({ ...request, activation_key: "active-again" });
       expect(reactivated.status).toBe("reactivated");
       expect(reactivated.activation_sequence).toBeGreaterThan(oldSnapshot.fence_sequence);

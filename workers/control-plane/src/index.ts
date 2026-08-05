@@ -598,11 +598,12 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       }
       const snapshot = await catalog.snapshotByGeneration(request.catalog_generation);
       const close = await catalog.closeForSnapshot(request.catalog_generation);
+      const cutoffConfig = await catalog.partitionConfigForDay(request.fleet_id, request.cutoff.slice(0, 10));
       if (
         snapshot.status !== "complete"
         || snapshot.cutoff_ms !== new Date(request.cutoff).getTime()
         || snapshot.snapshot_hash !== request.catalog_snapshot_hash
-        || snapshot.partition_config_root_hash !== request.partition_config_hash
+        || cutoffConfig.config_hash !== request.partition_config_hash
         || close === null
         || close.status !== "complete"
         || close.snapshot_hash !== request.catalog_snapshot_hash
