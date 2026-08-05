@@ -255,7 +255,7 @@ activation against hash-chained cutoff snapshots, pins append-only partition
 configuration, materializes all 16 partitions for every newly eligible day,
 and owns deterministic close progress plus the final fleet root. Enumeration is
 bucket-serial and keyset-paged. Its cursor binds the request, catalog snapshot,
-conflict root, seal receipt, and retention epoch. Missing receipts, unresolved
+seal receipt, and retention epoch. Missing receipts, unresolved
 quarantine, changed epochs, deleted coverage, and pre-reservation history return
 typed non-complete outcomes.
 

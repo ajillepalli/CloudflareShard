@@ -772,7 +772,6 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
       partition_config_hash: "a".repeat(64),
       catalog_generation: 1,
       catalog_snapshot_hash: "b".repeat(64),
-      conflict_resolution_root: "c".repeat(64),
       limit: 100,
       cursor: null,
     };
@@ -783,7 +782,6 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
       request_hash: requestHash,
       catalog_generation: request.catalog_generation,
       catalog_snapshot_hash: request.catalog_snapshot_hash,
-      conflict_resolution_root: request.conflict_resolution_root,
       reservation_utc_day: "2026-08-05",
       partition: 1,
       local_cursor: null,

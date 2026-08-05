@@ -329,7 +329,8 @@ export class FleetManifestCatalogStore {
         request_hash TEXT NOT NULL,
         reservation_hash TEXT NOT NULL,
         reservation_json TEXT NOT NULL,
-        created_at_ms INTEGER NOT NULL
+        created_at_ms INTEGER NOT NULL,
+        delete_after_ms INTEGER
       );
       CREATE TABLE IF NOT EXISTS catalog_enumeration_cursors (
         cursor_json TEXT PRIMARY KEY,
@@ -361,6 +362,12 @@ export class FleetManifestCatalogStore {
     ).toArray();
     if (!cursorColumns.some((column) => column.name === "expires_at_ms")) {
       this.storage.sql.exec("ALTER TABLE catalog_enumeration_cursors ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0");
+    }
+    const assignmentColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
+      "PRAGMA table_info(manifest_route_assignments)",
+    ).toArray();
+    if (!assignmentColumns.some((column) => column.name === "delete_after_ms")) {
+      this.storage.sql.exec("ALTER TABLE manifest_route_assignments ADD COLUMN delete_after_ms INTEGER");
     }
     this.storage.sql.exec(
       "INSERT OR IGNORE INTO _fleet_catalog_schema_migrations (id, applied_at) VALUES (1, ?)",
@@ -488,6 +495,49 @@ export class FleetManifestCatalogStore {
       );
       return { status: "assigned" as const, reservation, reservation_hash: reservationHash };
     });
+  }
+
+  releaseManifestRoute(fleetId: string, txId: string, reservationHash: string, deleteAfterMs: number): void {
+    assertText(fleetId, "fleet_id");
+    assertText(txId, "tx_id");
+    assertHash(reservationHash, "reservation_hash");
+    if (!Number.isSafeInteger(deleteAfterMs) || deleteAfterMs < 0) throw new TypeError("delete_after_ms must be a non-negative safe integer.");
+    const metadata = this.storage.sql.exec<MetadataRow>("SELECT * FROM fleet_catalog_metadata WHERE id = 1").toArray()[0];
+    if (metadata === undefined || metadata.fleet_id !== fleetId) throw new TypeError("Route release does not identify this fleet catalog.");
+    const assignment = this.storage.sql
+      .exec<{ reservation_hash: string }>(
+        "SELECT reservation_hash FROM manifest_route_assignments WHERE tx_id = ?",
+        txId,
+      )
+      .toArray()[0];
+    if (assignment === undefined) return;
+    if (assignment.reservation_hash !== reservationHash) throw new TypeError("Route release conflicts with the frozen reservation.");
+    this.storage.sql.exec(
+      `UPDATE manifest_route_assignments
+          SET delete_after_ms = CASE WHEN delete_after_ms IS NULL THEN ? ELSE MIN(delete_after_ms, ?) END
+        WHERE tx_id = ? AND reservation_hash = ?`,
+      deleteAfterMs,
+      deleteAfterMs,
+      txId,
+      reservationHash,
+    );
+  }
+
+  purgeReleasedRoutes(nowMs = Date.now(), limit = 128): number | null {
+    this.storage.sql.exec(
+      `DELETE FROM manifest_route_assignments WHERE assignment_key IN (
+         SELECT assignment_key FROM manifest_route_assignments
+          WHERE delete_after_ms IS NOT NULL AND delete_after_ms <= ?
+          ORDER BY delete_after_ms LIMIT ?
+       )`,
+      nowMs,
+      limit,
+    );
+    return this.storage.sql
+      .exec<{ delete_after_ms: number | null }>(
+        "SELECT MIN(delete_after_ms) AS delete_after_ms FROM manifest_route_assignments WHERE delete_after_ms IS NOT NULL",
+      )
+      .one().delete_after_ms;
   }
 
   async coverageState(fleetId: string): Promise<{
@@ -847,7 +897,13 @@ export class FleetManifestCatalogStore {
       || input.partition < 0
       || input.partition >= config.partition_count
     ) throw new TypeError("Legacy admission does not match the effective partition configuration.");
-    const activationKey = await hashCanonicalJson(["legacy-admission", input.record_hash]);
+    const activationKey = await hashCanonicalJson([
+      "legacy-bucket-activation",
+      input.fleet_id,
+      input.reservation_day,
+      input.partition,
+      input.partition_config_hash,
+    ]);
     const entryHash = await hashCanonicalJson({
       fleet_id: input.fleet_id,
       partition: input.partition,
@@ -1548,6 +1604,19 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     return await this.catalog.assignManifestRoute(draft, assignmentKey);
   }
 
+  async releaseManifestRoute(fleetId: string, txId: string, reservationHash: string, deleteAfterMs: number): Promise<void> {
+    const existing = this.catalog.purgeReleasedRoutes();
+    const next = Math.min(existing ?? Number.POSITIVE_INFINITY, deleteAfterMs);
+    this.catalog.schedulePurpose({
+      purpose: "route_gc",
+      fire_at_ms: next,
+      generation: 0,
+      payload_hash: await hashCanonicalJson(["route_gc", next]),
+    });
+    await this.armNextAlarm();
+    this.catalog.releaseManifestRoute(fleetId, txId, reservationHash, deleteAfterMs);
+  }
+
   async coverageState(fleetId: string): Promise<Awaited<ReturnType<FleetManifestCatalogStore["coverageState"]>>> {
     return await this.catalog.coverageState(fleetId);
   }
@@ -1679,6 +1748,17 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
             fire_at_ms: Math.max(Date.now(), nextExpiry),
             generation: 0,
             payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
+          });
+        }
+      } else if (purpose.purpose === "route_gc") {
+        this.catalog.completePurpose(purpose.purpose, purpose.generation);
+        const nextRelease = this.catalog.purgeReleasedRoutes(Date.now());
+        if (nextRelease !== null) {
+          this.catalog.schedulePurpose({
+            purpose: "route_gc",
+            fire_at_ms: Math.max(Date.now(), nextRelease),
+            generation: 0,
+            payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
           });
         }
       } else {

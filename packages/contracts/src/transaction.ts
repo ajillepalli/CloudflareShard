@@ -901,7 +901,6 @@ export interface ManifestEnumerationCursorV1 {
   readonly request_hash: string;
   readonly catalog_generation: number;
   readonly catalog_snapshot_hash: string;
-  readonly conflict_resolution_root: string;
   readonly reservation_utc_day: string;
   readonly partition: number;
   readonly local_cursor: ManifestLocalPageCursorV1 | null;
@@ -916,7 +915,6 @@ export interface ManifestEnumerationRequestV1 {
   readonly partition_config_hash: string;
   readonly catalog_generation: number;
   readonly catalog_snapshot_hash: string;
-  readonly conflict_resolution_root: string;
   readonly limit: number;
   readonly cursor: ManifestEnumerationCursorV1 | null;
 }
@@ -1344,13 +1342,12 @@ export function validateManifestEnumerationCursor(value: unknown): asserts value
   assertPlainObject(value, "manifest_enumeration_cursor");
   assertExactKeys(value, "manifest_enumeration_cursor", [
     "protocol_version", "format_version", "request_hash", "catalog_generation", "catalog_snapshot_hash",
-    "conflict_resolution_root", "reservation_utc_day", "partition", "local_cursor",
+    "reservation_utc_day", "partition", "local_cursor",
   ]);
   assertManifestVersion(value, MANIFEST_CURSOR_FORMAT_VERSION, "manifest_enumeration_cursor");
   assertManifestHash(value.request_hash, "request_hash");
   assertSafeInteger(value.catalog_generation, "catalog_generation", 1);
   assertManifestHash(value.catalog_snapshot_hash, "catalog_snapshot_hash");
-  assertManifestHash(value.conflict_resolution_root, "conflict_resolution_root");
   assertUtcDay(value.reservation_utc_day, "reservation_utc_day");
   assertSafeInteger(value.partition, "partition");
   if (value.partition >= MANIFEST_PARTITION_COUNT) fail("MANIFEST_INVALID_REQUEST", `partition must be less than ${MANIFEST_PARTITION_COUNT}.`);
@@ -1361,7 +1358,7 @@ export function validateManifestEnumerationRequest(value: unknown): asserts valu
   assertPlainObject(value, "manifest_enumeration_request");
   assertExactKeys(value, "manifest_enumeration_request", [
     "protocol_version", "format_version", "fleet_id", "coverage_start", "cutoff", "partition_config_hash",
-    "catalog_generation", "catalog_snapshot_hash", "conflict_resolution_root", "limit", "cursor",
+    "catalog_generation", "catalog_snapshot_hash", "limit", "cursor",
   ]);
   assertManifestVersion(value, MANIFEST_ENUMERATION_FORMAT_VERSION, "manifest_enumeration_request");
   assertManifestString(value.fleet_id, "fleet_id");
@@ -1371,7 +1368,6 @@ export function validateManifestEnumerationRequest(value: unknown): asserts valu
   assertManifestHash(value.partition_config_hash, "partition_config_hash");
   assertSafeInteger(value.catalog_generation, "catalog_generation", 1);
   assertManifestHash(value.catalog_snapshot_hash, "catalog_snapshot_hash");
-  assertManifestHash(value.conflict_resolution_root, "conflict_resolution_root");
   assertManifestPageLimit(value.limit);
   if (value.cursor !== null) validateManifestEnumerationCursor(value.cursor);
 }

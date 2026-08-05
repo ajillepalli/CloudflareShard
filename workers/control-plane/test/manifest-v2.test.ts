@@ -232,8 +232,8 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     const coordinatorState = {
       tx_id: assignedRoute.reservation.tx_id,
       coordinator_id: assignedRoute.reservation.coordinator_id,
-      state: "aborted_pending_manifest_cancel",
-      decision: "abort",
+      state: "quarantined",
+      decision: "quarantined",
       epoch: assignedRoute.reservation.decision_epoch,
       operation_hash: assignedRoute.reservation.operation_hash,
       reservation_hash: assignedRoute.reservation_hash,
@@ -293,6 +293,7 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       reservation: route.reservation,
       reservation_hash: route.reservation_hash,
       record_hash: finalized.record_hash,
+      retention_deadline_ms: new Date(finalized.record.retention_deadline).getTime(),
     });
     const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
     await runInDurableObject(bucket, async (instance, state) => {
@@ -311,6 +312,15 @@ describe("Manifest V2 reservation and terminal transitions", () => {
 
     await runInDurableObject(bucket, async (instance, state) => {
       state.storage.sql.exec("DELETE FROM manifest_seal_generations WHERE generation = 999");
+      state.storage.sql.exec(
+        `INSERT INTO manifest_page_cursors
+          (cursor_json, request_hash, created_at_ms, lease_expires_at_ms, coverage_start_ms, cutoff_ms)
+         VALUES ('non-overlapping-lease', ?, 0, ?, ?, ?)`,
+        "a".repeat(64),
+        Date.now() + 60_000,
+        finalized.record.commit_decided_at_ms + 1,
+        finalized.record.commit_decided_at_ms + 2,
+      );
       state.storage.sql.exec(
         "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
       );
@@ -589,7 +599,6 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
-      conflict_resolution_root: "0".repeat(64),
       limit: 10,
       cursor: null,
     });
@@ -612,7 +621,6 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
-      conflict_resolution_root: "0".repeat(64),
       limit: 10,
       cursor: enumeration.next_cursor,
     });
@@ -632,7 +640,6 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
-      conflict_resolution_root: "0".repeat(64),
       limit: 10,
       cursor: null,
     });
@@ -650,7 +657,6 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
-      conflict_resolution_root: "0".repeat(64),
       limit: 1,
       cursor: null,
     });
@@ -668,7 +674,6 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
-      conflict_resolution_root: "0".repeat(64),
       limit: 1,
       cursor: forgedCursor,
     })).resolves.toMatchObject({

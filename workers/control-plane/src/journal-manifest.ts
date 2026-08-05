@@ -408,7 +408,9 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           cursor_json TEXT PRIMARY KEY,
           request_hash TEXT NOT NULL,
           created_at_ms INTEGER NOT NULL,
-          lease_expires_at_ms INTEGER NOT NULL
+          lease_expires_at_ms INTEGER NOT NULL,
+          coverage_start_ms INTEGER NOT NULL,
+          cutoff_ms INTEGER NOT NULL
         )
       `);
       this.ctx.storage.sql.exec(
@@ -452,6 +454,21 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       }
       this.ctx.storage.sql.exec(
         "INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, ?)",
+        new Date().toISOString(),
+      );
+    });
+    if (current < 5) this.ctx.storage.transactionSync(() => {
+      const cursorColumns = this.ctx.storage.sql
+        .exec<{ readonly [key: string]: SqlStorageValue; name: string }>("PRAGMA table_info(manifest_page_cursors)")
+        .toArray();
+      if (!cursorColumns.some((column) => column.name === "coverage_start_ms")) {
+        this.ctx.storage.sql.exec("ALTER TABLE manifest_page_cursors ADD COLUMN coverage_start_ms INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!cursorColumns.some((column) => column.name === "cutoff_ms")) {
+        this.ctx.storage.sql.exec("ALTER TABLE manifest_page_cursors ADD COLUMN cutoff_ms INTEGER NOT NULL DEFAULT 0");
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (5, ?)",
         new Date().toISOString(),
       );
     });
@@ -1070,11 +1087,11 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         "commit_deciding", "commit_pending_manifest", "manifest_registered", "committing",
         "committed_pending_ack", "committed", "quarantined",
       ]);
-      const cancelAuthorized = new Set(["abort_decided", "aborting", "aborted_pending_manifest_cancel", "aborted"]);
+      const cancelAuthorized = new Set(["abort_decided", "aborting", "aborted_pending_manifest_cancel", "aborted", "quarantined"]);
       if (
         input.resolution === "FINALIZED"
           ? !commitAuthorized.has(coordinator.state) || !["commit", "quarantined"].includes(coordinator.decision)
-          : !cancelAuthorized.has(coordinator.state) || coordinator.decision !== "abort"
+          : !cancelAuthorized.has(coordinator.state) || !["abort", "quarantined"].includes(coordinator.decision)
       ) throw new TypeError("Coordinator state does not authorize the requested resolution.");
       if (input.resolution === "FINALIZED") validateManifestFinalizeIntent(input.terminal_intent);
       else validateManifestCancelIntent(input.terminal_intent);
@@ -1919,25 +1936,36 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           last_tx_id: last.tx_id,
         } as const : null;
         this.ctx.storage.sql.exec(
-          `INSERT INTO manifest_page_cursors (cursor_json, request_hash, created_at_ms, lease_expires_at_ms)
-           VALUES (?, ?, ?, ?)
+          `INSERT INTO manifest_page_cursors
+            (cursor_json, request_hash, created_at_ms, lease_expires_at_ms, coverage_start_ms, cutoff_ms)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(cursor_json) DO UPDATE SET
              request_hash = excluded.request_hash,
-             lease_expires_at_ms = excluded.lease_expires_at_ms`,
+             lease_expires_at_ms = excluded.lease_expires_at_ms,
+             coverage_start_ms = excluded.coverage_start_ms,
+             cutoff_ms = excluded.cutoff_ms`,
           `lease:${requestHash}`,
           requestHash,
           now,
           leaseExpiresAtMs,
+          coverageStartMs,
+          cutoffMs,
         );
         if (nextCursor !== null) {
           this.ctx.storage.sql.exec(
-            `INSERT INTO manifest_page_cursors (cursor_json, request_hash, created_at_ms, lease_expires_at_ms)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(cursor_json) DO UPDATE SET lease_expires_at_ms = excluded.lease_expires_at_ms`,
+            `INSERT INTO manifest_page_cursors
+              (cursor_json, request_hash, created_at_ms, lease_expires_at_ms, coverage_start_ms, cutoff_ms)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(cursor_json) DO UPDATE SET
+               lease_expires_at_ms = excluded.lease_expires_at_ms,
+               coverage_start_ms = excluded.coverage_start_ms,
+               cutoff_ms = excluded.cutoff_ms`,
             canonicalJson(nextCursor),
             requestHash,
             now,
             leaseExpiresAtMs,
+            coverageStartMs,
+            cutoffMs,
           );
         }
         return {
@@ -2290,12 +2318,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       now,
       limit,
     );
-    const cursorLease = this.ctx.storage.sql
-      .exec<{ expires_at_ms: number | null }>(
-        "SELECT MIN(lease_expires_at_ms) AS expires_at_ms FROM manifest_page_cursors",
-      )
-      .one().expires_at_ms;
-    if (cursorLease !== null) return { deleted: 0, deferred_until_ms: Math.max(now, cursorLease) };
     const drainingSeal = this.ctx.storage.sql
       .exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE status = 'DRAINING'",
@@ -2319,13 +2341,40 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       )
       .toArray();
     if (candidates.length === 0) return { deleted: 0, deferred_until_ms: null };
+    const minimumCandidateMs = candidates[0].commit_decided_at_ms;
+    const maximumCandidateMs = candidates.at(-1)!.commit_decided_at_ms;
+    const cursorLease = this.ctx.storage.sql
+      .exec<{ expires_at_ms: number | null }>(
+        `SELECT MIN(lease_expires_at_ms) AS expires_at_ms FROM manifest_page_cursors
+          WHERE coverage_start_ms <= ? AND cutoff_ms >= ?`,
+        maximumCandidateMs,
+        minimumCandidateMs,
+      )
+      .one().expires_at_ms;
+    if (cursorLease !== null) return { deleted: 0, deferred_until_ms: Math.max(now, cursorLease) };
     const priorRoot = this.ctx.storage.sql
       .exec<{ retention_evidence_root: string }>(
         "SELECT retention_evidence_root FROM manifest_bucket_state WHERE id = 1",
       )
       .one().retention_evidence_root;
     const evidenceRoot = await hashCanonicalJson([priorRoot || ZERO_HASH, candidates]);
-    const deleted = this.ctx.storage.transactionSync(() => {
+    const deletion = this.ctx.storage.transactionSync(() => {
+      const blockingLease = this.ctx.storage.sql
+        .exec<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM manifest_page_cursors
+            WHERE lease_expires_at_ms > ? AND coverage_start_ms <= ? AND cutoff_ms >= ?`,
+          now,
+          maximumCandidateMs,
+          minimumCandidateMs,
+        )
+        .one().count;
+      if (blockingLease > 0) return { deleted: 0, deferred: true };
+      const draining = this.ctx.storage.sql
+        .exec<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE status = 'DRAINING'",
+        )
+        .one().count;
+      if (draining > 0) return { deleted: 0, deferred: true };
       const replay = this.ctx.storage.sql
         .exec<{
           readonly [key: string]: SqlStorageValue;
@@ -2342,7 +2391,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           limit,
         )
         .toArray();
-      if (canonicalJson(replay) !== canonicalJson(candidates)) return 0;
+      if (canonicalJson(replay) !== canonicalJson(candidates)) return { deleted: 0, deferred: false };
       for (const candidate of candidates) {
         this.ctx.storage.sql.exec("DELETE FROM manifest_reservations WHERE tx_id = ?", candidate.tx_id);
       }
@@ -2357,9 +2406,12 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         evidenceRoot,
         now,
       );
-      return candidates.length;
+      return { deleted: candidates.length, deferred: false };
     });
-    return { deleted, deferred_until_ms: null };
+    return {
+      deleted: deletion.deleted,
+      deferred_until_ms: deletion.deferred ? now + HELD_RETENTION_RECHECK_MS : null,
+    };
   }
 
   async alarm(): Promise<void> {

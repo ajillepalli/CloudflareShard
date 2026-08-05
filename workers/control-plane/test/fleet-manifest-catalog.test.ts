@@ -33,6 +33,28 @@ async function activation(catalog: FleetManifestCatalogStore, partition: number,
 }
 
 describe("FleetManifestCatalogStore", () => {
+  it("releases terminal route-assignment idempotency state", async () => {
+    await withCatalog("route-release", async (catalog) => {
+      const draft = {
+        fleet_id: FLEET,
+        tx_id: "tx-route-release",
+        coordinator_id: "coordinator-route-release",
+        operation_hash: "a".repeat(64),
+        decision_epoch: 1,
+      };
+      const assigned = await catalog.assignManifestRoute(draft, "route-release-key", Date.UTC(2026, 7, 5, 12));
+      expect(assigned.status).toBe("assigned");
+      catalog.releaseManifestRoute(FLEET, draft.tx_id, assigned.reservation_hash, Date.UTC(2026, 7, 5, 13));
+      await expect(catalog.assignManifestRoute(draft, "route-release-key", Date.UTC(2026, 7, 5, 12, 30))).resolves.toMatchObject({
+        status: "already_assigned",
+      });
+      catalog.purgeReleasedRoutes(Date.UTC(2026, 7, 5, 13));
+      await expect(catalog.assignManifestRoute(draft, "route-release-key", Date.UTC(2026, 7, 5, 13))).resolves.toMatchObject({
+        status: "assigned",
+      });
+    });
+  });
+
   it("starts with an immutable 16-partition configuration and rejects near-term resharding", async () => {
     await withCatalog("partition-config", async (catalog) => {
       const initial = await catalog.partitionConfigForDay(FLEET, DAY);

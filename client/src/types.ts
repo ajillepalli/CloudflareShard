@@ -359,6 +359,10 @@ export type TxStatusResponse =
       epoch: number;
       operationHash: string;
       commitAuthorized: boolean;
+      quarantineCandidates?: Array<{
+        kind: "record" | "finalize_intent" | "cancel_intent";
+        hash: string;
+      }>;
     };
 
 export interface TxForceAbortRequest {

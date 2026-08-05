@@ -11,6 +11,7 @@ import {
   canonicalJson,
   createManifestRegistration,
   hashCanonicalJson,
+  hashManifestFinalizeIntent,
   hashManifestRecordV2,
   hashManifestReservation,
   hashParticipantOperations,
@@ -1081,11 +1082,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         transactionError("MANIFEST_TERMINAL_CONFLICT", "Finalized manifest record conflicts with the durable coordinator decision."),
       );
     }
-    const completedEnvelope: RedoEnvelopeV1 = {
-      ...(JSON.parse(row.redo_envelope_intent_json!) as Omit<RedoEnvelopeV1, "commit_decided_at" | "retention_deadline">),
-      commit_decided_at: result.record.commit_decided_at,
-      retention_deadline: result.record.retention_deadline,
-    };
+    const storedEnvelopeIntent = JSON.parse(row.redo_envelope_intent_json!) as Record<string, unknown>;
+    const completedEnvelope = (
+      "commit_decided_at" in storedEnvelopeIntent && "retention_deadline" in storedEnvelopeIntent
+        ? storedEnvelopeIntent
+        : {
+            ...storedEnvelopeIntent,
+            commit_decided_at: result.record.commit_decided_at,
+            retention_deadline: result.record.retention_deadline,
+          }
+    ) as unknown as RedoEnvelopeV1;
     await validateRedoEnvelope(completedEnvelope);
     try {
       this.transition(row.tx_id, [state], "manifest_registered", () => {
@@ -1499,6 +1505,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
               reservation,
               reservation_hash: reservationHash,
               record_hash: row.manifest_record_hash,
+              retention_deadline_ms: new Date(record.retention_deadline).getTime(),
             })
           : null;
       } catch {
@@ -1837,6 +1844,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const row = this.loadTx(body.txId);
     if (!row) return json({ found: false });
     const state = this.stateOf(row);
+    const quarantineCandidates: Array<{ kind: "record" | "finalize_intent" | "cancel_intent"; hash: string }> = [];
+    if (row.manifest_record_hash) quarantineCandidates.push({ kind: "record", hash: row.manifest_record_hash });
+    if (row.manifest_finalize_request_json) {
+      const finalize = JSON.parse(row.manifest_finalize_request_json) as ManifestFinalizeRequestV1;
+      quarantineCandidates.push({ kind: "finalize_intent", hash: await hashManifestFinalizeIntent(finalize.intent) });
+    }
+    if (row.manifest_cancel_request_json) {
+      const cancel = JSON.parse(row.manifest_cancel_request_json) as ManifestCancelRequestV1;
+      quarantineCandidates.push({ kind: "cancel_intent", hash: await hashCanonicalJson(cancel.intent) });
+    }
     return json({
       found: true,
       status: state,
@@ -1844,6 +1861,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       epoch: row.epoch,
       operationHash: row.operation_hash,
       commitAuthorized: ["manifest_registered", "committing", "committed_pending_ack", "committed"].includes(state),
+      ...(["quarantined", "aborted_pending_manifest_cancel"].includes(state) ? { quarantineCandidates } : {}),
     });
   }
 
@@ -2065,11 +2083,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       if (!row.redo_envelope_intent_json) {
         return protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Resolved finalize has no durable redo-envelope intent."));
       }
-      const completedEnvelope: RedoEnvelopeV1 = {
-        ...(JSON.parse(row.redo_envelope_intent_json) as Omit<RedoEnvelopeV1, "commit_decided_at" | "retention_deadline">),
-        commit_decided_at: resolvedRecord.commit_decided_at,
-        retention_deadline: resolvedRecord.retention_deadline,
-      };
+      const storedEnvelopeIntent = JSON.parse(row.redo_envelope_intent_json) as Record<string, unknown>;
+      const completedEnvelope = (
+        "commit_decided_at" in storedEnvelopeIntent && "retention_deadline" in storedEnvelopeIntent
+          ? storedEnvelopeIntent
+          : {
+              ...storedEnvelopeIntent,
+              commit_decided_at: resolvedRecord.commit_decided_at,
+              retention_deadline: resolvedRecord.retention_deadline,
+            }
+      ) as unknown as RedoEnvelopeV1;
       await validateRedoEnvelope(completedEnvelope);
       try {
         this.ctx.storage.transactionSync(() => {

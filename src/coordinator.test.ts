@@ -975,6 +975,9 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         expect(JSON.parse(durable.manifest_reservation_json)).toMatchObject({ tx_id: txId });
         expect(JSON.parse(durable.manifest_finalize_request_json)).toMatchObject({ intent: { tx_id: txId } });
         expect(JSON.parse(durable.manifest_record_json)).toMatchObject({ tx_id: txId });
+        expect(await hashCanonicalJson(JSON.parse(durable.redo_envelope_json))).toBe(
+          JSON.parse(durable.manifest_record_json).envelope_hash,
+        );
       });
     },
   );
@@ -1288,6 +1291,12 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect(parked.decision).toBe("abort");
       expect(JSON.parse(parked.manifest_cancel_request_json)).toMatchObject({ intent: { tx_id: txId } });
       expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+      const status = await instance.fetch(post("/tx-status", { txId }));
+      const statusBody = (await status.json()) as { quarantineCandidates: Array<{ kind: string; hash: string }> };
+      expect(statusBody.quarantineCandidates).toContainEqual({
+        kind: "cancel_intent",
+        hash: await hashCanonicalJson(JSON.parse(parked.manifest_cancel_request_json).intent),
+      });
 
       const retry = await instance.fetch(post("/begin", {
         txId,

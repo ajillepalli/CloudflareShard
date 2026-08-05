@@ -382,10 +382,10 @@ seal evidence required by the supported recovery window. Retirement requires a
 bucket-issued empty/retention-safe certificate and is itself retained in catalog
 history long enough to validate every supported cursor and cutoff.
 
-Every catalog entry also pins the bucket's current conflict/resolution root.
-An unresolved quarantine blocks that snapshot. A resolution appends a new catalog
-evidence generation; cursors bound to an older root fail closed and restart, while
-the underlying immutable seal receipt remains chained rather than rewritten.
+Every seal receipt records the bucket's conflict/resolution root for audit.
+Unresolved quarantine is rechecked by each local page and blocks enumeration;
+later audited resolutions do not change immutable membership or invalidate an
+already returned cursor page.
 
 The catalog owns append-only `partition_config_history` records containing
 `effective_from_day`, protocol version, partition count, prior hash, and config

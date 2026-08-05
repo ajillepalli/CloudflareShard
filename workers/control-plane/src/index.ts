@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   CURRENT_PROTOCOL_VERSION,
+  COORDINATOR_RETENTION_DAYS,
   MANIFEST_CURSOR_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_PAGE_FORMAT_VERSION,
@@ -143,7 +144,13 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         partition: reservation.partition,
         partition_count: reservation.partition_count,
         partition_config_hash: reservation.partition_config_hash,
-        activation_key: request.reservation_hash,
+        activation_key: await hashCanonicalJson([
+          "bucket-activation",
+          reservation.fleet_id,
+          reservation.reservation_utc_day,
+          reservation.partition,
+          reservation.partition_config_hash,
+        ]),
       });
       const bucket = this.env.JOURNAL_MANIFEST.getByName(objectName);
       return await bucket.reserve(
@@ -187,7 +194,18 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       if (request.intent.reservation_hash !== request.reservation_hash || request.intent.tx_id !== request.reservation.tx_id) {
         throw new TransactionContractViolation(transactionError("MANIFEST_TERMINAL_CONFLICT", "Cancel request does not identify its frozen reservation."));
       }
-      return await this.env.JOURNAL_MANIFEST.getByName(objectName).cancel(request.intent);
+      const result = await this.env.JOURNAL_MANIFEST.getByName(objectName).cancel(request.intent);
+      if (result.ok) {
+        await this.env.FLEET_MANIFEST_CATALOG
+          .getByName(`fleet:${request.reservation.fleet_id}`)
+          .releaseManifestRoute(
+            request.reservation.fleet_id,
+            request.reservation.tx_id,
+            request.reservation_hash,
+            Date.now() + COORDINATOR_RETENTION_DAYS * 86_400_000,
+          );
+      }
+      return result;
     } catch (error) {
       const protocolError = asProtocolError(error);
       return {
@@ -219,11 +237,22 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
   async releaseManifestV2(request: ManifestV2ReleaseRequest): Promise<ManifestReleaseResult> {
     try {
       const objectName = await manifestObjectNameForReservation(request.reservation, request.reservation_hash);
-      return await this.env.JOURNAL_MANIFEST.getByName(objectName).releaseV2(
+      const result = await this.env.JOURNAL_MANIFEST.getByName(objectName).releaseV2(
         request.reservation.tx_id,
         request.reservation_hash,
         request.record_hash,
       );
+      if (result.ok && result.status !== "not_found") {
+        await this.env.FLEET_MANIFEST_CATALOG
+          .getByName(`fleet:${request.reservation.fleet_id}`)
+          .releaseManifestRoute(
+            request.reservation.fleet_id,
+            request.reservation.tx_id,
+            request.reservation_hash,
+            request.retention_deadline_ms,
+          );
+      }
+      return result;
     } catch (error) {
       const protocolError = asProtocolError(error);
       return {
@@ -520,11 +549,6 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           diagnostics: { inspected_buckets: 0, incomplete_buckets: 1, returned_records: 0 },
         };
       }
-      if (request.conflict_resolution_root !== "0".repeat(64)) {
-        throw new TransactionContractViolation(
-          transactionError("MANIFEST_CURSOR_MISMATCH", "Requested conflict-resolution root is not the current catalog root."),
-        );
-      }
       const cursor = request.cursor;
       const afterDay = cursor?.reservation_utc_day ?? "";
       const afterPartition = cursor === null
@@ -651,7 +675,6 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
             request_hash: requestHash,
             catalog_generation: request.catalog_generation,
             catalog_snapshot_hash: request.catalog_snapshot_hash,
-            conflict_resolution_root: request.conflict_resolution_root,
             reservation_utc_day: entry.reservation_day,
             partition: entry.partition,
             local_cursor: local.next_cursor,
@@ -667,7 +690,6 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           request_hash: requestHash,
           catalog_generation: request.catalog_generation,
           catalog_snapshot_hash: request.catalog_snapshot_hash,
-          conflict_resolution_root: request.conflict_resolution_root,
           reservation_utc_day: lastEntry.reservation_day,
           partition: lastEntry.partition,
           local_cursor: null,

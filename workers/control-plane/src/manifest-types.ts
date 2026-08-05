@@ -194,6 +194,7 @@ export interface ManifestV2ReleaseRequest {
   readonly reservation: ManifestReservationV1;
   readonly reservation_hash: string;
   readonly record_hash: string;
+  readonly retention_deadline_ms: number;
 }
 
 export interface ManifestCoordinatorStateAttestationV1 {

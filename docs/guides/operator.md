@@ -598,7 +598,10 @@ An unresolved V2 conflict requires explicit audited repair through
 `POST /admin/resolve-manifest-quarantine` with the admin bearer token. Supply
 `txId`, `resolution` (`FINALIZED` or `CANCELLED`), the reviewed `selectedHash`
 and `evidenceHash`, non-empty `actor` and `reason`, and a stable
-`idempotencyKey`. The CoordinatorDO derives and hashes its durable state and
+`idempotencyKey`. First call `POST /admin/tx-status`; a quarantined or parked
+transaction returns `quarantineCandidates` with labeled record, finalize-intent,
+and cancel-intent hashes. Review those values against the incident evidence and
+use the hash matching the selected canonical outcome. The CoordinatorDO derives and hashes its durable state and
 terminal intent; a changed or outcome-incompatible state fails closed. Replay
 the same idempotency key after an ambiguous response. Never invent a new key to
 bypass a conflicting prior repair attestation.
