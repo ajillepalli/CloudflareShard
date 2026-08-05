@@ -768,6 +768,10 @@ export class FleetManifestCatalogStore {
 
     return this.storage.transactionSync(() => {
       const metadata = this.storage.sql.exec<MetadataRow>("SELECT * FROM fleet_catalog_metadata WHERE id = 1").one();
+      const requiredDecisionFloorMs = Math.max(
+        metadata.decision_floor_ms,
+        (metadata.reservation_required_since_ms ?? 0) - 1,
+      );
       const replay = this.storage.sql
         .exec<{ readonly [key: string]: SqlStorageValue; reservation_day: string; partition: number; entry_hash: string }>(
           "SELECT reservation_day, partition, entry_hash FROM catalog_activation_keys WHERE activation_key = ?",
@@ -812,7 +816,7 @@ export class FleetManifestCatalogStore {
             status: "reactivated",
             activation_sequence: sequence,
             entry_hash: entryHash,
-            required_decision_floor_ms: metadata.decision_floor_ms,
+            required_decision_floor_ms: requiredDecisionFloorMs,
           };
         }
         return {
@@ -820,7 +824,7 @@ export class FleetManifestCatalogStore {
           status: "already_active",
           activation_sequence: row.activation_sequence,
           entry_hash: entryHash,
-          required_decision_floor_ms: metadata.decision_floor_ms,
+          required_decision_floor_ms: requiredDecisionFloorMs,
         };
       }
 
@@ -846,7 +850,7 @@ export class FleetManifestCatalogStore {
           status: "already_active",
           activation_sequence: existing.activation_sequence,
           entry_hash: entryHash,
-          required_decision_floor_ms: metadata.decision_floor_ms,
+          required_decision_floor_ms: requiredDecisionFloorMs,
         };
       }
 
@@ -905,7 +909,7 @@ export class FleetManifestCatalogStore {
         status: existing === undefined ? "activated" : "reactivated",
         activation_sequence: sequence,
         entry_hash: entryHash,
-        required_decision_floor_ms: metadata.decision_floor_ms,
+        required_decision_floor_ms: requiredDecisionFloorMs,
       };
     });
   }

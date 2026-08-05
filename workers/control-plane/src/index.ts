@@ -368,16 +368,8 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         ? coverageState.reservation_required_since_day
         : new Date(Date.parse(`${coverageState.legacy_grid_materialized_through_day}T00:00:00.000Z`) + 86_400_000)
             .toISOString().slice(0, 10);
-      const daysToMaterialize: string[] = [];
-      for (
-        let day = firstUnmaterializedDay;
-        day <= cutoffDay;
-        day = new Date(Date.parse(`${day}T00:00:00.000Z`) + 86_400_000).toISOString().slice(0, 10)
-      ) {
-        if (daysToMaterialize.length === 36) break;
-        daysToMaterialize.push(day);
-      }
-      for (const day of daysToMaterialize) {
+      if (firstUnmaterializedDay <= cutoffDay) {
+        const day = firstUnmaterializedDay;
         const dayConfig = await catalog.partitionConfigForDay(request.fleet_id, day);
         for (let partition = 0; partition < dayConfig.partition_count; partition += 1) {
           await catalog.activateBucket({
@@ -391,8 +383,6 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           });
         }
         await catalog.advanceLegacyGridMaterializedThrough(request.fleet_id, day);
-      }
-      if (daysToMaterialize.at(-1) !== undefined && daysToMaterialize.at(-1)! < cutoffDay) {
         return {
           ok: true,
           status: "pending",
@@ -450,7 +440,19 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         const bucket = this.env.JOURNAL_MANIFEST.getByName(
           await manifestObjectName(request.fleet_id, entry.reservation_day, entry.partition),
         );
-        await bucket.initializeForSeal(sealRequest, snapshot.decision_floor_ms);
+        const initialized = await bucket.initializeForSeal(
+          sealRequest,
+          snapshot.decision_floor_ms,
+          coverageState.reservation_required_since_ms!,
+        );
+        if (!initialized.ok) {
+          return {
+            ok: false,
+            status: initialized.status,
+            http_status: initialized.http_status,
+            error: initialized.error,
+          };
+        }
         const sealed = await bucket.closeThrough(sealRequest);
         if (!sealed.ok && sealed.status === "seal_in_progress") {
           return {

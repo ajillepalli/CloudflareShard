@@ -69,12 +69,15 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     };
     const first = await assignedRoute.worker.reserveManifest(request);
     const replay = await assignedRoute.worker.reserveManifest(request);
+    const catalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${assignedRoute.reservation.fleet_id}`);
+    const coverage = await catalog.coverageState(assignedRoute.reservation.fleet_id);
+    if (coverage.reservation_required_since_ms === null) throw new Error("Expected a V2 coverage boundary.");
 
     expect(first).toMatchObject({
       ok: true,
       status: "reserved",
       reservation_hash: assignedRoute.reservation_hash,
-      required_decision_floor_ms: 0,
+      required_decision_floor_ms: coverage.reservation_required_since_ms - 1,
       local_legacy_certificate_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     expect(replay).toMatchObject({ ok: true, status: "already_reserved" });
@@ -163,6 +166,68 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       status: "unavailable",
       http_status: 503,
       error: { code: "TX_MANIFEST_UNAVAILABLE", retryable: true },
+    });
+  });
+
+  it("refuses fleet close when certified legacy evidence overlaps the V2 coverage boundary", async () => {
+    const route = await assigned(`tx-legacy-overlap-${crypto.randomUUID()}`);
+    const catalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${route.reservation.fleet_id}`);
+    const coverage = await catalog.coverageState(route.reservation.fleet_id);
+    if (coverage.reservation_required_since_ms === null) throw new Error("Expected a V2 coverage boundary.");
+    const participants: readonly RedoParticipantV1[] = [{
+      participant_id: "shard-a",
+      epoch: 1,
+      intents: [{
+        intent_seq: 0,
+        sql: "INSERT INTO t (id) VALUES (?)",
+        params: ["legacy-overlap"],
+        tenant_id: "tenant-a",
+        table_name: "t",
+        partition_key: "legacy-overlap",
+        vbucket: null,
+        operation: "insert",
+        mirror_target_participant_id: null,
+      }],
+    }];
+    const commitDecidedAt = new Date(coverage.reservation_required_since_ms).toISOString();
+    const envelope: RedoEnvelopeV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: REDO_ENVELOPE_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      fleet_id: route.reservation.fleet_id,
+      coordinator_id: route.reservation.coordinator_id,
+      decision: "commit",
+      decision_epoch: 1,
+      commit_decided_at: commitDecidedAt,
+      retention_deadline: new Date(coverage.reservation_required_since_ms + COORDINATOR_RETENTION_DAYS * 86_400_000).toISOString(),
+      operation_hash: await hashParticipantOperations(participants),
+      participants,
+    };
+    const registration = await createManifestRegistration(envelope);
+    const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    await expect(bucket.register(registration)).resolves.toMatchObject({ ok: true, status: "registered" });
+    await expect(route.worker.reserveManifest({
+      reservation: route.reservation,
+      reservation_hash: route.reservation_hash,
+    })).resolves.toMatchObject({ ok: true });
+
+    let close = await route.worker.closeFleetThrough({
+      fleet_id: route.reservation.fleet_id,
+      cutoff: new Date(Math.max(Date.now(), coverage.reservation_required_since_ms)).toISOString(),
+    });
+    for (let attempt = 0; attempt < 4 && close.ok && close.status === "pending"; attempt += 1) {
+      close = await route.worker.closeFleetThrough({
+        fleet_id: route.reservation.fleet_id,
+        cutoff: new Date(Math.max(Date.now(), coverage.reservation_required_since_ms)).toISOString(),
+      });
+    }
+    expect(close).toMatchObject({
+      ok: false,
+      status: "rejected",
+      error: { code: "MANIFEST_UNPROVEN_LEGACY_WINDOW" },
+    });
+    await expect(catalog.coverageState(route.reservation.fleet_id)).resolves.toMatchObject({
+      legacy_scanned_through_day: null,
     });
   });
 
@@ -1030,6 +1095,32 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       ok: false,
       status: "rejected",
       error: { code: "MANIFEST_CURSOR_MISMATCH" },
+    });
+  });
+
+  it("materializes one legacy grid day per close invocation before starting a snapshot", async () => {
+    const route = await assigned(`tx-grid-budget-${crypto.randomUUID()}`);
+    const catalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${route.reservation.fleet_id}`);
+    const firstDay = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+    await runInDurableObject(catalog, async (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE fleet_catalog_metadata
+            SET reservation_required_since_day = ?,
+                reservation_required_since_ms = ?,
+                legacy_grid_materialized_through_day = NULL
+          WHERE id = 1`,
+        firstDay,
+        Date.parse(`${firstDay}T00:00:00.000Z`),
+      );
+    });
+
+    await expect(route.worker.closeFleetThrough({
+      fleet_id: route.reservation.fleet_id,
+      cutoff: new Date().toISOString(),
+    })).resolves.toMatchObject({ ok: true, status: "pending", total_buckets: 0 });
+    await expect(catalog.coverageState(route.reservation.fleet_id)).resolves.toMatchObject({
+      legacy_grid_materialized_through_day: firstDay,
+      current_snapshot_generation: 0,
     });
   });
 });

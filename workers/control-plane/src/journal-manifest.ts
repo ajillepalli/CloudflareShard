@@ -155,6 +155,7 @@ interface BucketStateRow {
   evidence_revision: number;
   legacy_certificate_hash: string | null;
   legacy_certificate_json: string | null;
+  legacy_max_commit_decided_at_ms: number | null;
   legacy_closed: number;
 }
 
@@ -302,6 +303,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           retention_evidence_root TEXT NOT NULL DEFAULT '',
           legacy_certificate_hash TEXT,
           legacy_certificate_json TEXT,
+          legacy_max_commit_decided_at_ms INTEGER,
           legacy_closed INTEGER NOT NULL DEFAULT 0,
           updated_at_ms INTEGER NOT NULL
         )
@@ -493,6 +495,18 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         new Date().toISOString(),
       );
     });
+    if (current < 7) this.ctx.storage.transactionSync(() => {
+      const bucketColumns = this.ctx.storage.sql
+        .exec<{ readonly [key: string]: SqlStorageValue; name: string }>("PRAGMA table_info(manifest_bucket_state)")
+        .toArray();
+      if (!bucketColumns.some((column) => column.name === "legacy_max_commit_decided_at_ms")) {
+        this.ctx.storage.sql.exec("ALTER TABLE manifest_bucket_state ADD COLUMN legacy_max_commit_decided_at_ms INTEGER");
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (7, ?)",
+        new Date().toISOString(),
+      );
+    });
   }
 
   private partitionMatches(record: ManifestRecordV1, metadata: PartitionMetadataRow): boolean {
@@ -570,11 +584,13 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
    * deterministically completes the certificate before V2 admission. */
   private async ensureLegacyCertificate(): Promise<string> {
     const existing = this.ctx.storage.sql
-      .exec<{ legacy_certificate_hash: string | null }>(
-        "SELECT legacy_certificate_hash FROM manifest_bucket_state WHERE id = 1",
+      .exec<{ legacy_certificate_hash: string | null; legacy_max_commit_decided_at_ms: number | null }>(
+        "SELECT legacy_certificate_hash, legacy_max_commit_decided_at_ms FROM manifest_bucket_state WHERE id = 1",
       )
-      .one().legacy_certificate_hash;
-    if (existing !== null) return existing;
+      .one();
+    if (existing.legacy_certificate_hash !== null && existing.legacy_max_commit_decided_at_ms !== null) {
+      return existing.legacy_certificate_hash;
+    }
 
     const legacyRows = this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
@@ -582,31 +598,40 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         Date.now(),
       );
       return this.ctx.storage.sql
-        .exec<{ tx_id: string; record_hash: string }>(
-          "SELECT tx_id, record_hash FROM manifest_records ORDER BY tx_id",
+        .exec<{ tx_id: string; record_hash: string; commit_decided_at: string }>(
+          "SELECT tx_id, record_hash, commit_decided_at FROM manifest_records WHERE protocol_version = 1 ORDER BY tx_id",
         )
         .toArray();
     });
+    const legacyMaxCommitDecidedAtMs = legacyRows.reduce(
+      (maximum, row) => Math.max(maximum, new Date(row.commit_decided_at).getTime()),
+      -1,
+    );
     const certificate = {
-      schema_version: 1,
+      schema_version: 2,
       status: legacyRows.length === 0 ? "NO_LEGACY" : "IMPORTED",
       record_count: legacyRows.length,
       records_root: await hashCanonicalJson(legacyRows),
+      maximum_commit_decided_at_ms: legacyMaxCommitDecidedAtMs,
     } as const;
     const certificateHash = await hashCanonicalJson(certificate);
     return this.ctx.storage.transactionSync(() => {
       const current = this.ctx.storage.sql
-        .exec<{ legacy_certificate_hash: string | null }>(
-          "SELECT legacy_certificate_hash FROM manifest_bucket_state WHERE id = 1",
+        .exec<{ legacy_certificate_hash: string | null; legacy_max_commit_decided_at_ms: number | null }>(
+          "SELECT legacy_certificate_hash, legacy_max_commit_decided_at_ms FROM manifest_bucket_state WHERE id = 1",
         )
-        .one().legacy_certificate_hash;
-      if (current !== null) return current;
+        .one();
+      if (current.legacy_certificate_hash !== null && current.legacy_max_commit_decided_at_ms !== null) {
+        return current.legacy_certificate_hash;
+      }
       this.ctx.storage.sql.exec(
         `UPDATE manifest_bucket_state
-            SET legacy_certificate_hash = ?, legacy_certificate_json = ?, updated_at_ms = ?
+            SET legacy_certificate_hash = ?, legacy_certificate_json = ?,
+                legacy_max_commit_decided_at_ms = ?, updated_at_ms = ?
           WHERE id = 1`,
         certificateHash,
         canonicalJson(certificate),
+        legacyMaxCommitDecidedAtMs,
         Date.now(),
       );
       return certificateHash;
@@ -1515,10 +1540,19 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
     }
   }
 
-  async initializeForSeal(input: unknown, requiredDecisionFloorMs: number): Promise<{
+  async initializeForSeal(
+    input: unknown,
+    requiredDecisionFloorMs: number,
+    reservationRequiredSinceMs: number,
+  ): Promise<{
     readonly ok: true;
     readonly local_legacy_certificate_hash: string;
     readonly decision_floor_ms: number;
+  } | {
+    readonly ok: false;
+    readonly status: "rejected";
+    readonly http_status: number;
+    readonly error: ReturnType<typeof manifestError>;
   }> {
     validateManifestSealRequest(input);
     const request: ManifestSealRequestV1 = input;
@@ -1527,7 +1561,24 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         manifestError("MANIFEST_INVALID_REQUEST", "required_decision_floor_ms must be a non-negative safe integer."),
       );
     }
+    if (!Number.isSafeInteger(reservationRequiredSinceMs) || reservationRequiredSinceMs < 0) {
+      throw new TransactionContractViolation(
+        manifestError("MANIFEST_INVALID_REQUEST", "reservation_required_since_ms must be a non-negative safe integer."),
+      );
+    }
     const certificateHash = await this.ensureLegacyCertificate();
+    const legacyMaximum = this.ctx.storage.sql
+      .exec<{ legacy_max_commit_decided_at_ms: number | null }>(
+        "SELECT legacy_max_commit_decided_at_ms FROM manifest_bucket_state WHERE id = 1",
+      )
+      .one().legacy_max_commit_decided_at_ms;
+    if (legacyMaximum === null || legacyMaximum >= reservationRequiredSinceMs) {
+      const error = manifestError(
+        "MANIFEST_UNPROVEN_LEGACY_WINDOW",
+        "Legacy bucket evidence overlaps the fleet reservation coverage boundary.",
+      );
+      return { ok: false, status: "rejected", http_status: error.http_status, error };
+    }
     const decisionFloor = this.ctx.storage.transactionSync(() => {
       const metadata = this.ctx.storage.sql
         .exec<PartitionMetadataRow>(
