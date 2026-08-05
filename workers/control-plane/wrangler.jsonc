@@ -11,11 +11,19 @@
       {
         "name": "JOURNAL_MANIFEST",
         "class_name": "JournalManifestDO"
+      },
+      {
+        "name": "FLEET_MANIFEST_CATALOG",
+        "class_name": "FleetManifestCatalogDO"
       }
     ]
   },
   "exports": {
     "JournalManifestDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "FleetManifestCatalogDO": {
       "type": "durable-object",
       "storage": "sqlite"
     }
