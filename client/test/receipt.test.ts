@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { stableStringify, writeReceipt } from "../src/receipt.js";
 import type { VerifyResult } from "../src/onboarding.js";
+import { credentialUrl } from "./redaction-fixtures.js";
 
 const result: VerifyResult = {
   schemaVersion: "cloudflareshard.onboarding-result.v1",
@@ -23,7 +24,11 @@ describe("versioned receipts", () => {
       ...result,
       diagnostic: { password: "nested-password", metadata: { client_secret: "nested-client-secret" } },
     } as VerifyResult;
-    const written = await writeReceipt(unsafeResult, "https://alice:target-password@worker.example.test/path?token=admin-secret#fragment-secret", { directory, secrets: ["admin-secret", "tenant-secret"] });
+    const written = await writeReceipt(
+      unsafeResult,
+      credentialUrl("alice", "target-password", "worker.example.test", "/path?token=admin-secret#fragment-secret"),
+      { directory, secrets: ["admin-secret", "tenant-secret"] },
+    );
     const text = await readFile(written.path, "utf8");
     const parsed = JSON.parse(text) as Record<string, unknown>;
     expect(text).not.toContain("admin-secret");

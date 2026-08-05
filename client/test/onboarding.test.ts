@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { runDoctor, runVerify, type OnboardingClock, type VerifyAdminApi, type VerifyTenantApi } from "../src/onboarding.js";
 import { exitCodeFor } from "../src/onboarding-output.js";
 import type { MutateRequest } from "../src/types.js";
+import { credentialUrl } from "./redaction-fixtures.js";
 
 const clock: OnboardingClock = { now: () => new Date("2026-08-05T12:00:00.000Z") };
 
@@ -44,7 +45,7 @@ describe("doctor domain result", () => {
   it.each([
     {
       name: "URL userinfo",
-      message: "request to https://alice:supersecret@worker.example.test/status failed",
+      message: `request to ${credentialUrl("alice", "supersecret", "worker.example.test", "/status")} failed`,
       forbidden: ["alice", "supersecret", "worker.example.test"],
     },
     {

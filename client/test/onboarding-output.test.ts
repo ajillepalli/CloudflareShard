@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { exitCodeFor, renderHuman, renderJson, terminalWidth, type OnboardingOutput } from "../src/onboarding-output.js";
 import type { DoctorResult, VerifyResult } from "../src/onboarding.js";
+import { credentialUrl } from "./redaction-fixtures.js";
 
 const base = {
   schemaVersion: "cloudflareshard.onboarding-result.v1" as const,
@@ -46,12 +47,12 @@ describe("onboarding renderers", () => {
         id: "failure",
         label: "password: label-secret",
         status: "FAIL",
-        message: "https://alice:supersecret@worker.example.test/path?token=query-secret#fragment-secret",
+        message: credentialUrl("alice", "supersecret", "worker.example.test", "/path?token=query-secret#fragment-secret"),
       }],
     };
     const unsafeOutput = output(doctor);
     if (!unsafeOutput.receipt) throw new Error("test fixture requires a receipt");
-    unsafeOutput.receipt.path = "https://alice:receipt-secret@receipts.example.test/result.json?token=path-secret";
+    unsafeOutput.receipt.path = credentialUrl("alice", "receipt-secret", "receipts.example.test", "/result.json?token=path-secret");
 
     for (const rendered of [renderHuman(unsafeOutput), renderJson(unsafeOutput)]) {
       for (const secret of ["label-secret", "supersecret", "worker.example.test", "query-secret", "receipt-secret", "receipts.example.test", "path-secret"]) {

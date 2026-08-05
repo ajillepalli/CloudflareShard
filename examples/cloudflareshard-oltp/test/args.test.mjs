@@ -18,7 +18,10 @@ test("numeric options require finite positive values and integer options stay in
 });
 
 test("base URL rejects secrets and non-local cleartext targets", () => {
-  assert.throws(() => parseArgs(["--base-url", "https://user:secret@example.com"]), /credentials/);
+  const credentialTarget = new URL("https://example.com");
+  credentialTarget.username = "user";
+  credentialTarget.password = "secret";
+  assert.throws(() => parseArgs(["--base-url", credentialTarget.href]), /credentials/);
   assert.throws(() => parseArgs(["--base-url", "http://example.com"]), /HTTPS/);
   assert.equal(parseArgs(["--base-url", "http://localhost:8787/"]).baseUrl, "http://localhost:8787");
 });

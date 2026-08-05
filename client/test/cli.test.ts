@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CloudflareShardAdminClient } from "../src/admin-client.js";
 import { dispatch, isCommand, requireFlag, run, usage } from "../src/cli.js";
 import { mockFetch } from "./test-helpers.js";
+import { credentialUrl } from "./redaction-fixtures.js";
 
 describe("CLI", () => {
   afterEach(() => {
@@ -50,7 +51,7 @@ describe("CLI", () => {
     vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => { stdout += String(chunk); return true; }) as typeof process.stdout.write);
     vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => { stderr += String(chunk); return true; }) as typeof process.stderr.write);
 
-    await expect(run(["doctor", "--url", "https://alice:supersecret@worker.example.test", "--token", "admin-secret", "--receipt-dir", blockingFile, "--output", "json"])).resolves.toBe(3);
+    await expect(run(["doctor", "--url", credentialUrl("alice", "supersecret", "worker.example.test"), "--token", "admin-secret", "--receipt-dir", blockingFile, "--output", "json"])).resolves.toBe(3);
 
     const output = JSON.parse(stdout) as { receipt: unknown; failure?: { code?: string; category?: string } };
     expect(output.receipt).toBeNull();
