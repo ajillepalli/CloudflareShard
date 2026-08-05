@@ -474,7 +474,7 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
   // and /v1/mutate paths. Otherwise a no-op DELETE strips the __cf_row_owners
   // entry for a STILL-LIVE row (writeOrDeleteProvenance deletes on any DELETE),
   // stranding it in a migration.
-  it("a committed 2PC delete intent that matches zero rows preserves provenance and enqueues no mirror", async () => {
+  it("a guard-mismatched 2PC delete is rejected at prepare and cannot later commit", async () => {
     const stub = await freshShard();
     await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY, v TEXT)");
 
@@ -496,9 +496,9 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     );
     expect(provBefore).toBe(1);
 
-    // 2PC delete intent for live-row whose WHERE matches nothing (v mismatch),
-    // with a mirror target set (as if the vbucket is mid-migration). Commit it.
-    await stub.fetch(
+    // A delete whose guard matches no row cannot vote prepared. Accepting a
+    // later commit without durable prepared intent would violate 2PC.
+    const prepareRes = await stub.fetch(
       post("/prepare", {
         coordinatorTxId: "tx-noop-del",
         intents: [
@@ -515,8 +515,9 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
         ],
       }),
     );
+    expect(prepareRes.status).toBe(409);
     const commitRes = await stub.fetch(post("/commit", { coordinatorTxId: "tx-noop-del" }));
-    expect(commitRes.status).toBe(200);
+    expect(commitRes.status).toBe(503);
 
     // The still-live row survives (the delete matched nothing).
     const rowCount = (await (
@@ -563,6 +564,70 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     expect(abortRetry.status).toBe(200);
   });
 
+  it("upgrade regression: unversioned commit resolves migrated prepared rows with an empty predecessor hash", async () => {
+    const stub = await freshShard();
+    const txId = `tx-legacy-commit-${crypto.randomUUID()}`;
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");
+    expect((await stub.fetch(post("/prepare", {
+      coordinatorTxId: txId,
+      intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }],
+    }))).status).toBe(200);
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE pending_intents SET protocol_version = 0, operation_hash = '' WHERE coordinator_tx_id = ?",
+        txId,
+      );
+    });
+
+    const committed = await stub.fetch(post("/commit", { coordinatorTxId: txId }));
+    expect(committed.status).toBe(200);
+    expect((await stub.fetch(post("/commit", { coordinatorTxId: txId }))).status).toBe(200);
+
+    const durable = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => ({
+      rowCount: state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM t WHERE id = ?", txId).one().n,
+      tombstone: state.storage.sql.exec<{ decision: string; operation_hash: string }>(
+        "SELECT decision, operation_hash FROM participant_decision_tombstones WHERE tx_id = ?",
+        txId,
+      ).one(),
+    }));
+    expect(durable.rowCount).toBe(1);
+    expect(durable.tombstone.decision).toBe("commit");
+    expect(durable.tombstone.operation_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("upgrade regression: unversioned abort resolves migrated prepared rows with an empty predecessor hash", async () => {
+    const stub = await freshShard();
+    const txId = `tx-legacy-abort-${crypto.randomUUID()}`;
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");
+    expect((await stub.fetch(post("/prepare", {
+      coordinatorTxId: txId,
+      intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }],
+    }))).status).toBe(200);
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE pending_intents SET protocol_version = 0, operation_hash = '' WHERE coordinator_tx_id = ?",
+        txId,
+      );
+    });
+
+    const aborted = await stub.fetch(post("/abort", { coordinatorTxId: txId }));
+    expect(aborted.status).toBe(200);
+    expect((await stub.fetch(post("/abort", { coordinatorTxId: txId }))).status).toBe(200);
+
+    const durable = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => ({
+      intents: Array.from(state.storage.sql.exec("SELECT * FROM pending_intents WHERE coordinator_tx_id = ?", txId)).length,
+      locks: Array.from(state.storage.sql.exec("SELECT * FROM row_locks WHERE coordinator_tx_id = ?", txId)).length,
+      tombstone: state.storage.sql.exec<{ decision: string; operation_hash: string }>(
+        "SELECT decision, operation_hash FROM participant_decision_tombstones WHERE tx_id = ?",
+        txId,
+      ).one(),
+    }));
+    expect(durable.intents).toBe(0);
+    expect(durable.locks).toBe(0);
+    expect(durable.tombstone.decision).toBe("abort");
+    expect(durable.tombstone.operation_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
   it("rejects abort after commit (would violate atomicity)", async () => {
     const stub = await freshShard();
     await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");
@@ -577,7 +642,44 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     const abortRes = await stub.fetch(post("/abort", { coordinatorTxId: "tx-4" }));
     expect(abortRes.status).toBe(409);
     const body = (await abortRes.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("ALREADY_COMMITTED");
+    expect(body.error.code).toBe("TX_DECISION_CONFLICT");
+  });
+
+  it("enforces epoch/hash monotonicity and preserves the terminal decision after intent cleanup", async () => {
+    const stub = await freshShard();
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");
+    const txId = `tx-monotonic-${crypto.randomUUID()}`;
+    const operationHash = "a".repeat(64);
+    const message = (phase: "prepare" | "commit" | "abort", epoch = 2, hash = operationHash) => ({
+      protocol_version: 1,
+      tx_id: txId,
+      epoch,
+      phase,
+      operation_hash: hash,
+    });
+
+    const prepared = await stub.fetch(post("/prepare", {
+      ...message("prepare"),
+      intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }],
+    }));
+    expect(prepared.status).toBe(200);
+
+    const stale = await stub.fetch(post("/commit", message("commit", 1)));
+    expect(stale.status).toBe(409);
+    expect(((await stale.json()) as { error: { code: string } }).error.code).toBe("TX_EPOCH_STALE");
+
+    const mismatched = await stub.fetch(post("/commit", message("commit", 2, "b".repeat(64))));
+    expect(mismatched.status).toBe(409);
+    expect(((await mismatched.json()) as { error: { code: string } }).error.code).toBe("TX_ENVELOPE_HASH_MISMATCH");
+
+    expect((await stub.fetch(post("/commit", message("commit")))).status).toBe(200);
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM pending_intents WHERE coordinator_tx_id = ?", txId);
+    });
+    expect((await stub.fetch(post("/commit", message("commit")))).status).toBe(200);
+    const contradictory = await stub.fetch(post("/abort", message("abort")));
+    expect(contradictory.status).toBe(409);
+    expect(((await contradictory.json()) as { error: { code: string } }).error.code).toBe("TX_DECISION_CONFLICT");
   });
 
   it("lock conflict across two coordinatorTxIds returns 409 with retryAfterMs", async () => {
@@ -991,7 +1093,7 @@ describe("ShardDO 2PC: TTL sweep queries the coordinator, never unilaterally abo
     });
   });
 
-  it("aborts locally when the coordinator has no record of the txId (never durably persisted)", async () => {
+  it("blocks when the coordinator has no record of the txId instead of making a unilateral decision", async () => {
     const stub = await freshShard();
     const coordinatorTxId = `sweep-not-found-${crypto.randomUUID()}`;
     await makeStalePendingIntent(stub, coordinatorTxId);
@@ -1003,7 +1105,9 @@ describe("ShardDO 2PC: TTL sweep queries the coordinator, never unilaterally abo
 
     await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
       const intents = Array.from(state.storage.sql.exec("SELECT * FROM pending_intents WHERE coordinator_tx_id = ?", coordinatorTxId));
-      expect(intents).toHaveLength(0);
+      const locks = Array.from(state.storage.sql.exec("SELECT * FROM row_locks WHERE coordinator_tx_id = ?", coordinatorTxId));
+      expect(intents).toHaveLength(1);
+      expect(locks).toHaveLength(1);
     });
   });
 

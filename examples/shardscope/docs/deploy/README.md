@@ -1,46 +1,58 @@
 # Deploy your own CloudflareShard cluster
 
-> **The live Deploy button is in the repo-root [`README.md`](../../../../README.md)**
-> ("Deploy your own cluster"). This directory is the detailed reference: the
-> confirm-gated teardown script, the `.env.example` secret note, and a copy of
-> the button-compatible cluster `wrangler.toml`. The one thing still open is the
-> first real deploy→teardown verification against a live account — see
-> [`NOTES.md`](./NOTES.md).
+> **The former one-Worker Deploy button is retired.** Cloudflare does not deploy
+> multiple Worker applications from one repository together, while the current
+> cluster requires both the route-less control-plane Worker and the public
+> Worker. Use the repo-root [`README.md`](../../../../README.md) instructions and
+> the ordered `npm run deploy` command. Live deploy→teardown qualification is
+> still pending; see [`NOTES.md`](./NOTES.md).
 
 Spin up your own CloudflareShard cluster — the same multi-tenant, sharded,
-transactional database Shardscope demos — in your own Cloudflare account, in a
-few clicks.
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
+transactional database Shardscope demos — in your own Cloudflare account from
+a repository clone.
 
 ## What this creates (and what it costs)
 
-The button clones this repo into **your** GitHub and deploys **to your own
-Cloudflare account**. It provisions:
+The ordered root deployment command deploys **to your own Cloudflare account**.
+It provisions:
 
-- **One Worker** (`cloudflare-shard`, renameable on the setup page) — the cluster.
-- **Three SQLite Durable Object classes** — `CATALOG` (control plane / routing +
-  the topology lock), `SHARD` (data plane / your tenant data), `COORDINATOR`
-  (2PC). Created automatically from the `[[migrations]]` in `wrangler.toml`.
+- **Two Workers** — the required route-less `cloudflare-shard-control-plane`
+  service first, then the public `cloudflare-shard-mvp` gateway.
+- **Four SQLite Durable Object classes** — `JOURNAL_MANIFEST` in the control
+  plane, plus `CATALOG`, `SHARD`, and `COORDINATOR` in the public Worker.
 
-There are **no** KV/D1/R2/Queue resources — the cluster is a single
-self-contained Worker.
+There are **no** KV/D1/R2/Queue resources. The two-Worker cluster is
+self-contained.
 
-**Cost — read this.** Durable Objects require the **Workers Paid** plan, and
-everything created here is **billed to your account** (Worker requests + Durable
-Object requests/duration/storage; Workers Logs too, if you leave observability
-on). This is a real database in your account, not a sandbox. Idle cost is low,
-but it is not zero, and load costs money. Tear it down when you're done (below).
+**Cost — read this.** SQLite-backed Durable Objects are available on Workers
+Free and Paid, subject to the current plan limits, and everything created here
+is **billed to your account**. This is a real database in your account, not a
+sandbox. Check the current official pricing and limits before a run, and tear
+the cluster down when you're done.
+
+Deploy from the repository root:
+
+```bash
+npm install
+npm run deploy
+```
+
+This deploys the control plane first and the public Worker second. Do not
+reverse or skip those steps.
 
 ## After deploy: set your admin token
 
-The cluster gates its whole `/admin/*` surface on a secret, `ADMIN_TOKEN`. The
-setup page prompts for it (from [`.env.example`](./.env.example)). Set
+The cluster gates its whole `/admin/*` surface on a secret, `ADMIN_TOKEN`. Set
 it to a **strong random value** (`openssl rand -hex 32`) — anyone with it can
 init, reshard, or drop your cluster. If it's unset the Worker returns
 `500 ADMIN_TOKEN is not configured`.
 
-Then initialize the cluster (from your machine, against your new Worker's URL):
+Set it on the public Worker with Wrangler, then initialize the cluster from your
+machine against the new public Worker URL:
+
+```bash
+npx wrangler secret put ADMIN_TOKEN --config wrangler.toml
+```
 
 ```bash
 # 1) create the shard topology
@@ -55,15 +67,14 @@ curl -X POST https://<your-worker>.workers.dev/admin/init \
 
 ## Point an app (or the Shardscope dashboard) at it
 
-The Deploy button provisions **one** Worker and does **not** wire a service
-binding to a second one. So an app or the Shardscope dashboard is a **separate**
-Worker in the same account whose `SHARD_API` service binding targets the
-`cloudflare-shard` Worker above:
+An app or the Shardscope dashboard is a **separate** Worker in the same account
+whose `SHARD_API` service binding targets the public `cloudflare-shard-mvp`
+Worker:
 
 ```toml
 [[services]]
 binding = "SHARD_API"
-service = "cloudflare-shard"          # the Worker name you deployed above
+service = "cloudflare-shard-mvp"      # the public Worker deployed above
 entrypoint = "CloudflareShardRpc"
 ```
 
@@ -74,9 +85,10 @@ binding block — just set `service` to your cluster's Worker name and
 ## Tear it down
 
 ```bash
-./teardown.sh            # reads the Worker name from wrangler.toml
-# or: ./teardown.sh <the-name-you-chose>
+npm run delete
 ```
 
-Deleting the Worker deletes its Durable Objects and all cluster data, and billing
-for it stops. Delete any separate dashboard/app Worker yourself.
+The aggregate command deletes the public Worker first and the control plane
+second. Do not delete the control plane first: a surviving gateway must never
+start transactions against a missing manifest service. Delete any separate
+dashboard/app Worker yourself.

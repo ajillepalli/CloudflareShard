@@ -273,6 +273,48 @@ describe("Worker /v1/tx index-participant piggyback (Milestone 2 Chunk 3)", () =
     expect(postIndexBody.status).toBe("committed");
   });
 
+  it("keeps the eight caller-key budget valid when index intents fan out across more than eight physical shards", async () => {
+    await post("/admin/init", { numShards: 3, totalVBuckets: 24, force: true }, AUTH());
+    await createIndexTestTable("idx_physical_fanout_evt");
+    await post(
+      "/admin/create-index",
+      { indexName: "idx_physical_fanout_by_v", table: "idx_physical_fanout_evt", columns: ["v"] },
+      AUTH(),
+    );
+    const ring = ((await (await post("/admin/list-indexes", {}, AUTH())).json()) as {
+      indexes: Array<{ indexName: string; placementRing: string[] }>;
+    }).indexes.find((index) => index.indexName === "idx_physical_fanout_by_v")!.placementRing;
+    expect(ring.length).toBeGreaterThan(8);
+
+    const values: string[] = [];
+    const indexShards = new Set<string>();
+    for (let candidateIndex = 0; values.length < 8; candidateIndex += 1) {
+      const candidate = `fanout-${candidateIndex}`;
+      const shardId = indexShardIdForKey(
+        "idx_physical_fanout_evt",
+        "idx_physical_fanout_by_v",
+        JSON.stringify([candidate]),
+        ring,
+      );
+      if (shardId.startsWith("catalog-0-") || indexShards.has(shardId)) continue;
+      indexShards.add(shardId);
+      values.push(candidate);
+    }
+
+    const tenantId = tenantForCatalogShard(0, 4);
+    const token = await registerTenant(tenantId);
+    const mutations = values.map((value, index) => ({
+      op: "insert" as const,
+      table: "idx_physical_fanout_evt",
+      tenantId,
+      partitionKey: `row-${index}`,
+      values: { v: value },
+    }));
+    const response = await post("/v1/tx", { mutations, requestId: "req-physical-fanout" }, token);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, status: "committed" });
+  });
+
   it("eng-review fix, UPDATED (P0 fix — see shard.ts's TX_PARTICIPANT_GUARD_MISMATCH): an update via /v1/tx whose where clause doesn't match now aborts the whole transaction, leaving the base row and its index entry untouched", async () => {
     await post("/admin/init", { numShards: 1, totalVBuckets: 4, force: true }, AUTH());
     const res0 = await post(

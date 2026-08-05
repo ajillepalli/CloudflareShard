@@ -1,4 +1,21 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  CURRENT_PROTOCOL_VERSION,
+  PARTICIPANT_TOMBSTONE_FORMAT_VERSION,
+  PARTICIPANT_TOMBSTONE_RETENTION_DAYS,
+  TransactionContractViolation,
+  canonicalJson,
+  hashCanonicalJson,
+  transactionError,
+  validateParticipantMessageAgainstTombstone,
+  validateParticipantPhaseMessage,
+  validateParticipantTombstone,
+  type ParticipantDecision,
+  type ParticipantDecisionTombstoneV1,
+  type ParticipantPhase,
+  type ParticipantPhaseMessageV1,
+  type TransactionProtocolError,
+} from "../packages/contracts/src/index.js";
 import { json } from "./http";
 import { log } from "./log";
 import { indexShardIdForKey } from "./hash";
@@ -108,6 +125,35 @@ type CommittableIntent = {
   mirror_target_shard_id: string | null;
 };
 
+type PendingDecisionMetadata = {
+  protocol_version: number;
+  epoch: number;
+  operation_hash: string;
+};
+
+type StoredPendingIntentIdentity = {
+  intent_seq: number;
+  sql: string;
+  params_json: string;
+  status: string;
+  lock_keys_json: string;
+  tenant_id: string | null;
+  table_name: string | null;
+  partition_key: string | null;
+  vbucket: number | null;
+  op: string | null;
+  mirror_target_shard_id: string | null;
+  protocol_version: number;
+  epoch: number;
+  operation_hash: string;
+};
+
+type ParticipantPayload = ParticipantPhaseMessageV1 & {
+  intents?: PrepareIntent[];
+  /** True only for the predecessor coordinator's unversioned wire format. */
+  legacy_unversioned?: true;
+};
+
 /** Milestone 3 (review Tier 1 #5): requestIds ShardDO generates for its own
  * internal replication (mirror deliveries) live under this reserved prefix.
  * The gateway rejects any CLIENT-supplied requestId that starts with it, so a
@@ -129,6 +175,7 @@ const INDEX_JOB_BATCH_SIZE = 20;
 const MIRROR_JOB_BASE_DELAY_MS = 1000;
 const MIRROR_JOB_MAX_DELAY_MS = 60000;
 const MIRROR_JOB_BATCH_SIZE = 20;
+const PARTICIPANT_TOMBSTONE_RETENTION_MS = PARTICIPANT_TOMBSTONE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 // Single source of truth in sql-safety.ts (INTERNAL_TABLE_NAMES), so the
 // tenant-facing internal-table write guard and this /stats filter can't drift.
@@ -261,6 +308,7 @@ export class ShardDO extends DurableObject {
       "/commit": this.handleCommit.bind(this),
       "/abort": this.handleAbort.bind(this),
       "/tx-status": this.handleTxStatus.bind(this),
+      "/recover": this.handleRecover.bind(this),
       "/pending-intent-count": this.handlePendingIntentCount.bind(this),
       "/prepared-intent-count-for-vbucket": this.handlePreparedIntentCountForVbucket.bind(this),
       "/invalidate-request": this.handleInvalidateRequest.bind(this),
@@ -312,6 +360,7 @@ export class ShardDO extends DurableObject {
     this.ensureSchema();
     const cutoff = new Date(Date.now() - APPLIED_REQUESTS_TTL_MS).toISOString();
     this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
+    this.sql.exec("DELETE FROM participant_decision_tombstones WHERE retention_deadline < ?", new Date().toISOString());
     await this.sweepStalePendingIntents();
     const nextIndexJobRetry = await this.processIndexPendingJobs();
     const nextMirrorJobRetry = await this.processMirrorPendingJobs();
@@ -1274,8 +1323,17 @@ export class ShardDO extends DurableObject {
 
     for (const { coordinator_tx_id: coordinatorTxId } of stale) {
       try {
-        const decision = await this.queryCoordinatorDecision(coordinatorTxId);
-        if (decision === "committed") {
+        const recovery = await this.queryCoordinatorDecision(coordinatorTxId);
+        if (recovery.decision === "committed") {
+          const metadata = this.pendingMetadata(coordinatorTxId);
+          if (!metadata) continue;
+          this.persistTombstone({
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            tx_id: coordinatorTxId,
+            epoch: recovery.epoch ?? metadata.epoch,
+            phase: "recover",
+            operation_hash: recovery.operationHash ?? metadata.operation_hash,
+          }, "commit");
           const intents = this.many<CommittableIntent>(
             "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op, mirror_target_shard_id FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
             coordinatorTxId,
@@ -1284,13 +1342,22 @@ export class ShardDO extends DurableObject {
           // a recovery-driven commit mirrors identically.
           const enqueuedMirror = this.applyCommittedIntents(coordinatorTxId, intents);
           if (enqueuedMirror) await this.scheduleMirrorAlarmSoon();
-        } else if (decision === "aborted" || decision === "not_found") {
+        } else if (recovery.decision === "aborted") {
+          const metadata = this.pendingMetadata(coordinatorTxId);
+          if (!metadata) continue;
+          this.persistTombstone({
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            tx_id: coordinatorTxId,
+            epoch: recovery.epoch ?? metadata.epoch,
+            phase: "recover",
+            operation_hash: recovery.operationHash ?? metadata.operation_hash,
+          }, "abort");
           this.ctx.storage.transactionSync(() => {
             this.sql.exec("DELETE FROM pending_intents WHERE coordinator_tx_id = ?", coordinatorTxId);
             this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", coordinatorTxId);
           });
         } else {
-          log("shard.stuck_transaction_pending", { coordinatorTxId, decision });
+          log("shard.stuck_transaction_pending", { coordinatorTxId, decision: recovery.decision });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1302,7 +1369,7 @@ export class ShardDO extends DurableObject {
 
   private async queryCoordinatorDecision(
     coordinatorTxId: string,
-  ): Promise<"committed" | "aborted" | "not_found" | "pending" | "unreachable"> {
+  ): Promise<{ decision: "committed" | "aborted" | "pending" | "unreachable"; epoch?: number; operationHash?: string }> {
     try {
       // One CoordinatorDO instance per transaction (env.COORDINATOR.idFromName
       // is keyed directly on coordinatorTxId) — see Chunk 3's cost-model
@@ -1314,14 +1381,21 @@ export class ShardDO extends DurableObject {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ txId: coordinatorTxId }),
       });
-      if (!res.ok) return "unreachable";
-      const body = (await res.json()) as { found: boolean; status?: string };
-      if (!body.found) return "not_found";
-      if (body.status === "committed") return "committed";
-      if (body.status === "aborted") return "aborted";
-      return "pending";
+      if (!res.ok) return { decision: "unreachable" };
+      const body = (await res.json()) as { found: boolean; status?: string; epoch?: number; operationHash?: string; commitAuthorized?: boolean };
+      if (!body.found) return { decision: "unreachable" };
+      const operationHash = typeof body.operationHash === "string" && /^[a-f0-9]{64}$/.test(body.operationHash)
+        ? body.operationHash
+        : undefined;
+      if (body.commitAuthorized === true || body.status === "committed") {
+        return { decision: "committed", epoch: body.epoch, operationHash };
+      }
+      if (body.status === "abort_decided" || body.status === "aborting" || body.status === "aborted") {
+        return { decision: "aborted", epoch: body.epoch, operationHash };
+      }
+      return { decision: "pending", epoch: body.epoch, operationHash };
     } catch {
-      return "unreachable";
+      return { decision: "unreachable" };
     }
   }
 
@@ -1374,6 +1448,25 @@ export class ShardDO extends DurableObject {
     // Review Tier 1 #2: which target (if any) a committed base-row intent
     // must be mirrored to, enqueued atomically with the commit.
     this.ensureColumn("pending_intents", "mirror_target_shard_id", "TEXT");
+    // Expand-first monotonic participant protocol. Legacy in-flight rows read
+    // as protocol_version 0 and are resolved only through the explicit legacy
+    // adapter; new writes always carry the shared v1 epoch/hash message.
+    this.ensureColumn("pending_intents", "protocol_version", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("pending_intents", "epoch", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("pending_intents", "operation_hash", "TEXT NOT NULL DEFAULT ''");
+
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS participant_decision_tombstones (
+        tx_id TEXT PRIMARY KEY,
+        protocol_version INTEGER NOT NULL,
+        format_version INTEGER NOT NULL,
+        highest_epoch INTEGER NOT NULL,
+        decision TEXT NOT NULL,
+        operation_hash TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        retention_deadline TEXT NOT NULL
+      )
+    `);
 
     // Milestone 3, Chunk 0. One row per (table_name, partition_key) currently
     // owned by a base row on THIS shard, recording the logical (tenantId,
@@ -1569,10 +1662,271 @@ export class ShardDO extends DurableObject {
     return Array.from(this.sql.exec(sql, ...params));
   }
 
+  private protocolResponse(error: TransactionProtocolError): Response {
+    return json({ error }, error.http_status);
+  }
+
+  private tombstone(txId: string): ParticipantDecisionTombstoneV1 | null {
+    const row = this.one<{
+      tx_id: string;
+      protocol_version: number;
+      format_version: number;
+      highest_epoch: number;
+      decision: string;
+      operation_hash: string;
+      decided_at: string;
+      retention_deadline: string;
+    }>(
+      `SELECT tx_id, protocol_version, format_version, highest_epoch, decision,
+              operation_hash, decided_at, retention_deadline
+         FROM participant_decision_tombstones WHERE tx_id = ?`,
+      txId,
+    );
+    if (!row) return null;
+    const candidate = { ...row } as ParticipantDecisionTombstoneV1;
+    validateParticipantTombstone(candidate);
+    return candidate;
+  }
+
+  private pendingMetadata(txId: string): PendingDecisionMetadata | null {
+    return this.one<PendingDecisionMetadata>(
+      "SELECT protocol_version, epoch, operation_hash FROM pending_intents WHERE coordinator_tx_id = ? LIMIT 1",
+      txId,
+    );
+  }
+
+  private async participantPayload(
+    raw: Record<string, unknown>,
+    phase: ParticipantPhase,
+    intents?: PrepareIntent[],
+  ): Promise<ParticipantPayload> {
+    if (raw.protocol_version !== undefined) {
+      const message = {
+        protocol_version: raw.protocol_version,
+        tx_id: raw.tx_id,
+        epoch: raw.epoch,
+        phase: raw.phase,
+        operation_hash: raw.operation_hash,
+      };
+      validateParticipantPhaseMessage(message);
+      if (message.phase !== phase) {
+        throw new TransactionContractViolation(transactionError("TX_DECISION_CONFLICT", `Expected participant phase ${phase}.`));
+      }
+      return { ...message, ...(intents ? { intents } : {}) };
+    }
+
+    // Explicit expand-first adapter for the unversioned predecessor deployed
+    // before ADR-1. It never overwrites a v1 decision: a retry is hydrated
+    // from the already-durable pending row/tombstone, while a legacy prepare
+    // receives a deterministic content hash before creating state.
+    const legacyTxId = typeof raw.coordinatorTxId === "string" ? raw.coordinatorTxId : "";
+    if (!legacyTxId) {
+      throw new TransactionContractViolation(transactionError("TX_ENVELOPE_INVALID", "Missing participant tx_id."));
+    }
+    const durable = this.tombstone(legacyTxId);
+    const pending = this.pendingMetadata(legacyTxId);
+    // Rows migrated from the predecessor schema deliberately carry the
+    // expand-first sentinel operation_hash=''. A terminal replay cannot
+    // reconstruct the coordinator-wide operation hash from one participant,
+    // but it still needs a stable valid identity for its durable tombstone.
+    // Domain-separate that identity by txId; compatibility below permits it
+    // only for an unversioned terminal message over a wholly-unadopted row set.
+    const legacyTerminalHash = pending?.protocol_version === 0
+      && pending.operation_hash === ""
+      && (phase === "commit" || phase === "abort")
+      ? await hashCanonicalJson({ kind: "legacy-participant-terminal-v1", tx_id: legacyTxId })
+      : null;
+    const operationHash = durable?.operation_hash
+      ?? legacyTerminalHash
+      ?? pending?.operation_hash
+      ?? await hashCanonicalJson(intents ?? []);
+    return {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      tx_id: legacyTxId,
+      epoch: durable?.highest_epoch ?? pending?.epoch ?? 1,
+      phase,
+      operation_hash: operationHash,
+      ...(intents ? { intents } : {}),
+      legacy_unversioned: true,
+    };
+  }
+
+  private assertMessageCompatible(message: ParticipantPayload): void {
+    const durable = this.tombstone(message.tx_id);
+    if (durable) {
+      validateParticipantMessageAgainstTombstone(message, durable);
+      if (
+        message.phase === "prepare"
+        || (message.phase === "commit" && durable.decision !== "commit")
+        || (message.phase === "abort" && durable.decision !== "abort")
+      ) {
+        throw new TransactionContractViolation(
+          transactionError("TX_DECISION_CONFLICT", `Participant phase ${message.phase} contradicts its durable ${durable.decision} decision.`),
+        );
+      }
+      return;
+    }
+    const pending = this.pendingMetadata(message.tx_id);
+    if (!pending) return;
+    if (message.epoch < pending.epoch) {
+      throw new TransactionContractViolation(transactionError("TX_EPOCH_STALE", "Participant message epoch is stale."));
+    }
+    if (message.epoch > pending.epoch) {
+      throw new TransactionContractViolation(transactionError("TX_EPOCH_CONFLICT", "Participant message epoch conflicts with prepared state."));
+    }
+    const legacyTerminalBridge = message.legacy_unversioned === true
+      && (message.phase === "commit" || message.phase === "abort")
+      && this.storedIntentIdentity(message.tx_id).every(
+        (row) => row.protocol_version === 0 && row.operation_hash === "" && row.status === "prepared",
+      );
+    if (message.operation_hash !== pending.operation_hash && !legacyTerminalBridge) {
+      throw new TransactionContractViolation(transactionError("TX_ENVELOPE_HASH_MISMATCH", "Participant operation hash conflicts with prepared state."));
+    }
+  }
+
+  private storedIntentIdentity(txId: string): StoredPendingIntentIdentity[] {
+    return this.many<StoredPendingIntentIdentity>(
+      `SELECT intent_seq, sql, params_json, status, lock_keys_json, tenant_id,
+              table_name, partition_key, vbucket, op, mirror_target_shard_id,
+              protocol_version, epoch, operation_hash
+         FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC`,
+      txId,
+    );
+  }
+
+  private legacyIntentsSemanticallyMatch(stored: StoredPendingIntentIdentity[], intents: PrepareIntent[]): boolean {
+    if (stored.length !== intents.length || stored.length === 0) return false;
+    return stored.every((row, index) => {
+      const intent = intents[index];
+      if (!intent || row.intent_seq !== index || row.status !== "prepared") return false;
+      let storedParams: unknown;
+      let storedLocks: unknown;
+      try {
+        storedParams = JSON.parse(row.params_json);
+        storedLocks = JSON.parse(row.lock_keys_json);
+      } catch {
+        return false;
+      }
+      return row.sql === intent.sql
+        && canonicalJson(storedParams) === canonicalJson(intent.params ?? [])
+        && canonicalJson(storedLocks) === canonicalJson([rowKey(intent.tenantId, intent.table, intent.partitionKey)])
+        && row.tenant_id === intent.tenantId
+        && row.table_name === intent.table
+        && row.partition_key === intent.partitionKey
+        && row.vbucket === (intent.vbucket ?? null)
+        && row.op === (intent.op ?? null)
+        && row.mirror_target_shard_id === (intent.mirrorTargetShardId ?? null);
+    });
+  }
+
+  private adoptLegacyPrepared(message: ParticipantPhaseMessageV1, intents: PrepareIntent[]): number {
+    return this.ctx.storage.transactionSync(() => {
+      const stored = this.storedIntentIdentity(message.tx_id);
+      const entirelyUnadopted = stored.length > 0
+        && stored.every((row) => row.protocol_version === 0 && row.operation_hash === "");
+      if (!entirelyUnadopted || !this.legacyIntentsSemanticallyMatch(stored, intents)) {
+        throw new TransactionContractViolation(
+          transactionError("TX_ENVELOPE_HASH_MISMATCH", "Versioned prepare does not exactly match the unadopted legacy participant intents."),
+        );
+      }
+      this.sql.exec(
+        `UPDATE pending_intents
+         SET protocol_version = ?, epoch = ?, operation_hash = ?
+         WHERE coordinator_tx_id = ? AND protocol_version = 0 AND operation_hash = ''`,
+        CURRENT_PROTOCOL_VERSION,
+        message.epoch,
+        message.operation_hash,
+        message.tx_id,
+      );
+      return stored.length;
+    });
+  }
+
+  private discardUnadoptedLegacy(message: ParticipantPhaseMessageV1): number {
+    const decidedAt = new Date().toISOString();
+    const tombstone: ParticipantDecisionTombstoneV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: PARTICIPANT_TOMBSTONE_FORMAT_VERSION,
+      tx_id: message.tx_id,
+      highest_epoch: message.epoch,
+      decision: "abort",
+      operation_hash: message.operation_hash,
+      decided_at: decidedAt,
+      retention_deadline: new Date(new Date(decidedAt).getTime() + PARTICIPANT_TOMBSTONE_RETENTION_MS).toISOString(),
+    };
+    validateParticipantTombstone(tombstone);
+    return this.ctx.storage.transactionSync(() => {
+      const stored = this.storedIntentIdentity(message.tx_id);
+      if (
+        stored.length === 0
+        || !stored.every((row) => row.protocol_version === 0 && row.operation_hash === "" && row.status === "prepared")
+      ) {
+        throw new TransactionContractViolation(
+          transactionError("TX_DECISION_CONFLICT", "Legacy pre-decision abort requires only unadopted prepared intents."),
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO participant_decision_tombstones
+          (tx_id, protocol_version, format_version, highest_epoch, decision, operation_hash, decided_at, retention_deadline)
+         VALUES (?, ?, ?, ?, 'abort', ?, ?, ?)`,
+        tombstone.tx_id,
+        tombstone.protocol_version,
+        tombstone.format_version,
+        tombstone.highest_epoch,
+        tombstone.operation_hash,
+        tombstone.decided_at,
+        tombstone.retention_deadline,
+      );
+      this.sql.exec("DELETE FROM pending_intents WHERE coordinator_tx_id = ?", message.tx_id);
+      this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", message.tx_id);
+      return stored.length;
+    });
+  }
+
+  private persistTombstone(message: ParticipantPhaseMessageV1, decision: ParticipantDecision): ParticipantDecisionTombstoneV1 {
+    const existing = this.tombstone(message.tx_id);
+    if (existing) {
+      validateParticipantMessageAgainstTombstone(message, existing);
+      if (existing.decision !== decision) {
+        throw new TransactionContractViolation(transactionError("TX_DECISION_CONFLICT", "Participant decision contradicts its durable tombstone."));
+      }
+      return existing;
+    }
+    const decidedAt = new Date().toISOString();
+    const tombstone: ParticipantDecisionTombstoneV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: PARTICIPANT_TOMBSTONE_FORMAT_VERSION,
+      tx_id: message.tx_id,
+      highest_epoch: message.epoch,
+      decision,
+      operation_hash: message.operation_hash,
+      decided_at: decidedAt,
+      retention_deadline: new Date(new Date(decidedAt).getTime() + PARTICIPANT_TOMBSTONE_RETENTION_MS).toISOString(),
+    };
+    validateParticipantTombstone(tombstone);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO participant_decision_tombstones
+          (tx_id, protocol_version, format_version, highest_epoch, decision, operation_hash, decided_at, retention_deadline)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        tombstone.tx_id,
+        tombstone.protocol_version,
+        tombstone.format_version,
+        tombstone.highest_epoch,
+        tombstone.decision,
+        tombstone.operation_hash,
+        tombstone.decided_at,
+        tombstone.retention_deadline,
+      );
+    });
+    return tombstone;
+  }
+
   async fetch(request: Request): Promise<Response> {
     try {
       return await this.handle(request);
     } catch (error) {
+      if (error instanceof TransactionContractViolation) return this.protocolResponse(error.protocolError);
       const message = error instanceof Error ? error.message : String(error);
       log("shard.unhandled_error", { path: new URL(request.url).pathname, message });
       return json({ error: "Internal error." }, 500);
@@ -2366,21 +2720,36 @@ export class ShardDO extends DurableObject {
   }
 
   private async handlePrepare(request: Request): Promise<Response> {
-    const body = (await request.json()) as { coordinatorTxId?: string; intents?: PrepareIntent[] };
-    if (!body.coordinatorTxId || !body.intents || body.intents.length === 0) {
+    const raw = (await request.json()) as Record<string, unknown>;
+    const intents = Array.isArray(raw.intents) ? raw.intents as PrepareIntent[] : undefined;
+    if (!intents || intents.length === 0) {
       return json({ error: { code: "MISSING_FIELDS", message: "Missing coordinatorTxId or intents.", fix: "Provide both." } }, 400);
     }
-    const coordinatorTxId = body.coordinatorTxId;
-    const intents = body.intents;
+    const message = await this.participantPayload(raw, "prepare", intents);
+    const coordinatorTxId = message.tx_id;
 
     // Idempotent on retry.
-    const existing = this.many<{ intent_seq: number }>(
-      "SELECT intent_seq FROM pending_intents WHERE coordinator_tx_id = ?",
-      coordinatorTxId,
-    );
+    const existing = this.storedIntentIdentity(coordinatorTxId);
     if (existing.length > 0) {
+      const entirelyUnadopted = existing.every((row) => row.protocol_version === 0 && row.operation_hash === "");
+      if (entirelyUnadopted) {
+        if (!this.legacyIntentsSemanticallyMatch(existing, intents)) {
+          return this.protocolResponse(
+            transactionError("TX_ENVELOPE_HASH_MISMATCH", "Prepare retry does not match the complete stored legacy participant intent set."),
+          );
+        }
+        // Adoption is deliberately prepare-only. A commit carrying a newly
+        // invented hash can never bless an old unhashed prepared row.
+        if (raw.protocol_version !== undefined) {
+          const adopted = this.adoptLegacyPrepared(message, intents);
+          return json({ ok: true, prepared: adopted, legacyAdopted: true });
+        }
+        return json({ ok: true, prepared: existing.length, legacyAdopted: false });
+      }
+      this.assertMessageCompatible(message);
       return json({ ok: true, prepared: existing.length });
     }
+    this.assertMessageCompatible(message);
 
     // Milestone 3, Chunk 4: cutover write fence — a 2PC prepare is a NEW
     // write (nothing is durably recorded for this txId yet, per the
@@ -2554,8 +2923,8 @@ export class ShardDO extends DurableObject {
         );
         this.sql.exec(
           `
-          INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, tenant_id, table_name, partition_key, vbucket, op, mirror_target_shard_id)
-          VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO pending_intents (coordinator_tx_id, intent_seq, sql, params_json, status, lock_keys_json, prepared_at, tenant_id, table_name, partition_key, vbucket, op, mirror_target_shard_id, protocol_version, epoch, operation_hash)
+          VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
           coordinatorTxId,
           i,
@@ -2569,6 +2938,9 @@ export class ShardDO extends DurableObject {
           intent.vbucket ?? null,
           intent.op ?? null,
           intent.mirrorTargetShardId ?? null,
+          CURRENT_PROTOCOL_VERSION,
+          message.epoch,
+          message.operation_hash,
         );
       });
     });
@@ -2577,11 +2949,10 @@ export class ShardDO extends DurableObject {
   }
 
   private async handleCommit(request: Request): Promise<Response> {
-    const body = (await request.json()) as { coordinatorTxId?: string };
-    if (!body.coordinatorTxId) {
-      return json({ error: { code: "MISSING_FIELDS", message: "Missing coordinatorTxId." } }, 400);
-    }
-    const coordinatorTxId = body.coordinatorTxId;
+    const raw = (await request.json()) as Record<string, unknown>;
+    const message = await this.participantPayload(raw, "commit");
+    const coordinatorTxId = message.tx_id;
+    this.assertMessageCompatible(message);
 
     const intents = this.many<CommittableIntent>(
       "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op, mirror_target_shard_id FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
@@ -2592,15 +2963,19 @@ export class ShardDO extends DurableObject {
       // this is a retry after the row was later cleaned up. Treat as success
       // rather than erroring — the coordinator only calls commit after every
       // participant confirmed prepared.
-      return json({ ok: true, alreadyResolved: true });
+      const durable = this.tombstone(coordinatorTxId);
+      if (durable?.decision === "commit") return json({ ok: true, alreadyResolved: true, epoch: durable.highest_epoch });
+      return this.protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Participant has no prepared intent or commit tombstone."));
     }
     if (intents[0].status === "committed") {
+      this.persistTombstone(message, "commit");
       return json({ ok: true, alreadyResolved: true });
     }
     if (intents[0].status === "aborted") {
-      return json({ error: { code: "ALREADY_ABORTED", message: "This transaction was already aborted on this shard." } }, 409);
+      return this.protocolResponse(transactionError("TX_DECISION_CONFLICT", "This participant already aborted the transaction."));
     }
 
+    this.persistTombstone(message, "commit");
     const enqueuedMirror = this.applyCommittedIntents(coordinatorTxId, intents);
     if (enqueuedMirror) await this.scheduleMirrorAlarmSoon();
 
@@ -2662,18 +3037,30 @@ export class ShardDO extends DurableObject {
   }
 
   private async handleAbort(request: Request): Promise<Response> {
-    const body = (await request.json()) as { coordinatorTxId?: string };
-    if (!body.coordinatorTxId) {
-      return json({ error: { code: "MISSING_FIELDS", message: "Missing coordinatorTxId." } }, 400);
+    const raw = (await request.json()) as Record<string, unknown>;
+    const message = await this.participantPayload(raw, "abort");
+    const coordinatorTxId = message.tx_id;
+    const pending = this.storedIntentIdentity(coordinatorTxId);
+    if (
+      raw.legacy_predecision_abort === true
+      && !this.tombstone(coordinatorTxId)
+      && pending.length > 0
+      && pending.every((row) => row.protocol_version === 0 && row.operation_hash === "")
+    ) {
+      const discarded = this.discardUnadoptedLegacy(message);
+      return json({ ok: true, aborted: discarded, legacyDiscarded: true });
     }
-    const coordinatorTxId = body.coordinatorTxId;
+    this.assertMessageCompatible(message);
 
     const intents = this.many<{ status: string }>(
       "SELECT status FROM pending_intents WHERE coordinator_tx_id = ?",
       coordinatorTxId,
     );
     if (intents.length === 0) {
-      return json({ ok: true, alreadyResolved: true });
+      const durable = this.tombstone(coordinatorTxId);
+      if (durable?.decision === "abort") return json({ ok: true, alreadyResolved: true, epoch: durable.highest_epoch });
+      this.persistTombstone(message, "abort");
+      return json({ ok: true, alreadyResolved: true, epoch: message.epoch });
     }
     if (intents.some((i) => i.status === "committed")) {
       return json(
@@ -2686,6 +3073,7 @@ export class ShardDO extends DurableObject {
     // prepare only validated-then-rolled-back), so abort has nothing to
     // undo. Just delete the bookkeeping — leaves no trace, matching commit's
     // "guaranteed to succeed" symmetry.
+    this.persistTombstone(message, "abort");
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("DELETE FROM pending_intents WHERE coordinator_tx_id = ?", coordinatorTxId);
       this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", coordinatorTxId);
@@ -2699,18 +3087,48 @@ export class ShardDO extends DurableObject {
    * CoordinatorDO's own /tx-status (coordinator.ts), which answers the
    * opposite direction: a shard asking the coordinator for its decision. */
   private async handleTxStatus(request: Request): Promise<Response> {
-    const body = (await request.json()) as { coordinatorTxId?: string };
-    if (!body.coordinatorTxId) {
-      return json({ error: "Missing coordinatorTxId" }, 400);
-    }
+    const raw = (await request.json()) as Record<string, unknown>;
+    const message = await this.participantPayload(raw, "status");
+    this.assertMessageCompatible(message);
+    const durable = this.tombstone(message.tx_id);
     const intents = this.many<{ status: string }>(
       "SELECT status FROM pending_intents WHERE coordinator_tx_id = ?",
-      body.coordinatorTxId,
+      message.tx_id,
     );
     if (intents.length === 0) {
-      return json({ found: false });
+      return durable
+        ? json({ found: true, status: durable.decision === "commit" ? "committed" : "aborted", decision: durable.decision, epoch: durable.highest_epoch })
+        : json({ found: false });
     }
-    return json({ found: true, status: intents[0].status });
+    return json({ found: true, status: intents[0].status, decision: durable?.decision ?? "undecided", epoch: message.epoch });
+  }
+
+  private async handleRecover(request: Request): Promise<Response> {
+    const raw = (await request.json()) as Record<string, unknown>;
+    const message = await this.participantPayload(raw, "recover");
+    this.assertMessageCompatible(message);
+    const durable = this.tombstone(message.tx_id);
+    const requestedDecision = raw.decision;
+    const decision = durable?.decision ?? (requestedDecision === "commit" || requestedDecision === "abort" ? requestedDecision : null);
+    if (!decision) {
+      return this.protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Recovery requires an authoritative durable decision."));
+    }
+    this.persistTombstone(message, decision);
+    if (decision === "abort") {
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("DELETE FROM pending_intents WHERE coordinator_tx_id = ?", message.tx_id);
+        this.sql.exec("DELETE FROM row_locks WHERE coordinator_tx_id = ?", message.tx_id);
+      });
+      return json({ ok: true, status: "aborted", epoch: message.epoch });
+    }
+    const intents = this.many<CommittableIntent>(
+      "SELECT intent_seq, sql, params_json, status, table_name, partition_key, tenant_id, vbucket, op, mirror_target_shard_id FROM pending_intents WHERE coordinator_tx_id = ? ORDER BY intent_seq ASC",
+      message.tx_id,
+    );
+    if (intents.length === 0 || intents[0].status === "committed") return json({ ok: true, status: "committed", epoch: message.epoch });
+    const enqueuedMirror = this.applyCommittedIntents(message.tx_id, intents);
+    if (enqueuedMirror) await this.scheduleMirrorAlarmSoon();
+    return json({ ok: true, status: "committed", epoch: message.epoch });
   }
 
   private async handlePendingIntentCount(): Promise<Response> {
