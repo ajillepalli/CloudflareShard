@@ -164,6 +164,9 @@ RESOLVED only through the trusted audited operation below. FINALIZED, CANCELLED,
 and SEALED never regress.
 Duplicate identical transitions are idempotent.
 Conflicting terminal transitions quarantine rather than overwrite evidence.
+An identical reservation replay against an unresolved overlay returns that
+existing quarantine without changing `conflict_root`, candidates, or the bucket
+evidence revision.
 
 `resolveQuarantine(tx_id, resolution, selected_hash, evidence_hash, actor, reason,
 coordinator_state_hash, idempotency_key)` is route-less and available only through
@@ -365,6 +368,8 @@ The boundary write is serialized in the fleet catalog after all route-building
 awaits and is strictly greater than `legacy_admitted_through_ms`, the maximum V1
 decision accepted by the preceding catalog transactions. A V1 row therefore
 cannot land at or above a boundary later reported as complete.
+Legacy decisions a few milliseconds ahead of the control-plane clock remain a
+retryable admission result; skew cannot quarantine an irreversible V1 commit.
 Enumeration fails closed on any mismatch. Requests older than the imported
 retention window return `coverage: unproven_legacy_window`; they never produce
 `complete`. Rollback after any bucket fence must preserve V2 bridge recovery and

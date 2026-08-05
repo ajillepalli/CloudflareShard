@@ -695,7 +695,16 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           .exec<ReservationRow>("SELECT * FROM manifest_reservations WHERE tx_id = ?", reservation.tx_id)
           .toArray()[0];
         if (existingReservation !== undefined) {
-          if (existingReservation.reservation_hash === reservationHash && existingReservation.quarantine_state !== "UNRESOLVED") {
+          if (existingReservation.reservation_hash === reservationHash) {
+            if (existingReservation.quarantine_state === "UNRESOLVED") {
+              return {
+                ok: false,
+                status: "quarantined",
+                bucket_row_may_exist: true,
+                http_status: 409,
+                error: manifestError("MANIFEST_RESERVATION_CONFLICT", "Reservation is quarantined pending audited resolution."),
+              };
+            }
             return {
               ok: true,
               status: "already_reserved",
@@ -2394,7 +2403,11 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
   private async sweepV2Retention(
     now: number,
     limit = 128,
-  ): Promise<{ readonly deleted: number; readonly deferred_until_ms: number | null }> {
+  ): Promise<{
+    readonly deleted: number;
+    readonly deferred_until_ms: number | null;
+    readonly remaining_cursor_ms: number | null;
+  }> {
     this.ctx.storage.sql.exec(
       `DELETE FROM manifest_page_cursors WHERE cursor_json IN (
          SELECT cursor_json FROM manifest_page_cursors
@@ -2403,12 +2416,17 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       now,
       limit,
     );
+    const remainingCursorMs = this.ctx.storage.sql
+      .exec<{ expires_at_ms: number | null }>(
+        "SELECT MIN(lease_expires_at_ms) AS expires_at_ms FROM manifest_page_cursors",
+      )
+      .one().expires_at_ms;
     const drainingSeal = this.ctx.storage.sql
       .exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE status = 'DRAINING'",
       )
       .one().count;
-    if (drainingSeal > 0) return { deleted: 0, deferred_until_ms: now + HELD_RETENTION_RECHECK_MS };
+    if (drainingSeal > 0) return { deleted: 0, deferred_until_ms: now + HELD_RETENTION_RECHECK_MS, remaining_cursor_ms: remainingCursorMs };
     const candidates = this.ctx.storage.sql
       .exec<{
         readonly [key: string]: SqlStorageValue;
@@ -2425,7 +2443,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         limit,
       )
       .toArray();
-    if (candidates.length === 0) return { deleted: 0, deferred_until_ms: null };
+    if (candidates.length === 0) return { deleted: 0, deferred_until_ms: null, remaining_cursor_ms: remainingCursorMs };
     const minimumCandidateMs = candidates[0].commit_decided_at_ms;
     const maximumCandidateMs = candidates.at(-1)!.commit_decided_at_ms;
     const cursorLease = this.ctx.storage.sql
@@ -2437,7 +2455,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         minimumCandidateMs,
       )
       .one().expires_at_ms;
-    if (cursorLease !== null) return { deleted: 0, deferred_until_ms: Math.max(now, cursorLease) };
+    if (cursorLease !== null) return { deleted: 0, deferred_until_ms: Math.max(now, cursorLease), remaining_cursor_ms: remainingCursorMs };
     const priorRoot = this.ctx.storage.sql
       .exec<{ retention_evidence_root: string }>(
         "SELECT retention_evidence_root FROM manifest_bucket_state WHERE id = 1",
@@ -2499,6 +2517,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
     return {
       deleted: deletion.deleted,
       deferred_until_ms: deletion.deferred ? now + HELD_RETENTION_RECHECK_MS : null,
+      remaining_cursor_ms: remainingCursorMs,
     };
   }
 
@@ -2694,6 +2713,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           nextAlarm = nextAlarm === null
             ? v2Sweep.deferred_until_ms
             : Math.min(nextAlarm, v2Sweep.deferred_until_ms);
+        }
+        if (v2Sweep.remaining_cursor_ms !== null) {
+          const cursorWake = Math.max(now, v2Sweep.remaining_cursor_ms);
+          nextAlarm = nextAlarm === null ? cursorWake : Math.min(nextAlarm, cursorWake);
         }
         if (historySweep.next_deadline_ms !== null) {
           nextAlarm = nextAlarm === null

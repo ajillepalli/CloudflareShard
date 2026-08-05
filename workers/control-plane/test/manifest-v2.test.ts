@@ -149,6 +149,21 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       status: "already_registered",
       record_hash: replayRegistration.record_hash,
     });
+
+    const futureDecidedAt = new Date(Date.now() + 60_000).toISOString();
+    const futureRegistration = await createManifestRegistration({
+      ...envelope,
+      tx_id: `legacy-clock-skew-${crypto.randomUUID()}`,
+      fleet_id: `fleet-clock-skew-${crypto.randomUUID()}`,
+      commit_decided_at: futureDecidedAt,
+      retention_deadline: new Date(new Date(futureDecidedAt).getTime() + COORDINATOR_RETENTION_DAYS * 86_400_000).toISOString(),
+    });
+    await expect(replayWorker.registerManifest(futureRegistration)).resolves.toMatchObject({
+      ok: false,
+      status: "unavailable",
+      http_status: 503,
+      error: { code: "TX_MANIFEST_UNAVAILABLE", retryable: true },
+    });
   });
 
   it("assigns the canonical decision in the bucket and replays finalization exactly", async () => {
@@ -235,6 +250,32 @@ describe("Manifest V2 reservation and terminal transitions", () => {
 
     const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(assignedRoute.reservation));
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 1, v2_quarantined: 1 });
+    const evidenceBeforeReplay = await runInDurableObject(bucket, async (_instance, state) => ({
+      reservation: state.storage.sql.exec<{ conflict_root: string }>(
+        "SELECT conflict_root FROM manifest_reservations WHERE tx_id = ?",
+        assignedRoute.reservation.tx_id,
+      ).one(),
+      bucket: state.storage.sql.exec<{ evidence_revision: number }>(
+        "SELECT evidence_revision FROM manifest_bucket_state WHERE id = 1",
+      ).one(),
+    }));
+    await expect(assignedRoute.worker.reserveManifest({
+      reservation: assignedRoute.reservation,
+      reservation_hash: assignedRoute.reservation_hash,
+    })).resolves.toMatchObject({ ok: false, status: "quarantined" });
+    await runInDurableObject(bucket, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ conflict_root: string }>(
+        "SELECT conflict_root FROM manifest_reservations WHERE tx_id = ?",
+        assignedRoute.reservation.tx_id,
+      ).one()).toEqual(evidenceBeforeReplay.reservation);
+      expect(state.storage.sql.exec<{ evidence_revision: number }>(
+        "SELECT evidence_revision FROM manifest_bucket_state WHERE id = 1",
+      ).one()).toEqual(evidenceBeforeReplay.bucket);
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_reservation_conflicts WHERE tx_id = ? AND transition_kind = 'RESERVE'",
+        assignedRoute.reservation.tx_id,
+      ).one().count).toBe(0);
+    });
 
     const authorizationSourceHash = await hashCanonicalJson(cancelIntent);
     const coordinatorState = {
@@ -480,6 +521,14 @@ describe("Manifest V2 reservation and terminal transitions", () => {
         "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
       );
       await instance.alarm?.();
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_page_cursors",
+      ).one().count).toBe(1);
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      await instance.alarm?.();
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_page_cursors",
+      ).one().count).toBe(0);
     });
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
   });

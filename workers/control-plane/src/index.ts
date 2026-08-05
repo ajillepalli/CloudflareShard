@@ -813,9 +813,9 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       if (new Date(validated.record.commit_decided_at).getTime() > Date.now()) {
         return {
           ok: false,
-          status: "rejected",
-          http_status: 400,
-          error: manifestError("TX_ENVELOPE_INVALID", "Legacy manifest decision time cannot be in the future."),
+          status: "unavailable",
+          http_status: 503,
+          error: manifestError("TX_MANIFEST_UNAVAILABLE", "Legacy manifest decision time is ahead of the control-plane clock."),
         };
       }
       const objectName = await manifestObjectNameForRegistration(validated);
