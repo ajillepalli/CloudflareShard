@@ -1,7 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   CURRENT_PROTOCOL_VERSION,
-  COORDINATOR_RETENTION_DAYS,
   MANIFEST_CURSOR_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_PAGE_FORMAT_VERSION,
@@ -55,7 +54,7 @@ import {
   validatedManifestRegistration,
 } from "./service.js";
 import type { JournalManifestDO } from "./journal-manifest.js";
-import type { FleetManifestCatalogDO } from "./fleet-manifest-catalog.js";
+import { MANIFEST_ROUTE_RECOVERY_MS, type FleetManifestCatalogDO } from "./fleet-manifest-catalog.js";
 
 export {
   JournalManifestDO,
@@ -153,13 +152,39 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         ]),
       });
       const bucket = this.env.JOURNAL_MANIFEST.getByName(objectName);
-      return await bucket.reserve(
+      const result = await bucket.reserve(
         reservation,
         request.reservation_hash,
         activation.required_decision_floor_ms,
       );
+      if (result.ok || result.status !== "unavailable") {
+        await catalog.releaseManifestRoute(
+          reservation.fleet_id,
+          reservation.tx_id,
+          request.reservation_hash,
+          Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
+        );
+      }
+      return result;
     } catch (error) {
       const protocolError = asProtocolError(error);
+      if (!protocolError.retryable) {
+        try {
+          await this.env.FLEET_MANIFEST_CATALOG
+            .getByName(`fleet:${request.reservation.fleet_id}`)
+            .releaseManifestRoute(
+              request.reservation.fleet_id,
+              request.reservation.tx_id,
+              request.reservation_hash,
+              Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
+            );
+        } catch (releaseError) {
+          log("warn", "manifest.route_release_deferred", {
+            tx_id: request.reservation.tx_id,
+            error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+          });
+        }
+      }
       return {
         ok: false,
         status: protocolError.retryable ? "unavailable" : "rejected_absent",
@@ -176,9 +201,37 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       if (request.intent.reservation_hash !== request.reservation_hash || request.intent.tx_id !== request.reservation.tx_id) {
         throw new TransactionContractViolation(transactionError("MANIFEST_TERMINAL_CONFLICT", "Finalize request does not identify its frozen reservation."));
       }
-      return await this.env.JOURNAL_MANIFEST.getByName(objectName).finalize(request.intent);
+      const result = await this.env.JOURNAL_MANIFEST.getByName(objectName).finalize(request.intent);
+      if (result.ok || result.status !== "unavailable") {
+        await this.env.FLEET_MANIFEST_CATALOG
+          .getByName(`fleet:${request.reservation.fleet_id}`)
+          .releaseManifestRoute(
+            request.reservation.fleet_id,
+            request.reservation.tx_id,
+            request.reservation_hash,
+            Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
+          );
+      }
+      return result;
     } catch (error) {
       const protocolError = asProtocolError(error);
+      if (!protocolError.retryable) {
+        try {
+          await this.env.FLEET_MANIFEST_CATALOG
+            .getByName(`fleet:${request.reservation.fleet_id}`)
+            .releaseManifestRoute(
+              request.reservation.fleet_id,
+              request.reservation.tx_id,
+              request.reservation_hash,
+              Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
+            );
+        } catch (releaseError) {
+          log("warn", "manifest.route_release_deferred", {
+            tx_id: request.reservation.tx_id,
+            error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+          });
+        }
+      }
       return {
         ok: false,
         status: protocolError.retryable ? "unavailable" : "conflict",
@@ -195,19 +248,36 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         throw new TransactionContractViolation(transactionError("MANIFEST_TERMINAL_CONFLICT", "Cancel request does not identify its frozen reservation."));
       }
       const result = await this.env.JOURNAL_MANIFEST.getByName(objectName).cancel(request.intent);
-      if (result.ok) {
+      if (result.ok || result.status !== "unavailable") {
         await this.env.FLEET_MANIFEST_CATALOG
           .getByName(`fleet:${request.reservation.fleet_id}`)
           .releaseManifestRoute(
             request.reservation.fleet_id,
             request.reservation.tx_id,
             request.reservation_hash,
-            Date.now() + COORDINATOR_RETENTION_DAYS * 86_400_000,
+            Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
           );
       }
       return result;
     } catch (error) {
       const protocolError = asProtocolError(error);
+      if (!protocolError.retryable) {
+        try {
+          await this.env.FLEET_MANIFEST_CATALOG
+            .getByName(`fleet:${request.reservation.fleet_id}`)
+            .releaseManifestRoute(
+              request.reservation.fleet_id,
+              request.reservation.tx_id,
+              request.reservation_hash,
+              Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
+            );
+        } catch (releaseError) {
+          log("warn", "manifest.route_release_deferred", {
+            tx_id: request.reservation.tx_id,
+            error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+          });
+        }
+      }
       return {
         ok: false,
         status: protocolError.retryable ? "unavailable" : "conflict",
@@ -249,7 +319,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
             request.reservation.fleet_id,
             request.reservation.tx_id,
             request.reservation_hash,
-            request.retention_deadline_ms,
+            Date.now() + MANIFEST_ROUTE_RECOVERY_MS,
           );
       }
       return result;
@@ -762,6 +832,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         partition_count: validated.record.partition_count,
         partition_config_hash: legacyConfig.config_hash,
         record_hash: validated.record_hash,
+        commit_decided_at_ms: new Date(validated.record.commit_decided_at).getTime(),
       });
       if (!legacyAdmission.ok) {
         const existing = await stub.lookup(validated.record.tx_id);

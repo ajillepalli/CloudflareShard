@@ -12,6 +12,7 @@ All notable changes to this project are documented in this file.
 ### Changed
 - New cross-shard transactions use `manifest_reserving` before participant prepare and irreversible `commit_deciding` before the bucket assigns the canonical decision time. Existing state-model-1/V1 rows remain readable; an in-flight V1 decision that meets the permanent fence durably bridges through V2 without re-preparing participants.
 - V1 manifest admission is fleet-fenced after the first V2 reservation boundary. Enumeration fails closed for pre-boundary, incomplete, quarantined, or retention-expired coverage.
+- The V1/V2 boundary now serializes above every admitted legacy decision, terminal route assignments use a one-hour recovery lease, and journal/catalog history is garbage-collected in bounded 35-day batches while preserving hash-chain heads.
 
 This work is locally verified only. Production deployment, restore execution, and live performance/SLO qualification remain separate gates.
 

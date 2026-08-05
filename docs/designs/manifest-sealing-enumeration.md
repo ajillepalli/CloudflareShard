@@ -361,6 +361,10 @@ eligible.
 
 `reservation_required_since`, the cutover generation/hash, and the earliest
 retained V1 decision time are copied into catalog snapshots and bucket receipts.
+The boundary write is serialized in the fleet catalog after all route-building
+awaits and is strictly greater than `legacy_admitted_through_ms`, the maximum V1
+decision accepted by the preceding catalog transactions. A V1 row therefore
+cannot land at or above a boundary later reported as complete.
 Enumeration fails closed on any mismatch. Requests older than the imported
 retention window return `coverage: unproven_legacy_window`; they never produce
 `complete`. Rollback after any bucket fence must preserve V2 bridge recovery and
@@ -405,8 +409,14 @@ retention epoch and revalidates it after serialization in the bucket. If
 `coverage_start <= records_deleted_through_ms`, the authoritative bucket returns
 `retention_expired`; a stale catalog mirror or seal receipt can never override it.
 
-Seal receipts, catalog snapshots, cutover proofs, and resolution attestations
-outlive the manifest rows and cursors they validate. Catalog propagation of a new
+Seal and snapshot hashes retain the chain commitment after their recoverable
+detail is garbage-collected. Superseded seal/snapshot/close generations,
+cancelled or abandoned reservations, conflict detail, and activation idempotency
+keys are removed in bounded alarm batches only after the 35-day recovery window;
+the newest chain head is retained. Per-transaction route assignments have a
+separate one-hour crash-recovery lease and are released on every terminal or
+quarantined path rather than scaling with the data-retention horizon.
+Catalog propagation of a new
 retention epoch may be asynchronous because fleet enumeration always checks the
 bucket before paging. A caller cannot materialize buckets to manufacture expired
 history.

@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   canonicalJson,
+  COORDINATOR_RETENTION_DAYS,
   createManifestReservation,
   hashCanonicalJson,
   hashManifestReservation,
@@ -14,6 +15,8 @@ export const DEFAULT_CATALOG_PAGE_SIZE = 64;
 export const MAX_CATALOG_PAGE_SIZE = 128;
 export const CATALOG_ALARM_BATCH_SIZE = 16;
 export const CATALOG_CURSOR_MAX_LEASE_MS = 15 * 60 * 1000;
+export const CATALOG_HISTORY_RETENTION_MS = COORDINATOR_RETENTION_DAYS * 86_400_000;
+export const MANIFEST_ROUTE_RECOVERY_MS = 60 * 60 * 1000;
 const ZERO_HASH = "0".repeat(64);
 const FIRST_EFFECTIVE_DAY = "0000-01-01";
 
@@ -31,6 +34,7 @@ interface MetadataRow {
   legacy_grid_materialized_through_day: string | null;
   reservation_required_since_day: string | null;
   reservation_required_since_ms: number | null;
+  legacy_admitted_through_ms: number;
 }
 
 interface ActiveBucketRow {
@@ -252,7 +256,8 @@ export class FleetManifestCatalogStore {
         activation_key TEXT PRIMARY KEY,
         reservation_day TEXT NOT NULL,
         partition INTEGER NOT NULL,
-        entry_hash TEXT NOT NULL
+        entry_hash TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS catalog_bucket_activation_history (
         activation_sequence INTEGER PRIMARY KEY,
@@ -357,6 +362,9 @@ export class FleetManifestCatalogStore {
     if (!metadataColumns.some((column) => column.name === "legacy_grid_materialized_through_day")) {
       this.storage.sql.exec("ALTER TABLE fleet_catalog_metadata ADD COLUMN legacy_grid_materialized_through_day TEXT");
     }
+    if (!metadataColumns.some((column) => column.name === "legacy_admitted_through_ms")) {
+      this.storage.sql.exec("ALTER TABLE fleet_catalog_metadata ADD COLUMN legacy_admitted_through_ms INTEGER NOT NULL DEFAULT -1");
+    }
     const cursorColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
       "PRAGMA table_info(catalog_enumeration_cursors)",
     ).toArray();
@@ -368,6 +376,12 @@ export class FleetManifestCatalogStore {
     ).toArray();
     if (!assignmentColumns.some((column) => column.name === "delete_after_ms")) {
       this.storage.sql.exec("ALTER TABLE manifest_route_assignments ADD COLUMN delete_after_ms INTEGER");
+    }
+    const activationKeyColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
+      "PRAGMA table_info(catalog_activation_keys)",
+    ).toArray();
+    if (!activationKeyColumns.some((column) => column.name === "created_at_ms")) {
+      this.storage.sql.exec("ALTER TABLE catalog_activation_keys ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0");
     }
     this.storage.sql.exec(
       "INSERT OR IGNORE INTO _fleet_catalog_schema_migrations (id, applied_at) VALUES (1, ?)",
@@ -476,22 +490,25 @@ export class FleetManifestCatalogStore {
       }
       this.storage.sql.exec(
         `INSERT INTO manifest_route_assignments
-          (assignment_key, tx_id, request_hash, reservation_hash, reservation_json, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+          (assignment_key, tx_id, request_hash, reservation_hash, reservation_json, created_at_ms, delete_after_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         assignmentKey,
         draft.tx_id,
         requestHash,
         reservationHash,
         JSON.stringify(reservation),
         nowMs,
+        nowMs + MANIFEST_ROUTE_RECOVERY_MS,
       );
+      const metadata = this.storage.sql.exec<MetadataRow>("SELECT * FROM fleet_catalog_metadata WHERE id = 1").one();
+      const boundaryMs = Math.max(Date.now(), metadata.legacy_admitted_through_ms + 1);
       this.storage.sql.exec(
         `UPDATE fleet_catalog_metadata
             SET reservation_required_since_day = COALESCE(reservation_required_since_day, ?),
                 reservation_required_since_ms = COALESCE(reservation_required_since_ms, ?)
           WHERE id = 1`,
-        reservation.reservation_utc_day,
-        new Date(reservation.reserved_at).getTime(),
+        new Date(boundaryMs).toISOString().slice(0, 10),
+        boundaryMs,
       );
       return { status: "assigned" as const, reservation, reservation_hash: reservationHash };
     });
@@ -805,11 +822,12 @@ export class FleetManifestCatalogStore {
       if (existing !== undefined && existing.entry_hash !== entryHash) throw new TypeError("Bucket route conflicts with immutable activation content.");
       if (existing !== undefined && existing.retired_sequence === null) {
         this.storage.sql.exec(
-          "INSERT INTO catalog_activation_keys (activation_key, reservation_day, partition, entry_hash) VALUES (?, ?, ?, ?)",
+          "INSERT INTO catalog_activation_keys (activation_key, reservation_day, partition, entry_hash, created_at_ms) VALUES (?, ?, ?, ?, ?)",
           input.activation_key,
           input.reservation_day,
           input.partition,
           entryHash,
+          nowMs,
         );
         return {
           ok: true,
@@ -863,11 +881,12 @@ export class FleetManifestCatalogStore {
         entryHash,
       );
       this.storage.sql.exec(
-        "INSERT INTO catalog_activation_keys (activation_key, reservation_day, partition, entry_hash) VALUES (?, ?, ?, ?)",
+        "INSERT INTO catalog_activation_keys (activation_key, reservation_day, partition, entry_hash, created_at_ms) VALUES (?, ?, ?, ?, ?)",
         input.activation_key,
         input.reservation_day,
         input.partition,
         entryHash,
+        nowMs,
       );
       return {
         ok: true,
@@ -886,10 +905,14 @@ export class FleetManifestCatalogStore {
     readonly partition_count: number;
     readonly partition_config_hash: string;
     readonly record_hash: string;
+    readonly commit_decided_at_ms: number;
   }, nowMs = Date.now()): Promise<CatalogLegacyAdmission> {
     assertUtcDay(input.reservation_day, "reservation_day");
     assertHash(input.partition_config_hash, "partition_config_hash");
     assertHash(input.record_hash, "record_hash");
+    if (!Number.isSafeInteger(input.commit_decided_at_ms) || input.commit_decided_at_ms < 0) {
+      throw new TypeError("commit_decided_at_ms must be a non-negative safe integer.");
+    }
     const config = await this.partitionConfigForDay(input.fleet_id, input.reservation_day);
     if (
       input.partition_config_hash !== config.config_hash
@@ -931,6 +954,10 @@ export class FleetManifestCatalogStore {
             input.partition,
           )
           .one();
+        this.storage.sql.exec(
+          "UPDATE fleet_catalog_metadata SET legacy_admitted_through_ms = MAX(legacy_admitted_through_ms, ?) WHERE id = 1",
+          input.commit_decided_at_ms,
+        );
         return { ok: true, admission_token: activationKey, activation_sequence: active.activation_sequence };
       }
       const existing = this.storage.sql
@@ -989,12 +1016,17 @@ export class FleetManifestCatalogStore {
         );
       }
       this.storage.sql.exec(
-        `INSERT INTO catalog_activation_keys (activation_key, reservation_day, partition, entry_hash)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO catalog_activation_keys (activation_key, reservation_day, partition, entry_hash, created_at_ms)
+         VALUES (?, ?, ?, ?, ?)`,
         activationKey,
         input.reservation_day,
         input.partition,
         entryHash,
+        nowMs,
+      );
+      this.storage.sql.exec(
+        "UPDATE fleet_catalog_metadata SET legacy_admitted_through_ms = MAX(legacy_admitted_through_ms, ?) WHERE id = 1",
+        input.commit_decided_at_ms,
       );
       return { ok: true, admission_token: activationKey, activation_sequence: sequence };
     });
@@ -1537,6 +1569,97 @@ export class FleetManifestCatalogStore {
     });
   }
 
+  purgeHistory(nowMs = Date.now(), limit = 8): { readonly deleted: number; readonly next_deadline_ms: number | null } {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 128) throw new TypeError("Invalid catalog history purge limit.");
+    const cutoffMs = nowMs - CATALOG_HISTORY_RETENTION_MS;
+    const deleted = this.storage.transactionSync(() => {
+      let count = 0;
+      const closeKeys = this.storage.sql
+        .exec<{ close_key: string }>(
+          `SELECT close_key FROM catalog_close_operations
+            WHERE updated_at_ms <= ? ORDER BY updated_at_ms, close_key LIMIT ?`,
+          cutoffMs,
+          limit,
+        )
+        .toArray();
+      for (const { close_key: closeKey } of closeKeys) {
+        this.storage.sql.exec("DELETE FROM catalog_close_progress WHERE close_key = ?", closeKey);
+        this.storage.sql.exec("DELETE FROM catalog_close_operations WHERE close_key = ?", closeKey);
+        count += 1;
+      }
+
+      const metadata = this.storage.sql.exec<MetadataRow>("SELECT * FROM fleet_catalog_metadata WHERE id = 1").one();
+      const generations = this.storage.sql
+        .exec<{ generation: number }>(
+          `SELECT generation FROM catalog_snapshots AS s
+            WHERE s.generation < ?
+              AND COALESCE(s.completed_at_ms, s.created_at_ms) <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM catalog_close_operations AS o WHERE o.snapshot_generation = s.generation
+              )
+            ORDER BY generation LIMIT ?`,
+          metadata.current_snapshot_generation,
+          cutoffMs,
+          limit,
+        )
+        .toArray();
+      for (const { generation } of generations) {
+        this.storage.sql.exec("DELETE FROM catalog_snapshot_entries WHERE generation = ?", generation);
+        this.storage.sql.exec("DELETE FROM catalog_snapshots WHERE generation = ?", generation);
+        count += 1;
+      }
+
+      const staleKeys = this.storage.sql
+        .exec<{ activation_key: string }>(
+          "SELECT activation_key FROM catalog_activation_keys WHERE created_at_ms <= ? ORDER BY created_at_ms LIMIT ?",
+          cutoffMs,
+          limit * MAX_CATALOG_PAGE_SIZE,
+        )
+        .toArray();
+      for (const { activation_key: activationKey } of staleKeys) {
+        this.storage.sql.exec("DELETE FROM catalog_activation_keys WHERE activation_key = ?", activationKey);
+      }
+      count += staleKeys.length;
+
+      const staleHistory = this.storage.sql
+        .exec<{ activation_sequence: number }>(
+          `SELECT h.activation_sequence FROM catalog_bucket_activation_history AS h
+            WHERE h.deactivation_sequence IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM catalog_snapshot_entries AS s
+                 WHERE s.activation_sequence = h.activation_sequence
+              )
+            ORDER BY h.activation_sequence LIMIT ?`,
+          limit * MAX_CATALOG_PAGE_SIZE,
+        )
+        .toArray();
+      for (const { activation_sequence: activationSequence } of staleHistory) {
+        this.storage.sql.exec("DELETE FROM catalog_bucket_activation_history WHERE activation_sequence = ?", activationSequence);
+      }
+      count += staleHistory.length;
+      return count;
+    });
+
+    const deadlines = [
+      this.storage.sql.exec<{ deadline: number | null }>(
+        "SELECT MIN(updated_at_ms + ?) AS deadline FROM catalog_close_operations",
+        CATALOG_HISTORY_RETENTION_MS,
+      ).one().deadline,
+      this.storage.sql.exec<{ deadline: number | null }>(
+        `SELECT MIN(COALESCE(completed_at_ms, created_at_ms) + ?) AS deadline
+           FROM catalog_snapshots
+          WHERE generation < (SELECT current_snapshot_generation FROM fleet_catalog_metadata WHERE id = 1)`,
+        CATALOG_HISTORY_RETENTION_MS,
+      ).one().deadline,
+      this.storage.sql.exec<{ deadline: number | null }>(
+        "SELECT MIN(created_at_ms + ?) AS deadline FROM catalog_activation_keys",
+        CATALOG_HISTORY_RETENTION_MS,
+      ).one().deadline,
+    ].filter((deadline): deadline is number => deadline !== null);
+    const nextDeadline = deadlines.length === 0 ? null : Math.min(...deadlines);
+    return { deleted, next_deadline_ms: nextDeadline === null ? null : Math.max(nowMs, nextDeadline) };
+  }
+
   schedulePurpose(purpose: CatalogAlarmPurpose): void {
     assertText(purpose.purpose, "purpose");
     assertHash(purpose.payload_hash, "payload_hash");
@@ -1593,6 +1716,20 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     }
   }
 
+  private async refreshHistoryGc(): Promise<void> {
+    const history = this.catalog.purgeHistory(Date.now());
+    this.catalog.completePurpose("history_gc", 0);
+    if (history.next_deadline_ms !== null) {
+      this.catalog.schedulePurpose({
+        purpose: "history_gc",
+        fire_at_ms: history.next_deadline_ms,
+        generation: 0,
+        payload_hash: await hashCanonicalJson(["history_gc", history.next_deadline_ms]),
+      });
+    }
+    await this.armNextAlarm();
+  }
+
   async partitionConfigForDay(fleetId: string, reservationDay: string): Promise<PartitionConfigRow> {
     return await this.catalog.partitionConfigForDay(fleetId, reservationDay);
   }
@@ -1601,7 +1738,18 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     draft: Omit<CreateManifestReservationInput, "partition_config_hash">,
     assignmentKey: string,
   ): Promise<CatalogRouteAssignment> {
-    return await this.catalog.assignManifestRoute(draft, assignmentKey);
+    const result = await this.catalog.assignManifestRoute(draft, assignmentKey);
+    const nextRelease = this.catalog.purgeReleasedRoutes(Date.now());
+    if (nextRelease !== null) {
+      this.catalog.schedulePurpose({
+        purpose: "route_gc",
+        fire_at_ms: Math.max(Date.now(), nextRelease),
+        generation: 0,
+        payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
+      });
+      await this.armNextAlarm();
+    }
+    return result;
   }
 
   async releaseManifestRoute(fleetId: string, txId: string, reservationHash: string, deleteAfterMs: number): Promise<void> {
@@ -1658,6 +1806,7 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
       });
       await this.armNextAlarm();
     }
+    await this.refreshHistoryGc();
     return result;
   }
 
@@ -1727,7 +1876,9 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
   }
 
   async finalizeClose(closeKey: string): Promise<CatalogCloseOperation> {
-    return await this.catalog.finalizeClose(closeKey);
+    const result = await this.catalog.finalizeClose(closeKey);
+    await this.refreshHistoryGc();
+    return result;
   }
 
   async alarm(): Promise<void> {
@@ -1761,6 +1912,8 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
             payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
           });
         }
+      } else if (purpose.purpose === "history_gc") {
+        await this.refreshHistoryGc();
       } else {
         // Unknown/future handlers never erase durable operation state. Removing
         // only the wake-up prevents a hot alarm loop until its owner retries.

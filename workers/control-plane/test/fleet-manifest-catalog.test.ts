@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
+  CATALOG_HISTORY_RETENTION_MS,
   FLEET_CATALOG_PROTOCOL_VERSION,
   FleetManifestCatalogStore,
   INITIAL_PARTITION_COUNT,
@@ -33,6 +34,42 @@ async function activation(catalog: FleetManifestCatalogStore, partition: number,
 }
 
 describe("FleetManifestCatalogStore", () => {
+  it("places the V2 boundary after every legacy decision admitted before the fence transaction", async () => {
+    await withCatalog("legacy-boundary", async (catalog) => {
+      const decisionMs = Date.now() + 60_000;
+      const config = await catalog.partitionConfigForDay(FLEET, DAY);
+      await expect(catalog.admitLegacyRegistration({
+        fleet_id: FLEET,
+        reservation_day: DAY,
+        partition: 0,
+        partition_count: config.partition_count,
+        partition_config_hash: config.config_hash,
+        record_hash: "b".repeat(64),
+        commit_decided_at_ms: decisionMs,
+      })).resolves.toMatchObject({ ok: true });
+
+      await catalog.assignManifestRoute({
+        fleet_id: FLEET,
+        tx_id: "tx-after-legacy-boundary",
+        coordinator_id: "coordinator-after-legacy-boundary",
+        operation_hash: "c".repeat(64),
+        decision_epoch: 1,
+      }, "route-after-legacy-boundary", 0);
+      const coverage = await catalog.coverageState(FLEET);
+      expect(coverage.reservation_required_since_ms).toBe(decisionMs + 1);
+      expect(coverage.reservation_required_since_day).toBe(new Date(decisionMs + 1).toISOString().slice(0, 10));
+      await expect(catalog.admitLegacyRegistration({
+        fleet_id: FLEET,
+        reservation_day: DAY,
+        partition: 1,
+        partition_count: config.partition_count,
+        partition_config_hash: config.config_hash,
+        record_hash: "d".repeat(64),
+        commit_decided_at_ms: decisionMs + 1,
+      })).resolves.toEqual({ ok: false, status: "v1_closed" });
+    });
+  });
+
   it("releases terminal route-assignment idempotency state", async () => {
     await withCatalog("route-release", async (catalog) => {
       const draft = {
@@ -141,6 +178,32 @@ describe("FleetManifestCatalogStore", () => {
           break;
         }
       }
+    });
+  });
+
+  it("garbage-collects expired close generations while preserving the snapshot hash chain", async () => {
+    await withCatalog("history-gc", async (catalog) => {
+      const first = await catalog.snapshotThrough({
+        protocol_version: 2,
+        fleet_id: FLEET,
+        cutoff_ms: 0,
+        idempotency_key: "history-snapshot-one",
+      }, 1);
+      const close = await catalog.beginClose({ fleet_id: FLEET, cutoff_ms: 0, snapshot_generation: first.generation }, 1);
+      await catalog.finalizeClose(close.close_key, 1);
+      const second = await catalog.snapshotThrough({
+        protocol_version: 2,
+        fleet_id: FLEET,
+        cutoff_ms: 1,
+        idempotency_key: "history-snapshot-two",
+      }, 2);
+      expect(second.prior_snapshot_hash).toBe(first.snapshot_hash);
+
+      const gc = catalog.purgeHistory(CATALOG_HISTORY_RETENTION_MS + 2);
+      expect(gc.deleted).toBeGreaterThanOrEqual(2);
+      expect(catalog.closeForSnapshot(first.generation)).toBeNull();
+      expect(() => catalog.snapshotByGeneration(first.generation)).toThrow();
+      expect(catalog.snapshotByGeneration(second.generation).snapshot_hash).toBe(second.snapshot_hash);
     });
   });
 

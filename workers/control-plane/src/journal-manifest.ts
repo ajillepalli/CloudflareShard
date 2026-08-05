@@ -47,6 +47,7 @@ import { manifestRegistrationTxId, validatedManifestRegistration } from "./servi
 export const LIFECYCLE_FAILURE_RETRY_MS = 5 * 60 * 1000;
 export const MANIFEST_CURSOR_LEASE_MS = 15 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const V2_HISTORY_RETENTION_MS = COORDINATOR_RETENTION_DAYS * DAY_MS;
 const ZERO_HASH = "0".repeat(64);
 
 interface LifecycleAlarmScheduler {
@@ -641,7 +642,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       }
       const legacyCertificateHash = await this.ensureLegacyCertificate();
       const now = Date.now();
-      return this.ctx.storage.transactionSync<ManifestReserveResult>(() => {
+      const result = this.ctx.storage.transactionSync<ManifestReserveResult>(() => {
         const metadata = this.ctx.storage.sql
           .exec<PartitionMetadataRow>(
             "SELECT fleet_id, utc_day, partition, partition_count, routing_key FROM partition_metadata WHERE id = 1",
@@ -768,6 +769,8 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           local_legacy_certificate_hash: legacyCertificateHash,
         };
       });
+      if (result.ok) await this.ensureAlarmAtOrBefore(now + V2_HISTORY_RETENTION_MS);
+      return result;
     } catch (error) {
       log("error", "journal_manifest.reserve_failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -996,7 +999,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       const intent: ManifestCancelIntentV1 = input;
       const intentHash = await hashCanonicalJson(intent);
       const now = Date.now();
-      return this.ctx.storage.transactionSync<ManifestCancelResult>(() => {
+      const result = this.ctx.storage.transactionSync<ManifestCancelResult>(() => {
         const row = this.ctx.storage.sql
           .exec<ReservationRow>("SELECT * FROM manifest_reservations WHERE tx_id = ?", intent.tx_id)
           .toArray()[0];
@@ -1068,6 +1071,8 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         );
         return { ok: true, status: "cancelled" };
       });
+      if (result.ok) await this.ensureAlarmAtOrBefore(now + V2_HISTORY_RETENTION_MS);
+      return result;
     } catch (error) {
       const protocolError = error instanceof TransactionContractViolation
         ? toManifestRpcError(error.protocolError)
@@ -1837,6 +1842,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       return { ok: true, status: "pending", generation, cutoff_ms: generationRow.cutoff_ms };
     }
     await this.rearmPhysicalAlarm();
+    await this.ensureAlarmAtOrBefore(Date.now() + V2_HISTORY_RETENTION_MS);
     return { ok: true, status: "complete", generation, cutoff_ms: generationRow.cutoff_ms, receipt };
   }
 
@@ -2463,6 +2469,8 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         .toArray();
       if (canonicalJson(replay) !== canonicalJson(candidates)) return { deleted: 0, deferred: false };
       for (const candidate of candidates) {
+        this.ctx.storage.sql.exec("DELETE FROM manifest_reservation_conflicts WHERE tx_id = ?", candidate.tx_id);
+        this.ctx.storage.sql.exec("DELETE FROM manifest_quarantine_resolutions WHERE tx_id = ?", candidate.tx_id);
         this.ctx.storage.sql.exec("DELETE FROM manifest_reservations WHERE tx_id = ?", candidate.tx_id);
       }
       const maximumDeleted = candidates.at(-1)?.commit_decided_at_ms ?? 0;
@@ -2482,6 +2490,72 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       deleted: deletion.deleted,
       deferred_until_ms: deletion.deferred ? now + HELD_RETENTION_RECHECK_MS : null,
     };
+  }
+
+  private sweepV2History(
+    now: number,
+    limit = 128,
+  ): { readonly deleted: number; readonly next_deadline_ms: number | null } {
+    const cutoff = now - V2_HISTORY_RETENTION_MS;
+    const deleted = this.ctx.storage.transactionSync(() => {
+      let count = 0;
+      const terminalRows = this.ctx.storage.sql
+        .exec<{ tx_id: string }>(
+          `SELECT tx_id FROM manifest_reservations
+            WHERE state IN ('RESERVED', 'CANCELLED')
+              AND quarantine_state <> 'UNRESOLVED' AND updated_at_ms <= ?
+            ORDER BY updated_at_ms, tx_id LIMIT ?`,
+          cutoff,
+          limit,
+        )
+        .toArray();
+      for (const { tx_id: txId } of terminalRows) {
+        this.ctx.storage.sql.exec("DELETE FROM manifest_reservation_conflicts WHERE tx_id = ?", txId);
+        this.ctx.storage.sql.exec("DELETE FROM manifest_quarantine_resolutions WHERE tx_id = ?", txId);
+        this.ctx.storage.sql.exec("DELETE FROM manifest_reservations WHERE tx_id = ?", txId);
+      }
+      count += terminalRows.length;
+
+      const generations = this.ctx.storage.sql
+        .exec<{ generation: number }>(
+          `SELECT generation FROM manifest_seal_generations
+            WHERE updated_at_ms <= ?
+              AND (status = 'QUARANTINED' OR (
+                status = 'COMPLETE' AND generation < COALESCE((
+                  SELECT MAX(generation) FROM manifest_seal_generations WHERE status = 'COMPLETE'
+                ), generation)
+              ))
+            ORDER BY generation LIMIT ?`,
+          cutoff,
+          limit,
+        )
+        .toArray();
+      for (const { generation } of generations) {
+        this.ctx.storage.sql.exec("DELETE FROM manifest_seal_digest_entries WHERE generation = ?", generation);
+        this.ctx.storage.sql.exec("DELETE FROM manifest_seal_generations WHERE generation = ?", generation);
+      }
+      count += generations.length;
+      return count;
+    });
+
+    const deadlines = [
+      this.ctx.storage.sql.exec<{ deadline: number | null }>(
+        `SELECT MIN(updated_at_ms + ?) AS deadline FROM manifest_reservations
+          WHERE state IN ('RESERVED', 'CANCELLED') AND quarantine_state <> 'UNRESOLVED'`,
+        V2_HISTORY_RETENTION_MS,
+      ).one().deadline,
+      this.ctx.storage.sql.exec<{ deadline: number | null }>(
+        `SELECT MIN(updated_at_ms + ?) AS deadline FROM manifest_seal_generations
+          WHERE status = 'QUARANTINED' OR (
+            status = 'COMPLETE' AND generation < COALESCE((
+              SELECT MAX(generation) FROM manifest_seal_generations WHERE status = 'COMPLETE'
+            ), generation)
+          )`,
+        V2_HISTORY_RETENTION_MS,
+      ).one().deadline,
+    ].filter((deadline): deadline is number => deadline !== null);
+    const nextDeadline = deadlines.length === 0 ? null : Math.min(...deadlines);
+    return { deleted, next_deadline_ms: nextDeadline === null ? null : Math.max(now, nextDeadline) };
   }
 
   async alarm(): Promise<void> {
@@ -2549,6 +2623,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         deleteAlarm: async () => this.clearAlarmPurpose("retention"),
       },
       async () => {
+        const historySweep = this.sweepV2History(now);
         const v2Sweep = await this.sweepV2Retention(now);
         const schedule = this.ctx.storage.transactionSync<{
           next_deadline_ms: number | null;
@@ -2610,9 +2685,14 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
             ? v2Sweep.deferred_until_ms
             : Math.min(nextAlarm, v2Sweep.deferred_until_ms);
         }
+        if (historySweep.next_deadline_ms !== null) {
+          nextAlarm = nextAlarm === null
+            ? historySweep.next_deadline_ms
+            : Math.min(nextAlarm, historySweep.next_deadline_ms);
+        }
         return {
           next_alarm_ms: nextAlarm,
-          deleted: schedule.deleted + v2Sweep.deleted,
+          deleted: schedule.deleted + v2Sweep.deleted + historySweep.deleted,
           held_expired: schedule.held_expired + (v2Sweep.deferred_until_ms === null ? 0 : 1),
         };
       },

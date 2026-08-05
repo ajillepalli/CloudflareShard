@@ -208,6 +208,14 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       reservation_hash: assignedRoute.reservation_hash,
       intent: cancelIntent,
     })).resolves.toEqual({ ok: true, status: "cancelled" });
+    const catalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${assignedRoute.reservation.fleet_id}`);
+    await runInDurableObject(catalog, async (_instance, state) => {
+      const release = state.storage.sql.exec<{ delete_after_ms: number }>(
+        "SELECT delete_after_ms FROM manifest_route_assignments WHERE tx_id = ?",
+        assignedRoute.reservation.tx_id,
+      ).one();
+      expect(release.delete_after_ms).toBeLessThanOrEqual(Date.now() + 60 * 60 * 1000);
+    });
 
     const finalizeIntent: ManifestFinalizeIntentV1 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -371,6 +379,47 @@ describe("Manifest V2 reservation and terminal transitions", () => {
         "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
       );
       await instance.alarm?.();
+    });
+    await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
+  });
+
+  it("garbage-collects old cancelled reservations and superseded seal generations", async () => {
+    const route = await assigned(`tx-history-gc-${crypto.randomUUID()}`);
+    await route.worker.reserveManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash });
+    const cancelIntent: ManifestCancelIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      reservation_hash: route.reservation_hash,
+      operation_hash: route.operationHash,
+      decision_epoch: 1,
+      idempotency_key: `cancel-${route.reservation.tx_id}`,
+    };
+    await route.worker.cancelManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash, intent: cancelIntent });
+    const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    await runInDurableObject(bucket, async (instance, state) => {
+      state.storage.sql.exec("UPDATE manifest_reservations SET updated_at_ms = 0 WHERE tx_id = ?", route.reservation.tx_id);
+      state.storage.sql.exec(
+        `INSERT INTO manifest_seal_generations
+          (generation, idempotency_key, cutoff_ms, mode, status, digest_count, digest_root,
+           evidence_revision, receipt_hash, receipt_json, created_at_ms, updated_at_ms)
+         VALUES (1, 'old-complete-seal', 0, 'ADVANCE', 'COMPLETE', 0, '', 0, ?, '{}', 0, 0),
+                (2, 'latest-complete-seal', 1, 'ADVANCE', 'COMPLETE', 0, '', 0, ?, '{}', 0, ?)`,
+        "a".repeat(64),
+        "b".repeat(64),
+        Date.now(),
+      );
+      state.storage.sql.exec(
+        "INSERT INTO manifest_seal_digest_entries (generation, commit_decided_at_ms, decision_sequence, tx_id, entry_hash) VALUES (1, 0, 0, 'old', ?)",
+        "c".repeat(64),
+      );
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
+      );
+      await instance.alarm?.();
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE generation = 1").one().count).toBe(0);
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE generation = 2").one().count).toBe(1);
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM manifest_seal_digest_entries WHERE generation = 1").one().count).toBe(0);
     });
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
   });
@@ -695,11 +744,15 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     if (!("status" in completed) || completed.status !== "complete") {
       throw new Error("Fleet close did not complete.");
     }
+    const fleetCatalog = env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${route.reservation.fleet_id}`);
+    const coverageState = await fleetCatalog.coverageState(route.reservation.fleet_id);
+    if (coverageState.reservation_required_since_ms === null) throw new Error("Expected a V2 coverage boundary.");
+    const coverageStart = new Date(coverageState.reservation_required_since_ms).toISOString();
     const enumeration = await route.worker.enumerateManifest({
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: route.reservation.fleet_id,
-      coverage_start: route.reservation.reserved_at,
+      coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
@@ -721,7 +774,7 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: route.reservation.fleet_id,
-      coverage_start: route.reservation.reserved_at,
+      coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
@@ -740,7 +793,7 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: route.reservation.fleet_id,
-      coverage_start: new Date(new Date(route.reservation.reserved_at).getTime() - 1).toISOString(),
+      coverage_start: new Date(coverageState.reservation_required_since_ms - 1).toISOString(),
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
@@ -757,7 +810,7 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: route.reservation.fleet_id,
-      coverage_start: route.reservation.reserved_at,
+      coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
@@ -774,7 +827,7 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: route.reservation.fleet_id,
-      coverage_start: route.reservation.reserved_at,
+      coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
       catalog_generation: completed.snapshot_generation,
