@@ -50,24 +50,71 @@ npm run dev
 ```
 
 Needs Node.js 20+ and a Cloudflare account with Wrangler authenticated.
+`npm run dev` starts both required Workers from their two Wrangler configs: the
+route-less `cloudflare-shard-control-plane` Worker that owns
+`JournalManifestDO`, and the public `cloudflare-shard-mvp` Worker that owns
+`CatalogDO`, `ShardDO`, and `CoordinatorDO`. The public Worker must not be run
+without that local `CONTROL_PLANE` service-binding target.
 
 ## Deploy your own
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
+Cloudflare's Deploy to Cloudflare flow does not deploy multiple Worker
+applications from one repository together, so it cannot create this complete
+topology. Clone the repository and use the ordered deployment command below;
+do not use a one-Worker deploy button for this release.
 
-One click clones this repo into your GitHub and deploys the cluster (one
-Worker plus three SQLite Durable Object classes: `CATALOG` control plane,
-`SHARD` data plane, `COORDINATOR` for 2PC) into **your own Cloudflare
-account**. No KV/D1/R2 resources; the cluster is self-contained.
+The deployment has two Workers and four SQLite Durable Object classes: a
+required route-less control-plane Worker owning `JOURNAL_MANIFEST`, followed
+by the public Worker owning `CATALOG`, `SHARD`, and `COORDINATOR`. No KV/D1/R2
+resources are required; the cluster is self-contained.
 
-Or from a clone: `npm run deploy`.
+From a clone, use the ordered aggregate command:
 
-**Cost:** Durable Objects require the **Workers Paid** plan, and everything
-created is billed to your account. This is a real database, not a sandbox.
-Tear it down (`npx wrangler delete --name <your-worker>`) when you're done.
+```bash
+npm run deploy
+```
 
-Set the `ADMIN_TOKEN` secret and call `/admin/init` to bring the topology up
-before your first write. Full deploy/init/teardown walkthrough:
+It deploys `cloudflare-shard-control-plane` first, then deploys
+`cloudflare-shard-mvp` with its `CONTROL_PLANE` service binding. The equivalent
+manual sequence is `npm run deploy:control-plane` followed by
+`npm run deploy:root`; reversing or skipping the first step leaves the root
+Worker without its mandatory commit-manifest dependency.
+
+**Cost:** SQLite-backed Durable Objects are available on both Workers Free and
+Paid. The Free plan is a bounded evaluation path: Cloudflare currently limits
+it to 100,000 Worker requests/day, 5 million Durable Object rows read/day, and
+100,000 rows written/day; operations fail after a daily limit is exhausted.
+Check the current official [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
+and [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+before relying on those numbers. This is a real database in your account, not
+a sandbox. Tear the two-Worker deployment down with `npm run delete` when done.
+That command deliberately deletes the public root Worker first and the
+route-less control-plane Worker second, so no surviving gateway can start a
+transaction against a missing manifest service. Do not delete the control
+plane first.
+
+After setting the `ADMIN_TOKEN` secret, use the tested CLI preflight and
+disposable-target verifier:
+
+```bash
+cd client && npm install && npm run build && cd ..
+export CLOUDFLARESHARD_URL=https://<your-worker>.workers.dev
+export CLOUDFLARESHARD_ADMIN_TOKEN=<your-ADMIN_TOKEN>
+node client/dist/cli.js doctor
+node client/dist/cli.js verify --disposable-target
+```
+
+`verify` never force-resets an initialized topology. It creates and retains an
+isolated table and tenant, so the explicit flag is only appropriate for a
+deployment you intend to tear down. It proves a transaction across two
+distinct physical placements, idempotent replay, and tenant-scoped readback.
+Receipts are written under `.cloudflareshard/receipts/`. A durable decision
+whose manifest registration or participant acknowledgement remains outstanding
+after idempotent replay is reported as `PENDING_RECONCILIATION`, never
+`VERIFIED`. Verification defers strict readback until replay reports that the
+transaction has converged to committed.
+
+Full deploy/init/teardown walkthrough:
 [docs/REFERENCE.md § Deploy your own cluster](docs/REFERENCE.md#deploy-your-own-cluster).
 
 ## Use it from your app
@@ -101,6 +148,7 @@ of a real live run) see [`docs/REFERENCE.md`](docs/REFERENCE.md#full-api-walkthr
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run: backend suite (workerd)
 npm run test:spa    # vitest run --config vitest.spa.config.ts: Shardscope SPA suite (jsdom)
+npm run verify      # aggregate root, SPA, client, contracts, control-plane, and public benchmark gate
 ```
 
 ## Learn more

@@ -50,6 +50,17 @@ describe("CloudflareShardAdminClient", () => {
     expect(calls[0].body).toEqual({ shardId: "catalog-0-shard-0" });
   });
 
+  it("routeProbe() uses a constant read-only query and returns authoritative placement", async () => {
+    const { fetchImpl, calls } = mockFetch(200, { route: { shardId: "catalog-0-shard-1", catalogShardId: "catalog-0" } });
+    const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "admin", fetchImpl });
+
+    const result = await client.routeProbe("events", "tenant-a", "row-7");
+
+    expect(result.route.shardId).toBe("catalog-0-shard-1");
+    expect(calls[0].url).toBe("http://x/v1/sql");
+    expect(calls[0].body).toEqual({ sql: "SELECT 1", table: "events", tenantId: "tenant-a", partitionKey: "row-7" });
+  });
+
   it("dropIndex() surfaces a partial-cleanup warning instead of erasing it (Codex review)", async () => {
     const { fetchImpl } = mockFetch(200, { ok: true, indexName: "idx", warning: "Physical cleanup failed on shard(s): catalog-1-shard-0." });
     const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
@@ -97,12 +108,12 @@ describe("CloudflareShardAdminClient", () => {
   });
 
   it("txStatus() returns the actual found/status shape, not a bare txId/status pair (Codex review)", async () => {
-    const { fetchImpl } = mockFetch(200, { found: true, status: "committed" });
+    const { fetchImpl } = mockFetch(200, { found: true, status: "committed", decision: "commit", epoch: 1, operationHash: "a".repeat(64), commitAuthorized: true });
     const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
     const res = await client.txStatus({ txId: "tx-1" });
 
-    expect(res).toEqual({ found: true, status: "committed" });
+    expect(res).toEqual({ found: true, status: "committed", decision: "commit", epoch: 1, operationHash: "a".repeat(64), commitAuthorized: true });
   });
 
   it("txStatus() reports found: false for an unknown txId, with no status field at all", async () => {
@@ -148,6 +159,43 @@ describe("CloudflareShardAdminClient", () => {
       const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
       await expect(client.waitForIndexReady("idx", { intervalMs: 5, maxWaitMs: 20 })).rejects.toThrow(/Timed out/);
+    });
+  });
+
+  describe("waitForTransaction()", () => {
+    const known = (status: "commit_pending_manifest" | "committed") => ({
+      found: true,
+      status,
+      decision: "commit",
+      epoch: 1,
+      operationHash: "b".repeat(64),
+      commitAuthorized: status === "committed",
+    });
+
+    it("polls pending manifest work until the coordinator is terminal", async () => {
+      const { fetchImpl } = mockFetchSequence([
+        { status: 200, body: known("commit_pending_manifest") },
+        { status: 200, body: known("committed") },
+      ]);
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      const result = await client.waitForTransaction("tx-1", { intervalMs: 1 });
+
+      expect(result.status).toBe("committed");
+    });
+
+    it("fails fast for an unknown transaction", async () => {
+      const { fetchImpl } = mockFetch(200, { found: false });
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.waitForTransaction("missing", { intervalMs: 1 })).rejects.toThrow(/not found/);
+    });
+
+    it("times out with the last non-terminal state", async () => {
+      const { fetchImpl } = mockFetch(200, known("commit_pending_manifest"));
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.waitForTransaction("tx-1", { intervalMs: 5, maxWaitMs: 20 })).rejects.toThrow(/commit_pending_manifest/);
     });
   });
 });

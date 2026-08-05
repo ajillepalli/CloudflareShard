@@ -9,7 +9,7 @@
 > backing, licensing, or building a company around.
 
 For the artifact itself, start with [`README.md`](../../README.md) (quickstart, API
-shape, deploy button) and [`docs/SPEC.md`](../SPEC.md) (the canonical protocol and
+shape, ordered deployment) and [`docs/SPEC.md`](../SPEC.md) (the canonical protocol and
 architecture reference). Open roadmap items are tracked in [`TODOS.md`](../../TODOS.md).
 This document doesn't repeat their content — it argues about what it means.
 
@@ -124,11 +124,12 @@ control plane, is expressed as Durable Objects and nothing else.
   load and real chaos against a real cluster while running an online split or drain, and
   tracks a live correctness meter through it — the mechanism (not a vanity number) is the
   point: the demo is built to be falsifiable in front of a viewer, not staged.
-- **A deployable artifact today.** The "Deploy to Cloudflare" button provisions the
-  actual Worker + three Durable Object classes to a real Cloudflare account, from
-  `wrangler.toml`'s `[[migrations]]` — no separate database service to provision. Per
-  the README, the end-to-end button flow hasn't yet been run start-to-finish against a
-  fresh account, so this is "wired and should work," not "verified clean-room."
+- **A deployable artifact today.** The repository defines an ordered deployment of
+  two Workers and four Durable Object classes to a real Cloudflare account, with no
+  separate database service to provision. Cloudflare's deploy-button flow cannot
+  deploy both Worker applications together, so operators must clone the repository
+  and run `npm run deploy`. Fresh-account qualification remains pending; this is a
+  locally verified deployment workflow, not a verified clean-room result.
 - **An unusually deep review discipline for a solo project.** The Milestone 3 changelog
   entry documents seventeen successive `codex review` passes against one PR, each
   surfacing and closing a real correctness bug (SQL-guard bypasses, migration-cutover

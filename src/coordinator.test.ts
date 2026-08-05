@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { CoordinatorDO } from "./coordinator";
+import { sha256Hex } from "../packages/contracts/src/index.js";
+import type { CoordinatorDO, TransactionManifestService } from "./coordinator";
 import type { ShardDO } from "./shard";
 
 async function freshCoordinator() {
@@ -369,6 +370,654 @@ describe("CoordinatorDO recovery sweep (alarm-driven retry of an unacknowledged 
     await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
       const remaining = Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId));
       expect(remaining).toHaveLength(0);
+    });
+  });
+});
+
+describe("CoordinatorDO protocol-0 deploy-boundary adoption", () => {
+  type LegacyIntent = {
+    sql: string;
+    params: string[];
+    tenantId: string;
+    table: string;
+    partitionKey: string;
+  };
+
+  async function seedLegacyPreparedParticipant(shardName: string, txId: string, intents: LegacyIntent[]) {
+    const shard = await freshShard(shardName);
+    await shard.fetch(shardPost("/execute", {
+      sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+      requestId: `schema-${txId}`,
+      isMutation: true,
+    }));
+    expect((await shard.fetch(shardPost("/prepare", { coordinatorTxId: txId, intents }))).status).toBe(200);
+    await runInDurableObject(shard, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE pending_intents SET protocol_version = 0, operation_hash = '' WHERE coordinator_tx_id = ?",
+        txId,
+      );
+    });
+    return shard;
+  }
+
+  async function seedLegacyCoordinator(
+    txId: string,
+    shardName: string,
+    intents: LegacyIntent[],
+    options: { status?: "preparing" | "prepared" | "committed" | "aborted"; queueResume?: boolean } = {},
+  ) {
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await coordinator.fetch(post("/tx-status", { txId: "schema-warmup" }));
+    const operationJson = JSON.stringify([{ shardId: shardName, intents }]);
+    const predecessorHash = await sha256Hex(operationJson);
+    const status = options.status ?? "prepared";
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        txId,
+        status,
+        JSON.stringify([shardName]),
+        operationJson,
+        predecessorHash,
+        now,
+        now,
+      );
+      if (options.queueResume) {
+        state.storage.sql.exec(
+          "INSERT INTO recovery_queue (tx_id, action, next_attempt_at, attempt_count) VALUES (?, 'commit', ?, 0)",
+          txId,
+          now,
+        );
+      }
+    });
+    return coordinator;
+  }
+
+  it("replays exact prepare adoption before manifest registration and converges to terminal commit", async () => {
+    const txId = `tx-legacy-adopt-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const intents = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }];
+    const shard = await seedLegacyPreparedParticipant(shardName, txId, intents);
+    const coordinator = await seedLegacyCoordinator(txId, shardName, intents);
+
+    const resumed = await coordinator.fetch(post("/begin", { txId, participants: [{ shardId: shardName, intents }] }));
+    expect(resumed.status).toBe(200);
+    expect(((await resumed.json()) as { status: string }).status).toBe("committed");
+
+    const read = await shard.fetch(shardPost("/execute", {
+      sql: "SELECT id FROM t WHERE id = ?",
+      params: [txId],
+      requestId: `read-${txId}`,
+      isMutation: false,
+    }));
+    expect(((await read.json()) as { rows: unknown[] }).rows).toHaveLength(1);
+    await runInDurableObject(shard, async (_instance: ShardDO, state: DurableObjectState) => {
+      const adopted = state.storage.sql.exec<{ protocol_version: number; operation_hash: string; status: string }>(
+        "SELECT protocol_version, operation_hash, status FROM pending_intents WHERE coordinator_tx_id = ?",
+        txId,
+      ).one();
+      expect(adopted.protocol_version).toBe(1);
+      expect(adopted.operation_hash).toMatch(/^[a-f0-9]{64}$/);
+      expect(adopted.status).toBe("committed");
+    });
+  });
+
+  it("adopts an exact predecessor preparing row without stranding its participant lock", async () => {
+    const txId = `tx-legacy-preparing-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const intents = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }];
+    const shard = await seedLegacyPreparedParticipant(shardName, txId, intents);
+    const coordinator = await seedLegacyCoordinator(txId, shardName, intents, { status: "preparing" });
+
+    const resumed = await coordinator.fetch(post("/begin", { txId, participants: [{ shardId: shardName, intents }] }));
+    expect(resumed.status).toBe(200);
+    expect(((await resumed.json()) as { status: string }).status).toBe("committed");
+
+    await runInDurableObject(shard, async (_instance: ShardDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM row_locks WHERE coordinator_tx_id = ?", txId))).toHaveLength(0);
+      const intent = state.storage.sql.exec<{ protocol_version: number; status: string }>(
+        "SELECT protocol_version, status FROM pending_intents WHERE coordinator_tx_id = ?",
+        txId,
+      ).one();
+      expect(intent).toEqual({ protocol_version: 1, status: "committed" });
+    });
+  });
+
+  it.each([
+    ["committed", 200, "committed", undefined],
+    ["aborted", 409, undefined, "TX_ABORTED"],
+  ] as const)("returns the predecessor %s terminal result for an exact replay", async (status, httpStatus, expectedStatus, expectedCode) => {
+    const txId = `tx-legacy-terminal-${status}-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const intents = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }];
+    const coordinator = await seedLegacyCoordinator(txId, shardName, intents, { status });
+
+    const replay = await coordinator.fetch(post("/begin", { txId, participants: [{ shardId: shardName, intents }] }));
+    expect(replay.status).toBe(httpStatus);
+    const body = (await replay.json()) as { status?: string; error?: { code: string } };
+    expect(body.status).toBe(expectedStatus);
+    expect(body.error?.code).toBe(expectedCode);
+  });
+
+  it("accepts an exact predecessor retry when its stored participant order was caller-controlled", async () => {
+    const txId = `tx-legacy-order-${crypto.randomUUID()}`;
+    const shardAName = `shard-a-${txId}`;
+    const shardBName = `shard-b-${txId}`;
+    const intentsA = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [`a-${txId}`], tenantId: "t1", table: "t", partitionKey: `a-${txId}` }];
+    const intentsB = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [`b-${txId}`], tenantId: "t1", table: "t", partitionKey: `b-${txId}` }];
+    const shardA = await seedLegacyPreparedParticipant(shardAName, txId, intentsA);
+    const shardB = await seedLegacyPreparedParticipant(shardBName, txId, intentsB);
+    const storedParticipants = [
+      { shardId: shardBName, intents: intentsB },
+      { shardId: shardAName, intents: intentsA },
+    ];
+    const operationJson = JSON.stringify(storedParticipants);
+    const predecessorHash = await sha256Hex(operationJson);
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await coordinator.fetch(post("/tx-status", { txId: "schema-warmup" }));
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at)
+         VALUES (?, 'prepared', ?, ?, ?, ?, ?)`,
+        txId,
+        JSON.stringify([shardBName, shardAName]),
+        operationJson,
+        predecessorHash,
+        now,
+        now,
+      );
+    });
+
+    // The gateway normalizes incoming participants to A,B. The legacy digest
+    // must still be verified against the original stored B,A serialization.
+    const resumed = await coordinator.fetch(post("/begin", { txId, participants: storedParticipants }));
+    expect(resumed.status).toBe(200);
+    expect(((await resumed.json()) as { status: string }).status).toBe("committed");
+
+    for (const [shard, id] of [[shardA, `a-${txId}`], [shardB, `b-${txId}`]] as const) {
+      const read = await shard.fetch(shardPost("/execute", {
+        sql: "SELECT id FROM t WHERE id = ?",
+        params: [id],
+        requestId: `read-${id}`,
+        isMutation: false,
+      }));
+      expect(((await read.json()) as { rows: unknown[] }).rows).toHaveLength(1);
+    }
+  });
+
+  it("alarm resume rejects mismatched stored participant identity and aborts without committing", async () => {
+    const txId = `tx-legacy-mismatch-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const coordinatorIntents = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [`expected-${txId}`], tenantId: "t1", table: "t", partitionKey: `expected-${txId}` }];
+    const participantIntents = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [`different-${txId}`], tenantId: "t1", table: "t", partitionKey: `different-${txId}` }];
+    const shard = await seedLegacyPreparedParticipant(shardName, txId, participantIntents);
+    const coordinator = await seedLegacyCoordinator(txId, shardName, coordinatorIntents, { queueResume: true });
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO) => {
+      await instance.alarm();
+    });
+    const status = await coordinator.fetch(post("/tx-status", { txId }));
+    expect(((await status.json()) as { status: string }).status).toBe("aborted");
+
+    await runInDurableObject(shard, async (_instance: ShardDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM pending_intents WHERE coordinator_tx_id = ?", txId))).toHaveLength(0);
+      expect(state.storage.sql.exec<{ decision: string }>("SELECT decision FROM participant_decision_tombstones WHERE tx_id = ?", txId).one().decision).toBe("abort");
+    });
+  });
+
+  it("force-aborts an unadopted prepared row and its abort tombstone blocks a later commit", async () => {
+    const txId = `tx-legacy-force-abort-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const intents = [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }];
+    const shard = await seedLegacyPreparedParticipant(shardName, txId, intents);
+    const coordinator = await seedLegacyCoordinator(txId, shardName, intents);
+
+    const forced = await coordinator.fetch(post("/force-abort", { txId }));
+    expect(forced.status).toBe(200);
+    expect(((await forced.json()) as { status: string }).status).toBe("aborted");
+    await runInDurableObject(shard, async (_instance: ShardDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM pending_intents WHERE coordinator_tx_id = ?", txId))).toHaveLength(0);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM row_locks WHERE coordinator_tx_id = ?", txId))).toHaveLength(0);
+    });
+
+    const lateCommit = await shard.fetch(shardPost("/commit", { coordinatorTxId: txId }));
+    expect(lateCommit.status).toBe(409);
+    expect(((await lateCommit.json()) as { error: { code: string } }).error.code).toBe("TX_DECISION_CONFLICT");
+  });
+});
+
+describe("CoordinatorDO manifest admission and lifecycle", () => {
+  it("concurrent identical retries waiting on manifest registration converge instead of returning a CAS 500", async () => {
+    const txId = `tx-manifest-race-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      let registrationMode: "ambiguous" | "barrier" = "ambiguous";
+      let barrierCalls = 0;
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      const service: TransactionManifestService = {
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          if (registrationMode === "ambiguous") {
+            return {
+              ok: false as const,
+              status: "unavailable" as const,
+              http_status: 503 as const,
+              error: { schema_version: 1 as const, code: "TX_MANIFEST_UNAVAILABLE" as const, message: "test outage", http_status: 503, retryable: true },
+            };
+          }
+          barrierCalls += 1;
+          if (barrierCalls === 2) releaseBarrier();
+          await barrier;
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      const mutable = instance as unknown as {
+        coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService };
+        callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
+      };
+      mutable.coordinatorEnv.CONTROL_PLANE = service;
+      mutable.callShard = async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      const payload = {
+        txId,
+        participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      };
+
+      const first = await instance.fetch(post("/begin", payload));
+      expect(first.status).toBe(202);
+      expect(((await first.json()) as { status: string }).status).toBe("commit_pending_manifest");
+
+      registrationMode = "barrier";
+      const [retryA, retryB] = await Promise.all([
+        instance.fetch(post("/begin", payload)),
+        instance.fetch(post("/begin", payload)),
+      ]);
+      expect([retryA.status, retryB.status]).toEqual([200, 200]);
+      expect((await retryA.json()) as { status: string }).toMatchObject({ status: "committed" });
+      expect((await retryB.json()) as { status: string }).toMatchObject({ status: "committed" });
+      expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("committed");
+      expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");
+    });
+  });
+
+  it("concurrent identical retries waiting on participant acknowledgements converge instead of returning a CAS 500", async () => {
+    const txId = `tx-ack-race-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const service: TransactionManifestService = {
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      let commitMode: "fail" | "barrier" = "fail";
+      let barrierCalls = 0;
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      const mutable = instance as unknown as {
+        coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService };
+        callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
+      };
+      mutable.coordinatorEnv.CONTROL_PLANE = service;
+      mutable.callShard = async (_row, _participant, phase) => {
+        if (phase !== "commit") return new Response("{}", { status: 200 });
+        if (commitMode === "fail") return new Response("{}", { status: 503 });
+        barrierCalls += 1;
+        if (barrierCalls === 2) releaseBarrier();
+        await barrier;
+        return new Response("{}", { status: 200 });
+      };
+      const payload = {
+        txId,
+        participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      };
+
+      const first = await instance.fetch(post("/begin", payload));
+      expect(first.status).toBe(202);
+      expect(((await first.json()) as { status: string }).status).toBe("committed_pending_ack");
+
+      commitMode = "barrier";
+      const [retryA, retryB] = await Promise.all([
+        instance.fetch(post("/begin", payload)),
+        instance.fetch(post("/begin", payload)),
+      ]);
+      expect([retryA.status, retryB.status]).toEqual([200, 200]);
+      expect((await retryA.json()) as { status: string }).toMatchObject({ status: "committed" });
+      expect((await retryB.json()) as { status: string }).toMatchObject({ status: "committed" });
+      expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("committed");
+      expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");
+    });
+  });
+
+  it("preserves monotonic recovery backoff across repeated committed-pending-ack failures", async () => {
+    const txId = `tx-ack-backoff-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const service: TransactionManifestService = {
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      const mutable = instance as unknown as {
+        coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService };
+        callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
+      };
+      mutable.coordinatorEnv.CONTROL_PLANE = service;
+      mutable.callShard = async (_row, _participant, phase) => new Response("{}", { status: phase === "commit" ? 503 : 200 });
+      const payload = {
+        txId,
+        participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      };
+      const attemptCount = () => state.storage.sql.exec<{ attempt_count: number }>(
+        "SELECT attempt_count FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one().attempt_count;
+
+      const first = await instance.fetch(post("/begin", payload));
+      expect(first.status).toBe(202);
+      expect(attemptCount()).toBe(1);
+
+      const second = await instance.fetch(post("/begin", payload));
+      expect(second.status).toBe(202);
+      expect(attemptCount()).toBe(2);
+
+      const third = await instance.fetch(post("/begin", payload));
+      expect(third.status).toBe(202);
+      expect(attemptCount()).toBe(3);
+    });
+  });
+
+  it("opens after three admission failures, permits one half-open probe, and resets on success", async () => {
+    const txId = `tx-circuit-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const shard = await freshShard(shardName);
+    await shard.fetch(shardPost("/execute", {
+      sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+      requestId: `schema-${txId}`,
+      isMutation: true,
+    }));
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      let failAdmission = true;
+      let admissionCalls = 0;
+      const service: TransactionManifestService = {
+        async checkManifestAdmission() {
+          admissionCalls += 1;
+          return failAdmission
+            ? {
+                ok: false as const,
+                status: "unavailable" as const,
+                http_status: 503 as const,
+                error: { schema_version: 1 as const, code: "TX_MANIFEST_UNAVAILABLE" as const, message: "test outage", http_status: 503, retryable: true },
+                circuit: { count_toward_open: true as const, failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const },
+              }
+            : { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+
+      const begin = () => instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      for (let attempt = 0; attempt < 3; attempt += 1) expect((await begin()).status).toBe(503);
+      expect(admissionCalls).toBe(3);
+      expect((await begin()).status).toBe(503);
+      expect(admissionCalls, "open circuit must reject without another RPC").toBe(3);
+
+      const opened = state.storage.sql.exec<{ open_until_ms: number; open_count: number }>(
+        "SELECT open_until_ms, open_count FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one();
+      expect(opened.open_count).toBe(1);
+      expect(opened.open_until_ms).toBeGreaterThan(Date.now());
+
+      state.storage.sql.exec("UPDATE manifest_admission_circuit SET open_until_ms = ? WHERE singleton = 1", Date.now() - 1);
+      failAdmission = false;
+      expect((await begin()).status).toBe(200);
+      expect(admissionCalls).toBe(4);
+      const reset = state.storage.sql.exec<{ failure_count: number; open_until_ms: number; open_count: number; half_open_probe: number }>(
+        "SELECT failure_count, open_until_ms, open_count, half_open_probe FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one();
+      expect(reset).toEqual({ failure_count: 0, open_until_ms: 0, open_count: 0, half_open_probe: 0 });
+    });
+  });
+
+  it("keeps participants prepared while manifest registration is ambiguous, grows durable backoff, and converges by alarm", async () => {
+    const txId = `tx-manifest-ambiguous-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const shard = await freshShard(shardName);
+    await shard.fetch(shardPost("/execute", {
+      sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+      requestId: `schema-${txId}`,
+      isMutation: true,
+    }));
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    let registrations = 0;
+    const service: TransactionManifestService = {
+      async checkManifestAdmission() {
+        return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+      },
+      async registerManifest(registration) {
+        registrations += 1;
+        if (registrations <= 2) throw new Error("ambiguous registration transport failure");
+        return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+      },
+      async releaseManifestRetention() {
+        return { ok: true as const, status: "released" as const };
+      },
+    };
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+
+      const begin = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(begin.status).toBe(202);
+      expect(((await begin.json()) as { status: string }).status).toBe("commit_pending_manifest");
+      expect(registrations).toBe(1);
+
+      expect(state.storage.sql.exec<{ attempt_count: number }>(
+        "SELECT attempt_count FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one().attempt_count).toBe(1);
+    });
+
+    const beforeManifest = await shard.fetch(shardPost("/execute", {
+      sql: "SELECT id FROM t WHERE id = ?",
+      params: [txId],
+      requestId: `read-before-manifest-${txId}`,
+      isMutation: false,
+    }));
+    expect(((await beforeManifest.json()) as { rows: unknown[] }).rows).toHaveLength(0);
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      state.storage.sql.exec("UPDATE recovery_queue SET next_attempt_at = ? WHERE tx_id = ?", new Date(0).toISOString(), txId);
+      await instance.alarm();
+      expect(registrations).toBe(2);
+      const secondRetry = state.storage.sql.exec<{ attempt_count: number; next_attempt_at: string }>(
+        "SELECT attempt_count, next_attempt_at FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one();
+      expect(secondRetry.attempt_count).toBe(2);
+      expect(new Date(secondRetry.next_attempt_at).getTime() - Date.now()).toBeGreaterThanOrEqual(9_000);
+    });
+
+    const stillUncommitted = await shard.fetch(shardPost("/execute", {
+      sql: "SELECT id FROM t WHERE id = ?",
+      params: [txId],
+      requestId: `read-second-ambiguity-${txId}`,
+      isMutation: false,
+    }));
+    expect(((await stillUncommitted.json()) as { rows: unknown[] }).rows).toHaveLength(0);
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      state.storage.sql.exec("UPDATE recovery_queue SET next_attempt_at = ? WHERE tx_id = ?", new Date(0).toISOString(), txId);
+      await instance.alarm();
+      expect(registrations).toBe(3);
+      const status = await instance.fetch(post("/tx-status", { txId }));
+      expect(((await status.json()) as { status: string }).status).toBe("committed");
+      expect(state.storage.sql.exec<{ action: string; attempt_count: number }>(
+        "SELECT action, attempt_count FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one()).toEqual({ action: "release", attempt_count: 0 });
+    });
+
+    const committed = await shard.fetch(shardPost("/execute", {
+      sql: "SELECT id FROM t WHERE id = ?",
+      params: [txId],
+      requestId: `read-committed-${txId}`,
+      isMutation: false,
+    }));
+    expect(((await committed.json()) as { rows: unknown[] }).rows).toHaveLength(1);
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      state.storage.sql.exec("UPDATE recovery_queue SET next_attempt_at = ? WHERE tx_id = ?", new Date(0).toISOString(), txId);
+      await instance.alarm();
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+    });
+  });
+
+  it("quarantines deterministic manifest rejection and removes nonretryable recovery work", async () => {
+    const txId = `tx-manifest-rejected-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const shard = await freshShard(shardName);
+    await shard.fetch(shardPost("/execute", {
+      sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+      requestId: `schema-${txId}`,
+      isMutation: true,
+    }));
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const service: TransactionManifestService = {
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest() {
+          return {
+            ok: false as const,
+            status: "rejected" as const,
+            http_status: 503,
+            error: { schema_version: 1 as const, code: "TX_VERSION_UNSUPPORTED" as const, message: "unsupported manifest version", http_status: 503, retryable: false },
+          };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+
+      const begin = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(begin.status).toBe(503);
+
+      const durable = state.storage.sql.exec<{ status: string; decision: string; last_error: string }>(
+        "SELECT status, decision, last_error FROM transactions WHERE tx_id = ?",
+        txId,
+      ).one();
+      expect(durable.status).toBe("quarantined");
+      expect(durable.decision).toBe("quarantined");
+      expect(JSON.parse(durable.last_error)).toMatchObject({ code: "TX_VERSION_UNSUPPORTED" });
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+
+      await instance.alarm();
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+      const replay = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(replay.status).toBe(409);
+      expect(((await replay.json()) as { error: { code: string } }).error.code).toBe("TX_QUARANTINED");
+    });
+  });
+
+  it("releases retention only after terminal commit and durably retries an ambiguous release", async () => {
+    const txId = `tx-release-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const shard = await freshShard(shardName);
+    await shard.fetch(shardPost("/execute", {
+      sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+      requestId: `schema-${txId}`,
+      isMutation: true,
+    }));
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      let releases = 0;
+      const service: TransactionManifestService = {
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          releases += 1;
+          if (releases === 1) throw new Error("ambiguous transport failure");
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+
+      const committed = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(committed.status).toBe(200);
+      expect(releases, "release must not run before terminal participant acknowledgements").toBe(0);
+      expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");
+
+      await instance.alarm();
+      expect(releases).toBe(1);
+      const retry = state.storage.sql.exec<{ action: string; attempt_count: number }>(
+        "SELECT action, attempt_count FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one();
+      expect(retry.action).toBe("release");
+      expect(retry.attempt_count).toBe(1);
+
+      state.storage.sql.exec("UPDATE recovery_queue SET next_attempt_at = ? WHERE tx_id = ?", new Date(0).toISOString(), txId);
+      await instance.alarm();
+      expect(releases).toBe(2);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
     });
   });
 });

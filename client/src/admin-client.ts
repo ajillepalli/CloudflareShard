@@ -24,6 +24,7 @@ import type {
   RegisterTableResponse,
   RegisterTenantRequest,
   RegisterTenantResponse,
+  RouteProbeResponse,
   SetPartitionKeyColumnRequest,
   SetRowOwnerRequest,
   SetRowOwnerResponse,
@@ -157,6 +158,19 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
     return this.post<StatusResponse>("/admin/status", {});
   }
 
+  /** Onboarding-only placement probe. Uses the admin-only raw SQL endpoint
+   * with a constant `SELECT 1`, so no customer SQL or row data is accepted or
+   * returned. This lets `cloudflareshard verify` choose a genuine two-shard
+   * transaction using the deployed cluster's authoritative router. */
+  async routeProbe(table: string, tenantId: string, partitionKey: string): Promise<RouteProbeResponse> {
+    return this.post<RouteProbeResponse>("/v1/sql", {
+      sql: "SELECT 1",
+      table,
+      tenantId,
+      partitionKey,
+    });
+  }
+
   /** Row counts and internal bookkeeping-table sizes for ONE physical
    * shard (not a cluster-wide aggregate) -- discover shard IDs via
    * status()'s catalogs, or an index's placementRing from listIndexes(). */
@@ -233,6 +247,27 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
 
   async txStatus(request: TxStatusRequest): Promise<TxStatusResponse> {
     return this.post<TxStatusResponse>("/admin/tx-status", request);
+  }
+
+  /** Polls the authoritative coordinator until the transaction reaches a
+   * terminal state. Pending-manifest and pending-ack states remain visible
+   * through txStatus() while this convenience helper waits for convergence. */
+  async waitForTransaction(
+    txId: string,
+    options: { intervalMs?: number; maxWaitMs?: number } = {},
+  ): Promise<Extract<TxStatusResponse, { found: true }>> {
+    const intervalMs = options.intervalMs ?? 500;
+    const maxWaitMs = options.maxWaitMs ?? 5 * 60 * 1000;
+    const deadline = Date.now() + maxWaitMs;
+    for (;;) {
+      const status = await this.txStatus({ txId });
+      if (!status.found) throw new Error(`Transaction ${txId} was not found.`);
+      if (status.status === "committed" || status.status === "aborted" || status.status === "quarantined") return status;
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out after ${maxWaitMs}ms waiting for transaction ${txId} to become terminal (still '${status.status}').`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
   }
 
   /** Escape hatch for a transaction stuck mid-2PC (e.g. an unreachable
