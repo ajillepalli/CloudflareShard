@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { CatalogDO } from "./catalog";
 import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
-import { CoordinatorDO } from "./coordinator";
+import { CoordinatorDO, type TransactionManifestService } from "./coordinator";
 import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth, isValidBearerToken } from "./auth";
@@ -26,6 +26,10 @@ export interface Env {
   CATALOG: DurableObjectNamespace<CatalogDO>;
   SHARD: DurableObjectNamespace<ShardDO>;
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
+  /** Route-less service-binding seam for the mandatory commit manifest.
+   * Optional in the TypeScript seam only for expand-first deployment; an
+   * absent runtime binding fails admission before any participant prepares. */
+  CONTROL_PLANE?: TransactionManifestService;
   ADMIN_TOKEN?: string;
   CATALOG_SHARD_COUNT?: string;
   /** SAFETY: demo-only fault-injection kill switch (Shardscope chaos mode —

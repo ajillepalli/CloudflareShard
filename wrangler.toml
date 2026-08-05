@@ -9,6 +9,12 @@ compatibility_date = "2026-06-29"
 enabled = true
 head_sampling_rate = 1
 
+# Cross-shard participant commits are gated on durable JournalManifestDO
+# registration through this route-less Worker RPC service.
+[[services]]
+binding = "CONTROL_PLANE"
+service = "cloudflare-shard-control-plane"
+
 [[durable_objects.bindings]]
 name = "CATALOG"
 class_name = "CatalogDO"
