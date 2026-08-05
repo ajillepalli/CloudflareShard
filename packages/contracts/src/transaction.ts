@@ -1373,8 +1373,12 @@ export function validateManifestEnumerationRequest(value: unknown): asserts valu
 }
 
 export async function hashManifestRequest(value: ManifestLocalPageRequestV1 | ManifestEnumerationRequestV1): Promise<string> {
-  if ("expected_retention_epoch" in value) validateManifestLocalPageRequest(value);
-  else validateManifestEnumerationRequest(value);
+  if ("expected_retention_epoch" in value) {
+    validateManifestLocalPageRequest(value);
+    const { expected_retention_epoch: _liveRetentionEpoch, ...stableRequest } = value;
+    return hashCanonicalJson({ ...stableRequest, cursor: null });
+  }
+  validateManifestEnumerationRequest(value);
   return hashCanonicalJson({ ...value, cursor: null });
 }
 

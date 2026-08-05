@@ -956,7 +956,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           || row.terminal_intent_hash !== intentHash
           || row.commit_decided_at_ms !== assignment.decided_at_ms
           || row.decision_sequence !== assignment.sequence
-          || row.quarantine_state === "UNRESOLVED"
         ) return false;
         if (row.record_hash !== null) return row.record_hash === recordHash;
         this.ctx.storage.sql.exec(
@@ -977,6 +976,20 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           status: "quarantined",
           http_status: 409,
           error: manifestError("MANIFEST_QUARANTINED", "Finalize evidence changed before canonical record publication."),
+        };
+      }
+      const published = this.ctx.storage.sql
+        .exec<{ quarantine_state: string }>(
+          "SELECT quarantine_state FROM manifest_reservations WHERE tx_id = ?",
+          intent.tx_id,
+        )
+        .one();
+      if (published.quarantine_state === "UNRESOLVED") {
+        return {
+          ok: false,
+          status: "quarantined",
+          http_status: 409,
+          error: manifestError("MANIFEST_QUARANTINED", "Finalize evidence requires audited conflict resolution."),
         };
       }
       return { ok: true, status: "finalized", record, record_hash: recordHash };
@@ -1904,10 +1917,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
             error: manifestError("MANIFEST_COVERAGE_GAP", "Local page request does not identify this manifest bucket."),
           };
         }
-        if (
-          request.expected_retention_epoch !== bucket.retention_epoch
-          || request.cursor?.retention_epoch !== undefined && request.cursor.retention_epoch !== bucket.retention_epoch
-        ) {
+        if (request.expected_retention_epoch !== bucket.retention_epoch) {
           return {
             ok: false,
             status: "cursor_mismatch",

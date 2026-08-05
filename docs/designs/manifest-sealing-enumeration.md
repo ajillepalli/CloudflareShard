@@ -391,6 +391,12 @@ Unresolved quarantine is rechecked by each local page and blocks enumeration;
 later audited resolutions do not change immutable membership or invalidate an
 already returned cursor page.
 
+The finalize decision and sequence are assigned before the canonical record hash
+is materialized. If a conflicting cancel arrives during that hash await, record
+materialization still completes while the unresolved overlay keeps the finalize
+result and sealing path quarantined. Audited `resolution=FINALIZED` repair thus
+remains satisfiable without exposing unresolved evidence.
+
 The catalog owns append-only `partition_config_history` records containing
 `effective_from_day`, protocol version, partition count, prior hash, and config
 hash. V2 starts at 16 partitions; a future reshard requires a new history entry
@@ -408,6 +414,9 @@ maximum deleted decision time. Every local page request carries the expected
 retention epoch and revalidates it after serialization in the bucket. If
 `coverage_start <= records_deleted_through_ms`, the authoritative bucket returns
 `retention_expired`; a stale catalog mirror or seal receipt can never override it.
+The live epoch is audit evidence, not part of the cursor's stable request hash:
+a deletion strictly below `coverage_start` may advance the epoch without
+invalidating a cursor whose requested window remains fully retained.
 
 Seal and snapshot hashes retain the chain commitment after their recoverable
 detail is garbage-collected. Superseded seal/snapshot/close generations,

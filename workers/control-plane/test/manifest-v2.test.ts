@@ -1,5 +1,5 @@
 import { createExecutionContext, env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CURRENT_PROTOCOL_VERSION,
   COORDINATOR_RETENTION_DAYS,
@@ -275,6 +275,107 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       reservation: assignedRoute.reservation,
       reservation_hash: assignedRoute.reservation_hash,
     })).resolves.toMatchObject({ ok: true, status: "already_reserved" });
+    await expect(bucket.stats()).resolves.toMatchObject({ v2_quarantined: 0 });
+  });
+
+  it("materializes a canonical record when cancel races the finalize hash and permits audited repair", async () => {
+    const route = await assigned(`tx-finalize-cancel-race-${crypto.randomUUID()}`);
+    await route.worker.reserveManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash });
+    const finalizeIntent: ManifestFinalizeIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      reservation_hash: route.reservation_hash,
+      redo_envelope_hash: await hashCanonicalJson({ redo: route.reservation.tx_id }),
+      operation_hash: route.operationHash,
+      decision_epoch: 1,
+      idempotency_key: `finalize-${route.reservation.tx_id}`,
+    };
+    const cancelIntent: ManifestCancelIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      reservation_hash: route.reservation_hash,
+      operation_hash: route.operationHash,
+      decision_epoch: 1,
+      idempotency_key: `cancel-${route.reservation.tx_id}`,
+    };
+
+    const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
+    let releaseRecordHash!: () => void;
+    const recordHashGate = new Promise<void>((resolve) => { releaseRecordHash = resolve; });
+    let signalRecordHash!: () => void;
+    const recordHashStarted = new Promise<void>((resolve) => { signalRecordHash = resolve; });
+    let intercepted = false;
+    const digestSpy = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (algorithm, data) => {
+      const bytes = data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      const canonicalInput = new TextDecoder().decode(bytes);
+      if (!intercepted && canonicalInput.includes('"decision_sequence"') && canonicalInput.includes('"retention_deadline"')) {
+        intercepted = true;
+        signalRecordHash();
+        await recordHashGate;
+      }
+      return await originalDigest(algorithm, data);
+    });
+
+    let finalizeResult;
+    try {
+      const finalizing = route.worker.finalizeManifest({
+        reservation: route.reservation,
+        reservation_hash: route.reservation_hash,
+        intent: finalizeIntent,
+      });
+      await recordHashStarted;
+      await expect(route.worker.cancelManifest({
+        reservation: route.reservation,
+        reservation_hash: route.reservation_hash,
+        intent: cancelIntent,
+      })).resolves.toMatchObject({ ok: false, status: "conflict" });
+      releaseRecordHash();
+      finalizeResult = await finalizing;
+    } finally {
+      releaseRecordHash();
+      digestSpy.mockRestore();
+    }
+    expect(intercepted).toBe(true);
+    expect(finalizeResult).toMatchObject({ ok: false, status: "quarantined" });
+
+    const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    const canonical = await runInDurableObject(bucket, async (_instance, state) => state.storage.sql
+      .exec<{ record_hash: string; record_json: string }>(
+        "SELECT record_hash, record_json FROM manifest_reservations WHERE tx_id = ?",
+        route.reservation.tx_id,
+      )
+      .one());
+    expect(canonical.record_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.parse(canonical.record_json)).toMatchObject({ tx_id: route.reservation.tx_id });
+
+    const authorizationSourceHash = await hashCanonicalJson(finalizeIntent);
+    const coordinatorState = {
+      tx_id: route.reservation.tx_id,
+      coordinator_id: route.reservation.coordinator_id,
+      state: "quarantined",
+      decision: "quarantined",
+      epoch: route.reservation.decision_epoch,
+      operation_hash: route.reservation.operation_hash,
+      reservation_hash: route.reservation_hash,
+      authorization_source_hash: authorizationSourceHash,
+    };
+    await expect(route.worker.resolveManifestQuarantine({
+      reservation: route.reservation,
+      reservation_hash: route.reservation_hash,
+      resolution: "FINALIZED",
+      selected_hash: canonical.record_hash,
+      evidence_hash: await hashCanonicalJson({ ticket: "INC-finalize-cancel-race" }),
+      actor: "operator@example.com",
+      reason: "The assigned finalize decision remains canonical.",
+      terminal_intent: finalizeIntent,
+      coordinator_state: coordinatorState,
+      coordinator_state_hash: await hashCanonicalJson(coordinatorState),
+      idempotency_key: `resolve-${route.reservation.tx_id}`,
+    })).resolves.toMatchObject({ ok: true, status: "resolved", resolution: "FINALIZED", record_hash: canonical.record_hash });
     await expect(bucket.stats()).resolves.toMatchObject({ v2_quarantined: 0 });
   });
 
@@ -650,7 +751,20 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     } as const;
     const localFirst = await bucket.localPage(localRequest);
     if (!localFirst.ok || localFirst.next_cursor === null) throw new Error("Expected a local cursor.");
-    await expect(bucket.localPage({ ...localRequest, cursor: localFirst.next_cursor })).resolves.toMatchObject({
+    await runInDurableObject(bucket, async (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE manifest_bucket_state
+            SET retention_epoch = retention_epoch + 1, records_deleted_through_ms = ?
+          WHERE id = 1`,
+        new Date(localRequest.coverage_start).getTime() - 1,
+      );
+    });
+    const afterDisjointRetention = await bucket.stats();
+    await expect(bucket.localPage({
+      ...localRequest,
+      expected_retention_epoch: afterDisjointRetention.retention_epoch,
+      cursor: localFirst.next_cursor,
+    })).resolves.toMatchObject({
       ok: true,
       records: [{ tx_id: secondTx }],
       next_cursor: null,

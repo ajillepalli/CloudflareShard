@@ -742,6 +742,7 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
       cursor: null,
     };
     const requestHash = await hashManifestRequest(request);
+    expect(await hashManifestRequest({ ...request, expected_retention_epoch: 1 })).toBe(requestHash);
     const cursor: ManifestLocalPageCursorV1 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_CURSOR_FORMAT_VERSION,
