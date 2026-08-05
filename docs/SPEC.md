@@ -972,10 +972,11 @@ This prevents duplicate writes after network retries and stops a reused requestI
     `new -> preparing -> prepared -> commit_decided -> commit_pending_manifest ->
     manifest_registered -> committing -> committed_pending_ack -> committed` (the two pending
     states are skipped when their acknowledgement succeeds immediately), or
-    `preparing/prepared -> abort_decided -> aborting -> aborted`. `quarantined` is a terminal
+    `preparing/prepared -> abort_decided -> aborting -> aborted`. `quarantined` is a parked
     manual-inspection state reached when immutable content conflicts or unsafe persisted state
-    is detected. Same-state replay is idempotent; no transition from a commit-decision state to
-    an abort state is legal.
+    is detected. Only the audited quarantine-repair path may leave it, using canonical terminal
+    intent plus operator attestation to reach `manifest_registered` or `aborted`. Same-state
+    replay is idempotent; no transition from a commit-decision state to an abort state is legal.
   - **Manifest-before-participant-commit sequence.** After every participant prepares, the
     coordinator (1) durably stores `commit_decided` plus the immutable redo envelope and
     manifest registration, (2) queues manifest recovery, (3) registers that exact record with

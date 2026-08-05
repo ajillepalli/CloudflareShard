@@ -256,7 +256,7 @@ describe("transaction state model", () => {
     committing: ["committed_pending_ack", "committed", "quarantined"],
     committed_pending_ack: ["committed", "quarantined"],
     committed: ["quarantined"],
-    quarantined: [],
+    quarantined: ["manifest_registered", "aborted"],
   };
 
   it("exhaustively accepts only same-state replay and the frozen transition table", () => {

@@ -742,7 +742,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     } catch (error) {
       if (error instanceof CoordinatorCasLost) {
         const latest = this.loadTx(row.tx_id);
-        if (latest && ["abort_decided", "aborting", "aborted"].includes(this.stateOf(latest))) return latest;
+        if (latest && ["abort_decided", "aborting", "aborted_pending_manifest_cancel", "aborted"].includes(this.stateOf(latest))) return latest;
       }
       throw error;
     }
@@ -762,6 +762,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }
     }
     else if (state === "aborted") return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
+    else if (state === "aborted_pending_manifest_cancel") return this.reconcileCancel(current);
     else if (state !== "aborting") return protocolResponse(transactionError("TX_INVALID_TRANSITION", `Cannot reconcile abort from ${state}.`));
 
     const legacyPredecisionAbort = knownLegacyPredecisionAbort ?? await this.coordinatorIdentity(current) === "legacy";
@@ -2052,7 +2053,52 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         || resolvedRecord.tx_id !== row.tx_id
         || resolvedRecord.reservation_hash !== reservationHash
       ) return protocolResponse(transactionError("MANIFEST_TERMINAL_CONFLICT", "Resolved record conflicts with coordinator identity."));
-      this.ctx.storage.transactionSync(() => {
+      try {
+        this.ctx.storage.transactionSync(() => {
+          const current = this.loadTx(row.tx_id);
+          if (
+            !current
+            || this.stateOf(current) !== coordinatorState.state
+            || current.decision !== coordinatorState.decision
+            || current.epoch !== coordinatorState.epoch
+            || current.operation_hash !== coordinatorState.operation_hash
+            || current.manifest_reservation_hash !== coordinatorState.reservation_hash
+            || current.manifest_finalize_request_json !== row.manifest_finalize_request_json
+          ) throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
+          const currentState = this.stateOf(current);
+          const nextState: TransactionState = ["manifest_registered", "committing", "committed_pending_ack", "committed"].includes(currentState)
+            ? currentState
+            : "manifest_registered";
+          assertTransactionTransition(currentState, nextState);
+          this.sql.exec(
+            `UPDATE transactions
+                SET status = ?, decision = 'commit', manifest_record_json = ?,
+                    manifest_record_hash = ?, commit_decided_at_ms = ?, decision_sequence = ?,
+                    last_error = NULL, updated_at = ?
+              WHERE tx_id = ?`,
+            nextState,
+            canonicalJson(resolvedRecord),
+            result.record_hash,
+            resolvedRecord.commit_decided_at_ms,
+            resolvedRecord.decision_sequence,
+            new Date().toISOString(),
+            row.tx_id,
+          );
+          if (nextState === "manifest_registered") this.queueRecovery(row.tx_id, "commit", new Date().toISOString());
+        });
+      } catch (error) {
+        if (error instanceof CoordinatorCasLost) {
+          return protocolResponse(transactionError("TX_INVALID_TRANSITION", `Coordinator state changed to ${error.state} during quarantine repair.`));
+        }
+        throw error;
+      }
+      const resolved = this.loadTx(row.tx_id);
+      if (!resolved) throw new Error(`Missing resolved transaction ${row.tx_id}.`);
+      return this.reconcileCommit(resolved);
+    }
+    let repairedAbortState: TransactionState;
+    try {
+      repairedAbortState = this.ctx.storage.transactionSync(() => {
         const current = this.loadTx(row.tx_id);
         if (
           !current
@@ -2061,48 +2107,36 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           || current.epoch !== coordinatorState.epoch
           || current.operation_hash !== coordinatorState.operation_hash
           || current.manifest_reservation_hash !== coordinatorState.reservation_hash
-          || current.manifest_finalize_request_json !== row.manifest_finalize_request_json
+          || current.manifest_cancel_request_json !== row.manifest_cancel_request_json
         ) throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
+        const currentState = this.stateOf(current);
+        const nextState: TransactionState = ["abort_decided", "aborting"].includes(currentState) ? currentState : "aborted";
+        assertTransactionTransition(currentState, nextState);
         this.sql.exec(
           `UPDATE transactions
-              SET status = 'manifest_registered', decision = 'commit', manifest_record_json = ?,
-                  manifest_record_hash = ?, commit_decided_at_ms = ?, decision_sequence = ?,
-                  last_error = NULL, updated_at = ?
+              SET status = ?, decision = 'abort', result_json = ?, last_error = NULL, updated_at = ?
             WHERE tx_id = ?`,
-          canonicalJson(resolvedRecord),
-          result.record_hash,
-          resolvedRecord.commit_decided_at_ms,
-          resolvedRecord.decision_sequence,
+          nextState,
+          nextState === "aborted" ? JSON.stringify({ status: "aborted" }) : current.result_json,
           new Date().toISOString(),
           row.tx_id,
         );
-        this.queueRecovery(row.tx_id, "commit", new Date().toISOString());
+        if (nextState === "aborted") this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+        else this.queueRecovery(row.tx_id, "abort", new Date().toISOString());
+        return nextState;
       });
-      const resolved = this.loadTx(row.tx_id);
-      if (!resolved) throw new Error(`Missing resolved transaction ${row.tx_id}.`);
-      return this.reconcileCommit(resolved);
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        return protocolResponse(transactionError("TX_INVALID_TRANSITION", `Coordinator state changed to ${error.state} during quarantine repair.`));
+      }
+      throw error;
     }
-    this.ctx.storage.transactionSync(() => {
-      const current = this.loadTx(row.tx_id);
-      if (
-        !current
-        || this.stateOf(current) !== coordinatorState.state
-        || current.decision !== coordinatorState.decision
-        || current.epoch !== coordinatorState.epoch
-        || current.operation_hash !== coordinatorState.operation_hash
-        || current.manifest_reservation_hash !== coordinatorState.reservation_hash
-        || current.manifest_cancel_request_json !== row.manifest_cancel_request_json
-      ) throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
-      this.sql.exec(
-        `UPDATE transactions
-            SET status = 'aborted', decision = 'abort', result_json = ?, last_error = NULL, updated_at = ?
-          WHERE tx_id = ?`,
-        JSON.stringify({ status: "aborted" }),
-        new Date().toISOString(),
-        row.tx_id,
-      );
-      this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
-    });
+    if (repairedAbortState !== "aborted") {
+      const repaired = this.loadTx(row.tx_id);
+      if (!repaired) throw new Error(`Missing repaired transaction ${row.tx_id}.`);
+      const response = await this.reconcileAbort(repaired);
+      if (response.status !== 409) return response;
+    }
     return json({ ok: true, txId: row.tx_id, status: "aborted", resolutionAttestationHash: result.resolution_attestation_hash });
   }
 

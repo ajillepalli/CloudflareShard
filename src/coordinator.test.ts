@@ -1188,6 +1188,45 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect(finalized.manifest_record_hash).toMatch(/^[a-f0-9]{64}$/);
       expect(finalized.commit_decided_at_ms).toBeGreaterThan(0);
       expect(finalized.decision_sequence).toBe(1);
+      expect(state.storage.sql.exec<{ action: string }>(
+        "SELECT action FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one().action).toBe("release");
+
+      service.resolveManifestQuarantine = async (resolution) => {
+        expect(resolution).toMatchObject({
+          resolution: "FINALIZED",
+          coordinator_state: { state: "committed", decision: "commit" },
+        });
+        return {
+          ok: true as const,
+          status: "resolved" as const,
+          resolution: "FINALIZED" as const,
+          resolution_attestation_hash: "e".repeat(64),
+          record: JSON.parse(finalized.manifest_record_json) as ManifestRecordV2,
+          record_hash: finalized.manifest_record_hash,
+        };
+      };
+      const repair = await instance.fetch(post("/resolve-manifest-quarantine", {
+        txId,
+        resolution: "FINALIZED",
+        selectedHash: finalized.manifest_record_hash,
+        evidenceHash: "d".repeat(64),
+        actor: "operator@example.com",
+        reason: "Canonical committed record resolves a stale terminal conflict.",
+        idempotencyKey: `resolve-${txId}`,
+      }));
+      expect(repair.status).toBe(200);
+      expect(await repair.json()).toMatchObject({ status: "committed" });
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM transactions WHERE tx_id = ?",
+        txId,
+      ).one().status).toBe("committed");
+      expect(state.storage.sql.exec<{ action: string }>(
+        "SELECT action FROM recovery_queue WHERE tx_id = ?",
+        txId,
+      ).one().action).toBe("release");
+      expect(commitCalls).toBe(1);
     });
   });
 
@@ -1281,6 +1320,53 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         resolutionAttestationHash: "e".repeat(64),
       });
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("aborted");
+    });
+  });
+
+  it("concurrent identical prepare failures converge to a typed abort instead of a CAS 500", async () => {
+    const txId = `tx-abort-race-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      let prepareCalls = 0;
+      let releasePrepares!: () => void;
+      const prepareBarrier = new Promise<void>((resolve) => { releasePrepares = resolve; });
+      const mutable = instance as unknown as {
+        coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService };
+        callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
+      };
+      mutable.coordinatorEnv.CONTROL_PLANE = service;
+      mutable.callShard = async (_row, _participant, phase) => {
+        if (phase !== "prepare") return new Response("{}", { status: 200 });
+        prepareCalls += 1;
+        if (prepareCalls === 2) releasePrepares();
+        await prepareBarrier;
+        return new Response("{}", { status: 409 });
+      };
+      const payload = {
+        txId,
+        participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "bad mutation", params: [], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      };
+      const [first, second] = await Promise.all([
+        instance.fetch(post("/begin", payload)),
+        instance.fetch(post("/begin", payload)),
+      ]);
+      expect([first.status, second.status]).toEqual([409, 409]);
+      expect(state.storage.sql.exec<{ status: string }>(
+        "SELECT status FROM transactions WHERE tx_id = ?",
+        txId,
+      ).one().status).toBe("aborted");
     });
   });
 

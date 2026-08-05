@@ -86,7 +86,9 @@ const DIRECT_TRANSITIONS: Readonly<Record<TransactionState, readonly Transaction
   committing: ["committed_pending_ack", "committed", "quarantined"],
   committed_pending_ack: ["committed", "quarantined"],
   committed: ["quarantined"],
-  quarantined: [],
+  // These exits are available only to the audited quarantine-repair path,
+  // which carries the canonical terminal intent and operator attestation.
+  quarantined: ["manifest_registered", "aborted"],
 };
 
 export const TRANSACTION_ERROR_CODES = [

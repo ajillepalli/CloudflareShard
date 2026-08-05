@@ -664,10 +664,18 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         };
       }
       if (nextCursor !== null) {
-        await catalog.issueEnumerationCursor(nextCursor, [
-          ...priorEvidencePins,
-          ...newEvidencePins,
-        ]);
+        // Completed buckets need no continuing retention hold: their records
+        // and evidence were returned on an earlier page. Only a partially
+        // consumed local bucket is carried forward, and localPage refreshed
+        // that lease on this request. This keeps cursor state O(1) and gives
+        // every fleet page a fresh bounded completion window.
+        const activePins = nextCursor.local_cursor === null
+          ? []
+          : newEvidencePins.filter((pin) => (
+              pin.reservation_day === nextCursor.reservation_utc_day
+              && pin.partition === nextCursor.partition
+            ));
+        await catalog.issueEnumerationCursor(nextCursor, activePins);
       }
       const exhaustedCatalog = nextCursor === null && entries.length < 128;
       return {
