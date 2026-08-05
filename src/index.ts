@@ -2972,6 +2972,28 @@ async function adminTxForceAbortCore(env: Env, body: { txId?: string }): Promise
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 
+type ManifestQuarantineResolutionAdminBody = {
+  txId?: string;
+  resolution?: "FINALIZED" | "CANCELLED";
+  selectedHash?: string;
+  evidenceHash?: string;
+  actor?: string;
+  reason?: string;
+  idempotencyKey?: string;
+};
+
+async function handleAdminResolveManifestQuarantine(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as ManifestQuarantineResolutionAdminBody;
+  if (!body.txId) return json({ error: "Missing txId" }, 400);
+  const stub = env.COORDINATOR.get(env.COORDINATOR.idFromName(body.txId));
+  const res = await stub.fetch("https://coordinator.internal/resolve-manifest-quarantine", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return new Response(res.body, { status: res.status, headers: res.headers });
+}
+
 /** Stage 4 (approved topology-lock design): admin inspection of the current
  * cluster-wide topology lock — a thin forwarder to catalog-0's own
  * /topology-lock-status (the lock's single canonical home). */
@@ -4049,6 +4071,7 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/drop-index": handleAdminDropIndex,
   "/admin/tx-status": handleAdminTxStatus,
   "/admin/tx-force-abort": handleAdminTxForceAbort,
+  "/admin/resolve-manifest-quarantine": handleAdminResolveManifestQuarantine,
   "/admin/backfill-provenance": handleAdminBackfillProvenance,
   "/admin/set-row-owner": handleAdminSetRowOwner,
   "/admin/migrate-vbucket": handleAdminMigrateVbucket,

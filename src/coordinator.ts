@@ -2,13 +2,17 @@ import { DurableObject } from "cloudflare:workers";
 import {
   COORDINATOR_RETENTION_DAYS,
   CURRENT_PROTOCOL_VERSION,
+  MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
   REDO_ENVELOPE_FORMAT_VERSION,
-  TRANSACTION_STATE_MODEL_VERSION,
   TransactionContractViolation,
+  assertReadableTransactionStateModelVersion,
   assertReadableProtocolVersion,
   assertTransactionTransition,
   canonicalJson,
   createManifestRegistration,
+  hashCanonicalJson,
+  hashManifestRecordV2,
+  hashManifestReservation,
   hashParticipantOperations,
   isCommitDecidedOrLater,
   isTransactionState,
@@ -16,7 +20,16 @@ import {
   transactionError,
   validateRedoEnvelope,
   validateRedoEnvelopeStructure,
+  validateManifestCancelIntent,
+  validateManifestFinalizeIntent,
+  validateManifestRegistration,
+  validateManifestRecordV2,
+  validateManifestReservation,
   type JsonValue,
+  type ManifestCancelIntentV1,
+  type ManifestFinalizeIntentV1,
+  type ManifestRecordV2,
+  type ManifestReservationV1,
   type ManifestRegistrationV1,
   type ParticipantPhase,
   type ParticipantPhaseMessageV1,
@@ -27,9 +40,20 @@ import {
 } from "../packages/contracts/src/index.js";
 import type {
   ManifestAdmissionResult,
+  ManifestCancelRequestV1,
+  ManifestCancelResult,
+  ManifestFinalizeRequestV1,
+  ManifestFinalizeResult,
   ManifestReleaseRequest,
   ManifestReleaseResult,
+  ManifestReserveRequestV1,
+  ManifestReserveResult,
+  ManifestRouteAssignmentRequestV1,
+  ManifestRouteAssignmentResult,
   ManifestServiceRegisterResult,
+  ManifestV2ReleaseRequest,
+  ManifestQuarantineResolutionRequestV1,
+  ManifestQuarantineResolutionResult,
 } from "../workers/control-plane/src/manifest-types.js";
 import { MANIFEST_CIRCUIT_POLICY } from "../workers/control-plane/src/manifest-types.js";
 import { json } from "./http";
@@ -38,6 +62,12 @@ import { log } from "./log";
 type GeneratedControlPlaneService = Cloudflare.Env["CONTROL_PLANE"];
 
 export interface TransactionManifestService {
+  assignManifestRoute(request: ManifestRouteAssignmentRequestV1): Promise<ManifestRouteAssignmentResult>;
+  reserveManifest(request: ManifestReserveRequestV1): Promise<ManifestReserveResult>;
+  finalizeManifest(request: ManifestFinalizeRequestV1): Promise<ManifestFinalizeResult>;
+  cancelManifest(request: ManifestCancelRequestV1): Promise<ManifestCancelResult>;
+  resolveManifestQuarantine?(request: ManifestQuarantineResolutionRequestV1): Promise<ManifestQuarantineResolutionResult>;
+  releaseManifestV2(request: ManifestV2ReleaseRequest): Promise<ManifestReleaseResult>;
   checkManifestAdmission(
     request: Parameters<GeneratedControlPlaneService["checkManifestAdmission"]>[0],
   ): Promise<ManifestAdmissionResult>;
@@ -51,7 +81,8 @@ type Assert<T extends true> = T;
 type _GeneratedControlPlaneBindingIsCompatible = Assert<
   Pick<
     GeneratedControlPlaneService,
-    "checkManifestAdmission" | "registerManifest" | "releaseManifestRetention"
+    "assignManifestRoute" | "reserveManifest" | "finalizeManifest" | "cancelManifest" | "resolveManifestQuarantine" | "releaseManifestV2"
+    | "checkManifestAdmission" | "registerManifest" | "releaseManifestRetention"
   > extends TransactionManifestService
     ? true
     : false
@@ -94,14 +125,45 @@ type TxRow = {
   coordinator_id: string;
   redo_envelope_json: string | null;
   manifest_registration_json: string | null;
+  manifest_route_assignment_request_json: string | null;
+  manifest_reservation_json: string | null;
+  manifest_reservation_hash: string | null;
+  manifest_finalize_request_json: string | null;
+  manifest_cancel_request_json: string | null;
+  redo_envelope_intent_json: string | null;
+  manifest_record_json: string | null;
+  manifest_record_hash: string | null;
+  commit_decided_at_ms: number | null;
+  decision_sequence: number | null;
   result_json: string | null;
+  last_error: string | null;
 };
 
-type RecoveryAction = "manifest" | "commit" | "abort" | "legacy_abort" | "release";
+type RecoveryAction = "reserve" | "finalize" | "cancel" | "manifest" | "commit" | "abort" | "legacy_abort" | "release";
 type CoordinatorIdentity = "current" | "legacy" | "invalid";
 const RECOVERY_BASE_DELAY_MS = 5_000;
 const RECOVERY_MAX_DELAY_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1_000;
+/** New transactions use reservation/finalization state model 2. Explicit
+ * predecessor adoption remains on model 1 so its V1 recovery bytes retain
+ * their original interpretation. */
+const COORDINATOR_WRITE_STATE_MODEL_VERSION = 2;
+const LEGACY_ADOPTION_STATE_MODEL_VERSION = 1;
+const STATE_MODEL_1_STATES: ReadonlySet<TransactionState> = new Set([
+  "new",
+  "preparing",
+  "abort_decided",
+  "aborting",
+  "aborted",
+  "prepared",
+  "commit_decided",
+  "commit_pending_manifest",
+  "manifest_registered",
+  "committing",
+  "committed_pending_ack",
+  "committed",
+  "quarantined",
+]);
 
 class CoordinatorCasLost extends Error {
   constructor(readonly state: TransactionState) {
@@ -138,6 +200,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       "/tx-status": this.handleTxStatus.bind(this),
       "/begin": this.handleBegin.bind(this),
       "/force-abort": this.handleForceAbort.bind(this),
+      "/resolve-manifest-quarantine": this.handleResolveManifestQuarantine.bind(this),
       "/stats": this.handleStats.bind(this),
     };
   }
@@ -174,6 +237,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     this.ensureColumn("transactions", "coordinator_id", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("transactions", "redo_envelope_json", "TEXT");
     this.ensureColumn("transactions", "manifest_registration_json", "TEXT");
+    this.ensureColumn("transactions", "manifest_route_assignment_request_json", "TEXT");
+    this.ensureColumn("transactions", "manifest_reservation_json", "TEXT");
+    this.ensureColumn("transactions", "manifest_reservation_hash", "TEXT");
+    this.ensureColumn("transactions", "manifest_finalize_request_json", "TEXT");
+    this.ensureColumn("transactions", "manifest_cancel_request_json", "TEXT");
+    this.ensureColumn("transactions", "redo_envelope_intent_json", "TEXT");
+    this.ensureColumn("transactions", "manifest_record_json", "TEXT");
+    this.ensureColumn("transactions", "manifest_record_hash", "TEXT");
+    this.ensureColumn("transactions", "commit_decided_at_ms", "INTEGER");
+    this.ensureColumn("transactions", "decision_sequence", "INTEGER");
     this.ensureColumn("transactions", "result_json", "TEXT");
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS transaction_participants (
@@ -221,7 +294,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return this.one<TxRow>(
       `SELECT tx_id, status, participant_shards_json, operation_json, operation_hash,
               protocol_version, state_model_version, epoch, decision, fleet_id,
-              coordinator_id, redo_envelope_json, manifest_registration_json, result_json
+              coordinator_id, redo_envelope_json, manifest_registration_json,
+              manifest_route_assignment_request_json, manifest_reservation_json,
+              manifest_reservation_hash, manifest_finalize_request_json,
+              manifest_cancel_request_json, redo_envelope_intent_json,
+              manifest_record_json, manifest_record_hash, commit_decided_at_ms,
+              decision_sequence, result_json, last_error
          FROM transactions WHERE tx_id = ?`,
       txId,
     );
@@ -229,14 +307,15 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private stateOf(row: TxRow): TransactionState {
     assertReadableProtocolVersion(row.protocol_version);
-    if (row.state_model_version !== TRANSACTION_STATE_MODEL_VERSION) {
-      throw new TransactionContractViolation(
-        transactionError("TX_VERSION_UNSUPPORTED", `Transaction state model ${row.state_model_version} is unsupported.`),
-      );
-    }
+    assertReadableTransactionStateModelVersion(row.state_model_version);
     if (!isTransactionState(row.status)) {
       throw new TransactionContractViolation(
         transactionError("TX_VERSION_UNSUPPORTED", `Unknown durable transaction state ${row.status}.`),
+      );
+    }
+    if (row.state_model_version === 1 && !STATE_MODEL_1_STATES.has(row.status)) {
+      throw new TransactionContractViolation(
+        transactionError("TX_VERSION_UNSUPPORTED", `Transaction state ${row.status} requires a newer state model.`),
       );
     }
     return row.status;
@@ -503,12 +582,161 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return envelope;
   }
 
+  private isV2(row: TxRow): boolean {
+    return row.state_model_version === 2;
+  }
+
+  private async routeAssignmentRequest(
+    txId: string,
+    fleetId: string,
+    coordinatorId: string,
+    operationHash: string,
+    decisionEpoch: number,
+  ): Promise<ManifestRouteAssignmentRequestV1> {
+    return {
+      draft: {
+        fleet_id: fleetId,
+        tx_id: txId,
+        coordinator_id: coordinatorId,
+        operation_hash: operationHash,
+        decision_epoch: decisionEpoch,
+      },
+      idempotency_key: await hashCanonicalJson([
+        "coordinator-manifest-route",
+        fleetId,
+        txId,
+        coordinatorId,
+        operationHash,
+        decisionEpoch,
+      ]),
+    };
+  }
+
+  private async validateAssignedReservation(
+    request: ManifestRouteAssignmentRequestV1,
+    result: Extract<ManifestRouteAssignmentResult, { ok: true }>,
+  ): Promise<void> {
+    validateManifestReservation(result.reservation);
+    const expectedHash = await hashManifestReservation(result.reservation);
+    if (
+      expectedHash !== result.reservation_hash
+      || result.reservation.fleet_id !== request.draft.fleet_id
+      || result.reservation.tx_id !== request.draft.tx_id
+      || result.reservation.coordinator_id !== request.draft.coordinator_id
+      || result.reservation.operation_hash !== request.draft.operation_hash
+      || result.reservation.decision_epoch !== request.draft.decision_epoch
+    ) {
+      throw new TransactionContractViolation(
+        transactionError("MANIFEST_RESERVATION_CONFLICT", "Assigned manifest reservation does not match the immutable transaction draft."),
+      );
+    }
+  }
+
+  private async reservationFor(row: TxRow): Promise<{ reservation: ManifestReservationV1; reservationHash: string }> {
+    if (!row.manifest_reservation_json || !row.manifest_reservation_hash) {
+      throw new TransactionContractViolation(
+        transactionError("TX_DECISION_UNAVAILABLE", "Model-2 transaction is missing its frozen manifest reservation."),
+      );
+    }
+    const reservation = JSON.parse(row.manifest_reservation_json) as unknown;
+    validateManifestReservation(reservation);
+    const reservationHash = await hashManifestReservation(reservation);
+    if (
+      reservationHash !== row.manifest_reservation_hash
+      || reservation.tx_id !== row.tx_id
+      || reservation.fleet_id !== row.fleet_id
+      || reservation.coordinator_id !== (row.coordinator_id || row.tx_id)
+      || reservation.operation_hash !== row.operation_hash
+      || reservation.decision_epoch !== row.epoch
+    ) {
+      throw new TransactionContractViolation(
+        transactionError("MANIFEST_RESERVATION_CONFLICT", "Stored manifest reservation conflicts with the durable coordinator identity."),
+      );
+    }
+    return { reservation, reservationHash };
+  }
+
+  private async reconcileReservation(row: TxRow): Promise<Response> {
+    if (this.stateOf(row) !== "manifest_reserving") return this.resume(row);
+    const { reservation, reservationHash } = await this.reservationFor(row);
+    const request: ManifestReserveRequestV1 = { reservation, reservation_hash: reservationHash };
+    let result: ManifestReserveResult | null = null;
+    try {
+      result = this.coordinatorEnv.CONTROL_PLANE
+        ? await this.coordinatorEnv.CONTROL_PLANE.reserveManifest(request)
+        : null;
+    } catch {
+      result = null;
+    }
+
+    const latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latest) !== "manifest_reserving") return this.resume(latest);
+    row = latest;
+
+    if (!result || (!result.ok && result.status === "unavailable")) {
+      await this.reschedule(row.tx_id, "reserve", ["manifest_reserving"]);
+      return json({ ok: true, txId: row.tx_id, status: "manifest_reserving" }, 202);
+    }
+    if (result.ok) {
+      if (result.reservation_hash !== reservationHash) {
+        throw new TransactionContractViolation(
+          transactionError("MANIFEST_RESERVATION_CONFLICT", "Manifest reserve acknowledgement returned a different reservation hash."),
+        );
+      }
+      try {
+        this.transition(row.tx_id, ["manifest_reserving"], "preparing", () => {
+          this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+        });
+      } catch (error) {
+        if (error instanceof CoordinatorCasLost) {
+          const concurrent = this.loadTx(row.tx_id);
+          if (concurrent) return this.resume(concurrent);
+        }
+        throw error;
+      }
+      const preparing = this.loadTx(row.tx_id);
+      if (!preparing) throw new Error(`Missing transaction ${row.tx_id} after manifest reservation.`);
+      return this.prepare(preparing);
+    }
+    if (result.status === "rejected_absent" && !result.bucket_row_may_exist) {
+      this.transition(row.tx_id, ["manifest_reserving"], "aborted", () => {
+        this.sql.exec("UPDATE transactions SET decision = 'abort', last_error = ?, result_json = ? WHERE tx_id = ?", JSON.stringify(result.error), JSON.stringify({ status: "aborted" }), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return protocolResponse(transactionError("TX_ABORTED", "Manifest reservation was rejected before participant prepare."));
+    }
+
+    const aborting = await this.persistAbortDecision(row);
+    return this.reconcileAbort(aborting);
+  }
+
   private async persistAbortDecision(row: TxRow, legacyPredecisionAbort = false): Promise<TxRow> {
     await this.ensureAlarmScheduled(Date.now());
     const now = new Date().toISOString();
+    let cancelRequestJson: string | null = null;
+    if (this.isV2(row)) {
+      const { reservation, reservationHash } = await this.reservationFor(row);
+      const intent: ManifestCancelIntentV1 = {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+        tx_id: row.tx_id,
+        reservation_hash: reservationHash,
+        operation_hash: row.operation_hash,
+        decision_epoch: row.epoch,
+        idempotency_key: await hashCanonicalJson(["coordinator-manifest-cancel", reservationHash]),
+      };
+      validateManifestCancelIntent(intent);
+      cancelRequestJson = canonicalJson({ reservation, reservation_hash: reservationHash, intent });
+    }
     try {
-      return this.transition(row.tx_id, ["preparing", "prepared"], "abort_decided", () => {
-        this.sql.exec("UPDATE transactions SET decision = 'abort' WHERE tx_id = ?", row.tx_id);
+      const expected: TransactionState[] = this.isV2(row) ? ["manifest_reserving", "preparing", "prepared"] : ["preparing", "prepared"];
+      return this.transition(row.tx_id, expected, "abort_decided", () => {
+        this.sql.exec(
+          "UPDATE transactions SET decision = 'abort', manifest_cancel_request_json = COALESCE(?, manifest_cancel_request_json) WHERE tx_id = ?",
+          cancelRequestJson,
+          row.tx_id,
+        );
         this.queueRecovery(row.tx_id, legacyPredecisionAbort ? "legacy_abort" : "abort", now);
       });
     } catch (error) {
@@ -541,6 +769,14 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     );
     const allAcknowledged = outcomes.every((outcome) => outcome.status === "fulfilled" && outcome.value.ok);
     if (allAcknowledged) {
+      if (this.isV2(current)) {
+        this.transition(current.tx_id, ["aborting"], "aborted_pending_manifest_cancel", () => {
+          this.queueRecovery(current.tx_id, "cancel", new Date().toISOString());
+        });
+        const pending = this.loadTx(current.tx_id);
+        if (!pending) throw new Error(`Missing transaction ${current.tx_id} before manifest cancellation.`);
+        return this.reconcileCancel(pending);
+      }
       this.transition(current.tx_id, ["aborting"], "aborted", () => {
         this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", current.tx_id);
         this.sql.exec("UPDATE transactions SET result_json = ? WHERE tx_id = ?", JSON.stringify({ status: "aborted" }), current.tx_id);
@@ -551,7 +787,117 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
   }
 
+  private async cancelRequestFor(row: TxRow): Promise<ManifestCancelRequestV1> {
+    if (!row.manifest_cancel_request_json) {
+      throw new TransactionContractViolation(
+        transactionError("TX_DECISION_UNAVAILABLE", "Aborted model-2 transaction is missing its immutable cancellation request."),
+      );
+    }
+    const request = JSON.parse(row.manifest_cancel_request_json) as ManifestCancelRequestV1;
+    validateManifestReservation(request.reservation);
+    validateManifestCancelIntent(request.intent);
+    const reservationHash = await hashManifestReservation(request.reservation);
+    if (
+      reservationHash !== request.reservation_hash
+      || request.intent.reservation_hash !== reservationHash
+      || request.intent.tx_id !== row.tx_id
+      || request.intent.operation_hash !== row.operation_hash
+      || request.intent.decision_epoch !== row.epoch
+    ) {
+      throw new TransactionContractViolation(
+        transactionError("MANIFEST_TERMINAL_CONFLICT", "Stored cancellation request conflicts with the durable transaction identity."),
+      );
+    }
+    return request;
+  }
+
+  private async reconcileCancel(row: TxRow): Promise<Response> {
+    if (this.stateOf(row) === "aborted") return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
+    if (this.stateOf(row) !== "aborted_pending_manifest_cancel") return this.resume(row);
+    const queued = this.one<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+    if (!queued && row.last_error) {
+      try {
+        const parked = JSON.parse(row.last_error) as { code?: string };
+        if (parked.code === "MANIFEST_QUARANTINED") {
+          return json({ ok: true, txId: row.tx_id, status: "aborted_pending_manifest_cancel" }, 202);
+        }
+      } catch {
+        // A malformed predecessor diagnostic is not proof of an audited park;
+        // continue with durable cancellation recovery instead of suppressing it.
+      }
+    }
+    const request = await this.cancelRequestFor(row);
+    const service = this.coordinatorEnv.CONTROL_PLANE;
+
+    // A force-abort may race an ambiguous reserve acknowledgement. Replaying
+    // the identical reservation first makes cancellation well-defined even if
+    // the original reserve failed before the bucket row was created.
+    let reserve: ManifestReserveResult | null = null;
+    try {
+      reserve = service ? await service.reserveManifest({ reservation: request.reservation, reservation_hash: request.reservation_hash }) : null;
+    } catch {
+      reserve = null;
+    }
+    let latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latest) !== "aborted_pending_manifest_cancel") return this.resume(latest);
+    row = latest;
+    if (!reserve || (!reserve.ok && reserve.status === "unavailable")) {
+      await this.reschedule(row.tx_id, "cancel", ["aborted_pending_manifest_cancel"]);
+      return json({ ok: true, txId: row.tx_id, status: "aborted_pending_manifest_cancel" }, 202);
+    }
+    if (!reserve.ok && reserve.status === "quarantined") {
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("UPDATE transactions SET last_error = ? WHERE tx_id = ?", JSON.stringify(reserve.error), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return json({ ok: true, txId: row.tx_id, status: "aborted_pending_manifest_cancel" }, 202);
+    }
+    if (!reserve.ok && reserve.status === "rejected_absent" && !reserve.bucket_row_may_exist) {
+      this.transition(row.tx_id, ["aborted_pending_manifest_cancel"], "aborted", () => {
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+        this.sql.exec("UPDATE transactions SET result_json = ? WHERE tx_id = ?", JSON.stringify({ status: "aborted" }), row.tx_id);
+      });
+      return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
+    }
+
+    let result: ManifestCancelResult | null = null;
+    try {
+      result = service ? await service.cancelManifest(request) : null;
+    } catch {
+      result = null;
+    }
+    latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latest) !== "aborted_pending_manifest_cancel") return this.resume(latest);
+    row = latest;
+    if (!result || (!result.ok && result.status === "unavailable")) {
+      await this.reschedule(row.tx_id, "cancel", ["aborted_pending_manifest_cancel"]);
+      return json({ ok: true, txId: row.tx_id, status: "aborted_pending_manifest_cancel" }, 202);
+    }
+    if (!result.ok && result.status === "quarantined_pending_resolution") {
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("UPDATE transactions SET last_error = ? WHERE tx_id = ?", JSON.stringify(result.error), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return json({ ok: true, txId: row.tx_id, status: "aborted_pending_manifest_cancel" }, 202);
+    }
+    if (!result.ok) {
+      this.transition(row.tx_id, ["aborted_pending_manifest_cancel"], "quarantined", () => {
+        this.sql.exec("UPDATE transactions SET decision = 'quarantined', last_error = ? WHERE tx_id = ?", JSON.stringify(result.error), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return protocolResponse(result.error);
+    }
+    this.transition(row.tx_id, ["aborted_pending_manifest_cancel"], "aborted", () => {
+      this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      this.sql.exec("UPDATE transactions SET result_json = ? WHERE tx_id = ?", JSON.stringify({ status: "aborted" }), row.tx_id);
+    });
+    return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
+  }
+
   private async persistCommitDecision(row: TxRow): Promise<TxRow> {
+    if (this.isV2(row)) return this.persistCommitDeciding(row);
     await this.ensureAlarmScheduled(Date.now());
     const commitDecidedAt = new Date().toISOString();
     const envelope = await this.envelopeFor(
@@ -583,7 +929,328 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
   }
 
+  private async persistCommitDeciding(row: TxRow): Promise<TxRow> {
+    await this.ensureAlarmScheduled(Date.now());
+    const { reservation, reservationHash } = await this.reservationFor(row);
+    const redoEnvelopeIntent = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: REDO_ENVELOPE_FORMAT_VERSION,
+      tx_id: row.tx_id,
+      fleet_id: row.fleet_id,
+      coordinator_id: row.coordinator_id || row.tx_id,
+      decision: "commit" as const,
+      decision_epoch: row.epoch,
+      operation_hash: row.operation_hash,
+      participants: this.redoParticipants(this.participants(row), row.epoch),
+    };
+    const computedOperationHash = await hashParticipantOperations(redoEnvelopeIntent.participants);
+    if (computedOperationHash !== row.operation_hash) {
+      throw new TransactionContractViolation(
+        transactionError("TX_ENVELOPE_HASH_MISMATCH", "Stored transaction participants do not match the durable operation hash."),
+      );
+    }
+    const redoEnvelopeHash = await hashCanonicalJson(redoEnvelopeIntent);
+    const intent: ManifestFinalizeIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: row.tx_id,
+      reservation_hash: reservationHash,
+      redo_envelope_hash: redoEnvelopeHash,
+      operation_hash: row.operation_hash,
+      decision_epoch: row.epoch,
+      idempotency_key: await hashCanonicalJson(["coordinator-manifest-finalize", reservationHash, redoEnvelopeHash]),
+    };
+    validateManifestFinalizeIntent(intent);
+    const request: ManifestFinalizeRequestV1 = { reservation, reservation_hash: reservationHash, intent };
+    const now = new Date().toISOString();
+    try {
+      return this.transition(row.tx_id, ["prepared"], "commit_deciding", () => {
+        this.sql.exec(
+          `UPDATE transactions
+              SET decision = 'commit', redo_envelope_intent_json = ?, manifest_finalize_request_json = ?
+            WHERE tx_id = ?`,
+          canonicalJson(redoEnvelopeIntent),
+          canonicalJson(request),
+          row.tx_id,
+        );
+        this.queueRecovery(row.tx_id, "finalize", now);
+      });
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        const latest = this.loadTx(row.tx_id);
+        if (latest && isCommitDecidedOrLater(this.stateOf(latest))) return latest;
+      }
+      throw error;
+    }
+  }
+
+  private async finalizeRequestFor(row: TxRow): Promise<ManifestFinalizeRequestV1> {
+    if (!row.manifest_finalize_request_json || !row.redo_envelope_intent_json) {
+      throw new TransactionContractViolation(
+        transactionError("TX_DECISION_UNAVAILABLE", "Commit-deciding transaction is missing immutable finalization recovery data."),
+      );
+    }
+    const request = JSON.parse(row.manifest_finalize_request_json) as ManifestFinalizeRequestV1;
+    validateManifestReservation(request.reservation);
+    validateManifestFinalizeIntent(request.intent);
+    const reservationHash = await hashManifestReservation(request.reservation);
+    const redoEnvelopeHash = await hashCanonicalJson(JSON.parse(row.redo_envelope_intent_json));
+    if (
+      reservationHash !== request.reservation_hash
+      || request.intent.reservation_hash !== reservationHash
+      || request.intent.redo_envelope_hash !== redoEnvelopeHash
+      || request.intent.tx_id !== row.tx_id
+      || request.intent.operation_hash !== row.operation_hash
+      || request.intent.decision_epoch !== row.epoch
+    ) {
+      throw new TransactionContractViolation(
+        transactionError("MANIFEST_TERMINAL_CONFLICT", "Stored finalization request conflicts with the durable transaction identity."),
+      );
+    }
+    return request;
+  }
+
+  private async reconcileFinalize(row: TxRow): Promise<Response> {
+    const state = this.stateOf(row);
+    if (state !== "commit_deciding" && state !== "commit_pending_manifest") return this.resume(row);
+    const request = await this.finalizeRequestFor(row);
+    let result: ManifestFinalizeResult | null = null;
+    try {
+      result = this.coordinatorEnv.CONTROL_PLANE
+        ? await this.coordinatorEnv.CONTROL_PLANE.finalizeManifest(request)
+        : null;
+    } catch {
+      result = null;
+    }
+
+    const latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latest) !== state) return this.resume(latest);
+    row = latest;
+    if (!result || (!result.ok && result.status === "unavailable")) {
+      try {
+        if (state === "commit_deciding") this.transition(row.tx_id, ["commit_deciding"], "commit_pending_manifest");
+      } catch (error) {
+        if (error instanceof CoordinatorCasLost) {
+          const concurrent = this.loadTx(row.tx_id);
+          if (concurrent) return this.resume(concurrent);
+        }
+        throw error;
+      }
+      await this.reschedule(row.tx_id, "finalize", ["commit_deciding", "commit_pending_manifest"]);
+      return json({ ok: true, txId: row.tx_id, status: "commit_pending_manifest" }, 202);
+    }
+    if (!result.ok) {
+      this.transition(row.tx_id, [state], "quarantined", () => {
+        this.sql.exec("UPDATE transactions SET decision = 'quarantined', last_error = ? WHERE tx_id = ?", JSON.stringify(result.error), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return protocolResponse(result.error);
+    }
+
+    validateManifestRecordV2(result.record);
+    const expectedRecordHash = await hashManifestRecordV2(result.record);
+    if (
+      expectedRecordHash !== result.record_hash
+      || result.record.tx_id !== row.tx_id
+      || result.record.fleet_id !== row.fleet_id
+      || result.record.coordinator_id !== (row.coordinator_id || row.tx_id)
+      || result.record.operation_hash !== row.operation_hash
+      || result.record.decision_epoch !== row.epoch
+      || result.record.reservation_hash !== request.reservation_hash
+      || result.record.envelope_hash !== request.intent.redo_envelope_hash
+    ) {
+      throw new TransactionContractViolation(
+        transactionError("MANIFEST_TERMINAL_CONFLICT", "Finalized manifest record conflicts with the durable coordinator decision."),
+      );
+    }
+    try {
+      this.transition(row.tx_id, [state], "manifest_registered", () => {
+        this.sql.exec(
+          `UPDATE transactions
+              SET manifest_record_json = ?, manifest_record_hash = ?, commit_decided_at_ms = ?, decision_sequence = ?
+            WHERE tx_id = ?`,
+          canonicalJson(result.record),
+          result.record_hash,
+          result.record.commit_decided_at_ms,
+          result.record.decision_sequence,
+          row.tx_id,
+        );
+        this.queueRecovery(row.tx_id, "commit", new Date().toISOString());
+      });
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        const concurrent = this.loadTx(row.tx_id);
+        if (concurrent) return this.resume(concurrent);
+      }
+      throw error;
+    }
+    const registered = this.loadTx(row.tx_id);
+    if (!registered) throw new Error(`Missing transaction ${row.tx_id} after manifest finalization.`);
+    return this.reconcileCommit(registered);
+  }
+
+  private async beginV2Bridge(row: TxRow, expectedState: "commit_decided" | "commit_pending_manifest"): Promise<Response> {
+    const assignmentRequest = await this.routeAssignmentRequest(
+      row.tx_id,
+      row.fleet_id,
+      row.coordinator_id || row.tx_id,
+      row.operation_hash,
+      row.epoch,
+    );
+    let assignment: ManifestRouteAssignmentResult | null = null;
+    try {
+      assignment = this.coordinatorEnv.CONTROL_PLANE
+        ? await this.coordinatorEnv.CONTROL_PLANE.assignManifestRoute(assignmentRequest)
+        : null;
+    } catch {
+      assignment = null;
+    }
+    const latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latest) !== expectedState || latest.state_model_version !== 1) return this.resume(latest);
+    row = latest;
+    if (!assignment || (!assignment.ok && assignment.status === "unavailable")) {
+      await this.reschedule(row.tx_id, "manifest", [expectedState]);
+      return json({ ok: true, txId: row.tx_id, status: "commit_pending_manifest" }, 202);
+    }
+    if (!assignment.ok) {
+      this.transition(row.tx_id, [expectedState], "quarantined", () => {
+        this.sql.exec("UPDATE transactions SET decision = 'quarantined', last_error = ? WHERE tx_id = ?", JSON.stringify(assignment.error), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return protocolResponse(assignment.error);
+    }
+    await this.validateAssignedReservation(assignmentRequest, assignment);
+    assertTransactionTransition(expectedState, "commit_pending_manifest");
+    try {
+      this.ctx.storage.transactionSync(() => {
+        const current = this.loadTx(row.tx_id);
+        if (!current || this.stateOf(current) !== expectedState || current.state_model_version !== 1) {
+          throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
+        }
+        this.sql.exec(
+          `UPDATE transactions
+              SET state_model_version = 2, status = 'commit_pending_manifest',
+                  manifest_route_assignment_request_json = ?, manifest_reservation_json = ?,
+                  manifest_reservation_hash = ?, updated_at = ?
+            WHERE tx_id = ?`,
+          canonicalJson(assignmentRequest),
+          canonicalJson(assignment.reservation),
+          assignment.reservation_hash,
+          new Date().toISOString(),
+          row.tx_id,
+        );
+        this.queueRecovery(row.tx_id, "reserve", new Date().toISOString());
+      });
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        const concurrent = this.loadTx(row.tx_id);
+        if (concurrent) return this.resume(concurrent);
+      }
+      throw error;
+    }
+    const bridged = this.loadTx(row.tx_id);
+    if (!bridged) throw new Error(`Missing transaction ${row.tx_id} after V1-to-V2 bridge assignment.`);
+    return this.reconcileV2BridgeReservation(bridged);
+  }
+
+  private async reconcileV2BridgeReservation(row: TxRow): Promise<Response> {
+    const state = this.stateOf(row);
+    if (row.state_model_version !== 2 || state !== "commit_pending_manifest") return this.resume(row);
+    if (row.manifest_finalize_request_json) return this.reconcileFinalize(row);
+    if (!row.redo_envelope_json || !row.manifest_registration_json) {
+      throw new TransactionContractViolation(
+        transactionError("TX_DECISION_UNAVAILABLE", "V1-to-V2 bridge is missing its immutable predecessor decision envelope."),
+      );
+    }
+    const predecessorEnvelope = JSON.parse(row.redo_envelope_json) as RedoEnvelopeV1;
+    const predecessorRegistration = JSON.parse(row.manifest_registration_json) as ManifestRegistrationV1;
+    await validateRedoEnvelope(predecessorEnvelope);
+    await validateManifestRegistration(predecessorRegistration, predecessorEnvelope);
+    if (
+      predecessorEnvelope.tx_id !== row.tx_id
+      || predecessorEnvelope.operation_hash !== row.operation_hash
+      || predecessorRegistration.record.tx_id !== row.tx_id
+      || predecessorRegistration.record.envelope_hash !== await hashCanonicalJson(predecessorEnvelope)
+    ) {
+      throw new TransactionContractViolation(
+        transactionError("TX_ENVELOPE_HASH_MISMATCH", "V1-to-V2 bridge predecessor artifacts conflict with the durable coordinator identity."),
+      );
+    }
+    const { reservation, reservationHash } = await this.reservationFor(row);
+    let reserve: ManifestReserveResult | null = null;
+    try {
+      reserve = this.coordinatorEnv.CONTROL_PLANE
+        ? await this.coordinatorEnv.CONTROL_PLANE.reserveManifest({ reservation, reservation_hash: reservationHash })
+        : null;
+    } catch {
+      reserve = null;
+    }
+    let latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latest) !== "commit_pending_manifest" || latest.state_model_version !== 2) return this.resume(latest);
+    row = latest;
+    if (!reserve || (!reserve.ok && reserve.status === "unavailable")) {
+      await this.reschedule(row.tx_id, "reserve", ["commit_pending_manifest"]);
+      return json({ ok: true, txId: row.tx_id, status: "commit_pending_manifest" }, 202);
+    }
+    if (!reserve.ok) {
+      this.transition(row.tx_id, ["commit_pending_manifest"], "quarantined", () => {
+        this.sql.exec("UPDATE transactions SET decision = 'quarantined', last_error = ? WHERE tx_id = ?", JSON.stringify(reserve.error), row.tx_id);
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+      });
+      return protocolResponse(reserve.error);
+    }
+    if (reserve.reservation_hash !== reservationHash) {
+      throw new TransactionContractViolation(
+        transactionError("MANIFEST_RESERVATION_CONFLICT", "V1-to-V2 bridge reserve acknowledgement returned a different reservation hash."),
+      );
+    }
+    const redoEnvelopeHash = await hashCanonicalJson(predecessorEnvelope);
+    const intent: ManifestFinalizeIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: row.tx_id,
+      reservation_hash: reservationHash,
+      redo_envelope_hash: redoEnvelopeHash,
+      operation_hash: row.operation_hash,
+      decision_epoch: row.epoch,
+      idempotency_key: await hashCanonicalJson(["coordinator-v1-v2-bridge-finalize", reservationHash, redoEnvelopeHash]),
+    };
+    validateManifestFinalizeIntent(intent);
+    const finalizeRequest: ManifestFinalizeRequestV1 = { reservation, reservation_hash: reservationHash, intent };
+    try {
+      this.ctx.storage.transactionSync(() => {
+        const current = this.loadTx(row.tx_id);
+        if (!current || this.stateOf(current) !== "commit_pending_manifest" || current.state_model_version !== 2) {
+          throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
+        }
+        this.sql.exec(
+          `UPDATE transactions
+              SET redo_envelope_intent_json = ?, manifest_finalize_request_json = ?, updated_at = ?
+            WHERE tx_id = ?`,
+          canonicalJson(predecessorEnvelope),
+          canonicalJson(finalizeRequest),
+          new Date().toISOString(),
+          row.tx_id,
+        );
+        this.queueRecovery(row.tx_id, "finalize", new Date().toISOString());
+      });
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        const concurrent = this.loadTx(row.tx_id);
+        if (concurrent) return this.resume(concurrent);
+      }
+      throw error;
+    }
+    latest = this.loadTx(row.tx_id);
+    if (!latest) throw new Error(`Missing transaction ${row.tx_id} after V1-to-V2 bridge reservation.`);
+    return this.reconcileFinalize(latest);
+  }
+
   private async reconcileManifest(row: TxRow): Promise<Response> {
+    if (this.isV2(row)) return this.reconcileFinalize(row);
     const state = this.stateOf(row);
     if (state !== "commit_decided" && state !== "commit_pending_manifest") {
       return this.resume(row);
@@ -637,6 +1304,9 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }
       return json({ ok: true, txId: row.tx_id, status: "commit_pending_manifest" }, 202);
     }
+    if (!result.ok && result.error.code === "V1_CLOSED") {
+      return this.beginV2Bridge(row, state);
+    }
     if (!result.ok) {
       // Every remaining result is a deterministic rejection (including a
       // manifest conflict). An irreversible commit decision must not retain a
@@ -676,7 +1346,17 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private async reconcileCommit(row: TxRow): Promise<Response> {
     let current = row;
     const state = this.stateOf(current);
-    if (state === "manifest_registered") current = this.transition(current.tx_id, ["manifest_registered"], "committing");
+    if (state === "manifest_registered") {
+      try {
+        current = this.transition(current.tx_id, ["manifest_registered"], "committing");
+      } catch (error) {
+        if (error instanceof CoordinatorCasLost) {
+          const latest = this.loadTx(current.tx_id);
+          if (latest) return this.reconcileCommit(latest);
+        }
+        throw error;
+      }
+    }
     else if (state === "committed") return json({ ok: true, txId: current.tx_id, status: "committed" });
     else if (state !== "committing" && state !== "committed_pending_ack") return this.resume(current);
 
@@ -773,6 +1453,42 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         transactionError("TX_INVALID_TRANSITION", "Manifest retention can be released only after terminal commit."),
       );
     }
+    if (this.isV2(row)) {
+      const { reservation, reservationHash } = await this.reservationFor(row);
+      if (!row.manifest_record_json || !row.manifest_record_hash) {
+        throw new TransactionContractViolation(
+          transactionError("TX_DECISION_UNAVAILABLE", "Committed model-2 transaction is missing its finalized manifest record."),
+        );
+      }
+      const record = JSON.parse(row.manifest_record_json) as ManifestRecordV2;
+      validateManifestRecordV2(record);
+      if (await hashManifestRecordV2(record) !== row.manifest_record_hash) {
+        throw new TransactionContractViolation(
+          transactionError("MANIFEST_TERMINAL_CONFLICT", "Stored model-2 manifest record hash is invalid."),
+        );
+      }
+      let result: ManifestReleaseResult | null = null;
+      try {
+        result = this.coordinatorEnv.CONTROL_PLANE
+          ? await this.coordinatorEnv.CONTROL_PLANE.releaseManifestV2({
+              reservation,
+              reservation_hash: reservationHash,
+              record_hash: row.manifest_record_hash,
+            })
+          : null;
+      } catch {
+        result = null;
+      }
+      if (result?.ok) {
+        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+        return;
+      }
+      if (result && result.status === "quarantined") {
+        this.sql.exec("UPDATE transactions SET last_error = ? WHERE tx_id = ?", JSON.stringify(result.error), row.tx_id);
+      }
+      await this.reschedule(row.tx_id, "release");
+      return;
+    }
     if (!row.manifest_registration_json) {
       // Expand-first legacy rows never registered a v1 manifest.
       this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
@@ -848,7 +1564,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const provisional: TxRow = {
       ...row,
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      state_model_version: TRANSACTION_STATE_MODEL_VERSION,
+      state_model_version: LEGACY_ADOPTION_STATE_MODEL_VERSION,
       epoch,
       operation_hash: operationHash,
     };
@@ -903,7 +1619,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
            WHERE tx_id = ?`,
           operationHash,
           CURRENT_PROTOCOL_VERSION,
-          TRANSACTION_STATE_MODEL_VERSION,
+          LEGACY_ADOPTION_STATE_MODEL_VERSION,
           epoch,
           now,
           row.tx_id,
@@ -935,6 +1651,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     switch (state) {
       case "new":
         return protocolResponse(transactionError("TX_INVALID_TRANSITION", "A durable transaction row cannot remain new."));
+      case "manifest_reserving":
+        return this.reconcileReservation(row);
+      case "commit_deciding":
+        return this.reconcileFinalize(row);
+      case "aborted_pending_manifest_cancel":
+        return this.reconcileCancel(row);
       case "preparing":
         if (await this.coordinatorIdentity(row) === "legacy") return this.adoptLegacyPredecision(row);
         return this.prepare(row);
@@ -953,7 +1675,9 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
       case "commit_decided":
       case "commit_pending_manifest":
-        return this.reconcileManifest(row);
+        return this.isV2(row)
+          ? (row.manifest_finalize_request_json ? this.reconcileFinalize(row) : this.reconcileV2BridgeReservation(row))
+          : this.reconcileManifest(row);
       case "manifest_registered":
       case "committing":
       case "committed_pending_ack":
@@ -1049,7 +1773,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         attemptCount: work.attempt_count + 1,
         error: error instanceof Error ? error.message : String(error),
       });
-      const normalizedAction: RecoveryAction = work.action === "/commit" ? "commit" : work.action === "/abort" ? "abort" : work.action === "abort" ? "abort" : work.action === "legacy_abort" ? "legacy_abort" : work.action === "commit" ? "commit" : work.action === "release" ? "release" : "manifest";
+      const normalizedAction: RecoveryAction = work.action === "/commit" ? "commit"
+        : work.action === "/abort" ? "abort"
+        : work.action === "reserve" ? "reserve"
+        : work.action === "finalize" ? "finalize"
+        : work.action === "cancel" ? "cancel"
+        : work.action === "abort" ? "abort"
+        : work.action === "legacy_abort" ? "legacy_abort"
+        : work.action === "commit" ? "commit"
+        : work.action === "release" ? "release"
+        : "manifest";
       await this.reschedule(work.tx_id, normalizedAction);
     }
   }
@@ -1085,7 +1818,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       decision: row.decision,
       epoch: row.epoch,
       operationHash: row.operation_hash,
-      commitAuthorized: state === "manifest_registered" || state === "committing" || state === "committed_pending_ack" || state === "committed",
+      commitAuthorized: isCommitDecidedOrLater(state),
     });
   }
 
@@ -1122,20 +1855,31 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       return this.resume(existing);
     }
 
-    const admission = await this.checkManifestAdmission({
-      fleet_id: fleetId,
-      tx_id: body.txId,
-      commit_decided_at: preflightAt,
-    });
-    if (!admission.ok) return protocolResponse(admission.error);
+    const assignmentRequest = await this.routeAssignmentRequest(body.txId, fleetId, coordinatorId, operationHash, 1);
+    let assignment: ManifestRouteAssignmentResult | null = null;
+    try {
+      assignment = this.coordinatorEnv.CONTROL_PLANE
+        ? await this.coordinatorEnv.CONTROL_PLANE.assignManifestRoute(assignmentRequest)
+        : null;
+    } catch {
+      assignment = null;
+    }
+    if (!assignment) {
+      return protocolResponse(transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest route assignment is temporarily unavailable before reservation."));
+    }
+    if (!assignment.ok) return protocolResponse(assignment.error);
+    await this.validateAssignedReservation(assignmentRequest, assignment);
+    await this.ensureAlarmScheduled(Date.now());
 
     const now = new Date().toISOString();
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec(
+    try {
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
         `INSERT INTO transactions
           (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
-           protocol_version, state_model_version, epoch, decision, fleet_id, coordinator_id)
-         VALUES (?, 'preparing', ?, ?, ?, ?, ?, ?, ?, 1, 'undecided', ?, ?)`,
+           protocol_version, state_model_version, epoch, decision, fleet_id, coordinator_id,
+           manifest_route_assignment_request_json, manifest_reservation_json, manifest_reservation_hash)
+         VALUES (?, 'manifest_reserving', ?, ?, ?, ?, ?, ?, ?, 1, 'undecided', ?, ?, ?, ?, ?)`,
         body.txId,
         JSON.stringify(participants.map((participant) => participant.shardId)),
         JSON.stringify(participants),
@@ -1143,12 +1887,15 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         now,
         now,
         CURRENT_PROTOCOL_VERSION,
-        TRANSACTION_STATE_MODEL_VERSION,
+        COORDINATOR_WRITE_STATE_MODEL_VERSION,
         fleetId,
         coordinatorId,
+        canonicalJson(assignmentRequest),
+        canonicalJson(assignment.reservation),
+        assignment.reservation_hash,
       );
-      for (const participant of participants) {
-        this.sql.exec(
+        for (const participant of participants) {
+          this.sql.exec(
           `INSERT INTO transaction_participants
             (tx_id, shard_id, phase_status, updated_at, epoch, operation_hash)
            VALUES (?, ?, 'pending', ?, 1, ?)`,
@@ -1156,12 +1903,18 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           participant.shardId,
           now,
           operationHash,
-        );
-      }
-    });
+          );
+        }
+        this.queueRecovery(body.txId, "reserve", now);
+      });
+    } catch (error) {
+      const concurrent = this.loadTx(body.txId);
+      if (concurrent && concurrent.operation_hash === operationHash) return this.resume(concurrent);
+      throw error;
+    }
     const row = this.loadTx(body.txId);
     if (!row) throw new Error(`Failed to persist transaction ${body.txId}.`);
-    return this.prepare(row);
+    return this.reconcileReservation(row);
   }
 
   private async handleForceAbort(request: Request): Promise<Response> {
@@ -1175,6 +1928,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
     if (state === "quarantined") return protocolResponse(transactionError("TX_QUARANTINED", "Transaction is quarantined."));
     if (state === "aborted") return json({ ok: true, txId: body.txId, status: "aborted" });
+    if (state === "aborted_pending_manifest_cancel") return this.reconcileCancel(row);
     const identity = await this.coordinatorIdentity(row);
     if (identity === "invalid") {
       return protocolResponse(transactionError("TX_ID_REQUEST_MISMATCH", "Cannot force-abort a coordinator whose stored hash is unverifiable."));
@@ -1186,6 +1940,143 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const response = await this.reconcileAbort(aborting, legacyPredecisionAbort);
     if (response.status === 409) return json({ ok: true, txId: body.txId, status: "aborted" });
     return response;
+  }
+
+  private async handleResolveManifestQuarantine(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      txId?: string;
+      resolution?: "FINALIZED" | "CANCELLED";
+      selectedHash?: string;
+      evidenceHash?: string;
+      actor?: string;
+      reason?: string;
+      idempotencyKey?: string;
+    };
+    if (
+      !body.txId || (body.resolution !== "FINALIZED" && body.resolution !== "CANCELLED")
+      || !body.selectedHash || !body.evidenceHash || !body.actor || !body.reason || !body.idempotencyKey
+    ) return json({ error: "Missing or invalid quarantine-resolution fields." }, 400);
+    const row = this.loadTx(body.txId);
+    if (!row) return json({ error: "Transaction not found." }, 404);
+    if (!this.isV2(row)) {
+      return protocolResponse(transactionError("TX_VERSION_UNSUPPORTED", "Quarantine resolution requires a V2 reservation."));
+    }
+    const { reservation, reservationHash } = await this.reservationFor(row);
+    let terminalIntent: ManifestFinalizeIntentV1 | ManifestCancelIntentV1;
+    let authorizationSourceHash: string;
+    if (body.resolution === "FINALIZED") {
+      if (!row.manifest_finalize_request_json) {
+        return protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Coordinator has no durable finalize authorization."));
+      }
+      terminalIntent = (JSON.parse(row.manifest_finalize_request_json) as ManifestFinalizeRequestV1).intent;
+      validateManifestFinalizeIntent(terminalIntent);
+      authorizationSourceHash = await hashCanonicalJson(terminalIntent);
+    } else {
+      if (!row.manifest_cancel_request_json) {
+        return protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Coordinator has no durable cancel authorization."));
+      }
+      terminalIntent = (JSON.parse(row.manifest_cancel_request_json) as ManifestCancelRequestV1).intent;
+      validateManifestCancelIntent(terminalIntent);
+      authorizationSourceHash = await hashCanonicalJson(terminalIntent);
+    }
+    const coordinatorState = {
+      tx_id: row.tx_id,
+      coordinator_id: row.coordinator_id || row.tx_id,
+      state: this.stateOf(row),
+      decision: row.decision,
+      epoch: row.epoch,
+      operation_hash: row.operation_hash,
+      reservation_hash: reservationHash,
+      authorization_source_hash: authorizationSourceHash,
+    } as const;
+    const resolutionRequest: ManifestQuarantineResolutionRequestV1 = {
+      reservation,
+      reservation_hash: reservationHash,
+      resolution: body.resolution,
+      selected_hash: body.selectedHash,
+      evidence_hash: body.evidenceHash,
+      actor: body.actor,
+      reason: body.reason,
+      terminal_intent: terminalIntent,
+      coordinator_state: coordinatorState,
+      coordinator_state_hash: await hashCanonicalJson(coordinatorState),
+      idempotency_key: body.idempotencyKey,
+    };
+    let result: ManifestQuarantineResolutionResult | null = null;
+    try {
+      result = this.coordinatorEnv.CONTROL_PLANE?.resolveManifestQuarantine
+        ? await this.coordinatorEnv.CONTROL_PLANE.resolveManifestQuarantine(resolutionRequest)
+        : null;
+    } catch {
+      result = null;
+    }
+    if (result === null) {
+      return protocolResponse(transactionError("TX_MANIFEST_UNAVAILABLE", "Quarantine resolution service is unavailable."));
+    }
+    if (!result.ok) return protocolResponse(result.error);
+    if (result.resolution === "FINALIZED") {
+      if (result.record === undefined || result.record_hash === undefined) {
+        return protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Resolved finalize omitted the canonical record."));
+      }
+      const resolvedRecord = result.record;
+      validateManifestRecordV2(resolvedRecord);
+      if (
+        await hashManifestRecordV2(resolvedRecord) !== result.record_hash
+        || resolvedRecord.tx_id !== row.tx_id
+        || resolvedRecord.reservation_hash !== reservationHash
+      ) return protocolResponse(transactionError("MANIFEST_TERMINAL_CONFLICT", "Resolved record conflicts with coordinator identity."));
+      this.ctx.storage.transactionSync(() => {
+        const current = this.loadTx(row.tx_id);
+        if (
+          !current
+          || this.stateOf(current) !== coordinatorState.state
+          || current.decision !== coordinatorState.decision
+          || current.epoch !== coordinatorState.epoch
+          || current.operation_hash !== coordinatorState.operation_hash
+          || current.manifest_reservation_hash !== coordinatorState.reservation_hash
+          || current.manifest_finalize_request_json !== row.manifest_finalize_request_json
+        ) throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
+        this.sql.exec(
+          `UPDATE transactions
+              SET status = 'manifest_registered', decision = 'commit', manifest_record_json = ?,
+                  manifest_record_hash = ?, commit_decided_at_ms = ?, decision_sequence = ?,
+                  last_error = NULL, updated_at = ?
+            WHERE tx_id = ?`,
+          canonicalJson(resolvedRecord),
+          result.record_hash,
+          resolvedRecord.commit_decided_at_ms,
+          resolvedRecord.decision_sequence,
+          new Date().toISOString(),
+          row.tx_id,
+        );
+        this.queueRecovery(row.tx_id, "commit", new Date().toISOString());
+      });
+      const resolved = this.loadTx(row.tx_id);
+      if (!resolved) throw new Error(`Missing resolved transaction ${row.tx_id}.`);
+      return this.reconcileCommit(resolved);
+    }
+    this.ctx.storage.transactionSync(() => {
+      const current = this.loadTx(row.tx_id);
+      if (
+        !current
+        || this.stateOf(current) !== coordinatorState.state
+        || current.decision !== coordinatorState.decision
+        || current.epoch !== coordinatorState.epoch
+        || current.operation_hash !== coordinatorState.operation_hash
+        || current.manifest_reservation_hash !== coordinatorState.reservation_hash
+        || current.manifest_cancel_request_json !== row.manifest_cancel_request_json
+      ) throw new CoordinatorCasLost(current ? this.stateOf(current) : "quarantined");
+      this.sql.exec(
+        `UPDATE transactions
+            SET status = 'aborted', decision = 'abort', result_json = ?, last_error = NULL, updated_at = ?
+          WHERE tx_id = ?`,
+        JSON.stringify({ status: "aborted" }),
+        new Date().toISOString(),
+        row.tx_id,
+      );
+      this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+    });
+    return json({ ok: true, txId: row.tx_id, status: "aborted", resolutionAttestationHash: result.resolution_attestation_hash });
   }
 
   private async handleStats(): Promise<Response> {
