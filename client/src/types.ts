@@ -37,8 +37,25 @@ export interface TxResponse {
    * participants' commit acknowledgement is still outstanding and queued
    * for alarm-driven retry (src/coordinator.ts) -- the transaction is
    * committed either way, only the ack is pending. */
-  status: "committed" | "committed_pending_ack";
+  status: "commit_pending_manifest" | "committed" | "committed_pending_ack";
 }
+
+export type TransactionState =
+  | "new"
+  | "preparing"
+  | "prepared"
+  | "abort_decided"
+  | "aborting"
+  | "aborted"
+  | "commit_decided"
+  | "commit_pending_manifest"
+  | "manifest_registered"
+  | "committing"
+  | "committed_pending_ack"
+  | "committed"
+  | "quarantined";
+
+export type TransactionDecision = "undecided" | "commit" | "abort" | "quarantined";
 
 export interface IndexQueryRequest {
   table: string;
@@ -197,6 +214,16 @@ export interface ShardStatsResponse {
   rowOwnerCount: number;
 }
 
+/** Minimal admin-only /v1/sql response used by the onboarding verifier to
+ * prove that two partition keys resolve to different physical shards. The
+ * verifier issues only `SELECT 1`; this is not a general raw-SQL SDK surface. */
+export interface RouteProbeResponse {
+  route: {
+    shardId: string;
+    catalogShardId: string;
+  };
+}
+
 export interface TopologyLockStatusResponse {
   held: boolean;
   operationId?: string;
@@ -323,7 +350,16 @@ export interface TxStatusRequest {
  * txId, {found: true, status} for a known one -- never a bare txId/status
  * pair, and no txId echoed back either way. Always check `found` before
  * reading `status`. */
-export type TxStatusResponse = { found: false } | { found: true; status: string };
+export type TxStatusResponse =
+  | { found: false }
+  | {
+      found: true;
+      status: TransactionState;
+      decision: TransactionDecision;
+      epoch: number;
+      operationHash: string;
+      commitAuthorized: boolean;
+    };
 
 export interface TxForceAbortRequest {
   txId: string;

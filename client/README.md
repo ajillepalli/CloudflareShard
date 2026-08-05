@@ -120,15 +120,40 @@ node dist/cli.js --help
 export CLOUDFLARESHARD_URL=http://127.0.0.1:8787
 export CLOUDFLARESHARD_ADMIN_TOKEN=<your ADMIN_TOKEN>
 
+node dist/cli.js doctor
+node dist/cli.js verify --disposable-target
 node dist/cli.js init --num-shards 4 --total-vbuckets 256
 node dist/cli.js create-table --table events --schema "CREATE TABLE events (id TEXT PRIMARY KEY, body TEXT)" --partition-key-column id
 node dist/cli.js status
 node dist/cli.js shard-stats --shard-id catalog-0-shard-0
 ```
 
-`--url`/`--token` flags work instead of the env vars if you prefer. Every
-command prints its JSON response to stdout and exits non-zero with a
-human-readable error on stderr for anything that fails.
+`doctor` is a read-only service/auth/topology preflight. Cloudflare does not
+expose live account-plan quota headroom through the CloudflareShard API, so the
+quota check is an explicit warning with dashboard remediation, never a
+fabricated pass.
+
+`verify` requires `--disposable-target`. It may initialize a fresh target with
+two shards, but never uses `force:true` and refuses an initialized topology with
+fewer than two active shards. It retains an isolated table and tenant because
+the API has no table-drop operation. The proof selects two keys through the
+authoritative router, commits them in one cross-shard transaction, replays the
+same request ID, and verifies exactly one copy of each row. A durable commit
+whose participant acknowledgement remains outstanding produces
+`PENDING_RECONCILIATION`, not `VERIFIED`. A durable decision still waiting for
+manifest registration is also pending reconciliation; participant commit is not
+yet authorized. After idempotent replay, verification defers strict readback for
+either pending state; if replay has converged to committed, it proceeds with the
+two-row readback proof.
+
+Both onboarding commands write redacted, versioned, SHA-256 checksummed
+receipts to `.cloudflareshard/receipts/`. TTY output is human-readable at an
+80- or 120-column layout; redirected output defaults to stable one-line JSON.
+Use `--output human|json`/`--json` to override. ANSI color is disabled for JSON,
+redirected output, and when `NO_COLOR` is set. Exit codes: 0 success/ready, 2
+invalid invocation or unsafe target, 3 prerequisite blocked, 4 verification
+failed, and 5 pending reconciliation. `--url`/`--token` flags work in
+place of the environment variables.
 
 ## What's covered
 
@@ -145,7 +170,7 @@ human-readable error on stderr for anything that fails.
 `drainShard`, `drainShardStatus`, `backfillProvenance`, `setRowOwner`,
 `txStatus`, `txForceAbort`.
 
-**CLI:** `init`, `create-table`, `register-table`, `register-tenant`,
+**CLI:** `doctor`, `verify`, `init`, `create-table`, `register-table`, `register-tenant`,
 `create-index`, `create-index-status`, `status`, `shard-stats`,
 `list-tables`, `list-indexes`.
 
@@ -170,14 +195,13 @@ npm run typecheck   # tsc --noEmit, covers src/ and test/
 npm test            # vitest: mocked-fetch unit tests, no network
 npm run build        # emits dist/
 
-# Full end-to-end check against a real server (not part of `npm test`):
+# Full end-to-end check against a disposable real server (not part of `npm test`):
 # in the repo root: npm run dev
+export CLOUDFLARESHARD_DISPOSABLE_TARGET=true
 node scripts/verify-live.mjs
 ```
 
-`verify-live.mjs` calls `/admin/init` with `force: true`, which resets
-cluster topology -- **destructive** against a deployment with real data. It
-only runs against `localhost`/`127.0.0.1` by default; pointing
-`CLOUDFLARESHARD_URL` at anything else requires setting
-`I_UNDERSTAND_THIS_WILL_RESET_CLUSTER_TOPOLOGY=true` explicitly. Never run
-it against a live/production deployment.
+`verify-live.mjs` is now only a compatibility wrapper around the same tested
+`cloudflareshard verify --disposable-target` implementation. It performs no
+force reset, but it does retain isolated verification resources, so never run
+it against a production deployment.
