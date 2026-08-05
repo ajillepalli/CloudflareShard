@@ -30,31 +30,69 @@ schemas, the routing algorithm, transaction semantics), see [`SPEC.md`](SPEC.md)
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
 
 One click clones this repo into your GitHub and deploys the cluster to **your own
-Cloudflare account**: one Worker plus three SQLite Durable Object classes
-(`CATALOG` control plane, `SHARD` data plane, `COORDINATOR` for 2PC), provisioned
-automatically from the `[[migrations]]` in `wrangler.toml`. There are no KV/D1/R2
-resources; the cluster is self-contained.
+Cloudflare account**. The complete topology is two Workers and four SQLite
+Durable Object classes:
 
-**Cost:** Durable Objects require the **Workers Paid** plan, and everything created
-is **billed to your account** (Worker + Durable Object requests/duration/storage).
-This is a real database in your account, not a sandbox. Tear it down when you're
-done.
+1. The required route-less `cloudflare-shard-control-plane` Worker owns
+   `JOURNAL_MANIFEST` (`JournalManifestDO`).
+2. The public `cloudflare-shard-mvp` Worker owns `CATALOG` (`CatalogDO`),
+   `SHARD` (`ShardDO`), and `COORDINATOR` (`CoordinatorDO`), and reaches the
+   first Worker through its mandatory `CONTROL_PLANE` service binding.
 
-**After deploy:**
+There are no KV/D1/R2 resources; the cluster is self-contained. From a fresh
+clone, `npm run deploy` enforces the safe creation order by running
+`npm run deploy:control-plane` before `npm run deploy:root`. Use those two
+commands in that order if deploying manually. For local development,
+`npm run dev` loads both Wrangler configs together, so the route-less service
+is available to the root Worker's `CONTROL_PLANE` binding before transaction
+traffic is handled.
+
+**Cost:** SQLite-backed Durable Objects are available on Workers Free and Paid.
+The Free plan is suitable for a bounded evaluation, not an implied production
+allowance. As of 2026-08-05, Cloudflare documents 100,000 Worker requests/day,
+5 million Durable Object rows read/day, and 100,000 rows written/day; exceeding
+one of the daily Free limits makes further operations of that type fail. Verify
+the current official [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
+and [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+before a run. This is a real database in your account, not a sandbox.
+
+**After both Workers deploy:**
 1. Set the `ADMIN_TOKEN` secret (the setup page prompts for it via `.env.example`)
    to a strong random value: `openssl rand -hex 32`. It gates the whole `/admin/*`
    surface; without it the Worker returns `500 ADMIN_TOKEN is not configured`.
-2. Initialize the topology:
+2. Build the zero-runtime-dependency client and run the read-only preflight:
    ```bash
-   curl -X POST https://<your-worker>.workers.dev/admin/init \
-     -H "authorization: Bearer $ADMIN_TOKEN" -H "content-type: application/json" \
-     -d '{"numShards": 2, "totalVBuckets": 16}'
+   cd client && npm install && npm run build && cd ..
+   export CLOUDFLARESHARD_URL=https://<your-worker>.workers.dev
+   export CLOUDFLARESHARD_ADMIN_TOKEN=$ADMIN_TOKEN
+   node client/dist/cli.js doctor
    ```
-3. To build an app against it, download the starter from Shardscope's "Build on it"
+3. On a deployment created only for this evaluation, run the verified path:
+   ```bash
+   node client/dist/cli.js verify --disposable-target
+   ```
+   A fresh target is initialized with two shards without `force`; an existing
+   initialized target is never reset. The verifier creates an isolated table
+   and tenant, proves two distinct physical placements, commits one cross-shard
+   transaction, replays its request ID, and reads back exactly one row per key.
+   Because the current API has no table-drop operation, resources remain on the
+   target. Tear the deployment down after the trial.
+4. To build an app against it, download the starter from Shardscope's "Build on it"
    panel (it service-binds to exactly this Worker), or see `examples/rpc-consumer/`.
 
-**Teardown:** `npx wrangler delete --name <your-worker>` removes the Worker and its
-Durable Objects (and stops billing). Full details + a confirm-gated teardown script:
+Every `doctor` and `verify` run writes a versioned, redacted JSON receipt with a
+SHA-256 checksum under `.cloudflareshard/receipts/`. Receipts contain a hash of
+the target origin, not its URL or credentials. `commit_pending_manifest` and
+`committed_pending_ack` are both reported as `PENDING_RECONCILIATION` (exit 5),
+not as verified success. The first state defers participant commit and strict
+readback until manifest registration succeeds; the second is durably committed
+but still waiting for every participant acknowledgement.
+
+**Teardown:** run `npm run delete`. It deletes the public root Worker first and
+the route-less control-plane Worker second. That order prevents a surviving
+gateway from accepting new cross-shard work after its manifest dependency has
+disappeared. Do not run `npm run delete:control-plane` while the root Worker is
+still deployed. Full operational details and confirm-gated teardown guidance:
 [`examples/shardscope/docs/deploy/`](../examples/shardscope/docs/deploy/).
 
 ## Project layout
@@ -62,6 +100,10 @@ Durable Objects (and stops billing). Full details + a confirm-gated teardown scr
 - `src/index.ts`: Gateway worker router and public API.
 - `src/catalog.ts`: Catalog durable object (metadata, routing, map changes).
 - `src/shard.ts`: Shard durable object (SQLite execution + idempotency).
+- `src/coordinator.ts`: Transaction coordinator durable object (decision,
+  manifest admission, participant reconciliation, and recovery).
+- `workers/control-plane/`: Required route-less Worker and
+  `JournalManifestDO` commit-manifest service.
 - `docs/SPEC.md`: Concrete architecture and protocol spec.
 - `client/`: Typed TypeScript SDK + CLI for the HTTP API, see `client/README.md`. Recommended over hand-writing raw HTTP calls.
 - `examples/rpc-consumer/`: Demo Worker calling the tenant data path over a Durable Object RPC / service binding instead of HTTP.
@@ -118,16 +160,26 @@ wrapper (see `client/README.md`'s "What's covered" section for why). Call it
 directly over HTTP using `ADMIN_TOKEN`; its request/response shape is in
 [`SPEC.md` §7](SPEC.md#7-public-http-api-gateway-worker).
 
-The CLI covers the admin calls above too, for scripting/one-offs without
-writing any TypeScript:
+The CLI covers onboarding and the admin calls above for scripting/one-offs
+without writing TypeScript:
 
 ```bash
 export CLOUDFLARESHARD_URL=http://127.0.0.1:8787
 export CLOUDFLARESHARD_ADMIN_TOKEN=<your ADMIN_TOKEN>
+node client/dist/cli.js doctor
+node client/dist/cli.js verify --disposable-target
 node client/dist/cli.js init --num-shards 4 --total-vbuckets 256
 node client/dist/cli.js create-table --table events --schema "CREATE TABLE events (id TEXT PRIMARY KEY, body TEXT)" --partition-key-column id
 node client/dist/cli.js status
 ```
+
+`doctor` is read-only. `verify` is intentionally mutating and refuses to run
+without `--disposable-target`; it never passes `force:true`. On a TTY these
+commands render an 80- or 120-column human report. Redirected output defaults
+to one-line JSON; force either form with `--output human|json` or `--json`.
+Color is disabled for redirected/JSON output and whenever `NO_COLOR` is set.
+Stable exit codes are 0 success/ready, 2 invalid invocation or unsafe target,
+3 prerequisite blocked, 4 verification failed, and 5 pending reconciliation.
 
 **Proof this runs for real:** the screenshots below are unedited terminal
 output from an actual live deployment, not fabricated example data.

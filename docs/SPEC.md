@@ -26,8 +26,10 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
   - AuthN/AuthZ hook.
   - Request validation.
   - Routes to catalog and shard DOs.
+  - Reaches the separately deployed route-less control-plane Worker through
+    the mandatory `CONTROL_PLANE` service binding.
 
-- CatalogDO (control plane)
+- CatalogDO (routing/topology control plane)
   - Owns table registry.
   - Owns vBucket to shard map.
   - Owns metadata version.
@@ -37,6 +39,26 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
   - Owns one SQLite database.
   - Executes SQL statements serially.
   - Maintains idempotency table for at-least-once retries.
+  - Persists prepared intents, row locks, and epoch/hash decision tombstones
+    for coordinated transactions.
+
+- CoordinatorDO (transaction control plane)
+  - One durable coordinator per transaction ID.
+  - Persists the monotonic decision state, immutable redo envelope, manifest
+    registration, participant acknowledgements, and recovery work.
+  - Never sends participant commit until the manifest service confirms the
+    durable commit record.
+
+- Route-less control-plane Worker (`cloudflare-shard-control-plane`)
+  - Has no public HTTP routes and is deployed before the Gateway Worker.
+  - Exposes manifest RPC methods through the Gateway Worker's
+    `CONTROL_PLANE` service binding.
+
+- JournalManifestDO (commit-manifest control plane)
+  - Owns immutable, queryable commit-manifest records and content-conflict
+    quarantine.
+  - Partitions records by fleet, UTC day, and a deterministic 16-way hash.
+  - Retains records for at least the coordinator/participant recovery window.
 
 ## 4) Logical Data Partitioning
 
@@ -249,6 +271,41 @@ Table: __cf_indexes (Milestone 2, extended in Milestone 3)
   `source_shard_id` column stays physically (additive-migration convention) but is unread.
 
 Application tables are created by tenant SQL statements routed to target shards.
+
+CoordinatorDO transaction state:
+- `transactions`: immutable participant/operation content and hash; protocol,
+  state-model, and decision epoch versions; current state and decision; fleet
+  and coordinator identity; redo envelope; manifest registration; result; and
+  timestamps/errors.
+- `transaction_participants`: one row per participant shard with its current
+  phase, decision epoch, operation hash, and update timestamp.
+- `recovery_queue`: durable forward work for manifest registration,
+  participant commit/abort reconciliation, and terminal manifest-retention
+  release. Alarms retry with bounded exponential backoff.
+- `manifest_admission_circuit`: the durable failure window, open cooldown, and
+  half-open probe state used to reject new transactions before prepare when
+  the manifest dependency is unhealthy.
+
+ShardDO transaction state:
+- `pending_intents` and `row_locks`: prepared, unapplied mutations and their
+  locks. Versioned rows carry `protocol_version`, `epoch`, and the immutable
+  `operation_hash`.
+- `participant_decision_tombstones`: the terminal commit/abort decision,
+  highest epoch, operation hash, protocol/format versions, decision time, and
+  retention deadline. Tombstones reject stale, contradictory, or
+  different-content messages after the pending intent has been removed.
+- A pre-v1 prepared row is adopted only by a versioned `prepare` whose complete
+  intents and identity exactly match the stored row. An unadopted legacy row
+  may be aborted before a commit decision; it is never blindly committed.
+
+JournalManifestDO state (owned by the separately deployed route-less Worker):
+- `partition_metadata`: immutable fleet/day/partition routing identity.
+- `manifest_records`: immutable commit record and hash, redo-envelope hash,
+  decision epoch, retention deadline, lifecycle-release flag, and quarantine
+  flag.
+- `manifest_conflicts`: every same-transaction/different-hash observation.
+  Conflicting content quarantines the transaction rather than overwriting its
+  original record.
 
 ## 7) Public HTTP API (Gateway Worker)
 
@@ -629,15 +686,38 @@ Request:
 - mutations array of StructuredMutation (see /v1/mutate above), 1 or more, bounded to 8 distinct (tenantId, table, partitionKey) rows
 - requestId string (required, the transaction's idempotency key; a retry with the same requestId returns the prior outcome rather than re-running 2PC)
 
-Response (200, committed):
+Response (200, terminal commit):
 - ok: true
 - txId string
-- status: "committed" (or "committed_pending_ack" if a commit acknowledgement from one or more shards is still outstanding and queued for alarm-driven retry, the transaction is durably committed either way, only the ack is pending)
+- status: "committed"
+
+Response (202, durable commit decision still reconciling):
+- ok: true
+- txId string
+- status: "commit_pending_manifest" | "committed_pending_ack"
+
+`commit_pending_manifest` means the coordinator's commit decision and immutable
+redo data are durable, but manifest registration is unavailable or its
+acknowledgement is ambiguous. Participant commit is not yet authorized, so a
+client must poll `/admin/tx-status` or retry the identical `/v1/tx` request; the
+coordinator alarm retries the identical registration. `committed_pending_ack`
+means manifest registration already authorized participant commit and the
+transaction is durably committed, but one or more participant acknowledgements
+remain queued for recovery. Neither 202 state is a verified terminal success.
 
 Response (409, aborted):
 - error { code: "TX_ABORTED", message, details }, prepare failed on at least one participant shard; every participant was rolled back (or had nothing to roll back, given /prepare's shadow-write design)
 
-Drives `CoordinatorDO`'s two-phase commit across every shard touched by the mutation set: each mutation is individually routed and validated (so a cross-tenant mutation in the same batch 401s the same way a lone `/v1/mutate` call would, with no separate check needed), grouped by shardId, then `/begin` fans out `/prepare` to all participants, aborts everyone on any failure, or fans out `/commit` on universal success.
+Drives `CoordinatorDO`'s two-phase commit across every shard touched by the
+mutation set. Each mutation is individually routed and validated (so a
+cross-tenant mutation in the same batch 401s the same way a lone `/v1/mutate`
+call would), grouped by shard ID, then `/begin` fans out versioned `/prepare`
+messages. On universal prepare success, the coordinator first persists its
+commit decision and immutable redo/manifest payload, then registers the
+manifest through `CONTROL_PLANE`, and only after successful registration fans
+out participant `/commit`. Any prepare failure durably selects abort and
+reconciles `/abort`; manifest failure after commit decision retains prepared
+state and never falls through to participant commit.
 
 POST /admin/tx-status (ADMIN_TOKEN)
 Request:
@@ -645,7 +725,15 @@ Request:
 
 Response:
 - found boolean
-- status string (if found, preparing/prepared/committing/committed/aborted)
+- status string, if found: `new`, `preparing`, `abort_decided`, `aborting`,
+  `aborted`, `prepared`, `commit_decided`, `commit_pending_manifest`,
+  `manifest_registered`, `committing`, `committed_pending_ack`, `committed`, or
+  `quarantined`
+- decision: `undecided` | `abort` | `commit` | `quarantined`
+- epoch number
+- operationHash string
+- commitAuthorized boolean (true only from `manifest_registered` onward on the
+  commit path)
 
 POST /admin/tx-force-abort (ADMIN_TOKEN)
 Request:
@@ -656,7 +744,18 @@ Response:
 - txId
 - status: "aborted"
 
-Manual escape hatch for a transaction stuck past a reasonable window (visible via `/admin/tx-status`), aborts every participant shard and marks the transaction aborted. Rejects 409 if the transaction already committed.
+Manual escape hatch for a transaction stuck before a durable commit decision
+(visible via `/admin/tx-status`). It atomically selects abort, sends versioned
+abort messages, and returns the abort decision as `aborted`; alarms continue
+any missing participant acknowledgements and `/admin/tx-status` may show
+`aborting` until every participant has persisted its abort tombstone. Repeated
+calls are idempotent. It rejects 409 `TX_COMMIT_ALREADY_DECIDED` for
+`commit_decided`, `commit_pending_manifest`, `manifest_registered`,
+`committing`, `committed_pending_ack`, or `committed`; a durable commit can
+never be converted to abort. It also rejects quarantined or unverifiable
+legacy content. A verified pre-v1 prepared transaction may be safely aborted
+before adoption, but may be committed only after exact versioned prepare
+replay adopts its stored intents.
 
 POST /v1/index-query (tenant bearer token), Milestone 2, Chunk 4
 Request:
@@ -819,7 +918,8 @@ This prevents duplicate writes after network retries and stops a reused requestI
     reclassified from "future, saga-first" to a non-negotiable day-one requirement (see
     Section 2). A caller derives a `StructuredMutation` set; the coordinator resolves
     participant shards and drives prepare/commit/abort across all of them atomically.
-  - Bounded to at most 8 participant shards per transaction.
+  - Bounded to at most 8 distinct caller participant keys per transaction;
+    synthetic index-maintenance intents do not consume that caller budget.
   - Requires the structured mutation contract (Section 7, `/v1/mutate`) and a mandatory
     partition-key-column convention on every registered table, both shipped.
   - **Shard-level primitives (implementation status: shipped and reachable via `/v1/tx`).**
@@ -829,8 +929,29 @@ This prevents duplicate writes after network retries and stops a reused requestI
     validates a mutation by executing it inside a transaction and forcing a rollback (so a
     concurrent read never sees it), then durably records a lock + pending intent in a
     separate transaction; `/commit` re-executes for real; `/abort` has nothing to undo,
-    since prepare never left anything applied. These are DO-binding-only, called from
-    `CoordinatorDO`, never directly by the Worker.
+    since prepare never left anything applied. Every v1 participant message carries
+    `{protocol_version, tx_id, epoch, phase, operation_hash}`. The shard rejects an older
+    epoch, an epoch/hash conflict, or a phase contradicting its durable decision. Commit and
+    abort persist a 35-day decision tombstone before deleting prepared state, so late retries
+    cannot reverse the outcome after locks/intents are gone. These routes are DO-binding-only,
+    called from `CoordinatorDO`, never directly by the Worker.
+  - **Monotonic state machine (protocol v1).** The legal paths are:
+    `new -> preparing -> prepared -> commit_decided -> commit_pending_manifest ->
+    manifest_registered -> committing -> committed_pending_ack -> committed` (the two pending
+    states are skipped when their acknowledgement succeeds immediately), or
+    `preparing/prepared -> abort_decided -> aborting -> aborted`. `quarantined` is a terminal
+    manual-inspection state reached when immutable content conflicts or unsafe persisted state
+    is detected. Same-state replay is idempotent; no transition from a commit-decision state to
+    an abort state is legal.
+  - **Manifest-before-participant-commit sequence.** After every participant prepares, the
+    coordinator (1) durably stores `commit_decided` plus the immutable redo envelope and
+    manifest registration, (2) queues manifest recovery, (3) registers that exact record with
+    `JournalManifestDO` through `CONTROL_PLANE`, (4) moves to `manifest_registered`, and only
+    then (5) sends versioned participant commit messages. An unavailable or ambiguous manifest
+    acknowledgement returns 202 `commit_pending_manifest`, leaves participant intents prepared,
+    and retries the identical registration. Same-ID/different-hash content is quarantined.
+    Partial participant acknowledgement returns 202 `committed_pending_ack`; the decision is
+    already commit and alarms continue reconciliation.
   - **Optimistic-concurrency (`where`-guarded) mutations inside `/v1/tx` (shipped).** A base-row
     UPDATE/DELETE intent's optional `where` clause is a real compare-and-swap guard, not a
     best-effort filter: if executing the intent during `/prepare`'s validation pass affects
@@ -854,12 +975,12 @@ This prevents duplicate writes after network retries and stops a reused requestI
     decision in the milestone plan: Cloudflare DO billing has no per-instantiation cost, so
     the simpler keying wins over a sharded pool at this project's realistic near-term scale).
     `txId = sha256Hex([mutations[0].tenantId, requestId])`. `/begin` persists the
-    transaction and its participants, fans out `/prepare` to every participant shard, aborts
-    everyone on any failure, or fans out `/commit` on universal success. A commit
-    acknowledgement that fails to reach one or more shards is queued in `recovery_queue` and
-    retried via `alarm()` with exponential backoff, the transaction is already durably
-    committed at that point, so this only affects when the shard-side state catches up, not
-    correctness. `/v1/tx` (Section 7) is the public entry point. `CoordinatorDO` stores a
+    transaction and participants, prepares them, and follows the manifest-gated sequence
+    above. Durable `recovery_queue` work and `alarm()` retries cover manifest registration,
+    participant commit/abort acknowledgement, and manifest-retention release after terminal
+    commit. Recovery dispatches from the persisted state rather than replaying a generic
+    "finish" action, so a crash cannot fall through from manifest-pending to commit or from a
+    commit decision to abort. `/v1/tx` (Section 7) is the public entry point. `CoordinatorDO` stores a
     hash of the participant/mutation set alongside each `txId`; retrying an existing `txId`
     (any status, in-flight, committed, or aborted) with a different mutation set rejects 409
     (`TX_ID_REQUEST_MISMATCH`) instead of silently resuming 2PC with the new data or replaying
@@ -870,6 +991,10 @@ This prevents duplicate writes after network retries and stops a reused requestI
     `operation_hash` on a pre-existing `transactions` table rather than crashing, a
     `/begin` retry against a pre-migration row degrades to the same fail-closed mismatch
     rejection instead of a 500 (found by a second Codex pass against this fix itself).
+    Expand-first recovery is also fail-closed: a predecessor `prepared` coordinator must
+    replay exact prepare content so each protocol-0 participant row can atomically adopt its
+    v1 epoch/hash before the coordinator decides commit. A mismatched row is rejected; an
+    unadopted legacy row can only take the safe pre-decision abort path.
   - A batch may legitimately contain multiple mutations against the same row (e.g. insert
     then update in one `/v1/tx` call, nothing caps mutation count, only distinct participant
     keys); `ShardDO./prepare` acquires each row lock with `INSERT OR IGNORE` rather than a
@@ -885,8 +1010,9 @@ This prevents duplicate writes after network retries and stops a reused requestI
     target `ShardDO`'s `/pending-intent-count` first, and only proceeds to `CatalogDO`'s
     `/drain-shard` if that count is 0; otherwise it rejects 409
     (`SHARD_HAS_IN_FLIGHT_TRANSACTIONS`). This preserves the "Worker orchestrates, DOs don't
-    call each other directly" invariant. Relies on Chunk 3's recovery loop (bounded time) or
-    `/admin/tx-force-abort` (manual escape hatch) to unblock a stuck retry.
+    call each other directly" invariant. A pre-decision transaction can be unblocked with
+    `/admin/tx-force-abort`; after `commit_decided`, only alarm-driven or polled forward
+    recovery is legal.
   - **Index-shard drain interaction (Milestone 2 Chunk 5, shipped).** Index-shard placement
     (`indexShardIdForKey`) is a pure hash over the current shard pool, independent of
     `vbucket_map`/`shards.status`, draining a shard in the catalog sense doesn't stop the
