@@ -13,6 +13,7 @@ export const INITIAL_PARTITION_COUNT = 16;
 export const DEFAULT_CATALOG_PAGE_SIZE = 64;
 export const MAX_CATALOG_PAGE_SIZE = 128;
 export const CATALOG_ALARM_BATCH_SIZE = 16;
+export const CATALOG_CURSOR_MAX_LEASE_MS = 15 * 60 * 1000;
 const ZERO_HASH = "0".repeat(64);
 const FIRST_EFFECTIVE_DAY = "0000-01-01";
 
@@ -333,7 +334,8 @@ export class FleetManifestCatalogStore {
       CREATE TABLE IF NOT EXISTS catalog_enumeration_cursors (
         cursor_json TEXT PRIMARY KEY,
         evidence_json TEXT NOT NULL,
-        created_at_ms INTEGER NOT NULL
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL
       );
     `);
     const closeColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
@@ -353,6 +355,12 @@ export class FleetManifestCatalogStore {
     }
     if (!metadataColumns.some((column) => column.name === "legacy_grid_materialized_through_day")) {
       this.storage.sql.exec("ALTER TABLE fleet_catalog_metadata ADD COLUMN legacy_grid_materialized_through_day TEXT");
+    }
+    const cursorColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
+      "PRAGMA table_info(catalog_enumeration_cursors)",
+    ).toArray();
+    if (!cursorColumns.some((column) => column.name === "expires_at_ms")) {
+      this.storage.sql.exec("ALTER TABLE catalog_enumeration_cursors ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0");
     }
     this.storage.sql.exec(
       "INSERT OR IGNORE INTO _fleet_catalog_schema_migrations (id, applied_at) VALUES (1, ?)",
@@ -1197,23 +1205,54 @@ export class FleetManifestCatalogStore {
       .toArray();
   }
 
-  issueEnumerationCursor(cursor: unknown, evidence: unknown): void {
+  issueEnumerationCursor(cursor: unknown, evidence: unknown, nowMs = Date.now()): number {
+    const evidenceLeases = Array.isArray(evidence)
+      ? evidence.flatMap((item) => {
+          if (typeof item !== "object" || item === null || !("lease_expires_at_ms" in item)) return [];
+          const expiry = (item as { lease_expires_at_ms?: unknown }).lease_expires_at_ms;
+          return Number.isSafeInteger(expiry) ? [expiry as number] : [];
+        })
+      : [];
+    const expiresAtMs = Math.min(nowMs + CATALOG_CURSOR_MAX_LEASE_MS, ...evidenceLeases);
     this.storage.sql.exec(
-      "INSERT OR IGNORE INTO catalog_enumeration_cursors (cursor_json, evidence_json, created_at_ms) VALUES (?, ?, ?)",
+      `INSERT INTO catalog_enumeration_cursors (cursor_json, evidence_json, created_at_ms, expires_at_ms)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(cursor_json) DO UPDATE SET
+         evidence_json = excluded.evidence_json, expires_at_ms = excluded.expires_at_ms`,
       canonicalJson(cursor),
       canonicalJson(evidence),
-      Date.now(),
+      nowMs,
+      expiresAtMs,
     );
+    return expiresAtMs;
   }
 
-  enumerationCursorEvidence(cursor: unknown): unknown[] | null {
+  enumerationCursorEvidence(cursor: unknown, nowMs = Date.now()): unknown[] | null {
+    this.purgeEnumerationCursors(nowMs);
     const row = this.storage.sql
       .exec<{ evidence_json: string }>(
-        "SELECT evidence_json FROM catalog_enumeration_cursors WHERE cursor_json = ?",
+        "SELECT evidence_json FROM catalog_enumeration_cursors WHERE cursor_json = ? AND expires_at_ms > ?",
         canonicalJson(cursor),
+        nowMs,
       )
       .toArray()[0];
     return row === undefined ? null : JSON.parse(row.evidence_json) as unknown[];
+  }
+
+  purgeEnumerationCursors(nowMs = Date.now(), limit = 128): number | null {
+    this.storage.sql.exec(
+      `DELETE FROM catalog_enumeration_cursors WHERE cursor_json IN (
+         SELECT cursor_json FROM catalog_enumeration_cursors
+          WHERE expires_at_ms <= ? ORDER BY expires_at_ms LIMIT ?
+       )`,
+      nowMs,
+      limit,
+    );
+    return this.storage.sql
+      .exec<{ expires_at_ms: number | null }>(
+        "SELECT MIN(expires_at_ms) AS expires_at_ms FROM catalog_enumeration_cursors",
+      )
+      .one().expires_at_ms;
   }
 
   async beginClose(input: {
@@ -1575,7 +1614,27 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
   }
 
   async issueEnumerationCursor(cursor: unknown, evidence: unknown): Promise<void> {
-    this.catalog.issueEnumerationCursor(cursor, evidence);
+    const now = Date.now();
+    const existingExpiry = this.catalog.purgeEnumerationCursors(now);
+    const prearmedExpiry = Math.min(existingExpiry ?? Number.POSITIVE_INFINITY, now + CATALOG_CURSOR_MAX_LEASE_MS);
+    this.catalog.schedulePurpose({
+      purpose: "cursor_gc",
+      fire_at_ms: prearmedExpiry,
+      generation: 0,
+      payload_hash: await hashCanonicalJson(["cursor_gc", prearmedExpiry]),
+    });
+    await this.armNextAlarm();
+    this.catalog.issueEnumerationCursor(cursor, evidence, now);
+    const nextExpiry = this.catalog.purgeEnumerationCursors(now);
+    if (nextExpiry !== null) {
+      this.catalog.schedulePurpose({
+        purpose: "cursor_gc",
+        fire_at_ms: nextExpiry,
+        generation: 0,
+        payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
+      });
+      await this.armNextAlarm();
+    }
   }
 
   async enumerationCursorEvidence(cursor: unknown): Promise<unknown[] | null> {
@@ -1610,6 +1669,17 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
         this.catalog.completePurpose(purpose.purpose, purpose.generation);
         if (result.status === "pending") {
           this.catalog.schedulePurpose({ ...purpose, fire_at_ms: Date.now() });
+        }
+      } else if (purpose.purpose === "cursor_gc") {
+        this.catalog.completePurpose(purpose.purpose, purpose.generation);
+        const nextExpiry = this.catalog.purgeEnumerationCursors(Date.now());
+        if (nextExpiry !== null) {
+          this.catalog.schedulePurpose({
+            purpose: "cursor_gc",
+            fire_at_ms: Math.max(Date.now(), nextExpiry),
+            generation: 0,
+            payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
+          });
         }
       } else {
         // Unknown/future handlers never erase durable operation state. Removing

@@ -442,6 +442,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         partition: number;
         retention_epoch: number;
         seal_receipt_hash: string;
+        lease_expires_at_ms: number;
       };
       const priorEvidencePins = request.cursor === null
         ? []
@@ -452,14 +453,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         );
       }
       for (const pin of priorEvidencePins) {
-        const priorBucket = this.env.JOURNAL_MANIFEST.getByName(
-          await manifestObjectName(request.fleet_id, pin.reservation_day, pin.partition),
-        );
-        const [priorStats, priorReceipt] = await Promise.all([
-          priorBucket.stats(),
-          priorBucket.sealReceipt(pin.seal_receipt_hash),
-        ]);
-        if (priorStats.retention_epoch !== pin.retention_epoch || priorReceipt === null) {
+        if (!Number.isSafeInteger(pin.lease_expires_at_ms) || pin.lease_expires_at_ms <= Date.now()) {
           return {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
@@ -536,6 +530,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       );
       const records: ManifestRecordV2[] = [];
       const evidence: ManifestEnumerationResultV1["evidence"][number][] = [];
+      const newEvidencePins: PriorEvidencePin[] = [];
       let inspectedBuckets = 0;
       let nextCursor: ManifestEnumerationResultV1["next_cursor"] = null;
       for (const entry of entries) {
@@ -580,7 +575,6 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           && cursor.partition === entry.partition
           ? cursor.local_cursor
           : null;
-        const remaining = Math.max(1, request.limit - records.length);
         const local = await bucket.localPage({
           protocol_version: CURRENT_PROTOCOL_VERSION,
           format_version: MANIFEST_PAGE_FORMAT_VERSION,
@@ -595,7 +589,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           expected_retention_epoch: stats.retention_epoch,
           seal_generation: receipt.generation,
           seal_receipt_hash: receipt.receipt_hash,
-          limit: remaining,
+          limit: request.limit,
           cursor: localCursor,
         });
         inspectedBuckets += 1;
@@ -633,7 +627,14 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           records_deleted_through_ms: local.records_deleted_through_ms,
           local_legacy_certificate_hash: receipt.local_legacy_certificate_hash,
         });
-        if (local.next_cursor !== null || records.length >= request.limit) {
+        newEvidencePins.push({
+          reservation_day: entry.reservation_day,
+          partition: entry.partition,
+          retention_epoch: local.retention_epoch,
+          seal_receipt_hash: receipt.receipt_hash,
+          lease_expires_at_ms: local.lease_expires_at_ms,
+        });
+        if (local.next_cursor !== null || local.records.length > 0) {
           nextCursor = {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             format_version: MANIFEST_CURSOR_FORMAT_VERSION,
@@ -665,12 +666,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       if (nextCursor !== null) {
         await catalog.issueEnumerationCursor(nextCursor, [
           ...priorEvidencePins,
-          ...evidence.map((item) => ({
-            reservation_day: item.reservation_utc_day,
-            partition: item.partition,
-            retention_epoch: item.retention_epoch,
-            seal_receipt_hash: item.seal_receipt_hash,
-          })),
+          ...newEvidencePins,
         ]);
       }
       const exhaustedCatalog = nextCursor === null && entries.length < 128;

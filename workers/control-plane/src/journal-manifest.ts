@@ -45,6 +45,7 @@ import {
 import { manifestRegistrationTxId, validatedManifestRegistration } from "./service.js";
 
 export const LIFECYCLE_FAILURE_RETRY_MS = 5 * 60 * 1000;
+export const MANIFEST_CURSOR_LEASE_MS = 15 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ZERO_HASH = "0".repeat(64);
 
@@ -406,7 +407,8 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         CREATE TABLE IF NOT EXISTS manifest_page_cursors (
           cursor_json TEXT PRIMARY KEY,
           request_hash TEXT NOT NULL,
-          created_at_ms INTEGER NOT NULL
+          created_at_ms INTEGER NOT NULL,
+          lease_expires_at_ms INTEGER NOT NULL
         )
       `);
       this.ctx.storage.sql.exec(
@@ -438,6 +440,18 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       `);
       this.ctx.storage.sql.exec(
         "INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (3, ?)",
+        new Date().toISOString(),
+      );
+    });
+    if (current < 4) this.ctx.storage.transactionSync(() => {
+      const cursorColumns = this.ctx.storage.sql
+        .exec<{ readonly [key: string]: SqlStorageValue; name: string }>("PRAGMA table_info(manifest_page_cursors)")
+        .toArray();
+      if (!cursorColumns.some((column) => column.name === "lease_expires_at_ms")) {
+        this.ctx.storage.sql.exec("ALTER TABLE manifest_page_cursors ADD COLUMN lease_expires_at_ms INTEGER NOT NULL DEFAULT 0");
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, ?)",
         new Date().toISOString(),
       );
     });
@@ -643,7 +657,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           .exec<ReservationRow>("SELECT * FROM manifest_reservations WHERE tx_id = ?", reservation.tx_id)
           .toArray()[0];
         if (existingReservation !== undefined) {
-          if (existingReservation.reservation_hash === reservationHash && existingReservation.quarantine_state === "NONE") {
+          if (existingReservation.reservation_hash === reservationHash && existingReservation.quarantine_state !== "UNRESOLVED") {
             return {
               ok: true,
               status: "already_reserved",
@@ -1369,8 +1383,14 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         );
         return { kind: "resume", generation };
       });
-      if (start.kind === "result") return start.result;
+      if (start.kind === "result") {
+        if (!start.result.ok && start.result.status === "quarantined" && start.result.generation !== undefined) {
+          await this.clearAlarmPurpose(`seal:${start.result.generation}`);
+        }
+        return start.result;
+      }
       if (start.kind === "complete") {
+        await this.clearAlarmPurpose(`seal:${start.generation}`);
         return { ok: true, status: "complete", generation: start.generation, cutoff_ms: cutoffMs, receipt: start.receipt };
       }
       return await this.resumeSeal(start.generation, request);
@@ -1459,12 +1479,24 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       .exec<SealGenerationRow>("SELECT * FROM manifest_seal_generations WHERE generation = ?", generation)
       .one();
     if (generationRow.status === "COMPLETE" && generationRow.receipt_json !== null) {
+      await this.clearAlarmPurpose(`seal:${generation}`);
       return {
         ok: true,
         status: "complete",
         generation,
         cutoff_ms: generationRow.cutoff_ms,
         receipt: JSON.parse(generationRow.receipt_json) as ManifestSealReceiptV1,
+      };
+    }
+    if (generationRow.status === "QUARANTINED") {
+      await this.clearAlarmPurpose(`seal:${generation}`);
+      return {
+        ok: false,
+        status: "quarantined",
+        http_status: 409,
+        error: manifestError("MANIFEST_QUARANTINED", "Eligible manifest evidence is unresolved."),
+        generation,
+        cutoff_ms: generationRow.cutoff_ms,
       };
     }
     const unresolved = this.ctx.storage.sql
@@ -1481,6 +1513,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         Date.now(),
         generation,
       );
+      await this.clearAlarmPurpose(`seal:${generation}`);
       return {
         ok: false,
         status: "quarantined",
@@ -1703,13 +1736,21 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       if (request.cursor !== null) assertManifestCursorMatchesRequest(request.cursor, requestHash);
       const coverageStartMs = new Date(request.coverage_start).getTime();
       const cutoffMs = new Date(request.cutoff).getTime();
-      return this.ctx.storage.transactionSync<ManifestLocalPageResult>(() => {
+      const now = Date.now();
+      const leaseExpiresAtMs = now + MANIFEST_CURSOR_LEASE_MS;
+      // Pre-arm cursor cleanup before publishing a lease. A crash after the
+      // alarm write leaves only a harmless wake-up; the inverse could strand
+      // a lease that indefinitely blocks retention.
+      await this.ensureAlarmAtOrBefore(leaseExpiresAtMs);
+      const result = this.ctx.storage.transactionSync<ManifestLocalPageResult>(() => {
         if (request.cursor !== null) {
           const issued = this.ctx.storage.sql
             .exec<{ count: number }>(
-              "SELECT COUNT(*) AS count FROM manifest_page_cursors WHERE cursor_json = ? AND request_hash = ?",
+              `SELECT COUNT(*) AS count FROM manifest_page_cursors
+                WHERE cursor_json = ? AND request_hash = ? AND lease_expires_at_ms > ?`,
               canonicalJson(request.cursor),
               requestHash,
+              now,
             )
             .one().count;
           if (issued !== 1) {
@@ -1851,12 +1892,26 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           last_decision_sequence: last.decision_sequence,
           last_tx_id: last.tx_id,
         } as const : null;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO manifest_page_cursors (cursor_json, request_hash, created_at_ms, lease_expires_at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(cursor_json) DO UPDATE SET
+             request_hash = excluded.request_hash,
+             lease_expires_at_ms = excluded.lease_expires_at_ms`,
+          `lease:${requestHash}`,
+          requestHash,
+          now,
+          leaseExpiresAtMs,
+        );
         if (nextCursor !== null) {
           this.ctx.storage.sql.exec(
-            "INSERT OR IGNORE INTO manifest_page_cursors (cursor_json, request_hash, created_at_ms) VALUES (?, ?, ?)",
+            `INSERT INTO manifest_page_cursors (cursor_json, request_hash, created_at_ms, lease_expires_at_ms)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(cursor_json) DO UPDATE SET lease_expires_at_ms = excluded.lease_expires_at_ms`,
             canonicalJson(nextCursor),
             requestHash,
-            Date.now(),
+            now,
+            leaseExpiresAtMs,
           );
         }
         return {
@@ -1866,9 +1921,11 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           complete: !hasMore,
           retention_epoch: bucket.retention_epoch,
           records_deleted_through_ms: bucket.records_deleted_through_ms === 0 ? null : bucket.records_deleted_through_ms,
+          lease_expires_at_ms: leaseExpiresAtMs,
           seal_receipt: JSON.parse(seal.receipt_json) as ManifestSealReceiptV1,
         };
       });
+      return result;
     } catch (error) {
       const protocolError = error instanceof TransactionContractViolation
         ? toManifestRpcError(error.protocolError)
@@ -2198,13 +2255,27 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
   private async sweepV2Retention(
     now: number,
     limit = 128,
-  ): Promise<{ readonly deleted: number; readonly deferred_for_seal: boolean }> {
+  ): Promise<{ readonly deleted: number; readonly deferred_until_ms: number | null }> {
+    this.ctx.storage.sql.exec(
+      `DELETE FROM manifest_page_cursors WHERE cursor_json IN (
+         SELECT cursor_json FROM manifest_page_cursors
+          WHERE lease_expires_at_ms <= ? ORDER BY lease_expires_at_ms LIMIT ?
+       )`,
+      now,
+      limit,
+    );
+    const cursorLease = this.ctx.storage.sql
+      .exec<{ expires_at_ms: number | null }>(
+        "SELECT MIN(lease_expires_at_ms) AS expires_at_ms FROM manifest_page_cursors",
+      )
+      .one().expires_at_ms;
+    if (cursorLease !== null) return { deleted: 0, deferred_until_ms: Math.max(now, cursorLease) };
     const drainingSeal = this.ctx.storage.sql
       .exec<{ count: number }>(
         "SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE status = 'DRAINING'",
       )
       .one().count;
-    if (drainingSeal > 0) return { deleted: 0, deferred_for_seal: true };
+    if (drainingSeal > 0) return { deleted: 0, deferred_until_ms: now + HELD_RETENTION_RECHECK_MS };
     const candidates = this.ctx.storage.sql
       .exec<{
         readonly [key: string]: SqlStorageValue;
@@ -2221,7 +2292,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         limit,
       )
       .toArray();
-    if (candidates.length === 0) return { deleted: 0, deferred_for_seal: false };
+    if (candidates.length === 0) return { deleted: 0, deferred_until_ms: null };
     const priorRoot = this.ctx.storage.sql
       .exec<{ retention_evidence_root: string }>(
         "SELECT retention_evidence_root FROM manifest_bucket_state WHERE id = 1",
@@ -2262,7 +2333,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       );
       return candidates.length;
     });
-    return { deleted, deferred_for_seal: false };
+    return { deleted, deferred_until_ms: null };
   }
 
   async alarm(): Promise<void> {
@@ -2276,6 +2347,9 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       )
       .toArray();
     for (const due of dueSeals) {
+      // Consume the logical wake-up before doing work. Pending seals schedule a
+      // successor; terminal seals cannot leave a past-due purpose hot-looping.
+      this.ctx.storage.sql.exec("DELETE FROM manifest_alarm_schedule WHERE purpose = ?", due.purpose);
       const seal = this.ctx.storage.sql
         .exec<SealGenerationRow>("SELECT * FROM manifest_seal_generations WHERE generation = ?", due.generation)
         .toArray()[0];
@@ -2291,18 +2365,22 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         this.ctx.storage.sql.exec("DELETE FROM manifest_alarm_schedule WHERE purpose = ?", due.purpose);
         continue;
       }
-      await this.resumeSeal(seal.generation, {
-        protocol_version: CURRENT_PROTOCOL_VERSION,
-        format_version: MANIFEST_SEAL_FORMAT_VERSION,
-        fleet_id: metadata.fleet_id,
-        reservation_utc_day: metadata.utc_day,
-        partition: metadata.partition,
-        partition_count: 16,
-        routing_key: metadata.routing_key,
-        partition_config_hash: bucket.partition_config_hash,
-        cutoff: new Date(seal.cutoff_ms).toISOString(),
-        idempotency_key: seal.idempotency_key,
-      });
+      try {
+        await this.resumeSeal(seal.generation, {
+          protocol_version: CURRENT_PROTOCOL_VERSION,
+          format_version: MANIFEST_SEAL_FORMAT_VERSION,
+          fleet_id: metadata.fleet_id,
+          reservation_utc_day: metadata.utc_day,
+          partition: metadata.partition,
+          partition_count: 16,
+          routing_key: metadata.routing_key,
+          partition_config_hash: bucket.partition_config_hash,
+          cutoff: new Date(seal.cutoff_ms).toISOString(),
+          idempotency_key: seal.idempotency_key,
+        });
+      } catch {
+        await this.scheduleAlarmPurpose(due.purpose, Date.now() + LIFECYCLE_FAILURE_RETRY_MS, due.generation);
+      }
     }
     const retentionSchedule = this.ctx.storage.sql
       .exec<{ fire_at_ms: number }>(
@@ -2375,14 +2453,19 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         });
 
         let nextAlarm = schedule.next_deadline_ms;
-        if (schedule.held_expired > 0 || v2Sweep.deferred_for_seal) {
+        if (schedule.held_expired > 0) {
           const heldRecheck = now + HELD_RETENTION_RECHECK_MS;
           nextAlarm = nextAlarm === null ? heldRecheck : Math.min(nextAlarm, heldRecheck);
+        }
+        if (v2Sweep.deferred_until_ms !== null) {
+          nextAlarm = nextAlarm === null
+            ? v2Sweep.deferred_until_ms
+            : Math.min(nextAlarm, v2Sweep.deferred_until_ms);
         }
         return {
           next_alarm_ms: nextAlarm,
           deleted: schedule.deleted + v2Sweep.deleted,
-          held_expired: schedule.held_expired + (v2Sweep.deferred_for_seal ? 1 : 0),
+          held_expired: schedule.held_expired + (v2Sweep.deferred_until_ms === null ? 0 : 1),
         };
       },
       now,

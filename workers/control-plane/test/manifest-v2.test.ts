@@ -5,6 +5,7 @@ import {
   COORDINATOR_RETENTION_DAYS,
   REDO_ENVELOPE_FORMAT_VERSION,
   MANIFEST_SEAL_FORMAT_VERSION,
+  MANIFEST_PAGE_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
   hashCanonicalJson,
@@ -232,6 +233,10 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       ...resolved,
       status: "already_resolved",
     });
+    await expect(assignedRoute.worker.reserveManifest({
+      reservation: assignedRoute.reservation,
+      reservation_hash: assignedRoute.reservation_hash,
+    })).resolves.toMatchObject({ ok: true, status: "already_reserved" });
     await expect(bucket.stats()).resolves.toMatchObject({ v2_quarantined: 0 });
   });
 
@@ -367,6 +372,64 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     expect(secondFinalized.record.commit_decided_at_ms).toBeGreaterThan(finalized.record.commit_decided_at_ms);
 
     await expect(bucket.closeThrough(sealRequest)).resolves.toEqual(sealed);
+    const secondSealRequest = {
+      ...sealRequest,
+      cutoff: secondFinalized.record.commit_decided_at,
+      idempotency_key: `seal-${secondTx}`,
+    };
+    const secondSeal = await bucket.closeThrough(secondSealRequest);
+    if (!secondSeal.ok || secondSeal.status !== "complete" || secondSeal.receipt === undefined) {
+      throw new Error("Expected the second exact seal to complete.");
+    }
+    const localRequest = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_PAGE_FORMAT_VERSION,
+      fleet_id: first.reservation.fleet_id,
+      reservation_utc_day: first.reservation.reservation_utc_day,
+      partition: first.reservation.partition,
+      partition_count: first.reservation.partition_count,
+      routing_key: first.reservation.routing_key,
+      partition_config_hash: first.reservation.partition_config_hash,
+      coverage_start: first.reservation.reserved_at,
+      cutoff: secondFinalized.record.commit_decided_at,
+      expected_retention_epoch: secondSeal.receipt.retention_epoch,
+      seal_generation: secondSeal.generation,
+      seal_receipt_hash: secondSeal.receipt.receipt_hash,
+      limit: 1,
+      cursor: null,
+    } as const;
+    const localFirst = await bucket.localPage(localRequest);
+    if (!localFirst.ok || localFirst.next_cursor === null) throw new Error("Expected a local cursor.");
+    await expect(bucket.localPage({ ...localRequest, cursor: localFirst.next_cursor })).resolves.toMatchObject({
+      ok: true,
+      records: [{ tx_id: secondTx }],
+      next_cursor: null,
+    });
+    await runInDurableObject(bucket, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES (?, 0, 1, '')",
+        "seal:1",
+      );
+    });
+    await expect(bucket.closeThrough(sealRequest)).resolves.toEqual(sealed);
+    await runInDurableObject(bucket, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_alarm_schedule WHERE purpose = 'seal:1'",
+      ).one().count).toBe(0);
+    });
+    await runInDurableObject(bucket, async (instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_page_cursors",
+      ).one().count).toBeGreaterThan(0);
+      state.storage.sql.exec("UPDATE manifest_page_cursors SET lease_expires_at_ms = 0");
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
+      );
+      await instance.alarm?.();
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM manifest_page_cursors",
+      ).one().count).toBe(0);
+    });
   });
 
   it("closes every cataloged bucket through an exact fleet cutoff and returns an immutable root", async () => {
@@ -429,15 +492,34 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       cursor: null,
     });
     expect(enumeration).toMatchObject({
-      coverage: "complete",
-      complete: true,
+      coverage: "incomplete",
+      complete: false,
       records: [{ tx_id: route.reservation.tx_id }],
-      next_cursor: null,
-      diagnostics: { inspected_buckets: 16, incomplete_buckets: 0, returned_records: 1 },
+      next_cursor: expect.objectContaining({ local_cursor: null }),
+      diagnostics: { inspected_buckets: expect.any(Number), incomplete_buckets: 1, returned_records: 1 },
     });
     if ("ok" in enumeration) throw new Error(enumeration.error.message);
-    expect(enumeration.evidence).toHaveLength(16);
+    expect(enumeration.evidence.length).toBeGreaterThan(0);
     expect(enumeration.evidence[0].seal_receipt_hash).toMatch(/^[a-f0-9]{64}$/);
+    const completedEnumeration = await route.worker.enumerateManifest({
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      fleet_id: route.reservation.fleet_id,
+      coverage_start: route.reservation.reserved_at,
+      cutoff: finalized.record.commit_decided_at,
+      partition_config_hash: route.reservation.partition_config_hash,
+      catalog_generation: completed.snapshot_generation,
+      catalog_snapshot_hash: completed.snapshot_hash,
+      conflict_resolution_root: "0".repeat(64),
+      limit: 10,
+      cursor: enumeration.next_cursor,
+    });
+    expect(completedEnumeration).toMatchObject({
+      coverage: "complete",
+      complete: true,
+      records: [],
+      next_cursor: null,
+    });
 
     const beforeReservationBoundary = await route.worker.enumerateManifest({
       protocol_version: CURRENT_PROTOCOL_VERSION,

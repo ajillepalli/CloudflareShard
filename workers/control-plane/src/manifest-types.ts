@@ -300,6 +300,7 @@ export type ManifestLocalPageResult =
       readonly complete: boolean;
       readonly retention_epoch: number;
       readonly records_deleted_through_ms: number | null;
+      readonly lease_expires_at_ms: number;
       readonly seal_receipt: ManifestSealReceiptV1;
     }
   | {

@@ -547,7 +547,7 @@ describe("CoordinatorDO /begin (2PC orchestration)", () => {
 
       const status = await coordinator.fetch(post("/tx-status", { txId }));
       expect(status.status).toBe(200);
-      expect(await status.json()).toMatchObject({ found: true, status: durableStatus });
+      expect(await status.json()).toMatchObject({ found: true, status: durableStatus, commitAuthorized: false });
     },
   );
 
@@ -1450,7 +1450,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
     });
   });
 
-  it("fails closed before durability when route assignment is unavailable and succeeds on an identical retry", async () => {
+  it("opens the admission circuit after three route-assignment failures and recovers through a half-open probe", async () => {
     const txId = `tx-circuit-${crypto.randomUUID()}`;
     const shardName = `shard-${txId}`;
     const shard = await freshShard(shardName);
@@ -1496,11 +1496,18 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
       }));
       expect((await begin()).status).toBe(503);
-      expect(assignmentCalls).toBe(1);
+      expect((await begin()).status).toBe(503);
+      expect((await begin()).status).toBe(503);
+      expect(assignmentCalls).toBe(3);
+      expect((await begin()).status).toBe(503);
+      expect(assignmentCalls).toBe(3);
       expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(0);
+      state.storage.sql.exec(
+        "UPDATE manifest_admission_circuit SET open_until_ms = 1, half_open_probe = 0, half_open_probe_until_ms = 0 WHERE singleton = 1",
+      );
       failAssignment = false;
       expect((await begin()).status).toBe(200);
-      expect(assignmentCalls).toBe(2);
+      expect(assignmentCalls).toBe(4);
       expect(state.storage.sql.exec<{ state_model_version: number }>(
         "SELECT state_model_version FROM transactions WHERE tx_id = ?",
         txId,

@@ -181,4 +181,16 @@ describe("FleetManifestCatalogStore", () => {
       expect(catalog.nextAlarmAt()).toBe(1_016);
     });
   });
+
+  it("expires and incrementally garbage-collects issued enumeration cursors", async () => {
+    await withCatalog("cursor-gc", (catalog) => {
+      const now = 10_000;
+      const cursor = { request_hash: "a".repeat(64), partition: 3 };
+      const evidence = [{ lease_expires_at_ms: now + 500 }];
+      expect(catalog.issueEnumerationCursor(cursor, evidence, now)).toBe(now + 500);
+      expect(catalog.enumerationCursorEvidence(cursor, now + 499)).toEqual(evidence);
+      expect(catalog.enumerationCursorEvidence(cursor, now + 500)).toBeNull();
+      expect(catalog.purgeEnumerationCursors(now + 500)).toBeNull();
+    });
+  });
 });

@@ -751,7 +751,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private async reconcileAbort(row: TxRow, knownLegacyPredecisionAbort?: boolean): Promise<Response> {
     let current = row;
     const state = this.stateOf(current);
-    if (state === "abort_decided") current = this.transition(current.tx_id, ["abort_decided"], "aborting");
+    if (state === "abort_decided") {
+      try {
+        current = this.transition(current.tx_id, ["abort_decided"], "aborting");
+      } catch (error) {
+        if (!(error instanceof CoordinatorCasLost)) throw error;
+        const latest = this.loadTx(current.tx_id);
+        if (!latest) throw new Error(`Missing transaction ${current.tx_id} during abort recovery.`);
+        return this.resume(latest);
+      }
+    }
     else if (state === "aborted") return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
     else if (state !== "aborting") return protocolResponse(transactionError("TX_INVALID_TRANSITION", `Cannot reconcile abort from ${state}.`));
 
@@ -770,9 +779,16 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const allAcknowledged = outcomes.every((outcome) => outcome.status === "fulfilled" && outcome.value.ok);
     if (allAcknowledged) {
       if (this.isV2(current)) {
-        this.transition(current.tx_id, ["aborting"], "aborted_pending_manifest_cancel", () => {
-          this.queueRecovery(current.tx_id, "cancel", new Date().toISOString());
-        });
+        try {
+          this.transition(current.tx_id, ["aborting"], "aborted_pending_manifest_cancel", () => {
+            this.queueRecovery(current.tx_id, "cancel", new Date().toISOString());
+          });
+        } catch (error) {
+          if (!(error instanceof CoordinatorCasLost)) throw error;
+          const latest = this.loadTx(current.tx_id);
+          if (!latest) throw new Error(`Missing transaction ${current.tx_id} during manifest cancellation recovery.`);
+          return this.resume(latest);
+        }
         const pending = this.loadTx(current.tx_id);
         if (!pending) throw new Error(`Missing transaction ${current.tx_id} before manifest cancellation.`);
         return this.reconcileCancel(pending);
@@ -1818,7 +1834,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       decision: row.decision,
       epoch: row.epoch,
       operationHash: row.operation_hash,
-      commitAuthorized: isCommitDecidedOrLater(state),
+      commitAuthorized: ["manifest_registered", "committing", "committed_pending_ack", "committed"].includes(state),
     });
   }
 
@@ -1856,6 +1872,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
 
     const assignmentRequest = await this.routeAssignmentRequest(body.txId, fleetId, coordinatorId, operationHash, 1);
+    const admissionNow = Date.now();
+    const admissionAttempt = this.beginAdmissionAttempt(admissionNow);
+    if (admissionAttempt === "open") {
+      return protocolResponse(transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest admission circuit is open; retry later."));
+    }
     let assignment: ManifestRouteAssignmentResult | null = null;
     try {
       assignment = this.coordinatorEnv.CONTROL_PLANE
@@ -1865,9 +1886,15 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       assignment = null;
     }
     if (!assignment) {
+      this.recordAdmissionFailure(admissionNow, admissionAttempt);
       return protocolResponse(transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest route assignment is temporarily unavailable before reservation."));
     }
-    if (!assignment.ok) return protocolResponse(assignment.error);
+    if (!assignment.ok) {
+      if (assignment.error.retryable) this.recordAdmissionFailure(admissionNow, admissionAttempt);
+      else this.recordAdmissionSuccess();
+      return protocolResponse(assignment.error);
+    }
+    this.recordAdmissionSuccess();
     await this.validateAssignedReservation(assignmentRequest, assignment);
     await this.ensureAlarmScheduled(Date.now());
 
