@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.14.0.0] - 2026-08-05: Verified onboarding and upgrade-safe distributed transactions
+
+You can now take a fresh CloudflareShard environment through `doctor -> deploy -> verify -> receipt`, prove that traffic reached distinct shards, and retain a redacted evidence receipt without treating pending reconciliation as success. Operators also get a reproducible OLTP baseline whose JSON and Markdown artifacts share one checksummed result.
+
+### Added
+- Added `doctor` and disposable-target `verify` CLI workflows with stable exit codes, human/JSON/non-TTY output, credential redaction, and checksummed receipts under `.cloudflareshard/receipts`.
+- Added versioned runtime contracts for coordinator, participant, redo-envelope, transaction-state, and manifest messages, plus ADRs explaining idempotency, decision ordering, recovery, and retention.
+- Added a route-less control-plane Worker with service-binding RPC and a SQLite-backed `JournalManifestDO` for admission, idempotent registration, hash-conflict quarantine, lifecycle release, alarms, and circuit directives.
+- Added a neutral `examples/cloudflareshard-oltp` baseline with strict inputs, bounded request and grace deadlines, deterministic run identity, complete outcome accounting, and matching JSON/Markdown artifacts.
+- Added generated Cloudflare binding types and aggregate verification lanes for the root Worker, SPA, client, contracts, control plane, and benchmark packages.
+
+### Changed
+- Upgraded distributed transaction recovery to persist monotonic epochs, operation hashes, durable decisions, participant tombstones, manifest state, circuit state, and retry work before externally visible effects.
+- Made expand-first upgrades safe for transactions prepared by the immediately previous coordinator and participant schemas, including non-lexicographic participant order, mismatch-to-abort convergence, force-abort cleanup, and late-commit rejection.
+- Updated the smoke and live-verification scripts to use the same disposable-target onboarding contract instead of maintaining separate destructive verification logic.
+- Expanded the README, client guide, reference documentation, benchmark guidance, and reviewed implementation plan around the new evidence-driven workflow and its honest limitations.
+
 ## [2.13.0.0] - 2026-07-29: Catch-up: 15 PRs shipped without a version bump
 
 None of `examples/shardscope`'s evolution since v2.8.0.0 had been changelogged (PRs #38-#52), caught up here in five grouped entries below, same pattern as the earlier v2.8.0.0 catch-up. The most important of these is the P0 fix in v2.9.0.0.
