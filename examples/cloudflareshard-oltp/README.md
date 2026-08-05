@@ -14,7 +14,9 @@ production capacity, or a comparison with another system.
 The target must already be initialized and must be safe to populate with a new
 table and tenant. The deterministic run identity means the exact same command
 must be reproduced against a fresh disposable target, not rerun against the
-same state.
+same state. Run from a clean Git worktree: the command fails before touching the
+target unless `git rev-parse HEAD` identifies the exact source and tracked plus
+untracked worktree state is clean.
 
 ```bash
 cd examples/cloudflareshard-oltp

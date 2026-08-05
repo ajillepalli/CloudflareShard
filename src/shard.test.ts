@@ -564,6 +564,70 @@ describe("ShardDO 2PC: prepare/commit/abort", () => {
     expect(abortRetry.status).toBe(200);
   });
 
+  it("upgrade regression: unversioned commit resolves migrated prepared rows with an empty predecessor hash", async () => {
+    const stub = await freshShard();
+    const txId = `tx-legacy-commit-${crypto.randomUUID()}`;
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");
+    expect((await stub.fetch(post("/prepare", {
+      coordinatorTxId: txId,
+      intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }],
+    }))).status).toBe(200);
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE pending_intents SET protocol_version = 0, operation_hash = '' WHERE coordinator_tx_id = ?",
+        txId,
+      );
+    });
+
+    const committed = await stub.fetch(post("/commit", { coordinatorTxId: txId }));
+    expect(committed.status).toBe(200);
+    expect((await stub.fetch(post("/commit", { coordinatorTxId: txId }))).status).toBe(200);
+
+    const durable = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => ({
+      rowCount: state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM t WHERE id = ?", txId).one().n,
+      tombstone: state.storage.sql.exec<{ decision: string; operation_hash: string }>(
+        "SELECT decision, operation_hash FROM participant_decision_tombstones WHERE tx_id = ?",
+        txId,
+      ).one(),
+    }));
+    expect(durable.rowCount).toBe(1);
+    expect(durable.tombstone.decision).toBe("commit");
+    expect(durable.tombstone.operation_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("upgrade regression: unversioned abort resolves migrated prepared rows with an empty predecessor hash", async () => {
+    const stub = await freshShard();
+    const txId = `tx-legacy-abort-${crypto.randomUUID()}`;
+    await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");
+    expect((await stub.fetch(post("/prepare", {
+      coordinatorTxId: txId,
+      intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }],
+    }))).status).toBe(200);
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE pending_intents SET protocol_version = 0, operation_hash = '' WHERE coordinator_tx_id = ?",
+        txId,
+      );
+    });
+
+    const aborted = await stub.fetch(post("/abort", { coordinatorTxId: txId }));
+    expect(aborted.status).toBe(200);
+    expect((await stub.fetch(post("/abort", { coordinatorTxId: txId }))).status).toBe(200);
+
+    const durable = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => ({
+      intents: Array.from(state.storage.sql.exec("SELECT * FROM pending_intents WHERE coordinator_tx_id = ?", txId)).length,
+      locks: Array.from(state.storage.sql.exec("SELECT * FROM row_locks WHERE coordinator_tx_id = ?", txId)).length,
+      tombstone: state.storage.sql.exec<{ decision: string; operation_hash: string }>(
+        "SELECT decision, operation_hash FROM participant_decision_tombstones WHERE tx_id = ?",
+        txId,
+      ).one(),
+    }));
+    expect(durable.intents).toBe(0);
+    expect(durable.locks).toBe(0);
+    expect(durable.tombstone.decision).toBe("abort");
+    expect(durable.tombstone.operation_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
   it("rejects abort after commit (would violate atomicity)", async () => {
     const stub = await freshShard();
     await createTable(stub, "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)");

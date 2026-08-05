@@ -27,11 +27,12 @@ schemas, the routing algorithm, transaction semantics), see [`SPEC.md`](SPEC.md)
 
 ## Deploy your own cluster
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
+Cloudflare's Deploy to Cloudflare flow does not deploy multiple Worker
+applications from one repository together. It therefore cannot create this
+complete topology; clone the repository and run the ordered aggregate command
+below instead of using a one-Worker deploy button.
 
-One click clones this repo into your GitHub and deploys the cluster to **your own
-Cloudflare account**. The complete topology is two Workers and four SQLite
-Durable Object classes:
+The complete topology is two Workers and four SQLite Durable Object classes:
 
 1. The required route-less `cloudflare-shard-control-plane` Worker owns
    `JOURNAL_MANIFEST` (`JournalManifestDO`).

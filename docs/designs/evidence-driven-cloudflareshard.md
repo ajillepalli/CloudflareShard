@@ -1319,10 +1319,11 @@ Synthesized from the engineering review. These are the only implementation tasks
   - Surfaced by: Architecture findings 2-5 and the missing Phase A prerequisite.
   - Files: `docs/adr/`, focused shared transaction contracts, protocol compatibility documentation.
   - Verify: exhaustive pure transition table; every state/error/epoch/envelope/manifest format has one owner and one version rule.
-- [x] **ER2 (P1, human: ~1w / CC: ~2d)** - control plane - Add the minimum JournalManifestDO dependency
+- [ ] **ER2 (P1, human: ~1w / CC: ~2d)** - control plane - Add and qualify the minimum JournalManifestDO dependency
   - Surfaced by: critical scope decision selecting manifest expansion with T4.
   - Files: `workers/control-plane/`, shared transaction contracts, service-binding and migration configuration.
-  - Verify: idempotent registration, same-ID/different-hash quarantine, UTC-day plus 16-way routing, ambiguous acknowledgment retry, overload cooldown, lookup, and 35-day lifecycle tests.
+  - Status: implementation and deterministic coverage are complete; the accepted ADR-3 reference-deployment measurement of p95 manifest overhead at or below 100 ms remains pending and blocks release qualification.
+  - Verify: idempotent registration, same-ID/different-hash quarantine, UTC-day plus 16-way routing, ambiguous acknowledgment retry, overload cooldown, lookup, 35-day lifecycle tests, and a sanitized reference-deployment qualification artifact naming the build, method, sample size, and p95 overhead.
 - [x] **ER3 (P1, human: ~2w / CC: ~4d)** - transactions - Implement monotonic coordinator and participant decisions
   - Surfaced by: critical commit-order and concurrent force-abort findings.
   - Files: `src/coordinator.ts`, `src/shard.ts`, gateway/admin transaction routes, client transaction types, shared contracts and transaction tests.
@@ -1345,9 +1346,10 @@ Synthesized from the engineering review. These are the only implementation tasks
   - Surfaced by: T8 and the need to avoid premature collector infrastructure.
   - Files: `docs/evidence/` schema/template, synthetic adversarial fixtures, privacy/version tests, private gitignored partner output directory.
   - Verify: purpose, recipient, consent, retention, and deletion owner precede data; strict allowlist with unknown-field rejection; nested and encoded secret/identifier corpus; unknown version fails closed; one qualified partner records useful/not-useful plus reason without prohibited raw data.
-- [x] **ER8 (P1, human: ~2d / CC: ~1d)** - quality gates - Make local, package, and staging verification explicit and hermetic
+- [ ] **ER8 (P1, human: ~2d / CC: ~1d)** - quality gates - Make local, package, and staging verification explicit and hermetic
   - Surfaced by: Test review gaps and `.claude/**` worktree discovery causing raw `npm test` failures.
   - Files: root/client/control-plane/benchmark test configuration, acceptance scripts, CI documentation.
+  - Status: local and package verification is hermetic; named staging gates and recorded fresh-account/reference-deployment evidence remain pending.
   - Verify: clean aggregate command runs root typecheck/tests, client build/typecheck/tests, contracts/control-plane tests, benchmark tests, docs/privacy contracts, and named staging gates without discovering sibling worktrees.
 
 ### Accepted roadmap tasks

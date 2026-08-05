@@ -148,7 +148,11 @@ type StoredPendingIntentIdentity = {
   operation_hash: string;
 };
 
-type ParticipantPayload = ParticipantPhaseMessageV1 & { intents?: PrepareIntent[] };
+type ParticipantPayload = ParticipantPhaseMessageV1 & {
+  intents?: PrepareIntent[];
+  /** True only for the predecessor coordinator's unversioned wire format. */
+  legacy_unversioned?: true;
+};
 
 /** Milestone 3 (review Tier 1 #5): requestIds ShardDO generates for its own
  * internal replication (mirror deliveries) live under this reserved prefix.
@@ -1721,7 +1725,21 @@ export class ShardDO extends DurableObject {
     }
     const durable = this.tombstone(legacyTxId);
     const pending = this.pendingMetadata(legacyTxId);
-    const operationHash = durable?.operation_hash ?? pending?.operation_hash ?? await hashCanonicalJson(intents ?? []);
+    // Rows migrated from the predecessor schema deliberately carry the
+    // expand-first sentinel operation_hash=''. A terminal replay cannot
+    // reconstruct the coordinator-wide operation hash from one participant,
+    // but it still needs a stable valid identity for its durable tombstone.
+    // Domain-separate that identity by txId; compatibility below permits it
+    // only for an unversioned terminal message over a wholly-unadopted row set.
+    const legacyTerminalHash = pending?.protocol_version === 0
+      && pending.operation_hash === ""
+      && (phase === "commit" || phase === "abort")
+      ? await hashCanonicalJson({ kind: "legacy-participant-terminal-v1", tx_id: legacyTxId })
+      : null;
+    const operationHash = durable?.operation_hash
+      ?? legacyTerminalHash
+      ?? pending?.operation_hash
+      ?? await hashCanonicalJson(intents ?? []);
     return {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       tx_id: legacyTxId,
@@ -1729,10 +1747,11 @@ export class ShardDO extends DurableObject {
       phase,
       operation_hash: operationHash,
       ...(intents ? { intents } : {}),
+      legacy_unversioned: true,
     };
   }
 
-  private assertMessageCompatible(message: ParticipantPhaseMessageV1): void {
+  private assertMessageCompatible(message: ParticipantPayload): void {
     const durable = this.tombstone(message.tx_id);
     if (durable) {
       validateParticipantMessageAgainstTombstone(message, durable);
@@ -1755,7 +1774,12 @@ export class ShardDO extends DurableObject {
     if (message.epoch > pending.epoch) {
       throw new TransactionContractViolation(transactionError("TX_EPOCH_CONFLICT", "Participant message epoch conflicts with prepared state."));
     }
-    if (message.operation_hash !== pending.operation_hash) {
+    const legacyTerminalBridge = message.legacy_unversioned === true
+      && (message.phase === "commit" || message.phase === "abort")
+      && this.storedIntentIdentity(message.tx_id).every(
+        (row) => row.protocol_version === 0 && row.operation_hash === "" && row.status === "prepared",
+      );
+    if (message.operation_hash !== pending.operation_hash && !legacyTerminalBridge) {
       throw new TransactionContractViolation(transactionError("TX_ENVELOPE_HASH_MISMATCH", "Participant operation hash conflicts with prepared state."));
     }
   }

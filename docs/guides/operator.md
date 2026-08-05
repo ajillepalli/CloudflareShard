@@ -1,7 +1,7 @@
 # Operator's Guide: Running a CloudflareShard Cluster
 
 This is a runbook for keeping a **deployed** CloudflareShard cluster healthy
-in production — your own Deploy-to-Cloudflare instance or a larger
+in production — your own ordered two-Worker deployment or a larger
 hand-rolled deployment. It assumes the cluster already exists and someone is
 on the hook for it staying up, staying fast, and not draining a bank account.
 
@@ -17,8 +17,8 @@ than re-deriving them.
 
 ## 1. Deploying and initial hardening
 
-Deploy mechanics (the "Deploy to Cloudflare" button, what it provisions, the
-`/admin/init` call, pointing a second Worker at it via service binding) are
+Deploy mechanics (the ordered `npm run deploy` command, what it provisions, the
+`/admin/init` call, and the mandatory control-plane service binding) are
 covered in the reference doc's
 [**"Deploy your own cluster"**](../REFERENCE.md#deploy-your-own-cluster)
 section and in
@@ -37,7 +37,7 @@ reads. Treat it like a database root password, because functionally it is
 one.
 
 - Generate it with `openssl rand -hex 32` (this is what the reference doc,
-  `docs/REFERENCE.md`, and the deploy-button `.env.example` recommend) —
+  `docs/REFERENCE.md`, and the root `.env.example` recommend) —
   don't hand-type something memorable.
 - Store it in a secrets manager, not in a chat message, ticket, or shell
   history file.
@@ -517,21 +517,26 @@ is not.
 
 ### 6.1 The billing model, plainly
 
-- Durable Objects require the **Workers Paid** plan. This is not optional
-  for running this project at all — the free-plan DO request-volume quota
-  is irrelevant here, not something to plan around, because Paid is a hard
-  prerequisite.
-- Everything the cluster does is billed to whichever Cloudflare account
-  deployed it: the Worker's own request volume, and every Durable Object's
-  requests, duration, and storage — across all three DO classes (`CATALOG`,
-  `SHARD`, `COORDINATOR`). Workers Logs (if left at `head_sampling_rate = 1`,
-  the shipped default) adds its own cost for high request volumes.
+- SQLite-backed Durable Objects are available on both Workers Free and Paid.
+  Free is a bounded evaluation path, not an implied production allowance: as
+  of 2026-08-05, Cloudflare documents daily limits of 100,000 Worker requests,
+  5 million Durable Object rows read, and 100,000 rows written. Operations fail
+  after the corresponding daily limit is exhausted. Verify the current official
+  [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
+  and [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+  before a run because those allowances can change.
+- Usage belongs to the Cloudflare account that deployed the cluster. Account
+  for both Workers — the route-less `cloudflare-shard-control-plane` service and
+  the public `cloudflare-shard-mvp` gateway — plus all four SQLite Durable Object
+  classes: `JOURNAL_MANIFEST`, `CATALOG`, `SHARD`, and `COORDINATOR`. Worker
+  requests, Durable Object requests/duration/storage, and enabled observability
+  all contribute to the account's applicable limits and billing.
 - This is a real, metered resource in your account from the moment it's
   deployed, not a sandboxed trial. Idle cost is low but not zero; load
   costs money in direct proportion to request volume and DO activity.
-  Tear it down (`npx wrangler delete --name <worker>`, or
-  `examples/shardscope/docs/deploy/teardown.sh`) when a cluster is no longer
-  needed.
+  Tear it down with `npm run delete` when a cluster is no longer needed. That
+  command deletes the public Worker first and the control-plane Worker second;
+  do not reverse the order.
 
 ### 6.2 What's request-heavy — be deliberate about these
 

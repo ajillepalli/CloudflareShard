@@ -4,6 +4,7 @@ import {
   CURRENT_PROTOCOL_VERSION,
   MANIFEST_PARTITION_COUNT,
   MAX_REDO_ENVELOPE_BYTES,
+  MAX_REDO_PARTICIPANTS,
   PARTICIPANT_TOMBSTONE_FORMAT_VERSION,
   REDO_ENVELOPE_FORMAT_VERSION,
   TRANSACTION_STATES,
@@ -202,6 +203,23 @@ describe("canonical redo envelope", () => {
 
   it("accepts a complete, sorted, reconstructable envelope with a matching operation hash", async () => {
     await expect(validateRedoEnvelope(envelope())).resolves.toBeUndefined();
+  });
+
+  it("separates the physical-shard ceiling from the eight caller-key budget", () => {
+    const base = envelope();
+    const participants = Array.from({ length: 9 }, (_, index) => ({
+      ...base.participants[0],
+      participant_id: `shard-${String(index).padStart(3, "0")}`,
+    }));
+    expect(() => validateRedoEnvelopeStructure(envelope({ participants }))).not.toThrow();
+
+    const overPhysicalCeiling = Array.from({ length: MAX_REDO_PARTICIPANTS + 1 }, (_, index) => ({
+      ...base.participants[0],
+      participant_id: `shard-${String(index).padStart(3, "0")}`,
+    }));
+    expect(errorCode(() => validateRedoEnvelopeStructure(envelope({ participants: overPhysicalCeiling })))).toBe(
+      "TX_ENVELOPE_INVALID",
+    );
   });
 
   it("rejects unsorted participants, epoch divergence, short retention, and oversize content", async () => {

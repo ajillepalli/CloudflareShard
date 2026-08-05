@@ -2,9 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
-## [2.14.0.0] - 2026-08-05: Verified onboarding and upgrade-safe distributed transactions
+## [2.14.0.0] - 2026-08-05: Evidence-driven onboarding implementation and upgrade-safe distributed transactions
 
-You can now take a fresh CloudflareShard environment through `doctor -> deploy -> verify -> receipt`, prove that traffic reached distinct shards, and retain a redacted evidence receipt without treating pending reconciliation as success. Operators also get a reproducible OLTP baseline whose JSON and Markdown artifacts share one checksummed result.
+CloudflareShard now includes a locally verified `doctor -> deploy -> verify -> receipt` workflow that can prove traffic reached distinct shards and retain a redacted evidence receipt without treating pending reconciliation as success. Operators also get a deterministic OLTP baseline whose JSON and Markdown artifacts share one checksummed result.
+
+Live qualification remains pending: the fresh-account walkthrough, 20-trial onboarding p90 gate, clean deployed benchmark reproduction, named staging gates, and ADR-3 reference-deployment p95 manifest-overhead gate have not yet been satisfied. Version 2.14.0.0 is therefore implementation-complete locally, but not reference-deployment qualified.
 
 ### Added
 - Added `doctor` and disposable-target `verify` CLI workflows with stable exit codes, human/JSON/non-TTY output, credential redaction, and checksummed receipts under `.cloudflareshard/receipts`.

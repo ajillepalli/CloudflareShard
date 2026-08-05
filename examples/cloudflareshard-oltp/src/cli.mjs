@@ -14,12 +14,35 @@ import {
   runClosedLoop,
 } from "./workload.mjs";
 
-function sourceRevision() {
+export class SourceProvenanceError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SourceProvenanceError";
+  }
+}
+
+export function sourceRevision(execFile = execFileSync) {
   try {
-    const revision = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    return /^[0-9a-f]{7,40}$/i.test(revision) ? revision : "unknown";
-  } catch {
-    return "unknown";
+    const revision = execFile("git", ["rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(revision)) {
+      throw new SourceProvenanceError("Git returned an invalid source revision.");
+    }
+    const dirty = execFile(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=normal"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    if (dirty) {
+      throw new SourceProvenanceError(
+        "The benchmark requires a clean Git worktree so its recorded source revision exactly identifies the executed code.",
+      );
+    }
+    return revision.toLowerCase();
+  } catch (error) {
+    if (error instanceof SourceProvenanceError) throw error;
+    throw new SourceProvenanceError(
+      "The benchmark requires a readable Git revision and a clean worktree; run it from a clean repository checkout.",
+    );
   }
 }
 
@@ -58,6 +81,15 @@ export async function main(argv = process.argv.slice(2), environment = process.e
     return 3;
   }
 
+  let verifiedSourceRevision;
+  try {
+    verifiedSourceRevision = sourceRevision();
+  } catch (error) {
+    const message = error instanceof SourceProvenanceError ? error.message : "Source provenance could not be verified.";
+    process.stderr.write(`Blocked: ${message}\n`);
+    return 3;
+  }
+
   const runId = deterministicRunId(args);
   process.stderr.write(`Run ${runId}: preparing disposable target ${args.baseUrl}\n`);
   const client = new BenchmarkApiClient({ baseUrl: args.baseUrl });
@@ -91,7 +123,7 @@ export async function main(argv = process.argv.slice(2), environment = process.e
       nodeVersion: process.version,
       platform: process.platform,
       arch: process.arch,
-      sourceRevision: sourceRevision(),
+      sourceRevision: verifiedSourceRevision,
     },
     reproduceCommand: reproduceCommand(args),
   });

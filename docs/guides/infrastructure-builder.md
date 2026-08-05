@@ -218,12 +218,14 @@ rely on scan results for anything migration-sensitive.
 
 ### Deploy a cluster
 
-Don't hand-roll this — the reference doc's
-[Deploy your own cluster](../REFERENCE.md#deploy-your-own-cluster) section
-has the one-click Deploy-to-Cloudflare flow, the `ADMIN_TOKEN` secret setup,
-and cost/teardown details (Durable Objects require Workers Paid, and
-everything is billed to your own account). Follow that, then come back here
-once you have a Worker URL and an `ADMIN_TOKEN`.
+Don't hand-roll the ordering — the reference doc's
+[Deploy your own cluster](../REFERENCE.md#deploy-your-own-cluster) section has
+the supported clone-and-`npm run deploy` flow, the `ADMIN_TOKEN` secret setup,
+and cost/teardown details. Cloudflare's deploy-button flow cannot deploy the
+required two Worker applications together. Durable Objects are available on
+Workers Free and Paid, subject to the documented plan limits, and everything
+is billed to your own account. Follow that guide, then come back here once you
+have a Worker URL and an `ADMIN_TOKEN`.
 
 ### Initialize topology
 

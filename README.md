@@ -58,14 +58,15 @@ without that local `CONTROL_PLANE` service-binding target.
 
 ## Deploy your own
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ajillepalli/CloudflareShard)
+Cloudflare's Deploy to Cloudflare flow does not deploy multiple Worker
+applications from one repository together, so it cannot create this complete
+topology. Clone the repository and use the ordered deployment command below;
+do not use a one-Worker deploy button for this release.
 
-One click clones this repo into your GitHub and deploys the cluster into **your
-own Cloudflare account**. The deployment has two Workers and four SQLite
-Durable Object classes: a required route-less control-plane Worker owning
-`JOURNAL_MANIFEST`, followed by the public Worker owning `CATALOG`, `SHARD`,
-and `COORDINATOR`. No KV/D1/R2 resources are required; the cluster is
-self-contained.
+The deployment has two Workers and four SQLite Durable Object classes: a
+required route-less control-plane Worker owning `JOURNAL_MANIFEST`, followed
+by the public Worker owning `CATALOG`, `SHARD`, and `COORDINATOR`. No KV/D1/R2
+resources are required; the cluster is self-contained.
 
 From a clone, use the ordered aggregate command:
 

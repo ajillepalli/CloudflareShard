@@ -605,12 +605,36 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }
     }
 
+    // registerManifest is an external await. An identical /begin retry can
+    // advance this coordinator while the RPC is in flight, so never apply the
+    // stale branch below to the state observed before that await.
+    const latestAfterRegistration = this.loadTx(row.tx_id);
+    if (!latestAfterRegistration) throw new Error(`Missing transaction ${row.tx_id}.`);
+    if (this.stateOf(latestAfterRegistration) !== state) return this.resume(latestAfterRegistration);
+    row = latestAfterRegistration;
+
     if (
       !result
       || (!result.ok && (result.status === "commit_pending_manifest" || result.status === "unavailable"))
     ) {
-      if (state === "commit_decided") this.transition(row.tx_id, ["commit_decided"], "commit_pending_manifest");
-      await this.reschedule(row.tx_id, "manifest");
+      try {
+        if (state === "commit_decided") this.transition(row.tx_id, ["commit_decided"], "commit_pending_manifest");
+      } catch (error) {
+        if (error instanceof CoordinatorCasLost) {
+          const latest = this.loadTx(row.tx_id);
+          if (latest) return this.resume(latest);
+        }
+        throw error;
+      }
+      const scheduled = await this.reschedule(
+        row.tx_id,
+        "manifest",
+        ["commit_decided", "commit_pending_manifest"],
+      );
+      if (!scheduled) {
+        const latest = this.loadTx(row.tx_id);
+        if (latest) return this.resume(latest);
+      }
       return json({ ok: true, txId: row.tx_id, status: "commit_pending_manifest" }, 202);
     }
     if (!result.ok) {
@@ -618,16 +642,32 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       // manifest conflict). An irreversible commit decision must not retain a
       // due recovery row with no future alarm, so converge to an inspectable
       // quarantine and remove the now-nonretryable work atomically.
-      this.transition(row.tx_id, [state], "quarantined", () => {
-        this.sql.exec("UPDATE transactions SET decision = 'quarantined', last_error = ? WHERE tx_id = ?", JSON.stringify(result.error), row.tx_id);
-        this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
-      });
+      try {
+        this.transition(row.tx_id, [state], "quarantined", () => {
+          this.sql.exec("UPDATE transactions SET decision = 'quarantined', last_error = ? WHERE tx_id = ?", JSON.stringify(result.error), row.tx_id);
+          this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", row.tx_id);
+        });
+      } catch (error) {
+        if (error instanceof CoordinatorCasLost) {
+          const latest = this.loadTx(row.tx_id);
+          if (latest) return this.resume(latest);
+        }
+        throw error;
+      }
       return protocolResponse(result.error);
     }
 
-    this.transition(row.tx_id, [state], "manifest_registered", () => {
-      this.queueRecovery(row.tx_id, "commit", new Date().toISOString());
-    });
+    try {
+      this.transition(row.tx_id, [state], "manifest_registered", () => {
+        this.queueRecovery(row.tx_id, "commit", new Date().toISOString());
+      });
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        const latest = this.loadTx(row.tx_id);
+        if (latest) return this.resume(latest);
+      }
+      throw error;
+    }
     const registered = this.loadTx(row.tx_id);
     if (!registered) throw new Error(`Missing transaction ${row.tx_id}.`);
     return this.reconcileCommit(registered);
@@ -649,7 +689,22 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const allAcknowledged = acknowledgments.every((acknowledgment) => acknowledgment.ok);
     const nextState: TransactionState = allAcknowledged ? "committed" : "committed_pending_ack";
     if (allAcknowledged) await this.ensureAlarmScheduled(Date.now());
-    this.transition(current.tx_id, ["committing", "committed_pending_ack"], nextState, () => {
+
+    // Participant RPCs (and getAlarm/setAlarm above) yield the input gate. A
+    // concurrent identical retry may have already recorded the same or a
+    // later outcome; reload before mutating so a stale response converges.
+    const latestAfterAcknowledgments = this.loadTx(current.tx_id);
+    if (!latestAfterAcknowledgments) throw new Error(`Missing transaction ${current.tx_id}.`);
+    const latestState = this.stateOf(latestAfterAcknowledgments);
+    if (latestState === "committed") {
+      return json({ ok: true, txId: current.tx_id, status: "committed" });
+    }
+    if (latestState !== "committing" && latestState !== "committed_pending_ack") {
+      return this.resume(latestAfterAcknowledgments);
+    }
+    current = latestAfterAcknowledgments;
+
+    const recordAcknowledgments = (queueCommitRecovery = true) => {
       const now = new Date().toISOString();
       for (const acknowledgment of acknowledgments) {
         if (acknowledgment.ok) {
@@ -667,12 +722,46 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         // coordinator state is terminal committed.
         this.queueRecovery(current.tx_id, "release", now);
         this.sql.exec("UPDATE transactions SET result_json = ? WHERE tx_id = ?", JSON.stringify({ status: "committed" }), current.tx_id);
-      } else {
+      } else if (queueCommitRecovery) {
         this.queueRecovery(current.tx_id, "commit", now);
       }
-    });
+    };
+    try {
+      if (latestState === nextState) {
+        // A concurrent retry already selected committed_pending_ack. Preserve
+        // any additional participant acknowledgements without attempting an
+        // invalid self-transition.
+        this.ctx.storage.transactionSync(() => {
+          const latest = this.loadTx(current.tx_id);
+          if (!latest || this.stateOf(latest) !== latestState) {
+            throw new CoordinatorCasLost(latest ? this.stateOf(latest) : "quarantined");
+          }
+          this.sql.exec("UPDATE transactions SET updated_at = ? WHERE tx_id = ?", new Date().toISOString(), current.tx_id);
+          // The recovery row already exists in this same-state retry. Do not
+          // recreate it with attempt_count=0; reschedule() below must advance
+          // the durable counter monotonically.
+          recordAcknowledgments(false);
+        });
+      } else {
+        this.transition(current.tx_id, ["committing", "committed_pending_ack"], nextState, recordAcknowledgments);
+      }
+    } catch (error) {
+      if (error instanceof CoordinatorCasLost) {
+        const latest = this.loadTx(current.tx_id);
+        if (latest) return this.resume(latest);
+      }
+      throw error;
+    }
     if (!allAcknowledged) {
-      await this.reschedule(current.tx_id, "commit");
+      const scheduled = await this.reschedule(
+        current.tx_id,
+        "commit",
+        ["committing", "committed_pending_ack"],
+      );
+      if (!scheduled) {
+        const latest = this.loadTx(current.tx_id);
+        if (latest) return this.resume(latest);
+      }
       return json({ ok: true, txId: current.tx_id, status: "committed_pending_ack" }, 202);
     }
     return json({ ok: true, txId: current.tx_id, status: "committed" });
@@ -714,9 +803,17 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     await this.reschedule(row.tx_id, "release");
   }
 
-  private async reschedule(txId: string, action: RecoveryAction): Promise<void> {
+  private async reschedule(
+    txId: string,
+    action: RecoveryAction,
+    onlyWhile?: readonly TransactionState[],
+  ): Promise<boolean> {
     let due = Date.now();
-    this.ctx.storage.transactionSync(() => {
+    const scheduled = this.ctx.storage.transactionSync(() => {
+      if (onlyWhile) {
+        const current = this.loadTx(txId);
+        if (!current || !onlyWhile.includes(this.stateOf(current))) return false;
+      }
       // Read the attempt from durable state instead of trusting a caller's
       // in-memory snapshot. Alarm dispatch may pass through resume() and
       // several reconciliation methods, but every failed attempt still
@@ -730,8 +827,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       const delay = Math.min(RECOVERY_MAX_DELAY_MS, RECOVERY_BASE_DELAY_MS * 2 ** Math.min(priorAttempt, 10));
       due = Date.now() + delay;
       this.queueRecovery(txId, action, new Date(due).toISOString(), attempt);
+      return true;
     });
+    if (!scheduled) return false;
     await this.ctx.storage.setAlarm(due);
+    return true;
   }
 
   private async adoptLegacyPredecision(row: TxRow): Promise<Response> {

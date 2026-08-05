@@ -52,7 +52,10 @@ discovers saturation nor corrects for coordinated omission.
 ## Reproduce
 
 Use a fresh disposable target because the deterministic run ID also makes the
-table, tenant, request IDs, and row keys deterministic.
+table, tenant, request IDs, and row keys deterministic. The driver also requires
+a clean Git worktree before target preparation, so the recorded full revision
+identifies the exact source used by the run rather than merely its nearest
+commit.
 
 ```bash
 cd examples/cloudflareshard-oltp

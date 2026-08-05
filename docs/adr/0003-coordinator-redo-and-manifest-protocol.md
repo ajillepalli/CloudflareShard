@@ -200,6 +200,13 @@ nonterminal outcomes, not errors and not participant-commit authorization.
 - Qualification measurement of p95 manifest overhead at or below 100 ms on the
   reference deployment; a miss blocks release and cannot bypass the manifest.
 
+**Qualification status (2026-08-05): pending.** Local tests, type checks, and
+Wrangler dry runs do not satisfy the reference-deployment gate. Before this
+release is qualified, a sanitized artifact must name the deployment and build,
+record the measurement method and sample size, and demonstrate p95 manifest
+overhead at or below 100 ms. Until that evidence exists, release qualification
+is incomplete.
+
 ## Consequences
 
 Every cross-shard commit adds one synchronous manifest registration plus any

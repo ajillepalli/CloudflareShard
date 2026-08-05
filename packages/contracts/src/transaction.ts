@@ -13,6 +13,12 @@ export const PARTICIPANT_TOMBSTONE_FORMAT_VERSION = 1 as const;
 export const TRANSACTION_ERROR_SCHEMA_VERSION = 1 as const;
 
 export const MAX_REDO_ENVELOPE_BYTES = 256 * 1024;
+/** Caller-supplied row keys are capped separately at the HTTP boundary. A
+ * redo envelope groups those rows plus system-generated index intents by
+ * physical shard, so its participant ceiling must cover the documented
+ * maximum cluster topology. The byte ceiling remains the tighter payload
+ * bound for realistic transactions. */
+export const MAX_REDO_PARTICIPANTS = 256;
 export const MAX_PARTICIPANT_KEYS = 8;
 export const MAX_VBUCKET = 65_535;
 export const MANIFEST_PARTITION_COUNT = 16 as const;
@@ -468,11 +474,11 @@ export function validateRedoEnvelopeStructure(value: unknown): asserts value is 
   assertRetentionWindow(value.commit_decided_at, value.retention_deadline, COORDINATOR_RETENTION_DAYS);
 
   if (!Array.isArray(value.participants)) fail("TX_ENVELOPE_INVALID", "participants must be an array.");
-  if (value.participants.length < 1 || value.participants.length > MAX_PARTICIPANT_KEYS) {
+  if (value.participants.length < 1 || value.participants.length > MAX_REDO_PARTICIPANTS) {
     fail(
       "TX_ENVELOPE_INVALID",
-      `Redo envelope must contain 1-${MAX_PARTICIPANT_KEYS} participants.`,
-      { participant_count: value.participants.length, maximum_participants: MAX_PARTICIPANT_KEYS },
+      `Redo envelope must contain 1-${MAX_REDO_PARTICIPANTS} physical participants.`,
+      { participant_count: value.participants.length, maximum_participants: MAX_REDO_PARTICIPANTS },
     );
   }
 
