@@ -1312,6 +1312,32 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
             return { kind: "complete", generation: replay.generation, receipt: JSON.parse(replay.receipt_json) as ManifestSealReceiptV1 };
           }
           if (replay.status === "QUARANTINED") {
+            const unresolved = this.ctx.storage.sql
+              .exec<{ count: number }>(
+                `SELECT COUNT(*) AS count FROM manifest_reservations
+                  WHERE state = 'FINALIZED' AND commit_decided_at_ms <= ?
+                    AND quarantine_state = 'UNRESOLVED'`,
+                replay.cutoff_ms,
+              )
+              .one().count;
+            if (unresolved === 0) {
+              this.ctx.storage.sql.exec(
+                `UPDATE manifest_seal_generations
+                    SET status = 'DRAINING', cursor_decided_at_ms = NULL,
+                        cursor_decision_sequence = NULL, cursor_tx_id = NULL,
+                        digest_count = 0, digest_root = ?, receipt_hash = NULL,
+                        receipt_json = NULL, updated_at_ms = ?
+                  WHERE generation = ? AND status = 'QUARANTINED'`,
+                ZERO_HASH,
+                Date.now(),
+                replay.generation,
+              );
+              this.ctx.storage.sql.exec(
+                "DELETE FROM manifest_seal_digest_entries WHERE generation = ?",
+                replay.generation,
+              );
+              return { kind: "resume", generation: replay.generation };
+            }
             return {
               kind: "result",
               result: {

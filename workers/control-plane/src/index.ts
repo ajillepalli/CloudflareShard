@@ -353,6 +353,16 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         );
         await bucket.initializeForSeal(sealRequest, snapshot.decision_floor_ms);
         const sealed = await bucket.closeThrough(sealRequest);
+        if (!sealed.ok && sealed.status === "seal_in_progress") {
+          return {
+            ok: true,
+            status: "pending",
+            cutoff_ms: cutoffMs,
+            snapshot_generation: snapshot.generation,
+            completed_buckets: operation.completed_entries,
+            total_buckets: operation.total_entries,
+          };
+        }
         if (!sealed.ok) {
           return {
             ok: false,
@@ -717,6 +727,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         };
       }
       const objectName = await manifestObjectNameForRegistration(validated);
+      const stub = this.env.JOURNAL_MANIFEST.getByName(objectName);
       const legacyCatalog = this.env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${validated.record.fleet_id}`);
       const legacyConfig = await legacyCatalog.partitionConfigForDay(
         validated.record.fleet_id,
@@ -731,6 +742,20 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         record_hash: validated.record_hash,
       });
       if (!legacyAdmission.ok) {
+        const existing = await stub.lookup(validated.record.tx_id);
+        if (
+          existing.ok && existing.found
+          && existing.record_hash === validated.record_hash
+          && !existing.quarantined
+        ) {
+          return {
+            ok: true,
+            status: "already_registered",
+            http_status: 200,
+            record_hash: existing.record_hash,
+            quarantined: false,
+          };
+        }
         return {
           ok: false,
           status: "rejected",
@@ -738,7 +763,6 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           error: manifestError("V1_CLOSED", "Legacy manifest admission is permanently fenced; use the V2 bridge."),
         };
       }
-      const stub = this.env.JOURNAL_MANIFEST.getByName(objectName);
       const result = await registerThroughManifestStub(
         { register: async (value) => await stub.register(value) },
         validated,

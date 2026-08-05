@@ -204,8 +204,11 @@ sequence, record, and hash before participant commit.
 The reservation ledger is separate from the existing v1 rows so expand-first
 reads remain possible. Finalization writes a versioned `ManifestRecordV2` whose
 frozen reservation route, reservation hash, bucket-issued decision time, and
-decision sequence are part of its canonical content. The matching redo envelope
-version is completed from those returned fields and hash-checked before storage.
+decision sequence are part of its canonical content. V2 `envelope_hash` pins the
+canonical pre-decision envelope intent; the matching completed redo envelope is
+built from the bucket-issued timestamps, fully validated, and stored before
+participant commit. A V1-to-V2 bridge retains its already-canonical predecessor
+envelope and completed-envelope hash rather than reinterpreting that evidence.
 V1 continues to validate and recover under its coordinator-issued
 `commit_decided_at` rules, but it is never reinterpreted as V2 and never
 contributes to a complete sealed window.

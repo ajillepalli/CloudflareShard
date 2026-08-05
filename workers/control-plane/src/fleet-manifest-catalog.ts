@@ -615,8 +615,8 @@ export class FleetManifestCatalogStore {
     readonly partition_count: number;
   }, nowMs = Date.now()): Promise<PartitionConfigRow> {
     assertUtcDay(input.effective_from_day, "effective_from_day");
-    if (!Number.isInteger(input.partition_count) || input.partition_count < 1 || input.partition_count > 4096) {
-      throw new TypeError("partition_count must be an integer from 1 through 4096.");
+    if (input.partition_count !== INITIAL_PARTITION_COUNT) {
+      throw new TypeError(`partition_count must remain ${INITIAL_PARTITION_COUNT} until versioned routing supports resharding.`);
     }
     const metadata = await this.ensureFleet(input.fleet_id);
     if (input.effective_from_day <= addUtcDays(todayUtc(nowMs), 1)) {

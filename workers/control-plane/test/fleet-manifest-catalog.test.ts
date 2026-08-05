@@ -46,15 +46,19 @@ describe("FleetManifestCatalogStore", () => {
 
       const now = Date.UTC(2026, 7, 5, 12);
       await expect(
-        catalog.appendPartitionConfig({ fleet_id: FLEET, effective_from_day: "2026-08-06", partition_count: 32 }, now),
+        catalog.appendPartitionConfig({ fleet_id: FLEET, effective_from_day: "2026-08-06", partition_count: 16 }, now),
       ).rejects.toThrow("later than the next UTC day");
-      const appended = await catalog.appendPartitionConfig(
+      await expect(catalog.appendPartitionConfig(
         { fleet_id: FLEET, effective_from_day: "2026-08-07", partition_count: 32 },
         now,
+      )).rejects.toThrow("must remain 16");
+      const appended = await catalog.appendPartitionConfig(
+        { fleet_id: FLEET, effective_from_day: "2026-08-07", partition_count: 16 },
+        now,
       );
-      expect(appended).toMatchObject({ partition_count: 32, prior_hash: initial.config_hash });
+      expect(appended).toMatchObject({ partition_count: 16, prior_hash: initial.config_hash });
       await expect(catalog.partitionConfigForDay(FLEET, "2026-08-07")).resolves.toMatchObject({
-        partition_count: 32,
+        partition_count: 16,
         config_hash: appended.config_hash,
       });
     });

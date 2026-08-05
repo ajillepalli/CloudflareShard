@@ -85,7 +85,7 @@ The minimum JournalManifestDO stores version 1 records with:
 | `coordinator_id` | Same value as the redo envelope |
 | `commit_decided_at` | Same canonical timestamp as the envelope |
 | `decision_epoch` | Same epoch as the envelope |
-| `envelope_hash` | SHA-256 of the canonical redo envelope |
+| `envelope_hash` | V1: SHA-256 of the canonical completed redo envelope. Native V2: SHA-256 of the canonical pre-decision envelope intent; the bucket-issued timestamps complete a separately validated envelope stored by the coordinator. A V1-to-V2 bridge preserves the predecessor V1 completed-envelope hash. |
 | `retention_deadline` | Same deadline as the envelope |
 
 For modulo routing, SHA-256 is interpreted as an unsigned big-endian integer;

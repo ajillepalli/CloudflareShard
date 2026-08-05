@@ -119,6 +119,36 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       status: "rejected",
       error: { code: "V1_CLOSED" },
     });
+
+    const replayWorker = new ControlPlaneWorker(createExecutionContext(), env);
+    const replayFleet = `fleet-v1-lost-ack-${crypto.randomUUID()}`;
+    const replayEnvelope: RedoEnvelopeV1 = {
+      ...envelope,
+      tx_id: `legacy-before-v2-${crypto.randomUUID()}`,
+      fleet_id: replayFleet,
+      coordinator_id: "legacy-replay-coordinator",
+    };
+    const replayRegistration = await createManifestRegistration(replayEnvelope);
+    await expect(replayWorker.registerManifest(replayRegistration)).resolves.toMatchObject({
+      ok: true,
+      status: "registered",
+    });
+    const fenceOperationHash = await hashCanonicalJson({ operation: "fence-v1-replay" });
+    await expect(replayWorker.assignManifestRoute({
+      draft: {
+        fleet_id: replayFleet,
+        tx_id: `v2-fence-${crypto.randomUUID()}`,
+        coordinator_id: "v2-fence-coordinator",
+        operation_hash: fenceOperationHash,
+        decision_epoch: 1,
+      },
+      idempotency_key: `fence-${crypto.randomUUID()}`,
+    })).resolves.toMatchObject({ ok: true, status: "assigned" });
+    await expect(replayWorker.registerManifest(replayRegistration)).resolves.toMatchObject({
+      ok: true,
+      status: "already_registered",
+      record_hash: replayRegistration.record_hash,
+    });
   });
 
   it("assigns the canonical decision in the bucket and replays finalization exactly", async () => {
@@ -289,6 +319,62 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
   });
 
+  it("restarts the same quarantined seal generation after audited evidence is resolved", async () => {
+    const route = await assigned(`tx-seal-repair-${crypto.randomUUID()}`);
+    await route.worker.reserveManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash });
+    const intent: ManifestFinalizeIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      reservation_hash: route.reservation_hash,
+      redo_envelope_hash: await hashCanonicalJson({ redo: route.reservation.tx_id }),
+      operation_hash: route.operationHash,
+      decision_epoch: 1,
+      idempotency_key: `finalize-${route.reservation.tx_id}`,
+    };
+    const finalized = await route.worker.finalizeManifest({
+      reservation: route.reservation,
+      reservation_hash: route.reservation_hash,
+      intent,
+    });
+    if (!finalized.ok) throw new Error(finalized.error.message);
+    const sealRequest = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_SEAL_FORMAT_VERSION,
+      fleet_id: route.reservation.fleet_id,
+      reservation_utc_day: route.reservation.reservation_utc_day,
+      partition: route.reservation.partition,
+      partition_count: route.reservation.partition_count,
+      routing_key: route.reservation.routing_key,
+      partition_config_hash: route.reservation.partition_config_hash,
+      cutoff: finalized.record.commit_decided_at,
+      idempotency_key: `repaired-seal-${route.reservation.tx_id}`,
+    } as const;
+    const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    await runInDurableObject(bucket, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE manifest_reservations SET quarantine_state = 'RESOLVED' WHERE tx_id = ?",
+        route.reservation.tx_id,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO manifest_seal_generations
+          (generation, idempotency_key, cutoff_ms, mode, status, digest_count, digest_root, created_at_ms, updated_at_ms)
+         VALUES (1, ?, ?, 'ADVANCE', 'QUARANTINED', 7, 'stale-digest', 0, 0)`,
+        sealRequest.idempotency_key,
+        finalized.record.commit_decided_at_ms,
+      );
+      state.storage.sql.exec(
+        "UPDATE manifest_bucket_state SET next_seal_generation = 2 WHERE id = 1",
+      );
+    });
+    await expect(bucket.closeThrough(sealRequest)).resolves.toMatchObject({
+      ok: true,
+      status: "complete",
+      generation: 1,
+      receipt: { record_count: 1 },
+    });
+  });
+
   it("publishes an exact-cutoff receipt and assigns later finalizations above its floor", async () => {
     const first = await assigned(`tx-seal-first-${crypto.randomUUID()}`);
     await first.worker.reserveManifest({ reservation: first.reservation, reservation_hash: first.reservation_hash });
@@ -451,6 +537,22 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       intent,
     });
     if (!finalized.ok) throw new Error(finalized.error.message);
+
+    const routedBucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    await runInDurableObject(routedBucket, async (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO manifest_seal_generations
+          (generation, idempotency_key, cutoff_ms, mode, status, digest_count, digest_root, created_at_ms, updated_at_ms)
+         VALUES (999, 'foreign-close-in-progress', 0, 'ADVANCE', 'DRAINING', 0, '', 0, 0)`,
+      );
+    });
+    await expect(route.worker.closeFleetThrough({
+      fleet_id: route.reservation.fleet_id,
+      cutoff: finalized.record.commit_decided_at,
+    })).resolves.toMatchObject({ ok: true, status: "pending" });
+    await runInDurableObject(routedBucket, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM manifest_seal_generations WHERE generation = 999");
+    });
 
     let completed = await route.worker.closeFleetThrough({
       fleet_id: route.reservation.fleet_id,

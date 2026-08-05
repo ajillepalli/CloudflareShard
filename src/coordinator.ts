@@ -1081,12 +1081,20 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         transactionError("MANIFEST_TERMINAL_CONFLICT", "Finalized manifest record conflicts with the durable coordinator decision."),
       );
     }
+    const completedEnvelope: RedoEnvelopeV1 = {
+      ...(JSON.parse(row.redo_envelope_intent_json!) as Omit<RedoEnvelopeV1, "commit_decided_at" | "retention_deadline">),
+      commit_decided_at: result.record.commit_decided_at,
+      retention_deadline: result.record.retention_deadline,
+    };
+    await validateRedoEnvelope(completedEnvelope);
     try {
       this.transition(row.tx_id, [state], "manifest_registered", () => {
         this.sql.exec(
           `UPDATE transactions
-              SET manifest_record_json = ?, manifest_record_hash = ?, commit_decided_at_ms = ?, decision_sequence = ?
+              SET redo_envelope_json = ?, manifest_record_json = ?, manifest_record_hash = ?,
+                  commit_decided_at_ms = ?, decision_sequence = ?
             WHERE tx_id = ?`,
+          canonicalJson(completedEnvelope),
           canonicalJson(result.record),
           result.record_hash,
           result.record.commit_decided_at_ms,
@@ -2052,7 +2060,17 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         await hashManifestRecordV2(resolvedRecord) !== result.record_hash
         || resolvedRecord.tx_id !== row.tx_id
         || resolvedRecord.reservation_hash !== reservationHash
+        || resolvedRecord.envelope_hash !== (terminalIntent as ManifestFinalizeIntentV1).redo_envelope_hash
       ) return protocolResponse(transactionError("MANIFEST_TERMINAL_CONFLICT", "Resolved record conflicts with coordinator identity."));
+      if (!row.redo_envelope_intent_json) {
+        return protocolResponse(transactionError("TX_DECISION_UNAVAILABLE", "Resolved finalize has no durable redo-envelope intent."));
+      }
+      const completedEnvelope: RedoEnvelopeV1 = {
+        ...(JSON.parse(row.redo_envelope_intent_json) as Omit<RedoEnvelopeV1, "commit_decided_at" | "retention_deadline">),
+        commit_decided_at: resolvedRecord.commit_decided_at,
+        retention_deadline: resolvedRecord.retention_deadline,
+      };
+      await validateRedoEnvelope(completedEnvelope);
       try {
         this.ctx.storage.transactionSync(() => {
           const current = this.loadTx(row.tx_id);
@@ -2072,11 +2090,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
           assertTransactionTransition(currentState, nextState);
           this.sql.exec(
             `UPDATE transactions
-                SET status = ?, decision = 'commit', manifest_record_json = ?,
+                SET status = ?, decision = 'commit', redo_envelope_json = ?, manifest_record_json = ?,
                     manifest_record_hash = ?, commit_decided_at_ms = ?, decision_sequence = ?,
                     last_error = NULL, updated_at = ?
               WHERE tx_id = ?`,
             nextState,
+            canonicalJson(completedEnvelope),
             canonicalJson(resolvedRecord),
             result.record_hash,
             resolvedRecord.commit_decided_at_ms,

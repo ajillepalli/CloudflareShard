@@ -1173,17 +1173,23 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect(commitCalls).toBe(1);
       const finalized = state.storage.sql.exec<{
         status: string;
+        redo_envelope_json: string;
         manifest_record_json: string;
         manifest_record_hash: string;
         commit_decided_at_ms: number;
         decision_sequence: number;
       }>(
-        `SELECT status, manifest_record_json, manifest_record_hash,
+        `SELECT status, redo_envelope_json, manifest_record_json, manifest_record_hash,
                 commit_decided_at_ms, decision_sequence
            FROM transactions WHERE tx_id = ?`,
         txId,
       ).one();
       expect(finalized.status).toBe("committed");
+      expect(JSON.parse(finalized.redo_envelope_json)).toMatchObject({
+        tx_id: txId,
+        commit_decided_at: JSON.parse(finalized.manifest_record_json).commit_decided_at,
+        retention_deadline: JSON.parse(finalized.manifest_record_json).retention_deadline,
+      });
       expect(JSON.parse(finalized.manifest_record_json)).toMatchObject({ tx_id: txId });
       expect(finalized.manifest_record_hash).toMatch(/^[a-f0-9]{64}$/);
       expect(finalized.commit_decided_at_ms).toBeGreaterThan(0);
