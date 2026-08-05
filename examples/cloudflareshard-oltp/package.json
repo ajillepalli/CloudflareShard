@@ -1,0 +1,16 @@
+{
+  "name": "cloudflareshard-oltp-baseline",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "types": "./src/types.d.ts",
+  "description": "Bespoke preliminary OLTP workload for CloudflareShard with neutral operations and complete outcome accounting.",
+  "scripts": {
+    "benchmark": "node src/cli.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

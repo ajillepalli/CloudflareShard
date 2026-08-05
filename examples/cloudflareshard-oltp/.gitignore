@@ -1,0 +1,3 @@
+artifacts/*.json
+artifacts/*.md
+!artifacts/README.md
