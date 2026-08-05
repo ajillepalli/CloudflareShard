@@ -836,7 +836,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!queued && row.last_error) {
       try {
         const parked = JSON.parse(row.last_error) as { code?: string };
-        if (parked.code === "MANIFEST_QUARANTINED") {
+        if (parked.code === "MANIFEST_QUARANTINED" || parked.code === "MANIFEST_RESERVATION_CONFLICT") {
           return json({ ok: true, txId: row.tx_id, status: "aborted_pending_manifest_cancel" }, 202);
         }
       } catch {

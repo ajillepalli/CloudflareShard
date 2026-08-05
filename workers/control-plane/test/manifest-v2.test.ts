@@ -329,6 +329,52 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
   });
 
+  it("ignores an expired cursor backlog when sweeping V2 retention", async () => {
+    const route = await assigned(`tx-retention-expired-cursors-${crypto.randomUUID()}`);
+    await route.worker.reserveManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash });
+    const intent: ManifestFinalizeIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      reservation_hash: route.reservation_hash,
+      redo_envelope_hash: await hashCanonicalJson({ redo: route.reservation.tx_id }),
+      operation_hash: route.operationHash,
+      decision_epoch: 1,
+      idempotency_key: `finalize-${route.reservation.tx_id}`,
+    };
+    const finalized = await route.worker.finalizeManifest({
+      reservation: route.reservation,
+      reservation_hash: route.reservation_hash,
+      intent,
+    });
+    if (!finalized.ok) throw new Error(finalized.error.message);
+    await route.worker.releaseManifestV2({
+      reservation: route.reservation,
+      reservation_hash: route.reservation_hash,
+      record_hash: finalized.record_hash,
+      retention_deadline_ms: new Date(finalized.record.retention_deadline).getTime(),
+    });
+    const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    await runInDurableObject(bucket, async (instance, state) => {
+      state.storage.sql.exec("UPDATE manifest_reservations SET retention_deadline_ms = 0 WHERE tx_id = ?", route.reservation.tx_id);
+      for (let index = 0; index < 129; index += 1) {
+        state.storage.sql.exec(
+          `INSERT INTO manifest_page_cursors
+            (cursor_json, request_hash, created_at_ms, lease_expires_at_ms, coverage_start_ms, cutoff_ms)
+           VALUES (?, ?, 0, 0, 0, ?)`,
+          `expired-cursor-${index}`,
+          "b".repeat(64),
+          finalized.record.commit_decided_at_ms,
+        );
+      }
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
+      );
+      await instance.alarm?.();
+    });
+    await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
+  });
+
   it("restarts the same quarantined seal generation after audited evidence is resolved", async () => {
     const route = await assigned(`tx-seal-repair-${crypto.randomUUID()}`);
     await route.worker.reserveManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash });
@@ -383,6 +429,65 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       generation: 1,
       receipt: { record_count: 1 },
     });
+  });
+
+  it("restarts a draining seal when quarantine evidence changes before publication", async () => {
+    const route = await assigned(`tx-seal-evidence-race-${crypto.randomUUID()}`);
+    await route.worker.reserveManifest({ reservation: route.reservation, reservation_hash: route.reservation_hash });
+    const intent: ManifestFinalizeIntentV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+      tx_id: route.reservation.tx_id,
+      reservation_hash: route.reservation_hash,
+      redo_envelope_hash: await hashCanonicalJson({ redo: route.reservation.tx_id }),
+      operation_hash: route.operationHash,
+      decision_epoch: 1,
+      idempotency_key: `finalize-${route.reservation.tx_id}`,
+    };
+    const finalized = await route.worker.finalizeManifest({
+      reservation: route.reservation,
+      reservation_hash: route.reservation_hash,
+      intent,
+    });
+    if (!finalized.ok) throw new Error(finalized.error.message);
+    const sealRequest = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_SEAL_FORMAT_VERSION,
+      fleet_id: route.reservation.fleet_id,
+      reservation_utc_day: route.reservation.reservation_utc_day,
+      partition: route.reservation.partition,
+      partition_count: route.reservation.partition_count,
+      routing_key: route.reservation.routing_key,
+      partition_config_hash: route.reservation.partition_config_hash,
+      cutoff: finalized.record.commit_decided_at,
+      idempotency_key: `evidence-race-seal-${route.reservation.tx_id}`,
+    } as const;
+    const bucket = env.JOURNAL_MANIFEST.getByName(await manifestObjectNameForReservation(route.reservation));
+    await runInDurableObject(bucket, async (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO manifest_seal_generations
+          (generation, idempotency_key, cutoff_ms, mode, status,
+           cursor_decided_at_ms, cursor_decision_sequence, cursor_tx_id,
+           digest_count, digest_root, evidence_revision, created_at_ms, updated_at_ms)
+         VALUES (1, ?, ?, 'ADVANCE', 'DRAINING', ?, ?, ?, 1, 'stale-digest', 0, 0, 0)`,
+        sealRequest.idempotency_key,
+        finalized.record.commit_decided_at_ms,
+        finalized.record.commit_decided_at_ms,
+        finalized.record.decision_sequence,
+        route.reservation.tx_id,
+      );
+      state.storage.sql.exec(
+        "UPDATE manifest_bucket_state SET next_seal_generation = 2, evidence_revision = 1 WHERE id = 1",
+      );
+    });
+
+    await expect(bucket.closeThrough(sealRequest)).resolves.toMatchObject({ ok: true, status: "pending", generation: 1 });
+    const sealed = await bucket.closeThrough(sealRequest);
+    expect(sealed).toMatchObject({ ok: true, status: "complete", generation: 1 });
+    if (!sealed.ok || sealed.status !== "complete" || sealed.receipt === undefined) {
+      throw new Error("Expected the restarted seal to complete.");
+    }
+    expect(sealed.receipt.records_root).not.toBe("stale-digest");
   });
 
   it("publishes an exact-cutoff receipt and assigns later finalizations above its floor", async () => {

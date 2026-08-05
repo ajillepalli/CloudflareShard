@@ -1338,6 +1338,82 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
     });
   });
 
+  it("parks a reserve-quarantined cancellation without replaying the reservation on ordinary retries", async () => {
+    const txId = `tx-reserve-cancel-park-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      let reserveCalls = 0;
+      let cancelCalls = 0;
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+        async reserveManifest({ reservation_hash: reservationHash }) {
+          reserveCalls += 1;
+          if (reserveCalls === 1) {
+            return {
+              ok: true as const,
+              status: "reserved" as const,
+              reservation_hash: reservationHash,
+              required_decision_floor_ms: 0,
+              local_legacy_certificate_hash: "a".repeat(64),
+            };
+          }
+          return {
+            ok: false as const,
+            status: "quarantined" as const,
+            bucket_row_may_exist: true as const,
+            http_status: 409,
+            error: {
+              schema_version: 1 as const,
+              code: "MANIFEST_RESERVATION_CONFLICT" as const,
+              message: "reservation identity is quarantined",
+              http_status: 409,
+              retryable: false,
+            },
+          };
+        },
+        async cancelManifest() {
+          cancelCalls += 1;
+          return { ok: true as const, status: "cancelled" as const };
+        },
+      };
+      const mutable = instance as unknown as {
+        coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService };
+        callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
+      };
+      mutable.coordinatorEnv.CONTROL_PLANE = service;
+      mutable.callShard = async (_row, _participant, phase) => new Response("{}", { status: phase === "prepare" ? 409 : 200 });
+
+      const request = {
+        txId,
+        participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "bad mutation", params: [], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      };
+      expect((await instance.fetch(post("/begin", request))).status).toBe(409);
+      expect(reserveCalls).toBe(2);
+      expect(cancelCalls).toBe(0);
+      expect(state.storage.sql.exec<{ status: string; last_error: string }>(
+        "SELECT status, last_error FROM transactions WHERE tx_id = ?",
+        txId,
+      ).one()).toMatchObject({
+        status: "aborted_pending_manifest_cancel",
+        last_error: expect.stringContaining("MANIFEST_RESERVATION_CONFLICT"),
+      });
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+
+      expect((await instance.fetch(post("/begin", request))).status).toBe(202);
+      expect(reserveCalls, "a reservation-conflict park must not hot-loop on ordinary retries").toBe(2);
+      expect(cancelCalls).toBe(0);
+    });
+  });
+
   it("concurrent identical prepare failures converge to a typed abort instead of a CAS 500", async () => {
     const txId = `tx-abort-race-${crypto.randomUUID()}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));

@@ -151,6 +151,7 @@ interface BucketStateRow {
   next_decision_sequence: number;
   records_deleted_through_ms: number;
   retention_epoch: number;
+  evidence_revision: number;
   legacy_certificate_hash: string | null;
   legacy_certificate_json: string | null;
   legacy_closed: number;
@@ -170,6 +171,7 @@ interface SealGenerationRow {
   digest_root: string;
   receipt_hash: string | null;
   receipt_json: string | null;
+  evidence_revision: number;
 }
 
 type JournalManifestEnv = Record<string, never>;
@@ -472,6 +474,24 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         new Date().toISOString(),
       );
     });
+    if (current < 6) this.ctx.storage.transactionSync(() => {
+      const bucketColumns = this.ctx.storage.sql
+        .exec<{ readonly [key: string]: SqlStorageValue; name: string }>("PRAGMA table_info(manifest_bucket_state)")
+        .toArray();
+      if (!bucketColumns.some((column) => column.name === "evidence_revision")) {
+        this.ctx.storage.sql.exec("ALTER TABLE manifest_bucket_state ADD COLUMN evidence_revision INTEGER NOT NULL DEFAULT 0");
+      }
+      const generationColumns = this.ctx.storage.sql
+        .exec<{ readonly [key: string]: SqlStorageValue; name: string }>("PRAGMA table_info(manifest_seal_generations)")
+        .toArray();
+      if (!generationColumns.some((column) => column.name === "evidence_revision")) {
+        this.ctx.storage.sql.exec("ALTER TABLE manifest_seal_generations ADD COLUMN evidence_revision INTEGER NOT NULL DEFAULT 0");
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (6, ?)",
+        new Date().toISOString(),
+      );
+    });
   }
 
   private partitionMatches(record: ManifestRecordV1, metadata: PartitionMetadataRow): boolean {
@@ -692,6 +712,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
             reservation.tx_id,
           );
           this.ctx.storage.sql.exec(
+            "UPDATE manifest_bucket_state SET evidence_revision = evidence_revision + 1, updated_at_ms = ? WHERE id = 1",
+            now,
+          );
+          this.ctx.storage.sql.exec(
             `INSERT OR IGNORE INTO manifest_reservation_conflicts
               (tx_id, candidate_hash, candidate_json, transition_kind, observed_at_ms)
              VALUES (?, ?, ?, 'RESERVE', ?)`,
@@ -805,6 +829,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
             intentHash,
             now,
             intent.tx_id,
+          );
+          this.ctx.storage.sql.exec(
+            "UPDATE manifest_bucket_state SET evidence_revision = evidence_revision + 1, updated_at_ms = ? WHERE id = 1",
+            now,
           );
           this.ctx.storage.sql.exec(
             `INSERT OR IGNORE INTO manifest_reservation_conflicts
@@ -999,6 +1027,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
             intentHash,
             now,
             intent.tx_id,
+          );
+          this.ctx.storage.sql.exec(
+            "UPDATE manifest_bucket_state SET evidence_revision = evidence_revision + 1, updated_at_ms = ? WHERE id = 1",
+            now,
           );
           this.ctx.storage.sql.exec(
             `INSERT OR IGNORE INTO manifest_reservation_conflicts
@@ -1202,6 +1234,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           Date.now(),
           row.tx_id,
         );
+        this.ctx.storage.sql.exec(
+          "UPDATE manifest_bucket_state SET evidence_revision = evidence_revision + 1, updated_at_ms = ? WHERE id = 1",
+          Date.now(),
+        );
         return "resolved";
       });
 
@@ -1343,9 +1379,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
                     SET status = 'DRAINING', cursor_decided_at_ms = NULL,
                         cursor_decision_sequence = NULL, cursor_tx_id = NULL,
                         digest_count = 0, digest_root = ?, receipt_hash = NULL,
-                        receipt_json = NULL, updated_at_ms = ?
+                        receipt_json = NULL, evidence_revision = ?, updated_at_ms = ?
                   WHERE generation = ? AND status = 'QUARANTINED'`,
                 ZERO_HASH,
+                bucket.evidence_revision,
                 Date.now(),
                 replay.generation,
               );
@@ -1406,13 +1443,14 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         this.ctx.storage.sql.exec(
           `INSERT INTO manifest_seal_generations
             (generation, idempotency_key, cutoff_ms, mode, status,
-             digest_count, digest_root, created_at_ms, updated_at_ms)
-           VALUES (?, ?, ?, ?, 'DRAINING', 0, ?, ?, ?)`,
+             digest_count, digest_root, evidence_revision, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'DRAINING', 0, ?, ?, ?, ?)`,
           generation,
           request.idempotency_key,
           cutoffMs,
           mode,
           ZERO_HASH,
+          bucket.evidence_revision,
           Date.now(),
           Date.now(),
         );
@@ -1566,6 +1604,27 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         cutoff_ms: generationRow.cutoff_ms,
       };
     }
+    const evidenceRevision = this.ctx.storage.sql
+      .exec<{ evidence_revision: number }>("SELECT evidence_revision FROM manifest_bucket_state WHERE id = 1")
+      .one().evidence_revision;
+    if (evidenceRevision !== generationRow.evidence_revision) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `UPDATE manifest_seal_generations
+              SET cursor_decided_at_ms = NULL, cursor_decision_sequence = NULL, cursor_tx_id = NULL,
+                  digest_count = 0, digest_root = ?, receipt_hash = NULL, receipt_json = NULL,
+                  evidence_revision = ?, updated_at_ms = ?
+            WHERE generation = ? AND status = 'DRAINING'`,
+          ZERO_HASH,
+          evidenceRevision,
+          Date.now(),
+          generation,
+        );
+        this.ctx.storage.sql.exec("DELETE FROM manifest_seal_digest_entries WHERE generation = ?", generation);
+      });
+      await this.scheduleAlarmPurpose(`seal:${generation}`, Date.now() + 1_000, generation);
+      return { ok: true, status: "pending", generation, cutoff_ms: generationRow.cutoff_ms };
+    }
     const afterDecided = generationRow.cursor_decided_at_ms ?? -1;
     const afterSequence = generationRow.cursor_decision_sequence ?? -1;
     const afterTx = generationRow.cursor_tx_id ?? "";
@@ -1616,6 +1675,10 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         .one();
       if (
         current.status !== "DRAINING"
+        || current.evidence_revision !== generationRow.evidence_revision
+        || this.ctx.storage.sql
+          .exec<{ evidence_revision: number }>("SELECT evidence_revision FROM manifest_bucket_state WHERE id = 1")
+          .one().evidence_revision !== current.evidence_revision
         || current.cursor_decided_at_ms !== generationRow.cursor_decided_at_ms
         || current.cursor_decision_sequence !== generationRow.cursor_decision_sequence
         || current.cursor_tx_id !== generationRow.cursor_tx_id
@@ -1671,6 +1734,7 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       const bucket = this.ctx.storage.sql
         .exec<BucketStateRow>("SELECT * FROM manifest_bucket_state WHERE id = 1")
         .one();
+      if (bucket.evidence_revision !== current.evidence_revision) return null;
       const prior = this.ctx.storage.sql
         .exec<{ receipt_hash: string }>(
           `SELECT receipt_hash FROM manifest_seal_generations
@@ -1724,6 +1788,9 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       const current = this.ctx.storage.sql
         .exec<SealGenerationRow>("SELECT * FROM manifest_seal_generations WHERE generation = ?", generation)
         .one();
+      const currentEvidenceRevision = this.ctx.storage.sql
+        .exec<{ evidence_revision: number }>("SELECT evidence_revision FROM manifest_bucket_state WHERE id = 1")
+        .one().evidence_revision;
       const eligible = this.ctx.storage.sql
         .exec<{ count: number; unresolved: number; incomplete: number }>(
           `SELECT COUNT(*) AS count,
@@ -1736,6 +1803,8 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         .one();
       if (
         current.status !== "DRAINING"
+        || current.evidence_revision !== finalState.current.evidence_revision
+        || currentEvidenceRevision !== current.evidence_revision
         || current.digest_count !== finalState.current.digest_count
         || current.digest_root !== finalState.current.digest_root
         || eligible.count !== current.digest_count
@@ -2346,7 +2415,8 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
     const cursorLease = this.ctx.storage.sql
       .exec<{ expires_at_ms: number | null }>(
         `SELECT MIN(lease_expires_at_ms) AS expires_at_ms FROM manifest_page_cursors
-          WHERE coverage_start_ms <= ? AND cutoff_ms >= ?`,
+          WHERE lease_expires_at_ms > ? AND coverage_start_ms <= ? AND cutoff_ms >= ?`,
+        now,
         maximumCandidateMs,
         minimumCandidateMs,
       )
