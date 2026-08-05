@@ -6,6 +6,10 @@
 - Depends on: ADR-1
 - Required before: participant commit under the monotonic protocol
 
+> 2026-08-05 amendment: the Manifest V2 section below supersedes the original
+> V1 write path for new state-model-2 transactions. V1 remains an expand-first
+> recovery format and is never reinterpreted as V2.
+
 ## Context
 
 A commit witness stored only inside participant objects cannot reconstruct a
@@ -19,6 +23,10 @@ This ADR freezes the redo, hashing, routing, registration, retention, error, and
 compatibility contracts. It does not authorize fleet cutoff enumeration, restore
 execution, bucket sealing workflows, R2 archival, or any other control-plane
 namespace.
+
+The original decision above describes the minimum V1 deployment. The accepted
+Manifest V2 amendment now authorizes cutoff sealing and enumeration preparation;
+restore preview/execution and R2 archival remain outside this ADR.
 
 ## Decision
 
@@ -215,3 +223,45 @@ make durable decisions enumerable and recoverable. The protocol may block after
 commit decision, but it cannot tear or reverse. The fixed 16-way UTC-day routing
 is intentionally an A-phase contract and must be re-benchmarked before broader
 scale claims.
+
+## Manifest V2 amendment: reservation, sealing, and enumeration
+
+New state-model-2 transactions reserve a frozen manifest route before participant
+prepare. Route assignment and reservation are separate idempotent RPCs: the
+coordinator durably stores the assigned `reserved_at`, reservation day,
+partition, partition-config hash, canonical reservation, and reservation hash
+before the catalog or bucket is mutated. Catalog activation precedes bucket
+acknowledgement. An ambiguous reserve remains `manifest_reserving` and replays
+the exact stored bytes; participant prepare is forbidden until acknowledgement.
+
+After prepare, the coordinator atomically enters irreversible
+`commit_deciding` and stores the exact finalize intent. `JournalManifestDO`, not
+the coordinator, assigns `(commit_decided_at_ms, decision_sequence)` using its
+trusted clock and decision floor. The returned record and hash are durable in
+the coordinator before participant commit. Abort before that boundary requires
+an acknowledged reservation cancellation; ambiguous cancellation remains
+`aborted_pending_manifest_cancel`.
+
+Each daily bucket has distinct `decision_floor_ms` and `sealed_through_ms`
+watermarks. Starting an exact-cutoff seal raises the decision floor immediately;
+publishing the immutable receipt advances `sealed_through_ms` only after the
+eligible record digest and the identical `FINALIZED AND commit_decided_at_ms <=
+cutoff` count are rechecked transactionally. Later finalizations therefore land
+strictly above the cutoff. Exact-prefix receipts are derived when a covering
+receipt exists; covering evidence alone never authorizes completeness.
+
+`FleetManifestCatalogDO` is the candidate-set authority. It serializes bucket
+activation against hash-chained cutoff snapshots, pins append-only partition
+configuration, materializes all 16 partitions for every newly eligible day,
+and owns deterministic close progress plus the final fleet root. Enumeration is
+bucket-serial and keyset-paged. Its cursor binds the request, catalog snapshot,
+conflict root, seal receipt, and retention epoch. Missing receipts, unresolved
+quarantine, changed epochs, deleted coverage, and pre-reservation history return
+typed non-complete outcomes.
+
+The first V2 route assignment establishes the fleet's reservation-required
+boundary and permanently closes new V1 admission. Each bucket certifies its
+local V1 ledger (or `NO_LEGACY`) before V2 reservation or sealing. The catalog's
+daily horizon advances only after all 16 exact receipts are committed. V1 rows
+and model-1 coordinators remain readable and recoverable, but they are never
+reinterpreted as V2 evidence.

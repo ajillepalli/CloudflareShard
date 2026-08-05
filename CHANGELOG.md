@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.15.0.0] - 2026-08-05: Cutoff-safe manifest sealing and enumeration
+
+### Added
+- Added Manifest V2 contracts for pre-prepare route reservation, bucket-owned commit decisions, cancellation, exact-cutoff seals, bounded local pages, fleet cursors, and typed coverage failures.
+- Added `FleetManifestCatalogDO`, including activation fencing, append-only partition configuration, hash-chained cutoff snapshots, deterministic close progress, continuous 16-partition daily certification, and immutable fleet roots.
+- Added V2 reservation/finalization/cancellation and exact-cutoff sealing to `JournalManifestDO`, with inline V1 certification, audited hash-chained quarantine resolution, separate decision/seal watermarks, retention epochs, and multiplexed alarm work.
+
+### Changed
+- New cross-shard transactions use `manifest_reserving` before participant prepare and irreversible `commit_deciding` before the bucket assigns the canonical decision time. Existing state-model-1/V1 rows remain readable; an in-flight V1 decision that meets the permanent fence durably bridges through V2 without re-preparing participants.
+- V1 manifest admission is fleet-fenced after the first V2 reservation boundary. Enumeration fails closed for pre-boundary, incomplete, quarantined, or retention-expired coverage.
+
+This work is locally verified only. Production deployment, restore execution, and live performance/SLO qualification remain separate gates.
+
 ## [2.14.0.0] - 2026-08-05: Evidence-driven onboarding implementation and upgrade-safe distributed transactions
 
 CloudflareShard now includes a locally verified `doctor -> deploy -> verify -> receipt` workflow that can prove traffic reached distinct shards and retain a redacted evidence receipt without treating pending reconciliation as success. Operators also get a deterministic OLTP baseline whose JSON and Markdown artifacts share one checksummed result.

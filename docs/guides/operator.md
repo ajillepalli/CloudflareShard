@@ -576,3 +576,29 @@ for exactly these jobs — but each one's cost is proportional to data
 volume or shard count, not to how small the underlying operational need
 felt when you clicked the button. Budget for that before running one
 against a large, live cluster for the first time.
+
+## Manifest V2 operational boundary
+
+Manifest close and enumeration are route-less service-binding operations, not
+public admin HTTP endpoints. Deploy the control-plane Worker first and preserve
+both `JOURNAL_MANIFEST` and `FLEET_MANIFEST_CATALOG` namespaces during rollback
+or PITR. Once a fleet receives its first V2 route assignment, new V1 admission
+is permanently fenced; rollback must keep V2 reserve/finalize/cancel recovery
+available and must not reopen V1 writes.
+
+A complete fleet close requires an exact-cutoff receipt for every cataloged
+bucket and all 16 partitions for each newly eligible UTC day. `pending` is a
+durable resumable operation, not an empty result. `quarantined`,
+`unproven_legacy_window`, `retention_expired`, cursor mismatch, or a missing
+receipt are fail-closed outcomes and must not be relabeled as complete. Keep the
+control-plane alarm healthy: one multiplexed alarm drives retention and bounded
+seal/snapshot continuation without one purpose overwriting another.
+
+An unresolved V2 conflict requires explicit audited repair through
+`POST /admin/resolve-manifest-quarantine` with the admin bearer token. Supply
+`txId`, `resolution` (`FINALIZED` or `CANCELLED`), the reviewed `selectedHash`
+and `evidenceHash`, non-empty `actor` and `reason`, and a stable
+`idempotencyKey`. The CoordinatorDO derives and hashes its durable state and
+terminal intent; a changed or outcome-incompatible state fails closed. Replay
+the same idempotency key after an ambiguous response. Never invent a new key to
+bypass a conflicting prior repair attestation.
