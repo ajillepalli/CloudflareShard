@@ -1727,6 +1727,23 @@ export class FleetManifestCatalogStore {
     });
   }
 
+  reschedulePurposeAfterFailure(purpose: CatalogAlarmPurpose, fireAtMs: number, attemptCount: number): void {
+    if (!Number.isSafeInteger(fireAtMs) || fireAtMs < 0 || !Number.isSafeInteger(attemptCount) || attemptCount < 1) {
+      throw new TypeError("Alarm retry time and attempt must be safe positive integers.");
+    }
+    this.storage.sql.exec(
+      `UPDATE alarm_schedule SET fire_at_ms = ?, attempt_count = ?
+        WHERE purpose = ? AND fire_at_ms = ? AND generation = ? AND payload_hash = ? AND attempt_count = ?`,
+      fireAtMs,
+      attemptCount,
+      purpose.purpose,
+      purpose.fire_at_ms,
+      purpose.generation,
+      purpose.payload_hash,
+      purpose.attempt_count ?? 0,
+    );
+  }
+
   nextAlarmAt(): number | null {
     return this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; fire_at_ms: number | null }>("SELECT MIN(fire_at_ms) AS fire_at_ms FROM alarm_schedule").one().fire_at_ms;
   }
@@ -1963,8 +1980,9 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
         } else if (purpose.purpose === "history_gc") {
           await this.refreshHistoryGc();
         } else {
-          // Unknown/future handlers never erase durable operation state.
-          this.catalog.completePurpose(purpose.purpose, purpose.generation);
+          // An older binary must retain work introduced by a newer one. The
+          // ordinary failure path defers it without leaking the unbounded name.
+          throw new TypeError("Unknown catalog alarm purpose.");
         }
         if ((purpose.attempt_count ?? 0) > 0) {
           console.log(JSON.stringify(reliabilitySloEvent({
@@ -1987,11 +2005,7 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
           baseDelay,
           CATALOG_ALARM_MAX_RETRY_MS,
         );
-        this.catalog.schedulePurpose({
-          ...purpose,
-          fire_at_ms: Date.now() + retryAfterMs,
-          attempt_count: attemptCount,
-        });
+        this.catalog.reschedulePurposeAfterFailure(purpose, Date.now() + retryAfterMs, attemptCount);
         console.warn(JSON.stringify(reliabilitySloEvent({
           component: "fleet_manifest_catalog",
           operation: "catalog_alarm",

@@ -316,10 +316,14 @@ describe("FleetManifestCatalogStore", () => {
       expect((scheduled?.fire_at_ms ?? 0) - now).toBeGreaterThanOrEqual(42_000);
       expect((scheduled?.fire_at_ms ?? 0) - now).toBeLessThanOrEqual(CATALOG_ALARM_MAX_RETRY_MS);
       expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS + 1)
-        .some((purpose) => purpose.purpose === "future-purpose")).toBe(false);
-      expect(await state.storage.getAlarm()).toBe(scheduled?.fire_at_ms);
-      expect(warnings).toHaveLength(1);
-      expect(JSON.parse(warnings[0])).toMatchObject({
+        .find((purpose) => purpose.purpose === "future-purpose")).toMatchObject({
+          generation: 1,
+          payload_hash: "b".repeat(64),
+          attempt_count: 1,
+        });
+      expect(await state.storage.getAlarm()).toBe(catalog.nextAlarmAt());
+      expect(warnings).toHaveLength(2);
+      expect(warnings.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
         schema_version: 1,
         event: "reliability.slo",
         component: "fleet_manifest_catalog",
@@ -329,10 +333,59 @@ describe("FleetManifestCatalogStore", () => {
         overloaded: true,
         retryable: false,
         attempt_count: 1,
-      });
-      expect(warnings[0]).not.toContain("secret");
-      expect(warnings[0]).not.toContain("private");
+      }));
+      expect(warnings.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        outcome: "retry_scheduled",
+        purpose: "unknown",
+        attempt_count: 1,
+      }));
+      expect(warnings.join("\n")).not.toContain("secret");
+      expect(warnings.join("\n")).not.toContain("private");
       expect(CATALOG_ALARM_BASE_RETRY_MS).toBeLessThan(42_000);
+    });
+  });
+
+  it("does not overwrite a purpose superseded while an awaited handler fails", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-cas-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      const original = {
+        purpose: "snapshot_resume",
+        fire_at_ms: 0,
+        generation: 7,
+        payload_hash: "a".repeat(64),
+      } as const;
+      catalog.schedulePurpose(original);
+      let rejectHandler!: (error: Error) => void;
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      (catalog as unknown as { resumeSnapshot: () => Promise<never> }).resumeSnapshot = async () => {
+        markStarted();
+        return await new Promise<never>((_resolve, reject) => { rejectHandler = reject; });
+      };
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const alarm = instance.alarm();
+        await started;
+        catalog.schedulePurpose({
+          purpose: "snapshot_resume",
+          fire_at_ms: 123_456,
+          generation: 8,
+          payload_hash: "b".repeat(64),
+        });
+        rejectHandler(new Error("older generation failed"));
+        await alarm;
+      } finally {
+        warning.mockRestore();
+      }
+      expect(catalog.duePurposes(123_456)).toEqual([expect.objectContaining({
+        purpose: "snapshot_resume",
+        fire_at_ms: 123_456,
+        generation: 8,
+        payload_hash: "b".repeat(64),
+        attempt_count: 0,
+      })]);
     });
   });
 
