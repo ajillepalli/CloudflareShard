@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   COORDINATOR_RETENTION_DAYS,
   CURRENT_PROTOCOL_VERSION,
+  DEFAULT_DURABLE_OBJECT_OVERLOAD_RETRY_AFTER_MS,
+  MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
   MANIFEST_CATALOG_FORMAT_VERSION,
   MANIFEST_CURSOR_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
@@ -17,14 +19,17 @@ import {
   PARTICIPANT_TOMBSTONE_FORMAT_VERSION,
   REDO_ENVELOPE_FORMAT_VERSION,
   TRANSACTION_STATES,
+  TRANSACTION_STATE_MODEL_VERSION,
   TransactionContractViolation,
   assertReadableProtocolVersion,
   assertReadableTransactionStateModelVersion,
   assertManifestCursorMatchesRequest,
   assertTransactionTransition,
   assertWritableProtocolVersion,
+  boundedExponentialBackoffMs,
   canonicalByteLength,
   canonicalJson,
+  classifyDurableObjectFailure,
   createManifestRegistration,
   createManifestReservation,
   decisionForState,
@@ -38,6 +43,7 @@ import {
   manifestRoute,
   manifestMemberAt,
   manifestReservationRoute,
+  reliabilitySloEvent,
   transactionError,
   validateIdempotencyDays,
   validateManifestRegistration,
@@ -311,6 +317,94 @@ describe("protocol compatibility and errors", () => {
     expect(transactionError("TX_DECISION_UNAVAILABLE", "retry")).toMatchObject({ http_status: 503, retryable: true });
     expect(transactionError("TX_MANIFEST_UNAVAILABLE", "retry")).toMatchObject({ http_status: 503, retryable: true });
   });
+
+  it("classifies Durable Object overload without leaking exception text or hot-loop retrying", () => {
+    const overloaded = Object.assign(new Error("token=must-not-escape tx=private"), {
+      overloaded: true,
+      retryable: true,
+      retryAfterMs: 42_000.2,
+    });
+    expect(classifyDurableObjectFailure(overloaded)).toEqual({
+      overloaded: true,
+      retryable: false,
+      retry_after_ms: 42_001,
+    });
+    expect(classifyDurableObjectFailure(Object.assign(new Error("temporary"), { retryable: true }))).toEqual({
+      overloaded: false,
+      retryable: true,
+      retry_after_ms: 5_000,
+    });
+    expect(classifyDurableObjectFailure({ overloaded: true, retryAfterMs: Number.MAX_VALUE })).toEqual({
+      overloaded: true,
+      retryable: false,
+      retry_after_ms: MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
+    });
+    expect(classifyDurableObjectFailure({ retryable: true, retry_after_ms: 1_234.1 })).toEqual({
+      overloaded: false,
+      retryable: true,
+      retry_after_ms: 1_235,
+    });
+    expect(classifyDurableObjectFailure({ overloaded: "yes", retryable: 1, retryAfterMs: "soon" })).toEqual({
+      overloaded: false,
+      retryable: false,
+      retry_after_ms: 5_000,
+    });
+    expect(classifyDurableObjectFailure(null)).toEqual({
+      overloaded: false,
+      retryable: false,
+      retry_after_ms: 5_000,
+    });
+    const hostile = Object.defineProperty({}, "overloaded", { get: () => { throw new Error("getter secret"); } });
+    expect(classifyDurableObjectFailure(hostile)).toEqual({
+      overloaded: false,
+      retryable: false,
+      retry_after_ms: 5_000,
+    });
+  });
+
+  it("caps alarm backoff and emits only the fixed privacy-safe SLO schema", () => {
+    expect(boundedExponentialBackoffMs(0, 1_000, 60_000)).toBe(1_000);
+    expect(boundedExponentialBackoffMs(3, 1_000, 60_000)).toBe(8_000);
+    expect(boundedExponentialBackoffMs(100, 1_000, 60_000)).toBe(60_000);
+    expect(boundedExponentialBackoffMs(-1, Number.NaN, -10)).toBe(1);
+    const event = reliabilitySloEvent({
+      component: "coordinator",
+      operation: "manifest_route_assignment",
+      outcome: "controlled_failure",
+      classification: classifyDurableObjectFailure({ overloaded: true }),
+      attempt_count: 2,
+      observed_at_ms: 0,
+    });
+    expect(event).toEqual({
+      schema_version: 1,
+      event: "reliability.slo",
+      component: "coordinator",
+      operation: "manifest_route_assignment",
+      outcome: "controlled_failure",
+      overloaded: true,
+      retryable: false,
+      attempt_count: 2,
+      retry_after_ms: DEFAULT_DURABLE_OBJECT_OVERLOAD_RETRY_AFTER_MS,
+      observed_at: "1970-01-01T00:00:00.000Z",
+    });
+    expect(Object.keys(event).sort()).toEqual([
+      "attempt_count", "component", "event", "observed_at", "operation", "outcome",
+      "overloaded", "retry_after_ms", "retryable", "schema_version",
+    ]);
+    expect(JSON.stringify(event)).not.toContain("must-not-escape");
+    expect(reliabilitySloEvent({
+      component: "journal_manifest",
+      operation: "recovery_alarm",
+      outcome: "recovered",
+      observed_at_ms: Number.MAX_VALUE,
+      retry_after_ms: 0,
+    })).toMatchObject({
+      overloaded: false,
+      retryable: false,
+      attempt_count: 0,
+      retry_after_ms: 0,
+    });
+  });
 });
 
 describe("canonical redo envelope", () => {
@@ -541,10 +635,17 @@ describe("participant epoch tombstones", () => {
 
 describe("manifest V2 state-model compatibility", () => {
   it("reads state-model v1 and v2 while writing the expanded v2 transition graph", () => {
-    expect(() => assertReadableTransactionStateModelVersion(1)).not.toThrow();
-    expect(() => assertReadableTransactionStateModelVersion(2)).not.toThrow();
+    const matrix = [
+      { version: TRANSACTION_STATE_MODEL_VERSION - 1, readable: true, writable: false },
+      { version: TRANSACTION_STATE_MODEL_VERSION, readable: true, writable: true },
+      { version: TRANSACTION_STATE_MODEL_VERSION + 1, readable: false, writable: false },
+    ] as const;
+    for (const row of matrix) {
+      if (row.readable) expect(() => assertReadableTransactionStateModelVersion(row.version)).not.toThrow();
+      else expect(errorCode(() => assertReadableTransactionStateModelVersion(row.version))).toBe("TX_VERSION_UNSUPPORTED");
+      expect(row.writable).toBe(row.version === TRANSACTION_STATE_MODEL_VERSION);
+    }
     expect(errorCode(() => assertReadableTransactionStateModelVersion(0))).toBe("TX_VERSION_UNSUPPORTED");
-    expect(errorCode(() => assertReadableTransactionStateModelVersion(3))).toBe("TX_VERSION_UNSUPPORTED");
     expect(isTransactionTransitionAllowed("new", "manifest_reserving")).toBe(true);
     expect(isTransactionTransitionAllowed("prepared", "commit_deciding")).toBe(true);
     expect(isTransactionTransitionAllowed("commit_deciding", "abort_decided")).toBe(false);

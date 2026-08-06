@@ -20,6 +20,10 @@ export const MANIFEST_ENUMERATION_FORMAT_VERSION = 1 as const;
 export const MANIFEST_CURSOR_FORMAT_VERSION = 1 as const;
 export const PARTICIPANT_TOMBSTONE_FORMAT_VERSION = 1 as const;
 export const TRANSACTION_ERROR_SCHEMA_VERSION = 1 as const;
+export const RELIABILITY_EVENT_SCHEMA_VERSION = 1 as const;
+export const DEFAULT_DURABLE_OBJECT_RETRY_AFTER_MS = 5_000;
+export const DEFAULT_DURABLE_OBJECT_OVERLOAD_RETRY_AFTER_MS = 30_000;
+export const MAX_DURABLE_OBJECT_RETRY_AFTER_MS = 5 * 60_000;
 
 export const MAX_REDO_ENVELOPE_BYTES = 256 * 1024;
 /** Caller-supplied row keys are capped separately at the HTTP boundary. A
@@ -174,8 +178,125 @@ export interface TransactionProtocolError {
   readonly code: TransactionErrorCode;
   readonly message: string;
   readonly http_status: number;
+  /** The operation is safe to retry eventually. When `overloaded` is present,
+   * overload takes precedence and the caller must first honor the cooldown. */
   readonly retryable: boolean;
+  /** Cloudflare sets `overloaded` on infrastructure exceptions that must not
+   * be retried immediately. This additive hint survives RPC/HTTP projection
+   * without exposing the provider exception text. */
+  readonly overloaded?: true;
+  readonly retry_after_ms?: number;
   readonly details?: Readonly<Record<string, JsonValue>>;
+}
+
+export interface DurableObjectFailureClassification {
+  readonly overloaded: boolean;
+  readonly retryable: boolean;
+  readonly retry_after_ms: number;
+}
+
+export type ReliabilityComponent = "coordinator" | "control_plane" | "fleet_manifest_catalog" | "journal_manifest";
+export type ReliabilityOperation = "manifest_admission" | "manifest_route_assignment" | "recovery_alarm" | "catalog_alarm";
+export type ReliabilityOutcome = "controlled_failure" | "retry_scheduled" | "recovered";
+
+export interface ReliabilitySloEvent {
+  readonly schema_version: typeof RELIABILITY_EVENT_SCHEMA_VERSION;
+  readonly event: "reliability.slo";
+  readonly component: ReliabilityComponent;
+  readonly operation: ReliabilityOperation;
+  readonly outcome: ReliabilityOutcome;
+  readonly overloaded: boolean;
+  readonly retryable: boolean;
+  readonly attempt_count: number;
+  readonly retry_after_ms: number;
+  readonly observed_at: string;
+}
+
+function errorFlag(error: unknown, key: "overloaded" | "retryable"): boolean {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return false;
+  try {
+    return (error as Record<string, unknown>)[key] === true;
+  } catch {
+    return false;
+  }
+}
+
+function retryAfterHint(error: unknown): unknown {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return undefined;
+  try {
+    const fields = error as Record<string, unknown>;
+    return fields.retryAfterMs ?? fields.retry_after_ms;
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedInteger(value: unknown, fallback: number, maximum: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(maximum, Math.max(1, Math.ceil(value)));
+}
+
+/** Classify only stable Cloudflare exception flags. Exception names/messages
+ * are deliberately ignored so secrets and high-cardinality identifiers cannot
+ * escape through typed responses or SLO events. Overload takes precedence over
+ * `retryable`: callers must cool down instead of retrying the hot object. */
+export function classifyDurableObjectFailure(error: unknown): DurableObjectFailureClassification {
+  const overloaded = errorFlag(error, "overloaded");
+  const retryable = !overloaded && errorFlag(error, "retryable");
+  const fallback = overloaded
+    ? DEFAULT_DURABLE_OBJECT_OVERLOAD_RETRY_AFTER_MS
+    : DEFAULT_DURABLE_OBJECT_RETRY_AFTER_MS;
+  return {
+    overloaded,
+    retryable,
+    retry_after_ms: boundedInteger(retryAfterHint(error), fallback, MAX_DURABLE_OBJECT_RETRY_AFTER_MS),
+  };
+}
+
+export function boundedExponentialBackoffMs(
+  priorAttemptCount: number,
+  baseDelayMs: number,
+  maximumDelayMs: number,
+): number {
+  const attempt = Number.isSafeInteger(priorAttemptCount) && priorAttemptCount > 0 ? priorAttemptCount : 0;
+  const base = boundedInteger(baseDelayMs, 1, Number.MAX_SAFE_INTEGER);
+  const maximum = Math.max(base, boundedInteger(maximumDelayMs, base, Number.MAX_SAFE_INTEGER));
+  return Math.min(maximum, base * 2 ** Math.min(attempt, 30));
+}
+
+export function reliabilitySloEvent(input: {
+  readonly component: ReliabilityComponent;
+  readonly operation: ReliabilityOperation;
+  readonly outcome: ReliabilityOutcome;
+  readonly classification?: DurableObjectFailureClassification;
+  readonly attempt_count?: number;
+  readonly retry_after_ms?: number;
+  readonly observed_at_ms?: number;
+}): ReliabilitySloEvent {
+  const classification = input.classification ?? { overloaded: false, retryable: false, retry_after_ms: 0 };
+  const attemptCount = Number.isSafeInteger(input.attempt_count) && (input.attempt_count ?? 0) > 0
+    ? input.attempt_count as number
+    : 0;
+  const retryAfterMs = input.retry_after_ms === 0
+    ? 0
+    : boundedInteger(input.retry_after_ms ?? classification.retry_after_ms, 0, MAX_DURABLE_OBJECT_RETRY_AFTER_MS);
+  const observedAtMs = typeof input.observed_at_ms === "number"
+    && Number.isFinite(input.observed_at_ms)
+    && Math.abs(input.observed_at_ms) <= 8_640_000_000_000_000
+    ? input.observed_at_ms
+    : Date.now();
+  return {
+    schema_version: RELIABILITY_EVENT_SCHEMA_VERSION,
+    event: "reliability.slo",
+    component: input.component,
+    operation: input.operation,
+    outcome: input.outcome,
+    overloaded: classification.overloaded,
+    retryable: classification.retryable,
+    attempt_count: attemptCount,
+    retry_after_ms: retryAfterMs,
+    observed_at: new Date(observedAtMs).toISOString(),
+  };
 }
 
 export class TransactionContractViolation extends Error {
@@ -192,6 +313,7 @@ export function transactionError(
   code: TransactionErrorCode,
   message: string,
   details?: Readonly<Record<string, JsonValue>>,
+  transport?: DurableObjectFailureClassification,
 ): TransactionProtocolError {
   return {
     schema_version: TRANSACTION_ERROR_SCHEMA_VERSION,
@@ -199,8 +321,18 @@ export function transactionError(
     message,
     http_status: ERROR_HTTP_STATUS[code],
     retryable: RETRYABLE_ERRORS.has(code),
+    ...(transport?.overloaded ? { overloaded: true as const } : {}),
+    ...(transport === undefined ? {} : { retry_after_ms: transport.retry_after_ms }),
     ...(details === undefined ? {} : { details }),
   };
+}
+
+export function durableObjectUnavailableError(
+  error: unknown,
+  code: "TX_DECISION_UNAVAILABLE" | "TX_MANIFEST_UNAVAILABLE" | "MANIFEST_TEMPORARILY_UNAVAILABLE" | "LEGACY_CERTIFICATION_UNAVAILABLE",
+  message: string,
+): TransactionProtocolError {
+  return transactionError(code, message, undefined, classifyDurableObjectFailure(error));
 }
 
 function fail(

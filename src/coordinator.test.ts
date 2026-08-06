@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   COORDINATOR_RETENTION_DAYS,
   createManifestRegistration,
@@ -573,6 +573,36 @@ describe("CoordinatorDO /begin (2PC orchestration)", () => {
     const status = await coordinator.fetch(post("/tx-status", { txId }));
     expect(status.status).toBe(503);
     expect(await status.json()).toMatchObject({ error: { code: "TX_VERSION_UNSUPPORTED" } });
+  });
+
+  it("fails closed on a future durable state-model version without mutating the row", async () => {
+    const txId = `tx-future-state-model-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await coordinator.fetch(post("/tx-status", { txId: "schema-warmup" }));
+    let before = "";
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash,
+           created_at, updated_at, protocol_version, state_model_version, epoch,
+           decision, fleet_id, coordinator_id)
+         VALUES (?, 'committed', '[]', '[]', 'future-model-hash', ?, ?,
+                 1, 3, 1, 'commit', 'future-fleet', 'future-coordinator')`,
+        txId,
+        now,
+        now,
+      );
+      before = JSON.stringify(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId).one());
+    });
+
+    const status = await coordinator.fetch(post("/tx-status", { txId }));
+    expect(status.status).toBe(503);
+    expect(await status.json()).toMatchObject({ error: { code: "TX_VERSION_UNSUPPORTED" } });
+    await runInDurableObject(coordinator, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      expect(JSON.stringify(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId).one())).toBe(before);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+    });
   });
 
   it("returns a typed error for a model-2 commit_decided row that cannot enter the V1 bridge", async () => {
@@ -1717,6 +1747,157 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         "SELECT state_model_version FROM transactions WHERE tx_id = ?",
         txId,
       ).one().state_model_version).toBe(2);
+    });
+  });
+
+  it("turns a thrown route-assignment overload into a sanitized controlled response before durable prepare", async () => {
+    const txId = `tx-overload-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      let assignmentCalls = 0;
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async assignManifestRoute() {
+          assignmentCalls += 1;
+          throw Object.assign(new Error("token=secret tx=private"), {
+            overloaded: true,
+            retryable: true,
+            retryAfterMs: 42_000,
+          });
+        },
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+
+      const response = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(response.status).toBe(503);
+      const body = await response.json() as { error: Record<string, unknown> };
+      expect(body.error).toMatchObject({
+        code: "TX_MANIFEST_UNAVAILABLE",
+        retryable: true,
+        overloaded: true,
+        retry_after_ms: 42_000,
+      });
+      expect(JSON.stringify(body)).not.toContain("secret");
+      expect(JSON.stringify(body)).not.toContain("private");
+      expect(assignmentCalls).toBe(1);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(0);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+    });
+    const stats = await (await freshShard(shardName)).fetch(shardPost("/stats", {}));
+    expect(await stats.json()).toMatchObject({ pendingIntentCount: 0 });
+  });
+
+  it("counts a returned assignment overload toward the circuit without preparing a participant", async () => {
+    const txId = `tx-returned-overload-${crypto.randomUUID()}`;
+    const shardName = `shard-${txId}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async assignManifestRoute() {
+          return {
+            ok: false as const,
+            status: "unavailable" as const,
+            http_status: 503,
+            error: {
+              schema_version: 1 as const,
+              code: "TX_MANIFEST_UNAVAILABLE" as const,
+              message: "sanitized overload",
+              http_status: 503,
+              retryable: true,
+              overloaded: true as const,
+              retry_after_ms: 43_000,
+            },
+          };
+        },
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      const response = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ error: { overloaded: true, retry_after_ms: 43_000 } });
+      expect(state.storage.sql.exec<{ failure_count: number }>(
+        "SELECT failure_count FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one().failure_count).toBe(1);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(0);
+    });
+    const stats = await (await freshShard(shardName)).fetch(shardPost("/stats", {}));
+    expect(await stats.json()).toMatchObject({ pendingIntentCount: 0 });
+  });
+
+  it("classifies a thrown admission overload, records the circuit failure, and emits a bounded SLO event", async () => {
+    const txId = `tx-admission-overload-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      await instance.fetch(post("/stats", {}));
+      const providerError = Object.assign(new Error("token=secret tx=private"), {
+        overloaded: true,
+        retryable: true,
+        retryAfterMs: 44_000,
+      });
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async checkManifestAdmission() { throw providerError; },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      const lines: string[] = [];
+      const info = vi.spyOn(console, "log").mockImplementation((value) => lines.push(String(value)));
+      let result;
+      try {
+        result = await (instance as unknown as {
+          checkManifestAdmission(request: { fleet_id: string; tx_id: string; commit_decided_at: string }): Promise<{
+            ok: boolean;
+            error?: { overloaded?: true; retry_after_ms?: number };
+          }>;
+        }).checkManifestAdmission({ fleet_id: "fleet-test", tx_id: txId, commit_decided_at: new Date().toISOString() });
+      } finally {
+        info.mockRestore();
+      }
+      expect(result).toMatchObject({ ok: false, error: { overloaded: true, retry_after_ms: 44_000 } });
+      expect(state.storage.sql.exec<{ failure_count: number }>(
+        "SELECT failure_count FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one().failure_count).toBe(1);
+      expect(lines.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        event: "reliability.slo",
+        component: "coordinator",
+        operation: "manifest_admission",
+        outcome: "controlled_failure",
+        overloaded: true,
+        retryable: false,
+      }));
+      expect(lines.join("\n")).not.toContain("secret");
+      expect(lines.join("\n")).not.toContain("private");
     });
   });
 
