@@ -8,6 +8,7 @@ import {
   MANIFEST_PAGE_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+  canonicalJson,
   hashCanonicalJson,
   createManifestRegistration,
   hashParticipantOperations,
@@ -646,16 +647,11 @@ describe("Manifest V2 reservation and terminal transitions", () => {
         Date.now(),
       );
       state.storage.sql.exec(
-        "INSERT INTO manifest_seal_digest_entries (generation, commit_decided_at_ms, decision_sequence, tx_id, entry_hash) VALUES (1, 0, 0, 'old', ?)",
-        "c".repeat(64),
-      );
-      state.storage.sql.exec(
         "INSERT OR REPLACE INTO manifest_alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('retention', 0, 0, '')",
       );
       await instance.alarm?.();
       expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE generation = 1").one().count).toBe(0);
       expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM manifest_seal_generations WHERE generation = 2").one().count).toBe(1);
-      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM manifest_seal_digest_entries WHERE generation = 1").one().count).toBe(0);
     });
     await expect(bucket.stats()).resolves.toMatchObject({ v2_reservations: 0 });
   });
@@ -817,6 +813,11 @@ describe("Manifest V2 reservation and terminal transitions", () => {
         records_root: expect.stringMatching(/^[a-f0-9]{64}$/),
         receipt_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
       },
+    });
+    await runInDurableObject(bucket, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'manifest_seal_digest_entries'",
+      ).one().count).toBe(0);
     });
 
     let secondTx = "";
@@ -1091,6 +1092,38 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 1,
       cursor: forgedCursor,
+    })).resolves.toMatchObject({
+      ok: false,
+      status: "rejected",
+      error: { code: "MANIFEST_CURSOR_MISMATCH" },
+    });
+
+    await runInDurableObject(fleetCatalog, async (_instance, state) => {
+      const expiredEvidence = [{
+        reservation_day: route.reservation.reservation_utc_day,
+        partition: route.reservation.partition,
+        retention_epoch: 0,
+        seal_receipt_hash: "0".repeat(64),
+        lease_expires_at_ms: 0,
+      }];
+      state.storage.sql.exec(
+        "UPDATE catalog_enumeration_cursors SET evidence_json = ?, expires_at_ms = ? WHERE cursor_json = ?",
+        canonicalJson(expiredEvidence),
+        Date.now() + 60_000,
+        canonicalJson(paged.next_cursor),
+      );
+    });
+    await expect(route.worker.enumerateManifest({
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      fleet_id: route.reservation.fleet_id,
+      coverage_start: coverageStart,
+      cutoff: finalized.record.commit_decided_at,
+      partition_config_hash: route.reservation.partition_config_hash,
+      catalog_generation: completed.snapshot_generation,
+      catalog_snapshot_hash: completed.snapshot_hash,
+      limit: 1,
+      cursor: paged.next_cursor,
     })).resolves.toMatchObject({
       ok: false,
       status: "rejected",

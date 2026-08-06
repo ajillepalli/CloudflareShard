@@ -17,6 +17,7 @@ All notable changes to this project are documented in this file.
 - Future-skewed V1 decisions now retry instead of quarantining, identical reserve replays preserve quarantine evidence, and multi-batch cursor cleanup re-arms itself.
 - Building snapshots now fence activation-history GC, multi-batch record retention self-rearms, invalid bridge states return typed errors, and enumeration validates the cutoff day's config rather than the fleet config root.
 - Legacy certificates now bind the maximum V1 decision time and block overlapping coverage claims, first activation inherits the fleet boundary floor, and close work yields after one legacy grid day to remain within Worker subrequest budgets.
+- Seal generations retain only their bounded rolling digest instead of per-record write-only rows, and expired enumeration leases now return a restartable cursor mismatch rather than claiming retained history was deleted.
 
 This work is locally verified only. Production deployment, restore execution, and live performance/SLO qualification remain separate gates.
 

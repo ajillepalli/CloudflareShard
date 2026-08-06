@@ -391,16 +391,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         )
       `);
       this.ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS manifest_seal_digest_entries (
-          generation INTEGER NOT NULL,
-          commit_decided_at_ms INTEGER NOT NULL,
-          decision_sequence INTEGER NOT NULL,
-          tx_id TEXT NOT NULL,
-          entry_hash TEXT NOT NULL,
-          PRIMARY KEY (generation, commit_decided_at_ms, decision_sequence, tx_id)
-        )
-      `);
-      this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS manifest_alarm_schedule (
           purpose TEXT PRIMARY KEY,
           fire_at_ms INTEGER NOT NULL,
@@ -1438,10 +1428,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
                 Date.now(),
                 replay.generation,
               );
-              this.ctx.storage.sql.exec(
-                "DELETE FROM manifest_seal_digest_entries WHERE generation = ?",
-                replay.generation,
-              );
               return { kind: "resume", generation: replay.generation };
             }
             return {
@@ -1698,7 +1684,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
           Date.now(),
           generation,
         );
-        this.ctx.storage.sql.exec("DELETE FROM manifest_seal_digest_entries WHERE generation = ?", generation);
       });
       await this.scheduleAlarmPurpose(`seal:${generation}`, Date.now() + 1_000, generation);
       return { ok: true, status: "pending", generation, cutoff_ms: generationRow.cutoff_ms };
@@ -1737,14 +1722,12 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
       await this.scheduleAlarmPurpose(`seal:${generation}`, Date.now() + 1_000, generation);
       return { ok: true, status: "pending", generation, cutoff_ms: generationRow.cutoff_ms };
     }
-    const entryHashes: string[] = [];
     let rollingRoot = generationRow.digest_root;
     for (const row of rows) {
       const entryHash = await hashCanonicalJson([
         row.record_hash,
         row.resolution_attestation_hash ?? ZERO_HASH,
       ]);
-      entryHashes.push(entryHash);
       rollingRoot = await hashCanonicalJson([rollingRoot, entryHash]);
     }
     const progressed = this.ctx.storage.transactionSync(() => {
@@ -1761,18 +1744,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         || current.cursor_decision_sequence !== generationRow.cursor_decision_sequence
         || current.cursor_tx_id !== generationRow.cursor_tx_id
       ) return false;
-      rows.forEach((row, index) => {
-        this.ctx.storage.sql.exec(
-          `INSERT OR IGNORE INTO manifest_seal_digest_entries
-            (generation, commit_decided_at_ms, decision_sequence, tx_id, entry_hash)
-           VALUES (?, ?, ?, ?, ?)`,
-          generation,
-          row.commit_decided_at_ms,
-          row.decision_sequence,
-          row.tx_id,
-          entryHashes[index],
-        );
-      });
       const last = rows.at(-1);
       this.ctx.storage.sql.exec(
         `UPDATE manifest_seal_generations
@@ -2620,7 +2591,6 @@ export class JournalManifestDO extends DurableObject<JournalManifestEnv> {
         )
         .toArray();
       for (const { generation } of generations) {
-        this.ctx.storage.sql.exec("DELETE FROM manifest_seal_digest_entries WHERE generation = ?", generation);
         this.ctx.storage.sql.exec("DELETE FROM manifest_seal_generations WHERE generation = ?", generation);
       }
       count += generations.length;

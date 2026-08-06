@@ -565,17 +565,9 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       }
       for (const pin of priorEvidencePins) {
         if (!Number.isSafeInteger(pin.lease_expires_at_ms) || pin.lease_expires_at_ms <= Date.now()) {
-          return {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-            request_hash: requestHash,
-            coverage: "retention_expired",
-            complete: false,
-            records: [],
-            evidence: [],
-            next_cursor: null,
-            diagnostics: { inspected_buckets: 0, incomplete_buckets: 1, returned_records: 0 },
-          };
+          throw new TransactionContractViolation(
+            transactionError("MANIFEST_CURSOR_MISMATCH", "Enumeration cursor lease expired; restart from a null cursor."),
+          );
         }
       }
       const coverageState = await catalog.coverageState(request.fleet_id);
