@@ -43,14 +43,14 @@ dev output.
 ## Before you open a PR
 
 ```bash
-npm run typecheck   # tsc --noEmit
-npm test            # vitest run -- backend suite, real workerd via @cloudflare/vitest-pool-workers
-npm run test:spa    # vitest run --config vitest.spa.config.ts -- Shardscope SPA suite (jsdom)
+npm run verify      # generated types, deploy dry-runs, all typechecks/tests, client build, benchmark contract
 ```
 
 There's no CI configured yet, so these are on you to run locally before
-opening a PR. Nothing enforces them automatically. Shardscope's own worker
-code has a separate tsconfig and needs its own typecheck:
+opening a PR. Nothing enforces them automatically. For a quicker local loop,
+`npm run typecheck`, `npm test`, and `npm run test:spa` remain available as
+focused root/SPA checks. Shardscope's own worker code has a separate tsconfig
+and needs its own typecheck when changed:
 
 ```bash
 cd examples/shardscope && npm run typecheck
@@ -64,6 +64,8 @@ their own `package.json` and `wrangler.toml`:
 | Path                        | What it is                                              |
 | ---------------------------- | -------------------------------------------------------- |
 | `src/`                       | Gateway Worker (`index.ts`), `CatalogDO`, `ShardDO`, `CoordinatorDO` |
+| `workers/control-plane/`     | Route-less manifest Worker, `JournalManifestDO`, and `FleetManifestCatalogDO` |
+| `packages/contracts/`        | Shared versioned transaction, manifest, overload, and reliability-event contracts |
 | `client/`                    | Typed TypeScript SDK + CLI for the HTTP API               |
 | `examples/rpc-consumer/`     | Demo Worker calling the tenant path over a service binding (no HTTP) |
 | `examples/tpc-c-benchmark/`  | TPC-C-derived OLTP benchmark and demo project              |
