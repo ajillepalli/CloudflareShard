@@ -490,6 +490,37 @@ describe("FleetManifestCatalogStore", () => {
     });
   });
 
+  it("protects no-argument history refresh from a competing schedule and still schedules its normal successor", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-history-refresh-cas-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      (catalog as unknown as { purgeHistory: () => { deleted: number; next_deadline_ms: number } }).purgeHistory = () => ({
+        deleted: 0,
+        next_deadline_ms: 60_000,
+      });
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 0, generation: 0, payload_hash: "a".repeat(64) });
+      const refresh = (instance as unknown as { refreshHistoryGc(): Promise<boolean> }).refreshHistoryGc();
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 123_456, generation: 1, payload_hash: "b".repeat(64) });
+      await expect(refresh).resolves.toBe(false);
+      expect(catalog.scheduledPurpose("history_gc")).toMatchObject({
+        fire_at_ms: 123_456,
+        generation: 1,
+        payload_hash: "b".repeat(64),
+      });
+
+      catalog.completePurpose("history_gc", 1);
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 0, generation: 0, payload_hash: "c".repeat(64) });
+      await expect((instance as unknown as { refreshHistoryGc(): Promise<boolean> }).refreshHistoryGc()).resolves.toBe(true);
+      expect(catalog.scheduledPurpose("history_gc")).toMatchObject({
+        purpose: "history_gc",
+        fire_at_ms: 60_000,
+        generation: 0,
+        attempt_count: 0,
+      });
+    });
+  });
+
   it("schedules a failed purpose from the failure time rather than the batch start", async () => {
     const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-fresh-time-${crypto.randomUUID()}`);
     await runInDurableObject(stub, async (durableObject) => {
