@@ -389,6 +389,32 @@ describe("FleetManifestCatalogStore", () => {
     });
   });
 
+  it("keeps a durable retry when cursor GC fails before successful completion", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-cursor-retry-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({
+        purpose: "cursor_gc",
+        fire_at_ms: 0,
+        generation: 0,
+        payload_hash: "c".repeat(64),
+      });
+      (catalog as unknown as { purgeEnumerationCursors: () => never }).purgeEnumerationCursors = () => {
+        throw new Error("cursor GC failed");
+      };
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+      }
+      expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS)).toEqual([
+        expect.objectContaining({ purpose: "cursor_gc", generation: 0, attempt_count: 1 }),
+      ]);
+    });
+  });
+
   it("schedules a failed purpose from the failure time rather than the batch start", async () => {
     const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-fresh-time-${crypto.randomUUID()}`);
     await runInDurableObject(stub, async (durableObject) => {

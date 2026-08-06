@@ -1758,6 +1758,31 @@ export class FleetManifestCatalogStore {
   completePurpose(purpose: string, generation: number): void {
     this.storage.sql.exec("DELETE FROM alarm_schedule WHERE purpose = ? AND generation = ?", purpose, generation);
   }
+
+  completePurposeIfCurrent(purpose: CatalogAlarmPurpose): boolean {
+    return this.storage.transactionSync(() => {
+      const current = this.storage.sql.exec<AlarmRow>(
+        "SELECT purpose, fire_at_ms, generation, payload_hash, attempt_count FROM alarm_schedule WHERE purpose = ?",
+        purpose.purpose,
+      ).toArray()[0];
+      if (
+        current === undefined
+        || current.fire_at_ms !== purpose.fire_at_ms
+        || current.generation !== purpose.generation
+        || current.payload_hash !== purpose.payload_hash
+        || current.attempt_count !== (purpose.attempt_count ?? 0)
+      ) return false;
+      this.storage.sql.exec(
+        "DELETE FROM alarm_schedule WHERE purpose = ? AND fire_at_ms = ? AND generation = ? AND payload_hash = ? AND attempt_count = ?",
+        purpose.purpose,
+        purpose.fire_at_ms,
+        purpose.generation,
+        purpose.payload_hash,
+        purpose.attempt_count ?? 0,
+      );
+      return true;
+    });
+  }
 }
 
 export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEnv> {
@@ -1779,15 +1804,20 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     }
   }
 
-  private async refreshHistoryGc(): Promise<void> {
+  private async refreshHistoryGc(expectedPurpose?: CatalogAlarmPurpose): Promise<void> {
     const history = this.catalog.purgeHistory(Date.now());
-    this.catalog.completePurpose("history_gc", 0);
-    if (history.next_deadline_ms !== null) {
+    const successor = history.next_deadline_ms === null ? null : {
+      purpose: "history_gc" as const,
+      fire_at_ms: history.next_deadline_ms,
+      generation: 0,
+      payload_hash: await hashCanonicalJson(["history_gc", history.next_deadline_ms]),
+    };
+    const completed = expectedPurpose === undefined
+      ? (this.catalog.completePurpose("history_gc", 0), true)
+      : this.catalog.completePurposeIfCurrent(expectedPurpose);
+    if (completed && successor !== null) {
       this.catalog.schedulePurpose({
-        purpose: "history_gc",
-        fire_at_ms: history.next_deadline_ms,
-        generation: 0,
-        payload_hash: await hashCanonicalJson(["history_gc", history.next_deadline_ms]),
+        ...successor,
       });
     }
     await this.armNextAlarm();
@@ -1951,34 +1981,38 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
       try {
         if (purpose.purpose === "snapshot_resume") {
           const result = await this.catalog.resumeSnapshot(purpose.generation);
-          this.catalog.completePurpose(purpose.purpose, purpose.generation);
-          if (result.status === "pending") {
+          const completed = this.catalog.completePurposeIfCurrent(purpose);
+          if (completed && result.status === "pending") {
             this.catalog.schedulePurpose({ ...purpose, fire_at_ms: Date.now(), attempt_count: 0 });
           }
         } else if (purpose.purpose === "cursor_gc") {
-          this.catalog.completePurpose(purpose.purpose, purpose.generation);
           const nextExpiry = this.catalog.purgeEnumerationCursors(Date.now());
-          if (nextExpiry !== null) {
+          const successor = nextExpiry === null ? null : {
+            purpose: "cursor_gc" as const,
+            fire_at_ms: Math.max(Date.now(), nextExpiry),
+            generation: 0,
+            payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
+          };
+          if (this.catalog.completePurposeIfCurrent(purpose) && successor !== null) {
             this.catalog.schedulePurpose({
-              purpose: "cursor_gc",
-              fire_at_ms: Math.max(Date.now(), nextExpiry),
-              generation: 0,
-              payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
+              ...successor,
             });
           }
         } else if (purpose.purpose === "route_gc") {
-          this.catalog.completePurpose(purpose.purpose, purpose.generation);
           const nextRelease = this.catalog.purgeReleasedRoutes(Date.now());
-          if (nextRelease !== null) {
+          const successor = nextRelease === null ? null : {
+            purpose: "route_gc" as const,
+            fire_at_ms: Math.max(Date.now(), nextRelease),
+            generation: 0,
+            payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
+          };
+          if (this.catalog.completePurposeIfCurrent(purpose) && successor !== null) {
             this.catalog.schedulePurpose({
-              purpose: "route_gc",
-              fire_at_ms: Math.max(Date.now(), nextRelease),
-              generation: 0,
-              payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
+              ...successor,
             });
           }
         } else if (purpose.purpose === "history_gc") {
-          await this.refreshHistoryGc();
+          await this.refreshHistoryGc(purpose);
         } else {
           // An older binary must retain work introduced by a newer one. The
           // ordinary failure path defers it without leaking the unbounded name.
