@@ -251,11 +251,11 @@ aggregation are tracked as open roadmap items. See
 Every request logs a structured `http.request` event
 (`{path, method, status, durationMs}`) from the Worker's single `fetch()`
 entrypoint, regardless of which route or outcome, plus whatever
-event-specific `log()` calls the handler itself makes along the way. Manifest
+  event-specific `log()` calls the handler itself makes along the way. Manifest
   admission, route assignment, and catalog alarm recovery use a fixed
-  `reliability.slo` event with `component`, `operation`, `outcome`, `overloaded`,
-  bounded `purpose`, `retryable`, `attempt_count`, `retry_after_ms`, and
-  `observed_at`. The schema
+  `reliability.slo` event with `schema_version`, `event`, `component`,
+  `operation`, `outcome`, `overloaded`, bounded `purpose`, `retryable`,
+  `attempt_count`, `retry_after_ms`, and `observed_at`. The schema
 does not accept transaction, tenant, or provider-error text, so operators get
 bounded recovery signals without copying secrets or high-cardinality identifiers
 into logs. Query them:

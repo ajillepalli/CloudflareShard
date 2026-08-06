@@ -343,10 +343,15 @@ JournalManifestDO state (owned by the separately deployed route-less Worker):
 FleetManifestCatalogDO alarm state:
 - `alarm_schedule`: one logical row per purpose, carrying its fire time,
   generation, payload hash, and durable `attempt_count`. The physical Durable
-  Object alarm is always the earliest logical due time.
+  Object alarm is always the earliest logical due time. This table is
+  expand-first rather than row-versioned: activation adds `attempt_count NOT
+  NULL DEFAULT 0`, so predecessor rows migrate without a rewrite. An older
+  binary retains and bounded-retries an unknown future purpose as `unknown`
+  instead of deleting the durable row.
 - Alarm dispatch isolates each due purpose. A failed purpose keeps the same
   generation and payload, increments its attempt, and is rescheduled with
-  capped exponential backoff that honors an overload cooldown. Later due
+  exponential backoff capped at 300,000 ms (five minutes) that honors an
+  overload cooldown. Later due
   purposes still run, so one failing snapshot or retention task cannot erase
   or block unrelated work. There is deliberately no attempt ceiling: durable
   maintenance work is never discarded after an arbitrary retry count. Operators
@@ -765,6 +770,10 @@ returns. Route-assignment failure uses the same `TX_MANIFEST_UNAVAILABLE` 503
 contract and occurs before transaction persistence and before any participant
 prepare call. A circuit-open response includes the remaining bounded
 `retry_after_ms` even when it is not itself a provider overload.
+
+Every client-visible `retry_after_ms` is a positive integer capped at 300,000
+ms. Clients may validate against that bound and must not retry before the
+returned cooldown expires.
 
 Drives `CoordinatorDO`'s two-phase commit across every shard touched by the
 mutation set. Each mutation is individually routed and validated (so a
@@ -1189,7 +1198,15 @@ fields:
 - `schema_version`, `event`, `component`, `operation`, `outcome`, `purpose`
 - `overloaded`, `retryable`, `attempt_count`, `retry_after_ms`, `observed_at`
 
-Components and operations are closed vocabularies. Transaction IDs, tenant IDs,
+The bounded vocabularies are:
+
+- `component`: `coordinator`, `control_plane`, `fleet_manifest_catalog`, `journal_manifest`
+- `operation`: `manifest_admission`, `manifest_route_assignment`, `recovery_alarm`, `catalog_alarm`
+- `outcome`: `controlled_failure`, `retry_scheduled`, `recovered`
+- `purpose`: `not_applicable`, `snapshot_resume`, `cursor_gc`, `route_gc`,
+  `history_gc`, `unknown`
+
+Transaction IDs, tenant IDs,
 exception messages, provider response bodies, and other dynamic identifiers are
 not accepted by the event constructor. Events are emitted on controlled failure
 and recovery transitions rather than every successful request.
