@@ -325,6 +325,7 @@ describe("FleetManifestCatalogStore", () => {
         component: "fleet_manifest_catalog",
         operation: "catalog_alarm",
         outcome: "retry_scheduled",
+        purpose: "snapshot_resume",
         overloaded: true,
         retryable: false,
         attempt_count: 1,
@@ -332,6 +333,36 @@ describe("FleetManifestCatalogStore", () => {
       expect(warnings[0]).not.toContain("secret");
       expect(warnings[0]).not.toContain("private");
       expect(CATALOG_ALARM_BASE_RETRY_MS).toBeLessThan(42_000);
+    });
+  });
+
+  it("schedules a failed purpose from the failure time rather than the batch start", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-fresh-time-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({
+        purpose: "snapshot_resume",
+        fire_at_ms: 0,
+        generation: 11,
+        payload_hash: "e".repeat(64),
+      });
+      (catalog as unknown as { resumeSnapshot: () => Promise<never> }).resumeSnapshot = async () => {
+        throw new Error("temporary failure");
+      };
+      const clock = vi.spyOn(Date, "now").mockReturnValue(50_000).mockReturnValueOnce(10_000);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+        clock.mockRestore();
+      }
+      expect(catalog.duePurposes(52_000)).toContainEqual(expect.objectContaining({
+        purpose: "snapshot_resume",
+        fire_at_ms: 52_000,
+        attempt_count: 1,
+      }));
     });
   });
 
@@ -400,6 +431,7 @@ describe("FleetManifestCatalogStore", () => {
         component: "fleet_manifest_catalog",
         operation: "catalog_alarm",
         outcome: "recovered",
+        purpose: "snapshot_resume",
         attempt_count: 101,
         retry_after_ms: 0,
       }));

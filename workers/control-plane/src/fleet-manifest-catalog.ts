@@ -1971,6 +1971,7 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
             component: "fleet_manifest_catalog",
             operation: "catalog_alarm",
             outcome: "recovered",
+            purpose: purpose.purpose,
             attempt_count: purpose.attempt_count,
             retry_after_ms: 0,
           })));
@@ -1988,13 +1989,14 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
         );
         this.catalog.schedulePurpose({
           ...purpose,
-          fire_at_ms: now + retryAfterMs,
+          fire_at_ms: Date.now() + retryAfterMs,
           attempt_count: attemptCount,
         });
         console.warn(JSON.stringify(reliabilitySloEvent({
           component: "fleet_manifest_catalog",
           operation: "catalog_alarm",
           outcome: "retry_scheduled",
+          purpose: purpose.purpose,
           classification,
           attempt_count: attemptCount,
           retry_after_ms: retryAfterMs,

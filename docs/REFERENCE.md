@@ -252,9 +252,10 @@ Every request logs a structured `http.request` event
 (`{path, method, status, durationMs}`) from the Worker's single `fetch()`
 entrypoint, regardless of which route or outcome, plus whatever
 event-specific `log()` calls the handler itself makes along the way. Manifest
-admission, route assignment, and catalog alarm recovery use a fixed
-`reliability.slo` event with `component`, `operation`, `outcome`, `overloaded`,
-`retryable`, `attempt_count`, `retry_after_ms`, and `observed_at`. The schema
+  admission, route assignment, and catalog alarm recovery use a fixed
+  `reliability.slo` event with `component`, `operation`, `outcome`, `overloaded`,
+  bounded `purpose`, `retryable`, `attempt_count`, `retry_after_ms`, and
+  `observed_at`. The schema
 does not accept transaction, tenant, or provider-error text, so operators get
 bounded recovery signals without copying secrets or high-cardinality identifiers
 into logs. Query them:
@@ -274,7 +275,9 @@ For an overloaded manifest dependency, `retry_after_ms` is the bounded cooldown
 returned to the caller and counted by the coordinator's admission circuit. For
 catalog alarm work, `attempt_count` increases durably for only the failed logical
 purpose; a later `outcome:"recovered"` event confirms that purpose converged while
-unrelated due purposes continued running.
+unrelated due purposes continued running. Retries do not expire at an arbitrary
+attempt count, so alert on repeated `retry_scheduled` events or a rising
+`attempt_count` for the same bounded `purpose` until `recovered` appears.
 
 Or use the Cloudflare dashboard's **Workers Logs** view (Workers & Pages →
 `cloudflare-shard-mvp` → Logs) for durable, searchable/filterable history.

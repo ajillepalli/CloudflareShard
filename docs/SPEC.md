@@ -348,7 +348,10 @@ FleetManifestCatalogDO alarm state:
   generation and payload, increments its attempt, and is rescheduled with
   capped exponential backoff that honors an overload cooldown. Later due
   purposes still run, so one failing snapshot or retention task cannot erase
-  or block unrelated work.
+  or block unrelated work. There is deliberately no attempt ceiling: durable
+  maintenance work is never discarded after an arbitrary retry count. Operators
+  alert on a purpose's bounded `reliability.slo` label and rising
+  `attempt_count`; a later `recovered` event closes the incident.
 
 ## 7) Public HTTP API (Gateway Worker)
 
@@ -758,8 +761,10 @@ Response (503, manifest dependency unavailable before prepare):
 The optional overload fields are controlled transport metadata. Provider
 exception text never crosses the response boundary, `retry_after_ms` is capped,
 and an overload counts toward the durable admission circuit before the request
-returns. Route-assignment failure occurs before transaction persistence and
-before any participant prepare call.
+returns. Route-assignment failure uses the same `TX_MANIFEST_UNAVAILABLE` 503
+contract and occurs before transaction persistence and before any participant
+prepare call. A circuit-open response includes the remaining bounded
+`retry_after_ms` even when it is not itself a provider overload.
 
 Drives `CoordinatorDO`'s two-phase commit across every shard touched by the
 mutation set. Each mutation is individually routed and validated (so a
@@ -1181,7 +1186,7 @@ Every Gateway request emits the existing fixed `http.request` event. Reliability
 boundaries additionally emit `reliability.slo` with exactly these low-cardinality
 fields:
 
-- `schema_version`, `event`, `component`, `operation`, `outcome`
+- `schema_version`, `event`, `component`, `operation`, `outcome`, `purpose`
 - `overloaded`, `retryable`, `attempt_count`, `retry_after_ms`, `observed_at`
 
 Components and operations are closed vocabularies. Transaction IDs, tenant IDs,

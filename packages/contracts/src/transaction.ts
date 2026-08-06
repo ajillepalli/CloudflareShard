@@ -198,6 +198,7 @@ export interface DurableObjectFailureClassification {
 export type ReliabilityComponent = "coordinator" | "control_plane" | "fleet_manifest_catalog" | "journal_manifest";
 export type ReliabilityOperation = "manifest_admission" | "manifest_route_assignment" | "recovery_alarm" | "catalog_alarm";
 export type ReliabilityOutcome = "controlled_failure" | "retry_scheduled" | "recovered";
+export type ReliabilityPurpose = "not_applicable" | "snapshot_resume" | "cursor_gc" | "route_gc" | "history_gc" | "unknown";
 
 export interface ReliabilitySloEvent {
   readonly schema_version: typeof RELIABILITY_EVENT_SCHEMA_VERSION;
@@ -205,6 +206,7 @@ export interface ReliabilitySloEvent {
   readonly component: ReliabilityComponent;
   readonly operation: ReliabilityOperation;
   readonly outcome: ReliabilityOutcome;
+  readonly purpose: ReliabilityPurpose;
   readonly overloaded: boolean;
   readonly retryable: boolean;
   readonly attempt_count: number;
@@ -272,6 +274,7 @@ export function reliabilitySloEvent(input: {
   readonly attempt_count?: number;
   readonly retry_after_ms?: number;
   readonly observed_at_ms?: number;
+  readonly purpose?: unknown;
 }): ReliabilitySloEvent {
   const classification = input.classification ?? { overloaded: false, retryable: false, retry_after_ms: 0 };
   const attemptCount = Number.isSafeInteger(input.attempt_count) && (input.attempt_count ?? 0) > 0
@@ -291,6 +294,13 @@ export function reliabilitySloEvent(input: {
     component: input.component,
     operation: input.operation,
     outcome: input.outcome,
+    purpose: input.purpose === undefined
+      ? "not_applicable"
+      : (["not_applicable", "snapshot_resume", "cursor_gc", "route_gc", "history_gc", "unknown"] as const).includes(
+          input.purpose as ReliabilityPurpose,
+        )
+        ? input.purpose as ReliabilityPurpose
+        : "unknown",
     overloaded: classification.overloaded,
     retryable: classification.retryable,
     attempt_count: attemptCount,

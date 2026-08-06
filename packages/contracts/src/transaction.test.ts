@@ -33,6 +33,7 @@ import {
   createManifestRegistration,
   createManifestReservation,
   decisionForState,
+  durableObjectUnavailableError,
   hashCanonicalJson,
   hashManifestFinalizeIntent,
   hashManifestRecordV2,
@@ -360,6 +361,19 @@ describe("protocol compatibility and errors", () => {
       retryable: false,
       retry_after_ms: 5_000,
     });
+    expect(durableObjectUnavailableError(
+      overloaded,
+      "TX_MANIFEST_UNAVAILABLE",
+      "Manifest service is unavailable.",
+    )).toEqual({
+      schema_version: 1,
+      code: "TX_MANIFEST_UNAVAILABLE",
+      message: "Manifest service is unavailable.",
+      http_status: 503,
+      retryable: true,
+      overloaded: true,
+      retry_after_ms: 42_001,
+    });
   });
 
   it("caps alarm backoff and emits only the fixed privacy-safe SLO schema", () => {
@@ -371,6 +385,7 @@ describe("protocol compatibility and errors", () => {
       component: "coordinator",
       operation: "manifest_route_assignment",
       outcome: "controlled_failure",
+      purpose: "not_applicable",
       classification: classifyDurableObjectFailure({ overloaded: true }),
       attempt_count: 2,
       observed_at_ms: 0,
@@ -381,6 +396,7 @@ describe("protocol compatibility and errors", () => {
       component: "coordinator",
       operation: "manifest_route_assignment",
       outcome: "controlled_failure",
+      purpose: "not_applicable",
       overloaded: true,
       retryable: false,
       attempt_count: 2,
@@ -388,8 +404,8 @@ describe("protocol compatibility and errors", () => {
       observed_at: "1970-01-01T00:00:00.000Z",
     });
     expect(Object.keys(event).sort()).toEqual([
-      "attempt_count", "component", "event", "observed_at", "operation", "outcome",
-      "overloaded", "retry_after_ms", "retryable", "schema_version",
+      "attempt_count", "component", "event", "observed_at", "operation", "outcome", "overloaded",
+      "purpose", "retry_after_ms", "retryable", "schema_version",
     ]);
     expect(JSON.stringify(event)).not.toContain("must-not-escape");
     expect(reliabilitySloEvent({
@@ -403,7 +419,14 @@ describe("protocol compatibility and errors", () => {
       retryable: false,
       attempt_count: 0,
       retry_after_ms: 0,
+      purpose: "not_applicable",
     });
+    expect(reliabilitySloEvent({
+      component: "fleet_manifest_catalog",
+      operation: "catalog_alarm",
+      outcome: "retry_scheduled",
+      purpose: "future-unbounded-purpose",
+    }).purpose).toBe("unknown");
   });
 });
 
@@ -634,16 +657,15 @@ describe("participant epoch tombstones", () => {
 });
 
 describe("manifest V2 state-model compatibility", () => {
-  it("reads state-model v1 and v2 while writing the expanded v2 transition graph", () => {
+  it("reads only the declared state-model compatibility window", () => {
     const matrix = [
-      { version: TRANSACTION_STATE_MODEL_VERSION - 1, readable: true, writable: false },
-      { version: TRANSACTION_STATE_MODEL_VERSION, readable: true, writable: true },
-      { version: TRANSACTION_STATE_MODEL_VERSION + 1, readable: false, writable: false },
+      { version: TRANSACTION_STATE_MODEL_VERSION - 1, readable: true },
+      { version: TRANSACTION_STATE_MODEL_VERSION, readable: true },
+      { version: TRANSACTION_STATE_MODEL_VERSION + 1, readable: false },
     ] as const;
     for (const row of matrix) {
       if (row.readable) expect(() => assertReadableTransactionStateModelVersion(row.version)).not.toThrow();
       else expect(errorCode(() => assertReadableTransactionStateModelVersion(row.version))).toBe("TX_VERSION_UNSUPPORTED");
-      expect(row.writable).toBe(row.version === TRANSACTION_STATE_MODEL_VERSION);
     }
     expect(errorCode(() => assertReadableTransactionStateModelVersion(0))).toBe("TX_VERSION_UNSUPPORTED");
     expect(isTransactionTransitionAllowed("new", "manifest_reserving")).toBe(true);

@@ -2,6 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import {
   COORDINATOR_RETENTION_DAYS,
+  MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
   createManifestRegistration,
   createManifestReservation,
   hashCanonicalJson,
@@ -1734,7 +1735,11 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect((await begin()).status).toBe(503);
       expect((await begin()).status).toBe(503);
       expect(assignmentCalls).toBe(3);
-      expect((await begin()).status).toBe(503);
+      const openResponse = await begin();
+      expect(openResponse.status).toBe(503);
+      const openBody = await openResponse.json() as { error: { retry_after_ms?: number } };
+      expect(openBody.error.retry_after_ms).toBeGreaterThan(0);
+      expect(openBody.error.retry_after_ms).toBeLessThanOrEqual(30_000);
       expect(assignmentCalls).toBe(3);
       expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(0);
       state.storage.sql.exec(
@@ -1754,18 +1759,27 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
     const txId = `tx-overload-${crypto.randomUUID()}`;
     const shardName = `shard-${txId}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await (await freshShard(shardName)).fetch(shardPost("/execute", {
+      sql: "CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)",
+      requestId: `req-schema-${txId}`,
+      isMutation: true,
+    }));
 
     await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
       let assignmentCalls = 0;
+      const v2 = defaultV2ManifestMethods();
       const service: TransactionManifestService = {
-        ...defaultV2ManifestMethods(),
-        async assignManifestRoute() {
+        ...v2,
+        async assignManifestRoute(request) {
           assignmentCalls += 1;
-          throw Object.assign(new Error("token=secret tx=private"), {
-            overloaded: true,
-            retryable: true,
-            retryAfterMs: 42_000,
-          });
+          if (assignmentCalls === 1) {
+            throw Object.assign(new Error("token=secret tx=private"), {
+              overloaded: true,
+              retryable: true,
+              retryAfterMs: 42_000,
+            });
+          }
+          return v2.assignManifestRoute(request);
         },
         async checkManifestAdmission() {
           return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
@@ -1796,6 +1810,13 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect(assignmentCalls).toBe(1);
       expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(0);
       expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue WHERE tx_id = ?", txId))).toHaveLength(0);
+      const retry = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect(retry.status).toBe(200);
+      expect(assignmentCalls).toBe(2);
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(1);
     });
     const stats = await (await freshShard(shardName)).fetch(shardPost("/stats", {}));
     expect(await stats.json()).toMatchObject({ pendingIntentCount: 0 });
@@ -1816,11 +1837,11 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
             error: {
               schema_version: 1 as const,
               code: "TX_MANIFEST_UNAVAILABLE" as const,
-              message: "sanitized overload",
+              message: "token=secret tx=private",
               http_status: 503,
-              retryable: true,
+              retryable: false,
               overloaded: true as const,
-              retry_after_ms: 43_000,
+              retry_after_ms: Number.MAX_SAFE_INTEGER,
             },
           };
         },
@@ -1835,12 +1856,33 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         },
       };
       (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
-      const response = await instance.fetch(post("/begin", {
-        txId,
-        participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
-      }));
+      const events: string[] = [];
+      const info = vi.spyOn(console, "log").mockImplementation((value) => events.push(String(value)));
+      let response: Response;
+      try {
+        response = await instance.fetch(post("/begin", {
+          txId,
+          participants: [{ shardId: shardName, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+        }));
+      } finally {
+        info.mockRestore();
+      }
       expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({ error: { overloaded: true, retry_after_ms: 43_000 } });
+      expect(await response.json()).toMatchObject({ error: {
+        code: "TX_MANIFEST_UNAVAILABLE",
+        retryable: true,
+        overloaded: true,
+        retry_after_ms: MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
+      } });
+      expect(events.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        event: "reliability.slo",
+        operation: "manifest_route_assignment",
+        outcome: "controlled_failure",
+        overloaded: true,
+        retry_after_ms: MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
+      }));
+      expect(events.join("\n")).not.toContain("secret");
+      expect(events.join("\n")).not.toContain("private");
       expect(state.storage.sql.exec<{ failure_count: number }>(
         "SELECT failure_count FROM manifest_admission_circuit WHERE singleton = 1",
       ).one().failure_count).toBe(1);
