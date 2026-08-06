@@ -576,6 +576,58 @@ describe("CoordinatorDO /begin (2PC orchestration)", () => {
     expect(await status.json()).toMatchObject({ error: { code: "TX_VERSION_UNSUPPORTED" } });
   });
 
+  it("leaves prior circuit failures intact across a deterministic assignment rejection", async () => {
+    const txId = `tx-circuit-neutral-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      let mode: "temporary" | "rejected" = "temporary";
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async assignManifestRoute() {
+          if (mode === "temporary") {
+            return {
+              ok: false as const,
+              status: "unavailable" as const,
+              http_status: 503,
+              error: { schema_version: 1 as const, code: "TX_MANIFEST_UNAVAILABLE" as const, message: "temporary", http_status: 503, retryable: true },
+            };
+          }
+          return {
+            ok: false as const,
+            status: "rejected" as const,
+            http_status: 409,
+            error: { schema_version: 1 as const, code: "MANIFEST_RESERVATION_CONFLICT" as const, message: "rejected", http_status: 409, retryable: false },
+          };
+        },
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      const begin = () => instance.fetch(post("/begin", {
+        txId,
+        participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
+      }));
+      expect((await begin()).status).toBe(503);
+      mode = "rejected";
+      expect((await begin()).status).toBe(409);
+      expect(state.storage.sql.exec<{ failure_count: number }>(
+        "SELECT failure_count FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one().failure_count).toBe(1);
+      mode = "temporary";
+      expect((await begin()).status).toBe(503);
+      expect(state.storage.sql.exec<{ failure_count: number }>(
+        "SELECT failure_count FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one().failure_count).toBe(2);
+    });
+  });
+
   it("fails closed on a future durable state-model version without mutating the row", async () => {
     const txId = `tx-future-state-model-${crypto.randomUUID()}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
@@ -1735,13 +1787,35 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect((await begin()).status).toBe(503);
       expect((await begin()).status).toBe(503);
       expect(assignmentCalls).toBe(3);
-      const openResponse = await begin();
+      const shedEvents: string[] = [];
+      const shedLog = vi.spyOn(console, "log").mockImplementation((value) => shedEvents.push(String(value)));
+      let openResponse: Response;
+      try {
+        openResponse = await begin();
+      } finally {
+        shedLog.mockRestore();
+      }
       expect(openResponse.status).toBe(503);
       const openBody = await openResponse.json() as { error: { retry_after_ms?: number } };
       expect(openBody.error.retry_after_ms).toBeGreaterThan(0);
       expect(openBody.error.retry_after_ms).toBeLessThanOrEqual(30_000);
+      expect(shedEvents.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        event: "reliability.slo",
+        operation: "manifest_route_assignment",
+        outcome: "controlled_failure",
+        retryable: true,
+      }));
       expect(assignmentCalls).toBe(3);
       expect(Array.from(state.storage.sql.exec("SELECT * FROM transactions WHERE tx_id = ?", txId))).toHaveLength(0);
+      state.storage.sql.exec(
+        "UPDATE manifest_admission_circuit SET open_until_ms = 1, half_open_probe = 1, half_open_probe_until_ms = ? WHERE singleton = 1",
+        Date.now() + 30_000,
+      );
+      const collision = await begin();
+      const collisionBody = await collision.json() as { error: { retry_after_ms?: number } };
+      expect(collisionBody.error.retry_after_ms).toBeGreaterThan(0);
+      expect(collisionBody.error.retry_after_ms).toBeLessThanOrEqual(5_000);
+      expect(assignmentCalls).toBe(3);
       state.storage.sql.exec(
         "UPDATE manifest_admission_circuit SET open_until_ms = 1, half_open_probe = 0, half_open_probe_until_ms = 0 WHERE singleton = 1",
       );
@@ -1940,6 +2014,44 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       }));
       expect(lines.join("\n")).not.toContain("secret");
       expect(lines.join("\n")).not.toContain("private");
+    });
+  });
+
+  it("treats a deterministic admission rejection as neutral circuit evidence", async () => {
+    const txId = `tx-admission-neutral-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      await instance.fetch(post("/stats", {}));
+      state.storage.sql.exec(
+        "UPDATE manifest_admission_circuit SET failure_count = 1, failure_window_started_at_ms = ? WHERE singleton = 1",
+        Date.now(),
+      );
+      const service: TransactionManifestService = {
+        ...defaultV2ManifestMethods(),
+        async checkManifestAdmission() {
+          return {
+            ok: false as const,
+            status: "unavailable" as const,
+            http_status: 503 as const,
+            error: { schema_version: 1 as const, code: "TX_QUARANTINED" as const, message: "rejected", http_status: 409, retryable: false },
+            circuit: { count_toward_open: true as const, failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const },
+          };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
+      const result = await (instance as unknown as {
+        checkManifestAdmission(request: { fleet_id: string; tx_id: string; commit_decided_at: string }): Promise<{ ok: boolean }>;
+      }).checkManifestAdmission({ fleet_id: "fleet-test", tx_id: txId, commit_decided_at: new Date().toISOString() });
+      expect(result.ok).toBe(false);
+      expect(state.storage.sql.exec<{ failure_count: number; half_open_probe: number }>(
+        "SELECT failure_count, half_open_probe FROM manifest_admission_circuit WHERE singleton = 1",
+      ).one()).toEqual({ failure_count: 1, half_open_probe: 0 });
     });
   });
 
