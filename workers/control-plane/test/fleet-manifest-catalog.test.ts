@@ -1,12 +1,22 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  CATALOG_ALARM_BASE_RETRY_MS,
+  CATALOG_ALARM_MAX_RETRY_MS,
   CATALOG_HISTORY_RETENTION_MS,
   FLEET_CATALOG_PROTOCOL_VERSION,
+  FleetManifestCatalogDO,
   FleetManifestCatalogStore,
   INITIAL_PARTITION_COUNT,
   type CatalogActivationRequest,
 } from "../src/fleet-manifest-catalog.js";
+import type { ManifestRegistrationV1 } from "../../../packages/contracts/src/index.js";
+import {
+  MANIFEST_CIRCUIT_POLICY,
+  admissionThroughManifestStub,
+  lookupThroughManifestStub,
+  registerThroughManifestStub,
+} from "../src/index.js";
 
 const FLEET = "fleet-catalog-test";
 const DAY = "2026-08-05";
@@ -270,6 +280,441 @@ describe("FleetManifestCatalogStore", () => {
       for (const purpose of due) catalog.completePurpose(purpose.purpose, purpose.generation);
       expect(catalog.nextAlarmAt()).toBe(1_016);
     });
+  });
+
+  it("durably reschedules one failed alarm purpose without starving the rest of the due batch", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-retry-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject, state) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      const now = Date.now();
+      catalog.schedulePurpose({ purpose: "snapshot_resume", fire_at_ms: now - 1, generation: 7, payload_hash: "a".repeat(64) });
+      catalog.schedulePurpose({ purpose: "future-purpose", fire_at_ms: now - 1, generation: 1, payload_hash: "b".repeat(64) });
+      (catalog as unknown as { resumeSnapshot: (generation: number) => Promise<never> }).resumeSnapshot = async () => {
+        throw Object.assign(new Error("token=secret fleet=private"), {
+          overloaded: true,
+          retryable: true,
+          retryAfterMs: 42_000,
+        });
+      };
+      const warnings: string[] = [];
+      const warning = vi.spyOn(console, "warn").mockImplementation((value) => warnings.push(String(value)));
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+      }
+
+      const scheduled = catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS + 1)
+        .find((purpose) => purpose.purpose === "snapshot_resume");
+      expect(scheduled).toMatchObject({
+        purpose: "snapshot_resume",
+        generation: 7,
+        payload_hash: "a".repeat(64),
+        attempt_count: 1,
+      });
+      expect((scheduled?.fire_at_ms ?? 0) - now).toBeGreaterThanOrEqual(42_000);
+      expect((scheduled?.fire_at_ms ?? 0) - now).toBeLessThanOrEqual(CATALOG_ALARM_MAX_RETRY_MS);
+      expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS + 1)
+        .find((purpose) => purpose.purpose === "future-purpose")).toMatchObject({
+          generation: 1,
+          payload_hash: "b".repeat(64),
+          attempt_count: 1,
+        });
+      expect(await state.storage.getAlarm()).toBe(catalog.nextAlarmAt());
+      expect(warnings).toHaveLength(2);
+      expect(warnings.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        schema_version: 1,
+        event: "reliability.slo",
+        component: "fleet_manifest_catalog",
+        operation: "catalog_alarm",
+        outcome: "retry_scheduled",
+        purpose: "snapshot_resume",
+        overloaded: true,
+        retryable: false,
+        attempt_count: 1,
+      }));
+      expect(warnings.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        outcome: "retry_scheduled",
+        purpose: "unknown",
+        attempt_count: 1,
+      }));
+      expect(warnings.join("\n")).not.toContain("secret");
+      expect(warnings.join("\n")).not.toContain("private");
+      expect(CATALOG_ALARM_BASE_RETRY_MS).toBeLessThan(42_000);
+    });
+  });
+
+  it("does not overwrite a purpose superseded while an awaited handler fails", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-cas-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      const original = {
+        purpose: "snapshot_resume",
+        fire_at_ms: 0,
+        generation: 7,
+        payload_hash: "a".repeat(64),
+      } as const;
+      catalog.schedulePurpose(original);
+      let rejectHandler!: (error: Error) => void;
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      (catalog as unknown as { resumeSnapshot: () => Promise<never> }).resumeSnapshot = async () => {
+        markStarted();
+        return await new Promise<never>((_resolve, reject) => { rejectHandler = reject; });
+      };
+      const warnings: string[] = [];
+      const warning = vi.spyOn(console, "warn").mockImplementation((value) => warnings.push(String(value)));
+      try {
+        const alarm = instance.alarm();
+        await started;
+        catalog.schedulePurpose({
+          purpose: "snapshot_resume",
+          fire_at_ms: 123_456,
+          generation: 8,
+          payload_hash: "b".repeat(64),
+        });
+        rejectHandler(new Error("older generation failed"));
+        await alarm;
+      } finally {
+        warning.mockRestore();
+      }
+      expect(catalog.duePurposes(123_456)).toEqual([expect.objectContaining({
+        purpose: "snapshot_resume",
+        fire_at_ms: 123_456,
+        generation: 8,
+        payload_hash: "b".repeat(64),
+        attempt_count: 0,
+      })]);
+      expect(warnings).toEqual([]);
+    });
+  });
+
+  it("does not report recovery when successful work was superseded mid-flight", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-recovery-cas-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({
+        purpose: "snapshot_resume",
+        fire_at_ms: 0,
+        generation: 7,
+        payload_hash: "a".repeat(64),
+        attempt_count: 2,
+      });
+      let resolveHandler!: (value: { status: "complete" }) => void;
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      (catalog as unknown as { resumeSnapshot: () => Promise<{ status: "complete" }> }).resumeSnapshot = async () => {
+        markStarted();
+        return await new Promise<{ status: "complete" }>((resolve) => { resolveHandler = resolve; });
+      };
+      const recovered: string[] = [];
+      const info = vi.spyOn(console, "log").mockImplementation((value) => recovered.push(String(value)));
+      try {
+        const alarm = instance.alarm();
+        await started;
+        catalog.schedulePurpose({
+          purpose: "snapshot_resume",
+          fire_at_ms: 123_456,
+          generation: 8,
+          payload_hash: "b".repeat(64),
+        });
+        resolveHandler({ status: "complete" });
+        await alarm;
+      } finally {
+        info.mockRestore();
+      }
+      expect(recovered).toEqual([]);
+      expect(catalog.duePurposes(123_456)).toEqual([
+        expect.objectContaining({ purpose: "snapshot_resume", generation: 8, attempt_count: 0 }),
+      ]);
+    });
+  });
+
+  it("keeps a durable retry when cursor GC fails before successful completion", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-cursor-retry-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({
+        purpose: "cursor_gc",
+        fire_at_ms: 0,
+        generation: 0,
+        payload_hash: "c".repeat(64),
+      });
+      (catalog as unknown as { purgeEnumerationCursors: () => never }).purgeEnumerationCursors = () => {
+        throw new Error("cursor GC failed");
+      };
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+      }
+      expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS)).toEqual([
+        expect.objectContaining({ purpose: "cursor_gc", generation: 0, attempt_count: 1 }),
+      ]);
+    });
+  });
+
+  it("keeps independent durable retries when route and history GC fail", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-gc-retries-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({ purpose: "route_gc", fire_at_ms: 0, generation: 0, payload_hash: "d".repeat(64) });
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 0, generation: 0, payload_hash: "e".repeat(64) });
+      (catalog as unknown as { purgeReleasedRoutes: () => never }).purgeReleasedRoutes = () => {
+        throw new Error("route GC failed");
+      };
+      (catalog as unknown as { purgeHistory: () => never }).purgeHistory = () => {
+        throw new Error("history GC failed");
+      };
+      const warnings: string[] = [];
+      const warning = vi.spyOn(console, "warn").mockImplementation((value) => warnings.push(String(value)));
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+      }
+      expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ purpose: "route_gc", attempt_count: 1 }),
+        expect.objectContaining({ purpose: "history_gc", attempt_count: 1 }),
+      ]));
+      expect(warnings.map((line) => JSON.parse(line))).toEqual(expect.arrayContaining([
+        expect.objectContaining({ purpose: "route_gc", outcome: "retry_scheduled" }),
+        expect.objectContaining({ purpose: "history_gc", outcome: "retry_scheduled" }),
+      ]));
+    });
+  });
+
+  it("protects no-argument history refresh from a competing schedule and still schedules its normal successor", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-history-refresh-cas-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      (catalog as unknown as { purgeHistory: () => { deleted: number; next_deadline_ms: number } }).purgeHistory = () => ({
+        deleted: 0,
+        next_deadline_ms: 60_000,
+      });
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 0, generation: 0, payload_hash: "a".repeat(64) });
+      const refresh = (instance as unknown as { refreshHistoryGc(): Promise<boolean> }).refreshHistoryGc();
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 123_456, generation: 1, payload_hash: "b".repeat(64) });
+      await expect(refresh).resolves.toBe(false);
+      expect(catalog.scheduledPurpose("history_gc")).toMatchObject({
+        fire_at_ms: 123_456,
+        generation: 1,
+        payload_hash: "b".repeat(64),
+      });
+
+      catalog.completePurpose("history_gc", 1);
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 0, generation: 0, payload_hash: "c".repeat(64) });
+      await expect((instance as unknown as { refreshHistoryGc(): Promise<boolean> }).refreshHistoryGc()).resolves.toBe(true);
+      expect(catalog.scheduledPurpose("history_gc")).toMatchObject({
+        purpose: "history_gc",
+        fire_at_ms: 60_000,
+        generation: 0,
+        attempt_count: 0,
+      });
+    });
+  });
+
+  it("schedules a failed purpose from the failure time rather than the batch start", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-fresh-time-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({
+        purpose: "snapshot_resume",
+        fire_at_ms: 0,
+        generation: 11,
+        payload_hash: "e".repeat(64),
+      });
+      (catalog as unknown as { resumeSnapshot: () => Promise<never> }).resumeSnapshot = async () => {
+        throw new Error("temporary failure");
+      };
+      const clock = vi.spyOn(Date, "now").mockReturnValue(50_000).mockReturnValueOnce(10_000);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+        clock.mockRestore();
+      }
+      expect(catalog.duePurposes(52_000)).toContainEqual(expect.objectContaining({
+        purpose: "snapshot_resume",
+        fire_at_ms: 52_000,
+        attempt_count: 1,
+      }));
+    });
+  });
+
+  it("migrates predecessor alarm rows with a zero durable attempt count", async () => {
+    const stub = env.JOURNAL_MANIFEST.getByName(`catalog-alarm-migration-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TABLE alarm_schedule (
+          purpose TEXT PRIMARY KEY,
+          fire_at_ms INTEGER NOT NULL,
+          generation INTEGER NOT NULL,
+          payload_hash TEXT NOT NULL
+        )
+      `);
+      state.storage.sql.exec(
+        "INSERT INTO alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES ('predecessor', 1, 2, ?)",
+        "c".repeat(64),
+      );
+      const catalog = new FleetManifestCatalogStore(state.storage);
+      catalog.migrate();
+      expect(state.storage.sql.exec<{ name: string }>("PRAGMA table_info(alarm_schedule)").toArray()
+        .map((column) => column.name)).toContain("attempt_count");
+      expect(catalog.duePurposes(1)).toEqual([expect.objectContaining({
+        purpose: "predecessor",
+        generation: 2,
+        attempt_count: 0,
+      })]);
+    });
+  });
+
+  it("caps repeated non-overload alarm backoff and emits recovery after a later success", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-cap-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      const now = Date.now();
+      catalog.schedulePurpose({
+        purpose: "snapshot_resume",
+        fire_at_ms: now - 1,
+        generation: 9,
+        payload_hash: "d".repeat(64),
+        attempt_count: 100,
+      });
+      (catalog as unknown as { resumeSnapshot: () => Promise<never> }).resumeSnapshot = async () => {
+        throw new Error("sanitized by the SLO boundary");
+      };
+      await instance.alarm();
+      const retry = catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS + 1)
+        .find((purpose) => purpose.purpose === "snapshot_resume");
+      expect(retry).toMatchObject({ attempt_count: 101 });
+      expect((retry?.fire_at_ms ?? 0) - now).toBeGreaterThanOrEqual(CATALOG_ALARM_MAX_RETRY_MS);
+
+      (catalog as unknown as { resumeSnapshot: () => Promise<{ status: "complete" }> }).resumeSnapshot = async () => ({ status: "complete" });
+      catalog.schedulePurpose({ ...retry!, fire_at_ms: 0 });
+      const recovered: string[] = [];
+      const info = vi.spyOn(console, "log").mockImplementation((value) => recovered.push(String(value)));
+      try {
+        await instance.alarm();
+      } finally {
+        info.mockRestore();
+      }
+      expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS + 1)
+        .some((purpose) => purpose.purpose === "snapshot_resume")).toBe(false);
+      expect(recovered.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+        event: "reliability.slo",
+        component: "fleet_manifest_catalog",
+        operation: "catalog_alarm",
+        outcome: "recovered",
+        purpose: "snapshot_resume",
+        attempt_count: 101,
+        retry_after_ms: 0,
+      }));
+    });
+  });
+
+  it("projects an overload seam as a sanitized cooldown instead of a hot-loop retry", async () => {
+    const providerError = Object.assign(new Error("token=secret tx=private"), {
+      overloaded: true,
+      retryable: true,
+      retryAfterMs: 42_000,
+    });
+    const overloaded = { admission: async (): Promise<{ ok: true; status: "ready" }> => Promise.reject(providerError) };
+    const result = await admissionThroughManifestStub(overloaded);
+    expect(result).toEqual({
+      ok: false,
+      status: "unavailable",
+      http_status: 503,
+      error: expect.objectContaining({
+        code: "TX_MANIFEST_UNAVAILABLE",
+        retryable: true,
+        overloaded: true,
+        retry_after_ms: 42_000,
+      }),
+      circuit: {
+        count_toward_open: true,
+        ...MANIFEST_CIRCUIT_POLICY,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    expect(JSON.stringify(result)).not.toContain("private");
+  });
+
+  it("preserves overload cooldown on an ambiguous post-decision registration", async () => {
+    const providerError = Object.assign(new Error("token=secret tx=private"), {
+      overloaded: true,
+      retryable: true,
+      retryAfterMs: 55_000,
+    });
+    const registration = { record: { tx_id: "tx-ambiguous-overload" } } as ManifestRegistrationV1;
+    const result = await registerThroughManifestStub({ register: async () => { throw providerError; } }, registration);
+    expect(result).toMatchObject({
+      ok: false,
+      status: "commit_pending_manifest",
+      http_status: 202,
+      tx_id: "tx-ambiguous-overload",
+      retry_identical_registration: true,
+      overloaded: true,
+      retry_after_ms: 55_000,
+    });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    expect(JSON.stringify(result)).not.toContain("private");
+  });
+
+  it("preserves overload metadata returned as unavailable and on lookup transport failure", async () => {
+    const registration = { record: { tx_id: "tx-returned-overload" } } as ManifestRegistrationV1;
+    const returned = await registerThroughManifestStub({
+      register: async () => ({
+        ok: false as const,
+        status: "unavailable" as const,
+        http_status: 503,
+        error: {
+          schema_version: 1 as const,
+          code: "TX_MANIFEST_UNAVAILABLE" as const,
+          message: "sanitized",
+          http_status: 503,
+          retryable: true,
+          overloaded: true as const,
+          retry_after_ms: 61_000,
+        },
+      }),
+    }, registration);
+    expect(returned).toMatchObject({
+      status: "commit_pending_manifest",
+      overloaded: true,
+      retry_after_ms: 61_000,
+    });
+
+    const providerError = Object.assign(new Error("token=secret tx=private"), {
+      overloaded: true,
+      retryable: true,
+      retry_after_ms: 62_000,
+    });
+    const lookup = await lookupThroughManifestStub({ lookup: async () => { throw providerError; } }, "tx-lookup-overload");
+    expect(lookup).toMatchObject({
+      ok: false,
+      found: false,
+      status: "unavailable",
+      error: {
+        code: "TX_MANIFEST_UNAVAILABLE",
+        retryable: true,
+        overloaded: true,
+        retry_after_ms: 62_000,
+      },
+      circuit: { count_toward_open: true },
+    });
+    expect(JSON.stringify(lookup)).not.toContain("secret");
+    expect(JSON.stringify(lookup)).not.toContain("private");
   });
 
   it("expires and incrementally garbage-collects issued enumeration cursors", async () => {

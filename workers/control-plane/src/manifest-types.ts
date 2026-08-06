@@ -29,6 +29,8 @@ export interface ManifestRpcError {
   readonly message: string;
   readonly http_status: number;
   readonly retryable: boolean;
+  readonly overloaded?: true;
+  readonly retry_after_ms?: number;
 }
 
 export function toManifestRpcError(error: TransactionProtocolError): ManifestRpcError {
@@ -38,6 +40,8 @@ export function toManifestRpcError(error: TransactionProtocolError): ManifestRpc
     message: error.message,
     http_status: error.http_status,
     retryable: error.retryable,
+    ...(error.overloaded ? { overloaded: true as const } : {}),
+    ...(error.retry_after_ms === undefined ? {} : { retry_after_ms: error.retry_after_ms }),
   };
 }
 
@@ -90,6 +94,8 @@ export type ManifestServiceRegisterResult =
       readonly tx_id: string;
       readonly retry_identical_registration: true;
       readonly circuit: ManifestCircuitDirective;
+      readonly overloaded?: true;
+      readonly retry_after_ms?: number;
     };
 
 export type ManifestLookupResult =

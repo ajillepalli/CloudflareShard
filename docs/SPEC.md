@@ -315,7 +315,9 @@ CoordinatorDO transaction state:
   release. Alarms retry with bounded exponential backoff.
 - `manifest_admission_circuit`: the durable failure window, open cooldown, and
   half-open probe state used to reject new transactions before prepare when
-  the manifest dependency is unhealthy.
+  the manifest dependency is unhealthy. A returned or thrown overload counts
+  as a circuit failure and returns a sanitized cooldown to the caller before
+  any transaction row is inserted or participant prepare is attempted.
 
 ShardDO transaction state:
 - `pending_intents` and `row_locks`: prepared, unapplied mutations and their
@@ -337,6 +339,24 @@ JournalManifestDO state (owned by the separately deployed route-less Worker):
 - `manifest_conflicts`: every same-transaction/different-hash observation.
   Conflicting content quarantines the transaction rather than overwriting its
   original record.
+
+FleetManifestCatalogDO alarm state:
+- `alarm_schedule`: one logical row per purpose, carrying its fire time,
+  generation, payload hash, and durable `attempt_count`. The physical Durable
+  Object alarm is always the earliest logical due time. This table is
+  expand-first rather than row-versioned: activation adds `attempt_count NOT
+  NULL DEFAULT 0`, so predecessor rows migrate without a rewrite. An older
+  binary retains and bounded-retries an unknown future purpose as `unknown`
+  instead of deleting the durable row.
+- Alarm dispatch isolates each due purpose. A failed purpose keeps the same
+  generation and payload, increments its attempt, and is rescheduled with
+  exponential backoff capped at 300,000 ms (five minutes) that honors an
+  overload cooldown. Later due
+  purposes still run, so one failing snapshot or retention task cannot erase
+  or block unrelated work. There is deliberately no attempt ceiling: durable
+  maintenance work is never discarded after an arbitrary retry count. Operators
+  alert on a purpose's bounded `reliability.slo` label and rising
+  `attempt_count`; a later `recovered` event closes the incident.
 
 ## 7) Public HTTP API (Gateway Worker)
 
@@ -738,6 +758,22 @@ remain queued for recovery. Neither 202 state is a verified terminal success.
 
 Response (409, aborted):
 - error { code: "TX_ABORTED", message, details }, prepare failed on at least one participant shard; every participant was rolled back (or had nothing to roll back, given /prepare's shadow-write design)
+
+Response (503, manifest dependency unavailable before prepare):
+- error `{schema_version, code:"TX_MANIFEST_UNAVAILABLE", message,
+  http_status:503, retryable:true, overloaded?:true, retry_after_ms?:number}`
+
+The optional overload fields are controlled transport metadata. Provider
+exception text never crosses the response boundary, `retry_after_ms` is capped,
+and an overload counts toward the durable admission circuit before the request
+returns. Route-assignment failure uses the same `TX_MANIFEST_UNAVAILABLE` 503
+contract and occurs before transaction persistence and before any participant
+prepare call. A circuit-open response includes the remaining bounded
+`retry_after_ms` even when it is not itself a provider overload.
+
+Every client-visible `retry_after_ms` is a positive integer capped at 300,000
+ms. Clients may validate against that bound and must not retry before the
+returned cooldown expires.
 
 Drives `CoordinatorDO`'s two-phase commit across every shard touched by the
 mutation set. Each mutation is individually routed and validated (so a
@@ -1155,7 +1191,27 @@ for a never-created index.
 
 ## 13) Observability (required for production)
 
-Emit structured logs and counters for:
+Every Gateway request emits the existing fixed `http.request` event. Reliability
+boundaries additionally emit `reliability.slo` with exactly these low-cardinality
+fields:
+
+- `schema_version`, `event`, `component`, `operation`, `outcome`, `purpose`
+- `overloaded`, `retryable`, `attempt_count`, `retry_after_ms`, `observed_at`
+
+The bounded vocabularies are:
+
+- `component`: `coordinator`, `control_plane`, `fleet_manifest_catalog`, `journal_manifest`
+- `operation`: `manifest_admission`, `manifest_route_assignment`, `recovery_alarm`, `catalog_alarm`
+- `outcome`: `controlled_failure`, `retry_scheduled`, `recovered`
+- `purpose`: `not_applicable`, `snapshot_resume`, `cursor_gc`, `route_gc`,
+  `history_gc`, `unknown`
+
+Transaction IDs, tenant IDs,
+exception messages, provider response bodies, and other dynamic identifiers are
+not accepted by the event constructor. Events are emitted on controlled failure
+and recovery transitions rather than every successful request.
+
+The broader production metric set remains:
 - route_lookup_ms
 - shard_execute_ms
 - shard_row_count

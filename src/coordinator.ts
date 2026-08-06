@@ -2,14 +2,18 @@ import { DurableObject } from "cloudflare:workers";
 import {
   COORDINATOR_RETENTION_DAYS,
   CURRENT_PROTOCOL_VERSION,
+  DEFAULT_DURABLE_OBJECT_RETRY_AFTER_MS,
   MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
+  MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
   REDO_ENVELOPE_FORMAT_VERSION,
   TransactionContractViolation,
   assertReadableTransactionStateModelVersion,
   assertReadableProtocolVersion,
   assertTransactionTransition,
   canonicalJson,
+  classifyDurableObjectFailure,
   createManifestRegistration,
+  durableObjectUnavailableError,
   hashCanonicalJson,
   hashManifestFinalizeIntent,
   hashManifestRecordV2,
@@ -17,6 +21,7 @@ import {
   hashParticipantOperations,
   isCommitDecidedOrLater,
   isTransactionState,
+  reliabilitySloEvent,
   sha256Hex,
   transactionError,
   validateRedoEnvelope,
@@ -394,7 +399,9 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return allAcknowledged;
   }
 
-  private beginAdmissionAttempt(now: number): "closed" | "probe" | "open" {
+  private beginAdmissionAttempt(now: number):
+    | { readonly state: "closed" | "probe" }
+    | { readonly state: "open"; readonly retry_after_ms: number } {
     return this.ctx.storage.transactionSync(() => {
       const circuit = this.one<{
         open_until_ms: number;
@@ -402,16 +409,32 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         half_open_probe_until_ms: number;
       }>("SELECT open_until_ms, half_open_probe, half_open_probe_until_ms FROM manifest_admission_circuit WHERE singleton = 1");
       if (!circuit) throw new Error("Manifest admission circuit row is missing.");
-      if (circuit.open_until_ms > now) return "open";
+      if (circuit.open_until_ms > now) {
+        return {
+          state: "open",
+          retry_after_ms: Math.min(
+            MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
+            Math.max(1, Math.ceil(circuit.open_until_ms - now)),
+          ),
+        };
+      }
       if (circuit.open_until_ms > 0) {
-        if (circuit.half_open_probe === 1 && circuit.half_open_probe_until_ms > now) return "open";
+        if (circuit.half_open_probe === 1 && circuit.half_open_probe_until_ms > now) {
+          return {
+            state: "open",
+            retry_after_ms: Math.min(
+              DEFAULT_DURABLE_OBJECT_RETRY_AFTER_MS,
+              Math.max(1, Math.ceil(circuit.half_open_probe_until_ms - now)),
+            ),
+          };
+        }
         this.sql.exec(
           "UPDATE manifest_admission_circuit SET half_open_probe = 1, half_open_probe_until_ms = ? WHERE singleton = 1",
           now + MANIFEST_CIRCUIT_POLICY.failure_window_ms,
         );
-        return "probe";
+        return { state: "probe" };
       }
-      return "closed";
+      return { state: "closed" };
     });
   }
 
@@ -420,6 +443,14 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       `UPDATE manifest_admission_circuit
        SET failure_count = 0, failure_window_started_at_ms = 0, open_until_ms = 0,
            open_count = 0, half_open_probe = 0, half_open_probe_until_ms = 0
+       WHERE singleton = 1`,
+    );
+  }
+
+  private recordAdmissionNeutral(): void {
+    this.sql.exec(
+      `UPDATE manifest_admission_circuit
+       SET half_open_probe = 0, half_open_probe_until_ms = 0
        WHERE singleton = 1`,
     );
   }
@@ -466,12 +497,23 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private async checkManifestAdmission(request: { fleet_id: string; tx_id: string; commit_decided_at: string }): Promise<ManifestAdmissionResult> {
     const now = Date.now();
     const attempt = this.beginAdmissionAttempt(now);
-    if (attempt === "open") {
+    if (attempt.state === "open") {
+      log("reliability.slo", { ...reliabilitySloEvent({
+        component: "coordinator",
+        operation: "manifest_admission",
+        outcome: "controlled_failure",
+        classification: { overloaded: false, retryable: true, retry_after_ms: attempt.retry_after_ms },
+      }) });
       return {
         ok: false,
         status: "unavailable",
         http_status: 503,
-        error: transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest admission circuit is open; retry later."),
+        error: transactionError(
+          "TX_MANIFEST_UNAVAILABLE",
+          "Manifest admission circuit is open; retry later.",
+          undefined,
+          { overloaded: false, retryable: true, retry_after_ms: attempt.retry_after_ms },
+        ),
         circuit: {
           count_toward_open: true,
           failure_threshold: MANIFEST_CIRCUIT_POLICY.failure_threshold,
@@ -485,12 +527,23 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     try {
       if (!service) throw new Error("CONTROL_PLANE binding is unavailable.");
       result = await service.checkManifestAdmission(request);
-    } catch {
+    } catch (error) {
+      const classification = classifyDurableObjectFailure(error);
+      log("reliability.slo", { ...reliabilitySloEvent({
+        component: "coordinator",
+        operation: "manifest_admission",
+        outcome: "controlled_failure",
+        classification,
+      }) });
       result = {
         ok: false,
         status: "unavailable",
         http_status: 503,
-        error: transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest admission is unavailable before prepare."),
+        error: durableObjectUnavailableError(
+          error,
+          "TX_MANIFEST_UNAVAILABLE",
+          "Manifest admission is unavailable before prepare.",
+        ),
         circuit: {
           count_toward_open: true,
           failure_threshold: MANIFEST_CIRCUIT_POLICY.failure_threshold,
@@ -500,7 +553,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       };
     }
     if (result.ok) this.recordAdmissionSuccess();
-    else this.recordAdmissionFailure(now, attempt);
+    else if (result.error.retryable || result.error.overloaded) this.recordAdmissionFailure(now, attempt.state);
+    else this.recordAdmissionNeutral();
     return result;
   }
 
@@ -1906,24 +1960,73 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const assignmentRequest = await this.routeAssignmentRequest(body.txId, fleetId, coordinatorId, operationHash, 1);
     const admissionNow = Date.now();
     const admissionAttempt = this.beginAdmissionAttempt(admissionNow);
-    if (admissionAttempt === "open") {
-      return protocolResponse(transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest admission circuit is open; retry later."));
+    if (admissionAttempt.state === "open") {
+      log("reliability.slo", { ...reliabilitySloEvent({
+        component: "coordinator",
+        operation: "manifest_route_assignment",
+        outcome: "controlled_failure",
+        classification: { overloaded: false, retryable: true, retry_after_ms: admissionAttempt.retry_after_ms },
+      }) });
+      return protocolResponse(transactionError(
+        "TX_MANIFEST_UNAVAILABLE",
+        "Manifest admission circuit is open; retry later.",
+        undefined,
+        { overloaded: false, retryable: true, retry_after_ms: admissionAttempt.retry_after_ms },
+      ));
     }
     let assignment: ManifestRouteAssignmentResult | null = null;
+    let assignmentError: TransactionProtocolError | null = null;
     try {
       assignment = this.coordinatorEnv.CONTROL_PLANE
         ? await this.coordinatorEnv.CONTROL_PLANE.assignManifestRoute(assignmentRequest)
         : null;
-    } catch {
+    } catch (error) {
+      const classification = classifyDurableObjectFailure(error);
+      assignmentError = durableObjectUnavailableError(
+        error,
+        "TX_MANIFEST_UNAVAILABLE",
+        "Manifest route assignment is temporarily unavailable before reservation.",
+      );
+      log("reliability.slo", { ...reliabilitySloEvent({
+        component: "coordinator",
+        operation: "manifest_route_assignment",
+        outcome: "controlled_failure",
+        classification,
+      }) });
       assignment = null;
     }
     if (!assignment) {
-      this.recordAdmissionFailure(admissionNow, admissionAttempt);
-      return protocolResponse(transactionError("TX_MANIFEST_UNAVAILABLE", "Manifest route assignment is temporarily unavailable before reservation."));
+      this.recordAdmissionFailure(admissionNow, admissionAttempt.state);
+      return protocolResponse(assignmentError ?? transactionError(
+        "TX_MANIFEST_UNAVAILABLE",
+        "Manifest route assignment is temporarily unavailable before reservation.",
+      ));
     }
     if (!assignment.ok) {
-      if (assignment.error.retryable) this.recordAdmissionFailure(admissionNow, admissionAttempt);
-      else this.recordAdmissionSuccess();
+      if (assignment.error.retryable || assignment.error.overloaded) this.recordAdmissionFailure(admissionNow, admissionAttempt.state);
+      else this.recordAdmissionNeutral();
+      if (assignment.error.overloaded) {
+        const classification = classifyDurableObjectFailure(assignment.error);
+        const overloadError = durableObjectUnavailableError(
+          assignment.error,
+          "TX_MANIFEST_UNAVAILABLE",
+          "Manifest route assignment is temporarily unavailable before reservation.",
+        );
+        log("reliability.slo", { ...reliabilitySloEvent({
+          component: "coordinator",
+          operation: "manifest_route_assignment",
+          outcome: "controlled_failure",
+          classification,
+        }) });
+        return protocolResponse(overloadError);
+      }
+      if (assignment.status === "unavailable") {
+        return protocolResponse(durableObjectUnavailableError(
+          assignment.error,
+          "TX_MANIFEST_UNAVAILABLE",
+          "Manifest route assignment is temporarily unavailable before reservation.",
+        ));
+      }
       return protocolResponse(assignment.error);
     }
     this.recordAdmissionSuccess();

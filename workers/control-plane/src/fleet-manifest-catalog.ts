@@ -1,10 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  boundedExponentialBackoffMs,
   canonicalJson,
+  classifyDurableObjectFailure,
   COORDINATOR_RETENTION_DAYS,
   createManifestReservation,
   hashCanonicalJson,
   hashManifestReservation,
+  reliabilitySloEvent,
   type CreateManifestReservationInput,
   type ManifestReservationV1,
 } from "../../../packages/contracts/src/index.js";
@@ -14,6 +17,8 @@ export const INITIAL_PARTITION_COUNT = 16;
 export const DEFAULT_CATALOG_PAGE_SIZE = 64;
 export const MAX_CATALOG_PAGE_SIZE = 128;
 export const CATALOG_ALARM_BATCH_SIZE = 16;
+export const CATALOG_ALARM_BASE_RETRY_MS = 2_000;
+export const CATALOG_ALARM_MAX_RETRY_MS = 5 * 60_000;
 export const CATALOG_CURSOR_MAX_LEASE_MS = 15 * 60 * 1000;
 export const CATALOG_HISTORY_RETENTION_MS = COORDINATOR_RETENTION_DAYS * 86_400_000;
 export const MANIFEST_ROUTE_RECOVERY_MS = 60 * 60 * 1000;
@@ -79,6 +84,7 @@ interface AlarmRow {
   fire_at_ms: number;
   generation: number;
   payload_hash: string;
+  attempt_count: number;
 }
 
 export interface CatalogActivationRequest {
@@ -162,6 +168,7 @@ export interface CatalogAlarmPurpose {
   readonly fire_at_ms: number;
   readonly generation: number;
   readonly payload_hash: string;
+  readonly attempt_count?: number;
 }
 
 export interface CatalogRouteAssignment {
@@ -327,7 +334,8 @@ export class FleetManifestCatalogStore {
         purpose TEXT PRIMARY KEY,
         fire_at_ms INTEGER NOT NULL,
         generation INTEGER NOT NULL,
-        payload_hash TEXT NOT NULL
+        payload_hash TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS manifest_route_assignments (
         assignment_key TEXT PRIMARY KEY,
@@ -377,6 +385,12 @@ export class FleetManifestCatalogStore {
     ).toArray();
     if (!assignmentColumns.some((column) => column.name === "delete_after_ms")) {
       this.storage.sql.exec("ALTER TABLE manifest_route_assignments ADD COLUMN delete_after_ms INTEGER");
+    }
+    const alarmColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
+      "PRAGMA table_info(alarm_schedule)",
+    ).toArray();
+    if (!alarmColumns.some((column) => column.name === "attempt_count")) {
+      this.storage.sql.exec("ALTER TABLE alarm_schedule ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0");
     }
     const activationKeyColumns = this.storage.sql.exec<{ readonly [key: string]: SqlStorageValue; name: string }>(
       "PRAGMA table_info(catalog_activation_keys)",
@@ -1688,22 +1702,54 @@ export class FleetManifestCatalogStore {
   schedulePurpose(purpose: CatalogAlarmPurpose): void {
     assertText(purpose.purpose, "purpose");
     assertHash(purpose.payload_hash, "payload_hash");
-    if (!Number.isSafeInteger(purpose.fire_at_ms) || purpose.fire_at_ms < 0 || !Number.isSafeInteger(purpose.generation) || purpose.generation < 0) {
+    const attemptCount = purpose.attempt_count ?? 0;
+    if (
+      !Number.isSafeInteger(purpose.fire_at_ms) || purpose.fire_at_ms < 0
+      || !Number.isSafeInteger(purpose.generation) || purpose.generation < 0
+      || !Number.isSafeInteger(attemptCount) || attemptCount < 0
+    ) {
       throw new TypeError("Alarm time and generation must be non-negative safe integers.");
     }
     this.storage.transactionSync(() => {
       const existing = this.storage.sql.exec<AlarmRow>("SELECT * FROM alarm_schedule WHERE purpose = ?", purpose.purpose).toArray()[0];
       if (existing !== undefined && existing.generation > purpose.generation) return;
       this.storage.sql.exec(
-        `INSERT INTO alarm_schedule (purpose, fire_at_ms, generation, payload_hash) VALUES (?, ?, ?, ?)
+        `INSERT INTO alarm_schedule (purpose, fire_at_ms, generation, payload_hash, attempt_count) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(purpose) DO UPDATE SET fire_at_ms = excluded.fire_at_ms,
-           generation = excluded.generation, payload_hash = excluded.payload_hash`,
+           generation = excluded.generation, payload_hash = excluded.payload_hash,
+           attempt_count = excluded.attempt_count`,
         purpose.purpose,
         purpose.fire_at_ms,
         purpose.generation,
         purpose.payload_hash,
+        attemptCount,
       );
     });
+  }
+
+  reschedulePurposeAfterFailure(purpose: CatalogAlarmPurpose, fireAtMs: number, attemptCount: number): boolean {
+    if (!Number.isSafeInteger(fireAtMs) || fireAtMs < 0 || !Number.isSafeInteger(attemptCount) || attemptCount < 1) {
+      throw new TypeError("Alarm retry time and attempt must be safe positive integers.");
+    }
+    const result = this.storage.sql.exec(
+      `UPDATE alarm_schedule SET fire_at_ms = ?, attempt_count = ?
+        WHERE purpose = ? AND fire_at_ms = ? AND generation = ? AND payload_hash = ? AND attempt_count = ?`,
+      fireAtMs,
+      attemptCount,
+      purpose.purpose,
+      purpose.fire_at_ms,
+      purpose.generation,
+      purpose.payload_hash,
+      purpose.attempt_count ?? 0,
+    );
+    return result.rowsWritten === 1;
+  }
+
+  scheduledPurpose(purpose: string): CatalogAlarmPurpose | null {
+    return this.storage.sql.exec<AlarmRow>(
+      "SELECT purpose, fire_at_ms, generation, payload_hash, attempt_count FROM alarm_schedule WHERE purpose = ?",
+      purpose,
+    ).toArray()[0] ?? null;
   }
 
   nextAlarmAt(): number | null {
@@ -1713,12 +1759,37 @@ export class FleetManifestCatalogStore {
   duePurposes(nowMs: number, limit = CATALOG_ALARM_BATCH_SIZE): readonly CatalogAlarmPurpose[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > CATALOG_ALARM_BATCH_SIZE) throw new TypeError("Invalid alarm batch size.");
     return this.storage.sql
-      .exec<AlarmRow>("SELECT purpose, fire_at_ms, generation, payload_hash FROM alarm_schedule WHERE fire_at_ms <= ? ORDER BY fire_at_ms, purpose LIMIT ?", nowMs, limit)
+      .exec<AlarmRow>("SELECT purpose, fire_at_ms, generation, payload_hash, attempt_count FROM alarm_schedule WHERE fire_at_ms <= ? ORDER BY fire_at_ms, purpose LIMIT ?", nowMs, limit)
       .toArray();
   }
 
   completePurpose(purpose: string, generation: number): void {
     this.storage.sql.exec("DELETE FROM alarm_schedule WHERE purpose = ? AND generation = ?", purpose, generation);
+  }
+
+  completePurposeIfCurrent(purpose: CatalogAlarmPurpose): boolean {
+    return this.storage.transactionSync(() => {
+      const current = this.storage.sql.exec<AlarmRow>(
+        "SELECT purpose, fire_at_ms, generation, payload_hash, attempt_count FROM alarm_schedule WHERE purpose = ?",
+        purpose.purpose,
+      ).toArray()[0];
+      if (
+        current === undefined
+        || current.fire_at_ms !== purpose.fire_at_ms
+        || current.generation !== purpose.generation
+        || current.payload_hash !== purpose.payload_hash
+        || current.attempt_count !== (purpose.attempt_count ?? 0)
+      ) return false;
+      this.storage.sql.exec(
+        "DELETE FROM alarm_schedule WHERE purpose = ? AND fire_at_ms = ? AND generation = ? AND payload_hash = ? AND attempt_count = ?",
+        purpose.purpose,
+        purpose.fire_at_ms,
+        purpose.generation,
+        purpose.payload_hash,
+        purpose.attempt_count ?? 0,
+      );
+      return true;
+    });
   }
 }
 
@@ -1741,18 +1812,25 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     }
   }
 
-  private async refreshHistoryGc(): Promise<void> {
+  private async refreshHistoryGc(expectedPurpose?: CatalogAlarmPurpose): Promise<boolean> {
+    const scheduled = expectedPurpose ?? this.catalog.scheduledPurpose("history_gc");
     const history = this.catalog.purgeHistory(Date.now());
-    this.catalog.completePurpose("history_gc", 0);
-    if (history.next_deadline_ms !== null) {
+    const successor = history.next_deadline_ms === null ? null : {
+      purpose: "history_gc" as const,
+      fire_at_ms: history.next_deadline_ms,
+      generation: 0,
+      payload_hash: await hashCanonicalJson(["history_gc", history.next_deadline_ms]),
+    };
+    const completed = scheduled === null
+      ? this.catalog.scheduledPurpose("history_gc") === null
+      : this.catalog.completePurposeIfCurrent(scheduled);
+    if (completed && successor !== null) {
       this.catalog.schedulePurpose({
-        purpose: "history_gc",
-        fire_at_ms: history.next_deadline_ms,
-        generation: 0,
-        payload_hash: await hashCanonicalJson(["history_gc", history.next_deadline_ms]),
+        ...successor,
       });
     }
     await this.armNextAlarm();
+    return completed;
   }
 
   async partitionConfigForDay(fleetId: string, reservationDay: string): Promise<PartitionConfigRow> {
@@ -1907,42 +1985,85 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
   }
 
   async alarm(): Promise<void> {
-    const due = this.catalog.duePurposes(Date.now());
+    const now = Date.now();
+    const due = this.catalog.duePurposes(now);
     for (const purpose of due) {
-      if (purpose.purpose === "snapshot_resume") {
-        const result = await this.catalog.resumeSnapshot(purpose.generation);
-        this.catalog.completePurpose(purpose.purpose, purpose.generation);
-        if (result.status === "pending") {
-          this.catalog.schedulePurpose({ ...purpose, fire_at_ms: Date.now() });
-        }
-      } else if (purpose.purpose === "cursor_gc") {
-        this.catalog.completePurpose(purpose.purpose, purpose.generation);
-        const nextExpiry = this.catalog.purgeEnumerationCursors(Date.now());
-        if (nextExpiry !== null) {
-          this.catalog.schedulePurpose({
-            purpose: "cursor_gc",
+      try {
+        let completed = false;
+        if (purpose.purpose === "snapshot_resume") {
+          const result = await this.catalog.resumeSnapshot(purpose.generation);
+          completed = this.catalog.completePurposeIfCurrent(purpose);
+          if (completed && result.status === "pending") {
+            this.catalog.schedulePurpose({ ...purpose, fire_at_ms: Date.now(), attempt_count: 0 });
+          }
+        } else if (purpose.purpose === "cursor_gc") {
+          const nextExpiry = this.catalog.purgeEnumerationCursors(Date.now());
+          const successor = nextExpiry === null ? null : {
+            purpose: "cursor_gc" as const,
             fire_at_ms: Math.max(Date.now(), nextExpiry),
             generation: 0,
             payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
-          });
-        }
-      } else if (purpose.purpose === "route_gc") {
-        this.catalog.completePurpose(purpose.purpose, purpose.generation);
-        const nextRelease = this.catalog.purgeReleasedRoutes(Date.now());
-        if (nextRelease !== null) {
-          this.catalog.schedulePurpose({
-            purpose: "route_gc",
+          };
+          completed = this.catalog.completePurposeIfCurrent(purpose);
+          if (completed && successor !== null) {
+            this.catalog.schedulePurpose({
+              ...successor,
+            });
+          }
+        } else if (purpose.purpose === "route_gc") {
+          const nextRelease = this.catalog.purgeReleasedRoutes(Date.now());
+          const successor = nextRelease === null ? null : {
+            purpose: "route_gc" as const,
             fire_at_ms: Math.max(Date.now(), nextRelease),
             generation: 0,
             payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
-          });
+          };
+          completed = this.catalog.completePurposeIfCurrent(purpose);
+          if (completed && successor !== null) {
+            this.catalog.schedulePurpose({
+              ...successor,
+            });
+          }
+        } else if (purpose.purpose === "history_gc") {
+          completed = await this.refreshHistoryGc(purpose);
+        } else {
+          // An older binary must retain work introduced by a newer one. The
+          // ordinary failure path defers it without leaking the unbounded name.
+          throw new TypeError("Unknown catalog alarm purpose.");
         }
-      } else if (purpose.purpose === "history_gc") {
-        await this.refreshHistoryGc();
-      } else {
-        // Unknown/future handlers never erase durable operation state. Removing
-        // only the wake-up prevents a hot alarm loop until its owner retries.
-        this.catalog.completePurpose(purpose.purpose, purpose.generation);
+        if (completed && (purpose.attempt_count ?? 0) > 0) {
+          console.log(JSON.stringify(reliabilitySloEvent({
+            component: "fleet_manifest_catalog",
+            operation: "catalog_alarm",
+            outcome: "recovered",
+            purpose: purpose.purpose,
+            attempt_count: purpose.attempt_count,
+            retry_after_ms: 0,
+          })));
+        }
+      } catch (error) {
+        const classification = classifyDurableObjectFailure(error);
+        const attemptCount = (purpose.attempt_count ?? 0) + 1;
+        const baseDelay = classification.overloaded
+          ? Math.max(CATALOG_ALARM_BASE_RETRY_MS, classification.retry_after_ms)
+          : CATALOG_ALARM_BASE_RETRY_MS;
+        const retryAfterMs = boundedExponentialBackoffMs(
+          attemptCount - 1,
+          baseDelay,
+          CATALOG_ALARM_MAX_RETRY_MS,
+        );
+        const rescheduled = this.catalog.reschedulePurposeAfterFailure(purpose, Date.now() + retryAfterMs, attemptCount);
+        if (rescheduled) {
+          console.warn(JSON.stringify(reliabilitySloEvent({
+            component: "fleet_manifest_catalog",
+            operation: "catalog_alarm",
+            outcome: "retry_scheduled",
+            purpose: purpose.purpose,
+            classification,
+            attempt_count: attemptCount,
+            retry_after_ms: retryAfterMs,
+          })));
+        }
       }
     }
     await this.armNextAlarm();

@@ -1,6 +1,8 @@
 import {
   TransactionContractViolation,
   canonicalJson,
+  classifyDurableObjectFailure,
+  durableObjectUnavailableError,
   manifestRoute,
   hashManifestReservation,
   sha256Hex,
@@ -11,7 +13,6 @@ import {
 } from "../../../packages/contracts/src/index.js";
 import {
   MANIFEST_CIRCUIT_POLICY,
-  manifestError,
   toManifestRpcError,
   type ManifestAdmissionProbe,
   type ManifestAdmissionResult,
@@ -95,19 +96,32 @@ export async function manifestObjectNameForRoute(
 
 export function asProtocolError(error: unknown): ManifestRpcError {
   if (error instanceof TransactionContractViolation) return toManifestRpcError(error.protocolError);
-  return manifestError("TX_MANIFEST_UNAVAILABLE", "Journal manifest service is temporarily unavailable.");
+  return toManifestRpcError(durableObjectUnavailableError(
+    error,
+    "TX_MANIFEST_UNAVAILABLE",
+    "Journal manifest service is temporarily unavailable.",
+  ));
 }
 
 export async function registerThroughManifestStub(
   stub: ManifestRegistrar,
   registration: ManifestRegistrationV1,
 ): Promise<ManifestServiceRegisterResult> {
+  let overloaded = false;
+  let retryAfterMs: number | undefined;
   try {
     const result = await stub.register(registration);
     if (result.status !== "unavailable") return result;
-  } catch {
+    overloaded = result.error.overloaded === true;
+    retryAfterMs = result.error.retry_after_ms;
+  } catch (error) {
     // The registration may have committed before the response was lost. The
     // only safe response after commit_decided is a pollable ambiguous result.
+    const classification = classifyDurableObjectFailure(error);
+    overloaded = classification.overloaded;
+    retryAfterMs = classification.overloaded || classification.retryable
+      ? classification.retry_after_ms
+      : undefined;
   }
   return {
     ok: false,
@@ -116,6 +130,8 @@ export async function registerThroughManifestStub(
     tx_id: registration.record.tx_id,
     retry_identical_registration: true,
     circuit: CIRCUIT_DIRECTIVE,
+    ...(overloaded ? { overloaded: true as const } : {}),
+    ...(retryAfterMs === undefined ? {} : { retry_after_ms: retryAfterMs }),
   };
 }
 
