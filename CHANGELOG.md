@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.16.0.0] - 2026-08-05: Overload-safe reliability foundations
+
+### Added
+- Added bounded, privacy-safe reliability SLO events for manifest admission, route assignment, and catalog alarm recovery.
+- Added explicit Durable Object overload and retry-cooldown hints to transaction and control-plane RPC errors without exposing provider exception text.
+- Added executable compatibility coverage for current and predecessor transaction state, future-version rejection before mutation, and expand-first alarm schema migration.
+
+### Changed
+- Manifest admission and route assignment now count overloads toward the existing circuit breaker while returning a typed cooldown before any participant prepare or durable transaction mutation.
+- Fleet catalog alarms isolate each logical purpose, persist per-purpose attempts, continue later due work after a failure, and retry with capped exponential backoff that honors provider overload cooldowns.
+- Ambiguous manifest registration and lookup failures now preserve sanitized overload metadata across the control-plane boundary.
+
+This work is locally verified only. Production deployment and the planned live saturation, remote-fault, rollout, restore, and SLO qualification gates remain separate.
+
 ## [2.15.0.0] - 2026-08-05: Cutoff-safe manifest sealing and enumeration
 
 ### Added
