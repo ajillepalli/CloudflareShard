@@ -364,7 +364,8 @@ describe("FleetManifestCatalogStore", () => {
         markStarted();
         return await new Promise<never>((_resolve, reject) => { rejectHandler = reject; });
       };
-      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const warnings: string[] = [];
+      const warning = vi.spyOn(console, "warn").mockImplementation((value) => warnings.push(String(value)));
       try {
         const alarm = instance.alarm();
         await started;
@@ -386,6 +387,49 @@ describe("FleetManifestCatalogStore", () => {
         payload_hash: "b".repeat(64),
         attempt_count: 0,
       })]);
+      expect(warnings).toEqual([]);
+    });
+  });
+
+  it("does not report recovery when successful work was superseded mid-flight", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-recovery-cas-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({
+        purpose: "snapshot_resume",
+        fire_at_ms: 0,
+        generation: 7,
+        payload_hash: "a".repeat(64),
+        attempt_count: 2,
+      });
+      let resolveHandler!: (value: { status: "complete" }) => void;
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      (catalog as unknown as { resumeSnapshot: () => Promise<{ status: "complete" }> }).resumeSnapshot = async () => {
+        markStarted();
+        return await new Promise<{ status: "complete" }>((resolve) => { resolveHandler = resolve; });
+      };
+      const recovered: string[] = [];
+      const info = vi.spyOn(console, "log").mockImplementation((value) => recovered.push(String(value)));
+      try {
+        const alarm = instance.alarm();
+        await started;
+        catalog.schedulePurpose({
+          purpose: "snapshot_resume",
+          fire_at_ms: 123_456,
+          generation: 8,
+          payload_hash: "b".repeat(64),
+        });
+        resolveHandler({ status: "complete" });
+        await alarm;
+      } finally {
+        info.mockRestore();
+      }
+      expect(recovered).toEqual([]);
+      expect(catalog.duePurposes(123_456)).toEqual([
+        expect.objectContaining({ purpose: "snapshot_resume", generation: 8, attempt_count: 0 }),
+      ]);
     });
   });
 
@@ -412,6 +456,37 @@ describe("FleetManifestCatalogStore", () => {
       expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS)).toEqual([
         expect.objectContaining({ purpose: "cursor_gc", generation: 0, attempt_count: 1 }),
       ]);
+    });
+  });
+
+  it("keeps independent durable retries when route and history GC fail", async () => {
+    const stub = env.FLEET_MANIFEST_CATALOG.getByName(`catalog-alarm-gc-retries-${crypto.randomUUID()}`);
+    await runInDurableObject(stub, async (durableObject) => {
+      const instance = durableObject as unknown as FleetManifestCatalogDO;
+      const catalog = (instance as unknown as { catalog: FleetManifestCatalogStore }).catalog;
+      catalog.schedulePurpose({ purpose: "route_gc", fire_at_ms: 0, generation: 0, payload_hash: "d".repeat(64) });
+      catalog.schedulePurpose({ purpose: "history_gc", fire_at_ms: 0, generation: 0, payload_hash: "e".repeat(64) });
+      (catalog as unknown as { purgeReleasedRoutes: () => never }).purgeReleasedRoutes = () => {
+        throw new Error("route GC failed");
+      };
+      (catalog as unknown as { purgeHistory: () => never }).purgeHistory = () => {
+        throw new Error("history GC failed");
+      };
+      const warnings: string[] = [];
+      const warning = vi.spyOn(console, "warn").mockImplementation((value) => warnings.push(String(value)));
+      try {
+        await instance.alarm();
+      } finally {
+        warning.mockRestore();
+      }
+      expect(catalog.duePurposes(Date.now() + CATALOG_ALARM_MAX_RETRY_MS)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ purpose: "route_gc", attempt_count: 1 }),
+        expect.objectContaining({ purpose: "history_gc", attempt_count: 1 }),
+      ]));
+      expect(warnings.map((line) => JSON.parse(line))).toEqual(expect.arrayContaining([
+        expect.objectContaining({ purpose: "route_gc", outcome: "retry_scheduled" }),
+        expect.objectContaining({ purpose: "history_gc", outcome: "retry_scheduled" }),
+      ]));
     });
   });
 

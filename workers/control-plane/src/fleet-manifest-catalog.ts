@@ -1727,11 +1727,11 @@ export class FleetManifestCatalogStore {
     });
   }
 
-  reschedulePurposeAfterFailure(purpose: CatalogAlarmPurpose, fireAtMs: number, attemptCount: number): void {
+  reschedulePurposeAfterFailure(purpose: CatalogAlarmPurpose, fireAtMs: number, attemptCount: number): boolean {
     if (!Number.isSafeInteger(fireAtMs) || fireAtMs < 0 || !Number.isSafeInteger(attemptCount) || attemptCount < 1) {
       throw new TypeError("Alarm retry time and attempt must be safe positive integers.");
     }
-    this.storage.sql.exec(
+    const result = this.storage.sql.exec(
       `UPDATE alarm_schedule SET fire_at_ms = ?, attempt_count = ?
         WHERE purpose = ? AND fire_at_ms = ? AND generation = ? AND payload_hash = ? AND attempt_count = ?`,
       fireAtMs,
@@ -1742,6 +1742,14 @@ export class FleetManifestCatalogStore {
       purpose.payload_hash,
       purpose.attempt_count ?? 0,
     );
+    return result.rowsWritten === 1;
+  }
+
+  scheduledPurpose(purpose: string): CatalogAlarmPurpose | null {
+    return this.storage.sql.exec<AlarmRow>(
+      "SELECT purpose, fire_at_ms, generation, payload_hash, attempt_count FROM alarm_schedule WHERE purpose = ?",
+      purpose,
+    ).toArray()[0] ?? null;
   }
 
   nextAlarmAt(): number | null {
@@ -1804,7 +1812,8 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     }
   }
 
-  private async refreshHistoryGc(expectedPurpose?: CatalogAlarmPurpose): Promise<void> {
+  private async refreshHistoryGc(expectedPurpose?: CatalogAlarmPurpose): Promise<boolean> {
+    const scheduled = expectedPurpose ?? this.catalog.scheduledPurpose("history_gc");
     const history = this.catalog.purgeHistory(Date.now());
     const successor = history.next_deadline_ms === null ? null : {
       purpose: "history_gc" as const,
@@ -1812,15 +1821,16 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
       generation: 0,
       payload_hash: await hashCanonicalJson(["history_gc", history.next_deadline_ms]),
     };
-    const completed = expectedPurpose === undefined
-      ? (this.catalog.completePurpose("history_gc", 0), true)
-      : this.catalog.completePurposeIfCurrent(expectedPurpose);
+    const completed = scheduled === null
+      ? this.catalog.scheduledPurpose("history_gc") === null
+      : this.catalog.completePurposeIfCurrent(scheduled);
     if (completed && successor !== null) {
       this.catalog.schedulePurpose({
         ...successor,
       });
     }
     await this.armNextAlarm();
+    return completed;
   }
 
   async partitionConfigForDay(fleetId: string, reservationDay: string): Promise<PartitionConfigRow> {
@@ -1979,9 +1989,10 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     const due = this.catalog.duePurposes(now);
     for (const purpose of due) {
       try {
+        let completed = false;
         if (purpose.purpose === "snapshot_resume") {
           const result = await this.catalog.resumeSnapshot(purpose.generation);
-          const completed = this.catalog.completePurposeIfCurrent(purpose);
+          completed = this.catalog.completePurposeIfCurrent(purpose);
           if (completed && result.status === "pending") {
             this.catalog.schedulePurpose({ ...purpose, fire_at_ms: Date.now(), attempt_count: 0 });
           }
@@ -1993,7 +2004,8 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
             generation: 0,
             payload_hash: await hashCanonicalJson(["cursor_gc", nextExpiry]),
           };
-          if (this.catalog.completePurposeIfCurrent(purpose) && successor !== null) {
+          completed = this.catalog.completePurposeIfCurrent(purpose);
+          if (completed && successor !== null) {
             this.catalog.schedulePurpose({
               ...successor,
             });
@@ -2006,19 +2018,20 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
             generation: 0,
             payload_hash: await hashCanonicalJson(["route_gc", nextRelease]),
           };
-          if (this.catalog.completePurposeIfCurrent(purpose) && successor !== null) {
+          completed = this.catalog.completePurposeIfCurrent(purpose);
+          if (completed && successor !== null) {
             this.catalog.schedulePurpose({
               ...successor,
             });
           }
         } else if (purpose.purpose === "history_gc") {
-          await this.refreshHistoryGc(purpose);
+          completed = await this.refreshHistoryGc(purpose);
         } else {
           // An older binary must retain work introduced by a newer one. The
           // ordinary failure path defers it without leaking the unbounded name.
           throw new TypeError("Unknown catalog alarm purpose.");
         }
-        if ((purpose.attempt_count ?? 0) > 0) {
+        if (completed && (purpose.attempt_count ?? 0) > 0) {
           console.log(JSON.stringify(reliabilitySloEvent({
             component: "fleet_manifest_catalog",
             operation: "catalog_alarm",
@@ -2039,16 +2052,18 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
           baseDelay,
           CATALOG_ALARM_MAX_RETRY_MS,
         );
-        this.catalog.reschedulePurposeAfterFailure(purpose, Date.now() + retryAfterMs, attemptCount);
-        console.warn(JSON.stringify(reliabilitySloEvent({
-          component: "fleet_manifest_catalog",
-          operation: "catalog_alarm",
-          outcome: "retry_scheduled",
-          purpose: purpose.purpose,
-          classification,
-          attempt_count: attemptCount,
-          retry_after_ms: retryAfterMs,
-        })));
+        const rescheduled = this.catalog.reschedulePurposeAfterFailure(purpose, Date.now() + retryAfterMs, attemptCount);
+        if (rescheduled) {
+          console.warn(JSON.stringify(reliabilitySloEvent({
+            component: "fleet_manifest_catalog",
+            operation: "catalog_alarm",
+            outcome: "retry_scheduled",
+            purpose: purpose.purpose,
+            classification,
+            attempt_count: attemptCount,
+            retry_after_ms: retryAfterMs,
+          })));
+        }
       }
     }
     await this.armNextAlarm();
