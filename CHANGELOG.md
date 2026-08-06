@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.15.0.0] - 2026-08-05: Cutoff-safe manifest sealing and enumeration
+
+### Added
+- Added Manifest V2 contracts for pre-prepare route reservation, bucket-owned commit decisions, cancellation, exact-cutoff seals, bounded local pages, fleet cursors, and typed coverage failures.
+- Added `FleetManifestCatalogDO`, including activation fencing, append-only partition configuration, hash-chained cutoff snapshots, deterministic close progress, continuous 16-partition daily certification, and immutable fleet roots.
+- Added V2 reservation/finalization/cancellation and exact-cutoff sealing to `JournalManifestDO`, with inline V1 certification, audited hash-chained quarantine resolution, separate decision/seal watermarks, retention epochs, and multiplexed alarm work.
+
+### Changed
+- New cross-shard transactions use `manifest_reserving` before participant prepare and irreversible `commit_deciding` before the bucket assigns the canonical decision time. Existing state-model-1/V1 rows remain readable; an in-flight V1 decision that meets the permanent fence durably bridges through V2 without re-preparing participants.
+- V1 manifest admission is fleet-fenced after the first V2 reservation boundary. Enumeration fails closed for pre-boundary, incomplete, quarantined, or retention-expired coverage.
+- The V1/V2 boundary now serializes above every admitted legacy decision, terminal route assignments use a one-hour recovery lease, and journal/catalog history is garbage-collected in bounded 35-day batches while preserving hash-chain heads.
+- Finalize/cancel races now materialize repairable canonical records while remaining quarantined, and disjoint old-window retention no longer invalidates active newer-window cursors.
+- Future-skewed V1 decisions now retry instead of quarantining, identical reserve replays preserve quarantine evidence, and multi-batch cursor cleanup re-arms itself.
+- Building snapshots now fence activation-history GC, multi-batch record retention self-rearms, invalid bridge states return typed errors, and enumeration validates the cutoff day's config rather than the fleet config root.
+- Legacy certificates now bind the maximum V1 decision time and block overlapping coverage claims, first activation inherits the fleet boundary floor, and close work yields after one legacy grid day to remain within Worker subrequest budgets.
+- Seal generations retain only their bounded rolling digest instead of per-record write-only rows, and expired enumeration leases now return a restartable cursor mismatch rather than claiming retained history was deleted.
+
+This work is locally verified only. Production deployment, restore execution, and live performance/SLO qualification remain separate gates.
+
 ## [2.14.0.0] - 2026-08-05: Evidence-driven onboarding implementation and upgrade-safe distributed transactions
 
 CloudflareShard now includes a locally verified `doctor -> deploy -> verify -> receipt` workflow that can prove traffic reached distinct shards and retain a redacted evidence receipt without treating pending reconciliation as success. Operators also get a deterministic OLTP baseline whose JSON and Markdown artifacts share one checksummed result.

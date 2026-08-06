@@ -211,6 +211,7 @@ describe("35-day lifecycle alarm", () => {
     await runInDurableObject(stub, async (instance) => instance.alarm?.());
     await expect(stub.lookup(value.record.tx_id)).resolves.toEqual({ ok: true, found: false });
     await expect(stub.release(value.record.tx_id, value.record_hash)).resolves.toEqual({ ok: true, status: "not_found" });
+    await expect(stub.stats()).resolves.toMatchObject({ next_alarm_ms: null });
   });
 
   it("never lifecycle-deletes a quarantined conflict", async () => {

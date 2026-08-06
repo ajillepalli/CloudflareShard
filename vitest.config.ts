@@ -20,12 +20,74 @@ export default defineConfig({
             modules: true,
             script: `
               import { WorkerEntrypoint } from "cloudflare:workers";
+              const assignments = new Map();
+              const records = new Map();
+              let decisionSequence = 1;
+              const canonical = (value) => {
+                if (value === null || typeof value !== "object") return JSON.stringify(value);
+                if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+                return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
+              };
+              const sha = async (value) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))), (byte) => byte.toString(16).padStart(2, "0")).join("");
               export default class TestControlPlane extends WorkerEntrypoint {
                 async checkManifestAdmission() {
                   return { ok: true, status: "ready", circuit_policy: { failure_threshold: 3, failure_window_ms: 30000, maximum_cooldown_ms: 300000 } };
                 }
                 async registerManifest(registration) {
                   return { ok: true, status: "registered", http_status: 200, record_hash: registration.record_hash, quarantined: false };
+                }
+                async assignManifestRoute(request) {
+                  const prior = assignments.get(request.idempotency_key);
+                  if (prior) return { ok: true, status: "already_assigned", ...prior };
+                  const reservedAt = new Date().toISOString();
+                  const routeDigest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(request.draft.tx_id)));
+                  const partition = routeDigest[routeDigest.length - 1] % 16;
+                  const day = reservedAt.slice(0, 10);
+                  const reservation = {
+                    protocol_version: 1,
+                    format_version: 1,
+                    fleet_id: request.draft.fleet_id,
+                    reservation_utc_day: day,
+                    partition,
+                    partition_count: 16,
+                    routing_key: day + ":" + String(partition).padStart(2, "0"),
+                    partition_config_hash: "0".repeat(64),
+                    tx_id: request.draft.tx_id,
+                    coordinator_id: request.draft.coordinator_id,
+                    operation_hash: request.draft.operation_hash,
+                    decision_epoch: request.draft.decision_epoch,
+                    reserved_at: reservedAt,
+                  };
+                  const assignment = { reservation, reservation_hash: await sha(canonical(reservation)) };
+                  assignments.set(request.idempotency_key, assignment);
+                  return { ok: true, status: "assigned", ...assignment };
+                }
+                async reserveManifest(request) {
+                  return { ok: true, status: "reserved", reservation_hash: request.reservation_hash, required_decision_floor_ms: 0, local_legacy_certificate_hash: "0".repeat(64) };
+                }
+                async finalizeManifest(request) {
+                  const prior = records.get(request.intent.idempotency_key);
+                  if (prior) return { ok: true, status: "already_finalized", ...prior };
+                  const decidedMs = Date.now();
+                  const record = {
+                    ...request.reservation,
+                    format_version: 2,
+                    reservation_hash: request.reservation_hash,
+                    envelope_hash: request.intent.redo_envelope_hash,
+                    commit_decided_at: new Date(decidedMs).toISOString(),
+                    commit_decided_at_ms: decidedMs,
+                    decision_sequence: decisionSequence++,
+                    retention_deadline: new Date(decidedMs + 35 * 86400000).toISOString(),
+                  };
+                  const finalized = { record, record_hash: await sha(canonical(record)) };
+                  records.set(request.intent.idempotency_key, finalized);
+                  return { ok: true, status: "finalized", ...finalized };
+                }
+                async cancelManifest() {
+                  return { ok: true, status: "cancelled" };
+                }
+                async releaseManifestV2() {
+                  return { ok: true, status: "released" };
                 }
                 async releaseManifestRetention() {
                   return { ok: true, status: "released" };

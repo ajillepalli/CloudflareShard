@@ -60,6 +60,37 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
   - Partitions records by fleet, UTC day, and a deterministic 16-way hash.
   - Retains records for at least the coordinator/participant recovery window.
 
+- FleetManifestCatalogDO (manifest candidate-set control plane)
+  - Owns fleet-scoped active-bucket discovery; account-level Durable Object
+    listing is not a correctness source.
+  - Serializes activation against cutoff snapshots and returns the decision
+    floor that every later bucket must install.
+  - Owns partition-config history, daily legacy-certification horizon,
+    deterministic close progress, exact bucket receipt hashes, and fleet roots.
+
+### 3.1 Manifest V2 ordering
+
+For state-model-2 transactions the coordinator calls route assignment, persists
+`manifest_reserving` plus the exact reservation/hash and recovery work, and only
+then calls reserve. Participant prepare starts only after reserve succeeds.
+After all prepares, `prepared -> commit_deciding` is durable before finalize.
+The bucket assigns the canonical decision timestamp and sequence; the
+coordinator stores the returned V2 record/hash before participant commit.
+Conflicting evidence is held in a quarantine overlay without rewriting canonical
+membership. The authenticated operator repair path binds the requested outcome
+to the CoordinatorDO's durable state and exact terminal intent, appends an
+immutable resolution attestation, and rechecks coordinator state before applying
+the acknowledgement.
+
+The bucket's membership predicate is exactly `state = FINALIZED AND
+commit_decided_at_ms <= cutoff`. Sealing first advances `decision_floor_ms`,
+digests that set in keyset batches, rechecks its count and quarantine state, and
+then publishes an immutable exact-cutoff receipt. Fleet enumeration can report
+`complete=true` only when its immutable catalog snapshot has an exact receipt
+for every candidate bucket and every required day has all 16 local legacy
+certificates. Retention deletion atomically advances the deleted-through
+watermark, retention epoch, and retention-evidence root; stale cursors fail.
+
 ## 4) Logical Data Partitioning
 
 - Partition function input:
@@ -941,10 +972,11 @@ This prevents duplicate writes after network retries and stops a reused requestI
     `new -> preparing -> prepared -> commit_decided -> commit_pending_manifest ->
     manifest_registered -> committing -> committed_pending_ack -> committed` (the two pending
     states are skipped when their acknowledgement succeeds immediately), or
-    `preparing/prepared -> abort_decided -> aborting -> aborted`. `quarantined` is a terminal
+    `preparing/prepared -> abort_decided -> aborting -> aborted`. `quarantined` is a parked
     manual-inspection state reached when immutable content conflicts or unsafe persisted state
-    is detected. Same-state replay is idempotent; no transition from a commit-decision state to
-    an abort state is legal.
+    is detected. Only the audited quarantine-repair path may leave it, using canonical terminal
+    intent plus operator attestation to reach `manifest_registered` or `aborted`. Same-state
+    replay is idempotent; no transition from a commit-decision state to an abort state is legal.
   - **Manifest-before-participant-commit sequence.** After every participant prepares, the
     coordinator (1) durably stores `commit_decided` plus the immutable redo envelope and
     manifest registration, (2) queues manifest recovery, (3) registers that exact record with
