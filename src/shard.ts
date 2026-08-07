@@ -22,6 +22,8 @@ import { indexShardIdForKey } from "./hash";
 import { INTERNAL_TABLE_NAMES, isDeleteStatement, isMutation } from "./sql-safety";
 import { indexNameFromSyntheticTable, rowKey } from "./structured-op";
 
+const RESTORE_AUTHORITY_OBJECT_NAME = "deployment-restore-authority";
+
 type ExecutePayload = {
   sql: string;
   params?: unknown[];
@@ -1490,7 +1492,7 @@ export class ShardDO extends DurableObject {
         body: JSON.stringify({ txId: coordinatorTxId }),
       });
       if (!res.ok) return { decision: "unreachable" };
-      const body = (await res.json()) as { found: boolean; status?: string; epoch?: number; operationHash?: string; commitAuthorized?: boolean };
+      const body = (await res.json()) as { found: boolean; status?: string; epoch?: number; operationHash?: string; commitAuthorized?: boolean; discarded_by_restore?: boolean };
       if (!body.found) return { decision: "unreachable" };
       const operationHash = typeof body.operationHash === "string" && /^[a-f0-9]{64}$/.test(body.operationHash)
         ? body.operationHash
@@ -1499,6 +1501,9 @@ export class ShardDO extends DurableObject {
         return { decision: "committed", epoch: body.epoch, operationHash };
       }
       if (body.status === "abort_decided" || body.status === "aborting" || body.status === "aborted") {
+        return { decision: "aborted", epoch: body.epoch, operationHash };
+      }
+      if (body.discarded_by_restore === true) {
         return { decision: "aborted", epoch: body.epoch, operationHash };
       }
       return { decision: "pending", epoch: body.epoch, operationHash };
@@ -2117,7 +2122,7 @@ export class ShardDO extends DurableObject {
 
   private restoreCoordinatorStub(): RestoreCoordinatorStub | null {
     const namespace = this.restoreCoordinatorOverride ?? this.shardEnv.RESTORE_COORDINATOR;
-    return namespace ? namespace.getByName(`fleet:${this.restoreFleetId()}`) : null;
+    return namespace ? namespace.getByName(RESTORE_AUTHORITY_OBJECT_NAME) : null;
   }
 
   /** A configured authority is fail-closed: network errors, non-2xx replies,
@@ -2303,8 +2308,8 @@ export class ShardDO extends DurableObject {
     this.sql.exec("UPDATE __cf_restore_checkpoint_meta SET dirty = 1 WHERE singleton = 1");
   }
 
-  /** Certifies the provider-current state exactly once per participant
-   * mutation boundary. The wall-clock timestamp is captured only AFTER the
+  /** Certifies provider-current state at a bounded cadence while dirty. The
+   * wall-clock timestamp is captured only AFTER the
    * provider returned the exact bookmark, so `checkpoint_at_ms <= cutoff` is
    * a conservative selection rule. */
   private async certifyRestoreCheckpoint(): Promise<{ bookmark: string; checkpointAtMs: number }> {
@@ -2312,11 +2317,16 @@ export class ShardDO extends DurableObject {
       "SELECT dirty, coverage_start_ms FROM __cf_restore_checkpoint_meta WHERE singleton = 1",
     );
     if (!meta) throw new Error("Restore checkpoint metadata is missing.");
+    const latest = this.one<{ checkpoint_at_ms: number; bookmark: string }>(
+      "SELECT checkpoint_at_ms, bookmark FROM __cf_restore_checkpoints ORDER BY checkpoint_at_ms DESC LIMIT 1",
+    );
     if (meta.dirty === 0) {
-      const latest = this.one<{ checkpoint_at_ms: number; bookmark: string }>(
-        "SELECT checkpoint_at_ms, bookmark FROM __cf_restore_checkpoints ORDER BY checkpoint_at_ms DESC LIMIT 1",
-      );
       if (latest) return { bookmark: latest.bookmark, checkpointAtMs: latest.checkpoint_at_ms };
+    }
+    if (latest && Date.now() - latest.checkpoint_at_ms < 1_000) {
+      // Leave dirty set: a later mutation boundary will certify the accumulated
+      // changes. The direct-write journal remains the conservative loss proof.
+      return { bookmark: latest.bookmark, checkpointAtMs: latest.checkpoint_at_ms };
     }
     const bookmark = await this.pitrPort.getCurrentBookmark();
     const checkpointAtMs = Date.now();
@@ -2380,7 +2390,8 @@ export class ShardDO extends DurableObject {
     // Provider time lookup is intentionally not called: Cloudflare defines it
     // as approximate and it contributes no evidence to exact selection.
     const target = this.one<{ bookmark: string; checkpoint_at_ms: number }>(
-      "SELECT bookmark, checkpoint_at_ms FROM __cf_restore_checkpoints WHERE checkpoint_at_ms <= ? ORDER BY checkpoint_at_ms DESC LIMIT 1",
+      "SELECT bookmark, checkpoint_at_ms FROM __cf_restore_checkpoints WHERE checkpoint_at_ms >= ? AND checkpoint_at_ms <= ? ORDER BY checkpoint_at_ms DESC LIMIT 1",
+      coverageStart,
       cutoffMs,
     );
     if (!target) return json({ error: { code: "RESTORE_BOOKMARK_MISSING", message: "No certified exact checkpoint exists at or before cutoff." } }, 409);
@@ -2482,8 +2493,22 @@ export class ShardDO extends DurableObject {
     return json({ ok: true, restarting: true, restore_id: restoreId, generation: body.generation }, 202);
   }
 
+  private restoreInvariantFailure(): Response | null {
+    const quick = this.one<Record<string, unknown>>("PRAGMA quick_check");
+    const quickResult = quick ? Object.values(quick)[0] : null;
+    const foreignKeyFailures = this.many<Record<string, unknown>>("PRAGMA foreign_key_check");
+    if (quickResult === "ok" && foreignKeyFailures.length === 0) return null;
+    return json({
+      error: {
+        code: "RESTORE_INVARIANT_FAILED",
+        message: "Restored SQLite state failed integrity or foreign-key verification.",
+      },
+      verified: false,
+    }, 409);
+  }
+
   private async handlePitrVerify(request: Request): Promise<Response> {
-    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string; mode?: "undo" };
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string; mode?: "undo"; require_invariants?: boolean };
     const restoreId = body.restore_id ?? body.restoreId;
     const targetBookmark = body.target_bookmark ?? body.targetBookmark;
     const match = await this.matchingRestoreFence(restoreId, body.generation);
@@ -2501,6 +2526,10 @@ export class ShardDO extends DurableObject {
       if (body.mode === "undo" && (state.phase === "staging" || restoredOriginalStageMarker)) {
         const currentBookmark = await this.pitrPort.getCurrentBookmark();
         if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+        if (body.require_invariants === true) {
+          const invariantFailure = this.restoreInvariantFailure();
+          if (invariantFailure) return invariantFailure;
+        }
         return json({
           ok: true,
           verified: true,
@@ -2509,6 +2538,7 @@ export class ShardDO extends DurableObject {
           generation: body.generation,
           target_bookmark: targetBookmark,
           preview_bookmark: currentBookmark,
+          invariants_verified: body.require_invariants === true,
         });
       }
       log("shard.restore_verify_pending", {
@@ -2538,6 +2568,10 @@ export class ShardDO extends DurableObject {
       // and the stateful branch above returns pending.
       const currentBookmark = await this.pitrPort.getCurrentBookmark();
       if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+      if (body.require_invariants === true) {
+        const invariantFailure = this.restoreInvariantFailure();
+        if (invariantFailure) return invariantFailure;
+      }
       return json({
         ok: true,
         verified: true,
@@ -2547,10 +2581,15 @@ export class ShardDO extends DurableObject {
         target_bookmark: targetBookmark,
         preview_bookmark: currentBookmark,
         certification: "provider-next-session-plus-absent-durable-marker",
+        invariants_verified: body.require_invariants === true,
       });
     }
     const currentBookmark = await this.pitrPort.getCurrentBookmark();
     if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+    if (body.require_invariants === true) {
+      const invariantFailure = this.restoreInvariantFailure();
+      if (invariantFailure) return invariantFailure;
+    }
     return json({
       ok: true,
       verified: true,
@@ -2562,6 +2601,7 @@ export class ShardDO extends DurableObject {
       // is not expected to equal the target bookmark.
       bookmark_equality_assumed: false,
       certification: "provider-next-session-plus-external-fence",
+      invariants_verified: body.require_invariants === true,
     });
   }
 

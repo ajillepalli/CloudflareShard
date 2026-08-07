@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CloudflareShardAdminClient } from "../src/admin-client.js";
-import { dispatch, isCommand, requireFlag, requireSha256Flag, run, usage } from "../src/cli.js";
+import { dispatch, isCommand, requireCanonicalUtcFlag, requireFlag, requireSha256Flag, run, usage } from "../src/cli.js";
 import { mockFetch } from "./test-helpers.js";
 import { credentialUrl } from "./redaction-fixtures.js";
 
@@ -39,6 +39,34 @@ describe("CLI", () => {
   it("requireSha256Flag() requires an exact lowercase plan digest", () => {
     expect(requireSha256Flag({ "plan-hash": "a".repeat(64) }, "plan-hash")).toBe("a".repeat(64));
     expect(() => requireSha256Flag({ "plan-hash": "ABC" }, "plan-hash")).toThrow(/lowercase SHA-256/);
+  });
+
+  it("requireCanonicalUtcFlag() rejects ambiguous or normalized cutoff input", () => {
+    expect(requireCanonicalUtcFlag({ cutoff: "2026-08-05T12:00:00.000Z" }, "cutoff")).toBe("2026-08-05T12:00:00.000Z");
+    expect(() => requireCanonicalUtcFlag({ cutoff: "2026-08-05 12:00:00" }, "cutoff")).toThrow(/canonical UTC/);
+  });
+
+  it("restore-status exits 4 after printing a manual repair state", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: "restore-1",
+      plan_hash: "a".repeat(64),
+      fleet_id: "default",
+      cutoff: "2026-08-05T12:00:00.000Z",
+      phase: "manual_repair_required",
+      started_at: "2026-08-05T12:10:00.000Z",
+      updated_at: "2026-08-05T12:20:00.000Z",
+      completed_at: null,
+      progress: { participants_total: 1, participants_restored: 0, transactions_total: 0, transactions_reconciled: 0 },
+      blockers: [],
+      report: null,
+    })));
+    let stdout = "";
+    vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => { stdout += String(chunk); return true; }) as typeof process.stdout.write);
+
+    await expect(run(["restore-status", "--url", "http://x", "--token", "t", "--restore-id", "restore-1"])).resolves.toBe(4);
+    expect(stdout).toContain("manual_repair_required");
   });
 
   it("converts receipt filesystem rejection into stable JSON and exit 3 without rejecting", async () => {
@@ -118,6 +146,9 @@ describe("CLI", () => {
         cutoff: "2026-08-05T12:00:00.000Z",
         idempotency_key: "preview-1",
       });
+      await expect(dispatch(client, "restore-preview", {
+        "fleet-id": "default", cutoff: "2026-08-05 12:00:00", "idempotency-key": "preview-2",
+      })).rejects.toThrow(/canonical UTC/);
     });
 
     it("restore-execute requires the exact plan hash as destructive confirmation", async () => {

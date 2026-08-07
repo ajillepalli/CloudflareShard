@@ -418,13 +418,13 @@ function validateImpact(
   ]);
   assertInteger(value.participant_count, "participant_count", 1);
   assertInteger(value.transaction_count, "transaction_count");
-  parseTimestamp(value.intentional_loss_from, "intentional_loss_from");
+  const lossFrom = parseTimestamp(value.intentional_loss_from, "intentional_loss_from");
   parseTimestamp(value.intentional_loss_through, "intentional_loss_through");
   if (value.participant_count !== participantCount || value.transaction_count !== transactionCount) {
     failRestore("RESTORE_INVALID_REQUEST", "Restore impact counts do not match the immutable resource/evidence sets.");
   }
-  if (value.intentional_loss_from !== cutoff || value.intentional_loss_through !== executeBefore) {
-    failRestore("RESTORE_INVALID_REQUEST", "Restore impact loss bounds must equal cutoff and execute_before.");
+  if (lossFrom.getTime() > Date.parse(cutoff) || value.intentional_loss_through !== executeBefore) {
+    failRestore("RESTORE_INVALID_REQUEST", "Restore impact loss bounds must cover the cutoff through execute_before.");
   }
 }
 

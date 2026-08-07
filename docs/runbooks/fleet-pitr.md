@@ -100,7 +100,8 @@ plan. Review at least:
 - every manifest pin and `manifest.record_count`;
 - the sorted physical-shard participant list and both bookmarks per shard;
 - `impact.participant_count`, `impact.transaction_count`, and the intentional
-  loss interval;
+  loss interval (which begins at the earliest exact participant checkpoint,
+  so it may conservatively precede the requested cutoff);
 - `rollback.undo_supported`, `undo_expires_at`, and every limitation;
 - the exact 64-character `plan_hash`.
 
@@ -203,8 +204,8 @@ gate. The topology escape hatch cannot safely release a restore fence.
 Read `blockers[]`; each blocker carries a typed code/message and, when known,
 the affected `participant_id` or `tx_id`. Automatic reconcile is intentionally
 limited to retryable `RESTORE_INTERRUPTED` and `RESTORE_UNAVAILABLE` blockers.
-Repair that external condition, then resume the same durable stage with the
-same immutable plan hash:
+Only repair an external/provider availability condition while the fence is
+held, then resume the same durable stage with the same immutable plan hash:
 
 ```bash
 node client/dist/cli.js restore-reconcile \
@@ -214,9 +215,10 @@ node client/dist/cli.js restore-reconcile \
 
 Reconcile is idempotent. It refuses a different hash and refuses to resume when
 the matching fleet fence is not active. If the blocker remains, the operation
-parks again with the fence intact. A contradiction/invariant/evidence blocker
-is not automatically retryable; it requires a reviewed versioned repair path
-or an eligible rollback. Escalate rather than clearing state by hand.
+parks again with the fence intact. A contradiction, local invariant, or
+evidence blocker is not repairable through ordinary fenced traffic; it
+requires an eligible rollback or a reviewed versioned repair path. Escalate
+rather than clearing state by hand.
 
 An error detected before any shard restore begins follows a different
 path: the coordinator releases installed fences and records `failed`. Fix the
@@ -271,11 +273,16 @@ POST /admin/restore-rollback  {protocol_version:1, format_version:1, restore_id,
 
 The typed SDK methods are `restorePreview`, `restoreExecute`, `restoreStatus`,
 `restoreReconcile`, `restoreRollback`, and `waitForRestore`. `waitForRestore`
-defaults to polling every 500 ms for at most 30 minutes and returns `complete`,
-`rolled_back`, `manual_repair_required`, and `failed` as visible terminal
-states.
+defaults to polling every 500 ms for at most 30 minutes and returns `previewed`,
+`parked_lease_lost`, `complete`, `rolled_back`, `manual_repair_required`, and
+`failed` as visible non-progressing or terminal states.
 
 ## Release gate: three live rehearsals
+
+T6 satisfied this gate with three independent 8-Shard restores and a separate
+interrupted rollback rehearsal; see the
+[2026-08-07 qualification evidence](../rehearsals/t6-2026-08-07.md). Repeat the
+gate for any future change to provider PITR semantics or restore orchestration.
 
 Unit/workerd tests do not qualify provider PITR behavior. Before declaring a
 build production-ready, complete **3/3 independent live rehearsals** on

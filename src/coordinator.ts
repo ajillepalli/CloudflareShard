@@ -102,9 +102,10 @@ type _GeneratedControlPlaneBindingIsCompatible = Assert<
 
 type RestoreCoordinatorStub = { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> };
 type RestoreCoordinatorNamespace = { getByName(name: string): RestoreCoordinatorStub };
+const RESTORE_AUTHORITY_OBJECT_NAME = "deployment-restore-authority";
 type CoordinatorRegistrationResult =
   | { disposition: "registered" }
-  | { disposition: "discard_required"; restoreId: string; generation: number };
+  | { disposition: "discard_required"; restoreId: string; generation: number; cutoff: string };
 type RestoreGateSnapshot = {
   ok: true;
   state: "open" | "fenced";
@@ -703,7 +704,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private restoreCoordinatorStub(fleetId = this.deploymentFleetId()): RestoreCoordinatorStub | null {
     const namespace = this.restoreCoordinatorOverride ?? this.coordinatorEnv.RESTORE_COORDINATOR;
-    return namespace ? namespace.getByName(`fleet:${fleetId}`) : null;
+    void fleetId;
+    return namespace ? namespace.getByName(RESTORE_AUTHORITY_OBJECT_NAME) : null;
   }
 
   private async restoreGateSnapshot(
@@ -795,6 +797,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       disposition?: unknown;
       restore_id?: unknown;
       generation?: unknown;
+      cutoff?: unknown;
     } | null;
     if (body?.disposition === "discard_required") {
       if (
@@ -803,10 +806,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         || typeof body.generation !== "number"
         || !Number.isSafeInteger(body.generation)
         || body.generation < 0
+        || typeof body.cutoff !== "string"
+        || !Number.isFinite(Date.parse(body.cutoff))
+        || new Date(body.cutoff).toISOString() !== body.cutoff
       ) {
         throw new RestoreGateDenied("coordinator registry returned a malformed discard directive");
       }
-      return { disposition: "discard_required", restoreId: body.restore_id, generation: body.generation };
+      return { disposition: "discard_required", restoreId: body.restore_id, generation: body.generation, cutoff: body.cutoff };
     }
     if (!body || body.ok !== true || typeof body.registered_at !== "string") throw new RestoreGateDenied("coordinator registry returned malformed acknowledgement");
     // Registration is an external await. Re-read the gate so a restore that
@@ -831,6 +837,45 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }
       return { ...participant, prepare_bookmark: prepareBookmark };
     });
+  }
+
+  private restoreCheckpointCertificationEnabled(): boolean {
+    return !!(this.restoreCoordinatorOverride ?? this.coordinatorEnv.RESTORE_COORDINATOR);
+  }
+
+  private hasExactPrepareBookmarks(row: TxRow): boolean {
+    const expected = this.participants(row).length;
+    const counts = this.one<{ total: number; exact: number }>(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN prepare_bookmark IS NOT NULL AND prepare_bookmark != '' THEN 1 ELSE 0 END) AS exact
+         FROM transaction_participants WHERE tx_id = ?`,
+      row.tx_id,
+    );
+    return counts?.total === expected && counts.exact === expected;
+  }
+
+  private registrationRequiresDiscard(row: TxRow, cutoff: string): boolean {
+    if (row.decision === "abort" || row.status === "aborted") return false;
+    return row.commit_decided_at_ms === null || row.commit_decided_at_ms > Date.parse(cutoff);
+  }
+
+  private async abortParticipantsForRestore(row: TxRow, restoreId: string, generation: number): Promise<void> {
+    await Promise.all(this.participants(row).map(async (participant) => {
+      const stub = this.coordinatorEnv.SHARD.get(this.coordinatorEnv.SHARD.idFromName(participant.shardId));
+      const response = await stub.fetch("https://shard.internal/recover", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...this.participantMessage(row, "recover"),
+          decision: "abort",
+          restore_id: restoreId,
+          generation,
+        }),
+      });
+      if (!response.ok) {
+        throw new RestoreGateDenied(`participant ${participant.shardId} rejected restore discard cleanup with ${response.status}`);
+      }
+    }));
   }
 
   private async envelopeFor(
@@ -1236,7 +1281,10 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     await this.assertRestoreGateOpen(row.fleet_id);
     await this.ensureAlarmScheduled(Date.now());
     const { reservation, reservationHash } = await this.reservationFor(row);
-    const checkpointCertified = !!(this.restoreCoordinatorOverride ?? this.coordinatorEnv.RESTORE_COORDINATOR);
+    // Durable evidence, rather than the current binding rollout state, selects
+    // the envelope version. Prepared predecessor rows without bookmarks remain
+    // valid V1 work after an expand-first deployment.
+    const checkpointCertified = this.hasExactPrepareBookmarks(row);
     const redoEnvelopeIntent = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: checkpointCertified ? CURRENT_REDO_ENVELOPE_FORMAT_VERSION : REDO_ENVELOPE_V1_FORMAT_VERSION,
@@ -2044,7 +2092,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private async prepare(row: TxRow): Promise<Response> {
     const participants = this.participants(row);
-    const checkpointCertificationRequired = !!this.coordinatorEnv.RESTORE_COORDINATOR;
+    const checkpointCertificationRequired = this.restoreCheckpointCertificationEnabled();
     const outcomes = await Promise.all(
       participants.map(async (participant) => {
         try {
@@ -2105,8 +2153,8 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     // Recovery can cross the commit decision and mutate every participant.
     // Register the durable row before any recovery mutation so coordinators
     // created before inventory rollout cannot escape a concurrent restore.
-    // A closed or unavailable external gate must otherwise make the alarm a
-    // no-op; throwing preserves work for the platform's alarm retry.
+    // A closed or unavailable external gate explicitly re-arms the alarm so
+    // recovery cannot be starved while a fleet restore holds the fence.
     await this.awaitMutationDrain();
     this.enterMutation();
     try {
@@ -2129,9 +2177,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       row.created_at,
     );
     if (registration.disposition === "discard_required") {
-      const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
-      if (!discarded.ok) throw new RestoreGateDenied("coordinator registry discard directive conflicts with local restore state");
-      return;
+      if (this.registrationRequiresDiscard(row, registration.cutoff)) {
+        const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
+        if (!discarded.ok) throw new RestoreGateDenied("coordinator registry discard directive conflicts with local restore state");
+        return;
+      }
     }
     await this.assertRestoreGateOpen(row.fleet_id || this.deploymentFleetId());
     const due = new Date(work.next_attempt_at).getTime();
@@ -2174,6 +2224,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         : "manifest";
       await this.reschedule(work.tx_id, normalizedAction);
     }
+    } catch (error) {
+      if (error instanceof RestoreGateDenied) {
+        await this.ctx.storage.setAlarm(Date.now() + DEFAULT_DURABLE_OBJECT_RETRY_AFTER_MS);
+        return;
+      }
+      throw error;
     } finally {
       this.leaveMutation();
     }
@@ -2278,6 +2334,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!meta?.coverage_start_ms) {
       return json({ error: { code: "RESTORE_COVERAGE_MISSING", message: "Coordinator exact-checkpoint coverage is unavailable." } }, 409);
     }
+    if (target && target.checkpoint_at_ms < meta.coverage_start_ms) target = null;
     let emptyAtCutoff = false;
     if (!target && meta.initial_empty_bookmark && meta.initial_empty_at_ms !== null) {
       const firstTx = this.one<{ created_at: string }>("SELECT created_at FROM transactions ORDER BY created_at ASC LIMIT 1");
@@ -2527,6 +2584,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const match = await this.matchingRestoreFence(restoreId, body.generation);
     if ("response" in match) return match.response;
     await this.awaitMutationDrain();
+    const row = this.one<{ tx_id: string }>("SELECT tx_id FROM transactions LIMIT 1");
+    if (row) {
+      const transaction = this.loadTx(row.tx_id);
+      if (transaction) await this.abortParticipantsForRestore(transaction, restoreId!, body.generation!);
+    }
     const discarded = this.persistRestoreDiscard(restoreId!, body.generation!);
     if (!discarded.ok) {
       return json({ error: { code: "RESTORE_DISCARD_CONFLICT", message: "Coordinator was already discarded by a different restore generation." } }, 409);
@@ -2651,11 +2713,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     );
     if (registration.disposition === "discard_required") {
       if (!existing) throw new RestoreGateDenied("coordinator registry returned a discard directive for a new transaction");
-      const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
-      if (!discarded.ok) {
-        return json({ error: { code: "RESTORE_DISCARD_CONFLICT", message: "Coordinator was already discarded by a different restore generation." } }, 409);
+      if (this.registrationRequiresDiscard(existing, registration.cutoff)) {
+        const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
+        if (!discarded.ok) {
+          return json({ error: { code: "RESTORE_DISCARD_CONFLICT", message: "Coordinator was already discarded by a different restore generation." } }, 409);
+        }
+        return this.discardedByRestoreResponse();
       }
-      return this.discardedByRestoreResponse();
     }
     if (existing && await this.coordinatorIdentity(existing) === "legacy") {
       const state = this.stateOf(existing);

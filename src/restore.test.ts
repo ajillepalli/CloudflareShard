@@ -23,7 +23,7 @@ function admin(path: string, body: unknown): Promise<Response> {
 }
 
 function restoreStub() {
-  return env.RESTORE_COORDINATOR.getByName("fleet:default");
+  return env.RESTORE_COORDINATOR.getByName("deployment-restore-authority");
 }
 
 afterEach(async () => {
@@ -173,6 +173,109 @@ describe("RestoreCoordinatorDO external fleet gate", () => {
     });
   });
 
+  it("revalidates the live fenced head rather than requiring the preview head to stay unchanged", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at, updated_at)
+         VALUES ('restore-revalidate', 'default', ?, 'revalidate-head', ?, 'fencing', 'revalidating_participants',
+                 ?, ?, 6, ?, ?, ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "e".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+        now,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO restore_participants
+          (restore_id, participant_id, participant_kind, object_name, target_bookmark,
+           preview_bookmark, pre_fence_bookmark, coverage_start, status)
+         VALUES ('restore-revalidate', 'shard:one', 'shard', 'one', 'target',
+                 'head-at-preview', 'head-at-fence', ?, 'fenced')`,
+        now,
+      );
+      const mutable = instance as unknown as {
+        participantStub(): { fetch(input: RequestInfo | URL): Promise<Response> };
+        operation(restoreId: string): unknown;
+        revalidateNextParticipant(operation: unknown): Promise<void>;
+      };
+      mutable.participantStub = () => ({
+        fetch: async () => Response.json({ target_bookmark: "target", preview_bookmark: "head-at-fence" }),
+      });
+      await mutable.revalidateNextParticipant(mutable.operation("restore-revalidate"));
+      expect(Array.from(state.storage.sql.exec(
+        "SELECT status FROM restore_participants WHERE restore_id = 'restore-revalidate'",
+      ))).toEqual([{ status: "ready" }]);
+    });
+  });
+
+  it("resumes reconciliation after an ambiguous prepare response using hash-validated shard state", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      const envelope = {
+        protocol_version: 1,
+        format_version: 2,
+        tx_id: "tx-replayed-prepare",
+        decision_epoch: 1,
+        operation_hash: "f".repeat(64),
+        participants: [{ participant_id: "one", epoch: 1, prepare_bookmark: "pre-restore-prepare", intents: [] }],
+      };
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at, updated_at)
+         VALUES ('restore-reconcile-retry', 'default', ?, 'reconcile-retry', ?, 'reconciling', 'reconciling',
+                 ?, ?, 9, ?, ?, ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "1".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+        now,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO restore_manifest_records
+          (restore_id, record_hash, tx_id, coordinator_id, commit_decided_at, envelope_hash,
+           record_json, envelope_json, reconciliation_status)
+         VALUES ('restore-reconcile-retry', ?, 'tx-replayed-prepare', 'tx-replayed-prepare', ?, ?, '{}', ?, 'pending')`,
+        "2".repeat(64),
+        now,
+        "3".repeat(64),
+        JSON.stringify(envelope),
+      );
+      const calls: string[] = [];
+      const mutable = instance as unknown as {
+        shardStub(): { fetch(input: RequestInfo | URL): Promise<Response> };
+        operation(restoreId: string): unknown;
+        reconcileNextTransaction(operation: unknown): Promise<void>;
+      };
+      mutable.shardStub = () => ({
+        fetch: async (input) => {
+          const path = new URL(input instanceof Request ? input.url : input.toString()).pathname;
+          calls.push(path);
+          if (path === "/tx-status") {
+            return Response.json({ found: true, status: "prepared", prepare_bookmark_present: false });
+          }
+          return Response.json({ ok: true, status: "committed" });
+        },
+      });
+      await mutable.reconcileNextTransaction(mutable.operation("restore-reconcile-retry"));
+      expect(calls).toEqual(["/tx-status", "/recover"]);
+      expect(Array.from(state.storage.sql.exec(
+        "SELECT reconciliation_status FROM restore_manifest_records WHERE restore_id = 'restore-reconcile-retry'",
+      ))).toEqual([{ reconciliation_status: "complete" }]);
+    });
+  });
+
   it("only authorizes the active restore generation while fenced", async () => {
     const stub = restoreStub();
     await stub.fetch(internal("/gate", { fleet_id: "default" }));
@@ -306,6 +409,7 @@ describe("restore admin validation", () => {
       { name: "expired", stage: "restoring_participants", expired: true, undo: true, gate: true, discarded: false, code: "RESTORE_PLAN_STALE" },
       { name: "complete", stage: "complete", expired: false, undo: true, gate: false, discarded: false, code: "RESTORE_CONFLICT" },
       { name: "discarded", stage: "reconciling", expired: false, undo: true, gate: true, discarded: true, code: "RESTORE_CONFLICT" },
+      { name: "participant-released", stage: "releasing_participants", expired: false, undo: true, gate: true, discarded: false, participantStatus: "released", code: "RESTORE_CONFLICT" },
       { name: "gate-mismatch", stage: "restoring_participants", expired: false, undo: true, gate: false, discarded: false, code: "RESTORE_CONFLICT" },
       { name: "no-undo", stage: "fencing_participants", expired: false, undo: false, gate: true, discarded: false, code: "RESTORE_CONFLICT" },
     ] as const;
@@ -340,10 +444,11 @@ describe("restore admin validation", () => {
           state.storage.sql.exec(
             `INSERT INTO restore_participants
               (restore_id, participant_id, participant_kind, object_name, status, undo_bookmark)
-             VALUES (?, ?, 'shard', ?, 'restored', 'undo')`,
+             VALUES (?, ?, 'shard', ?, ?, 'undo')`,
             restoreId,
             `shard:${scenario.name}`,
             scenario.name,
+            "participantStatus" in scenario ? scenario.participantStatus : "restored",
           );
         }
         if (scenario.discarded) {

@@ -119,7 +119,7 @@ function validateRestorePlan(value: unknown): RestorePlan {
   exact(impact, "plan.impact", ["participant_count", "transaction_count", "intentional_loss_from", "intentional_loss_through"]);
   if (integer(impact.participant_count, "plan.impact.participant_count", 1) !== plan.participants.length) invalid("participant count is inconsistent.");
   if (integer(impact.transaction_count, "plan.impact.transaction_count") !== recordCount) invalid("transaction count is inconsistent.");
-  if (timestamp(impact.intentional_loss_from, "plan.impact.intentional_loss_from") !== cutoff
+  if (Date.parse(timestamp(impact.intentional_loss_from, "plan.impact.intentional_loss_from")) > Date.parse(cutoff)
       || timestamp(impact.intentional_loss_through, "plan.impact.intentional_loss_through") !== executeBefore) {
     invalid("intentional loss bounds are inconsistent.");
   }
@@ -138,7 +138,10 @@ function validateRestorePlan(value: unknown): RestorePlan {
   return plan as unknown as RestorePlan;
 }
 
-export function validateRestorePreviewResponse(value: unknown): RestorePreviewResponse {
+export function validateRestorePreviewResponse(
+  value: unknown,
+  expected?: { fleetId: string; cutoff: string },
+): RestorePreviewResponse {
   const response = object(value, "preview response");
   if (response.status === "previewing") {
     exact(response, "preview response", ["ok", "status", "restore_id", "retry_after_ms"]);
@@ -150,31 +153,41 @@ export function validateRestorePreviewResponse(value: unknown): RestorePreviewRe
   if (response.status === "previewed") {
     exact(response, "preview response", ["ok", "status", "plan"]);
     if (response.ok !== true) invalid("preview response must be successful.");
-    validateRestorePlan(response.plan);
+    const plan = validateRestorePlan(response.plan);
+    if (expected && (plan.fleet_id !== expected.fleetId || plan.cutoff !== expected.cutoff)) {
+      invalid("preview plan is not bound to the requested fleet and cutoff.");
+    }
     return response as unknown as RestorePreviewResponse;
   }
   invalid("preview status is unsupported.");
 }
 
-export function validateRestoreAcceptedResponse(value: unknown): RestoreAcceptedResponse {
+export function validateRestoreAcceptedResponse(
+  value: unknown,
+  expected?: { restoreId: string; planHash: string },
+): RestoreAcceptedResponse {
   const response = object(value, "accepted response");
   exact(response, "accepted response", ["ok", "status", "restore_id", "plan_hash"]);
   if (response.ok !== true || (response.status !== "accepted" && response.status !== "already_started")) {
     invalid("accepted response status is unsupported.");
   }
-  string(response.restore_id, "accepted response.restore_id");
-  hash(response.plan_hash, "accepted response.plan_hash");
+  const restoreId = string(response.restore_id, "accepted response.restore_id");
+  const planHash = hash(response.plan_hash, "accepted response.plan_hash");
+  if (expected && (restoreId !== expected.restoreId || planHash !== expected.planHash)) {
+    invalid("accepted response is not bound to the requested restore and plan.");
+  }
   return response as unknown as RestoreAcceptedResponse;
 }
 
-export function validateRestoreStatusResponse(value: unknown): RestoreStatusResponse {
+export function validateRestoreStatusResponse(value: unknown, expectedRestoreId?: string): RestoreStatusResponse {
   const response = object(value, "status response");
   exact(response, "status response", [
     "protocol_version", "format_version", "restore_id", "plan_hash", "fleet_id", "cutoff", "phase",
     "started_at", "updated_at", "completed_at", "progress", "blockers", "report",
   ]);
   if (response.protocol_version !== 1 || response.format_version !== 1) invalid("status response version is unsupported.");
-  string(response.restore_id, "status response.restore_id");
+  const restoreId = string(response.restore_id, "status response.restore_id");
+  if (expectedRestoreId && restoreId !== expectedRestoreId) invalid("status response is not bound to the requested restore.");
   string(response.fleet_id, "status response.fleet_id");
   timestamp(response.cutoff, "status response.cutoff");
   if (typeof response.phase !== "string" || !PHASES.has(response.phase)) invalid("status response phase is unsupported.");

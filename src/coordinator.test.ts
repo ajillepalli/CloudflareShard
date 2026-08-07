@@ -41,7 +41,7 @@ async function installCoordinatorRestoreFakes(
   options: {
     state: "open" | "fenced";
     registrationStatus?: number;
-    registrationDisposition?: { restoreId: string; generation: number };
+    registrationDisposition?: { restoreId: string; generation: number; cutoff?: string };
     onRegistration?: (body: Record<string, unknown>) => void;
     pitr?: CoordinatorPitrPort;
   },
@@ -64,6 +64,7 @@ async function installCoordinatorRestoreFakes(
                 disposition: "discard_required",
                 restore_id: options.registrationDisposition.restoreId,
                 generation: options.registrationDisposition.generation,
+                cutoff: options.registrationDisposition.cutoff ?? new Date().toISOString(),
               });
             }
             return Response.json({ ok: status === 200, registered_at: status === 200 ? new Date().toISOString() : undefined }, { status });
@@ -433,6 +434,47 @@ describe("CoordinatorDO restore integration", () => {
       ))[0];
       expect(row).toEqual({ status: "quarantined", decision: "quarantined" });
       expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue"))).toHaveLength(0);
+    });
+  });
+
+  it("retains a coordinator whose durable commit decision predates a late restore cutoff", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm-pre-cutoff-registration" }));
+    const txId = "tx-pre-cutoff-commit";
+    const createdAt = new Date(Date.now() - 120_000).toISOString();
+    const decidedAt = Date.now() - 90_000;
+    const cutoff = new Date(Date.now() - 60_000).toISOString();
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+           fleet_id, coordinator_id, decision, commit_decided_at_ms)
+         VALUES (?, 'committed', '[]', '[]', 'existing-hash', ?, ?, 'default', ?, 'commit', ?)`,
+        txId,
+        createdAt,
+        createdAt,
+        txId,
+        decidedAt,
+      );
+      state.storage.sql.exec(
+        "INSERT INTO recovery_queue (tx_id, action, next_attempt_at, attempt_count) VALUES (?, 'commit', ?, 0)",
+        txId,
+        createdAt,
+      );
+    });
+    await installCoordinatorRestoreFakes(stub, {
+      state: "open",
+      registrationDisposition: { restoreId: "restore-after-commit", generation: 23, cutoff },
+    });
+
+    await runInDurableObject(stub, async (instance: CoordinatorDO) => instance.alarm());
+
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec<{ status: string; decision: string }>(
+        "SELECT status, decision FROM transactions WHERE tx_id = ?",
+        txId,
+      ))[0]).toEqual({ status: "committed", decision: "commit" });
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM coordinator_restore_discard"))).toHaveLength(0);
     });
   });
 });

@@ -38,6 +38,7 @@ import {
 import type { CatalogDO } from "./catalog.js";
 import type { CoordinatorDO } from "./coordinator.js";
 import type { ShardDO } from "./shard.js";
+import type { RestoreManifestService } from "../workers/control-plane/src/manifest-types.js";
 import { json } from "./http.js";
 import { log } from "./log.js";
 
@@ -52,17 +53,12 @@ const COORDINATOR_REGISTRY_RETENTION_MS = 35 * 24 * 60 * 60_000;
 
 type JsonObject = Record<string, unknown>;
 
-export interface FleetRestoreManifestService {
-  closeFleetThrough(request: { fleet_id: string; cutoff: string }): Promise<unknown>;
-  enumerateManifest(request: unknown): Promise<unknown>;
-}
-
 export interface RestoreCoordinatorEnv {
   CATALOG: DurableObjectNamespace<CatalogDO>;
   SHARD: DurableObjectNamespace<ShardDO>;
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
   RESTORE_COORDINATOR: DurableObjectNamespace<RestoreCoordinatorDO>;
-  CONTROL_PLANE?: FleetRestoreManifestService;
+  CONTROL_PLANE?: RestoreManifestService;
   DEPLOYMENT_FLEET_ID?: string;
   CATALOG_SHARD_COUNT?: string;
   FAULT_INJECTION_ENABLED?: string;
@@ -103,6 +99,7 @@ type ParticipantRow = {
   participant_kind: "shard" | "coordinator";
   object_name: string;
   target_bookmark: string | null;
+  target_checkpoint_at: string | null;
   preview_bookmark: string | null;
   coverage_start: string | null;
   status: string;
@@ -211,7 +208,7 @@ async function postToStub(stub: DurableObjectStub, path: string, body: unknown):
 }
 
 /**
- * One RestoreCoordinatorDO is addressed by `fleet:<deployment fleet id>`.
+ * One RestoreCoordinatorDO is addressed by a stable deployment authority name.
  * Keeping the gate and coordinator registry in the same non-restored object
  * makes the authority discoverable to every participant after a PITR restart.
  */
@@ -264,6 +261,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
         participant_kind TEXT NOT NULL,
         object_name TEXT NOT NULL,
         target_bookmark TEXT,
+        target_checkpoint_at TEXT,
         preview_bookmark TEXT,
         coverage_start TEXT,
         status TEXT NOT NULL,
@@ -275,6 +273,10 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
         PRIMARY KEY (restore_id, participant_id)
       )
     `);
+    const participantColumns = this.many<{ name: string }>("PRAGMA table_info(restore_participants)");
+    if (!participantColumns.some((column) => column.name === "target_checkpoint_at")) {
+      this.sql.exec("ALTER TABLE restore_participants ADD COLUMN target_checkpoint_at TEXT");
+    }
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS restore_coordinator_work (
         restore_id TEXT NOT NULL,
@@ -427,19 +429,32 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     // Gate checks are deliberately not queued: participant restore RPCs call
     // back into /gate while an exclusive advance is awaiting them. Status is
     // read-only and may expose the latest durable checkpoint during an advance.
-    if (path === "/gate" || path === "/status") return this.respond(path, request);
+    // Registration has its own synchronous durable critical section and must
+    // remain callable while an advance awaits a CoordinatorDO. Queueing it
+    // behind that advance can deadlock with the coordinator mutation drain.
+    if (path === "/gate" || path === "/status" || path === "/register-coordinator") {
+      return this.respond(path, request);
+    }
     return this.runMutation(() => this.respond(path, request));
   }
 
   async alarm(): Promise<void> {
     this.ensureSchema();
     await this.runMutation(async () => {
-      const operation = this.one<OperationRow>(
-        `SELECT * FROM restore_operations
-         WHERE stage NOT IN ('previewed', 'complete', 'rolled_back', 'manual_repair_required', 'failed')
-         ORDER BY updated_at ASC LIMIT 1`,
-      );
+      const gate = this.gate();
+      const operation = gate.active === 1 && gate.restore_id !== null
+        ? this.operation(gate.restore_id)
+        : this.one<OperationRow>(
+          `SELECT * FROM restore_operations
+           WHERE stage NOT IN ('previewed', 'complete', 'rolled_back', 'manual_repair_required', 'failed')
+           ORDER BY updated_at ASC LIMIT 1`,
+        );
       if (!operation) return;
+      this.sql.exec(
+        "UPDATE restore_operations SET updated_at = ? WHERE restore_id = ?",
+        new Date().toISOString(),
+        operation.restore_id,
+      );
       try {
         await this.advance(operation.restore_id);
       } catch (error) {
@@ -552,8 +567,8 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       });
     }
     if (existingCreatedAt !== null) {
-      const missedRestore = this.one<{ restore_id: string; fence_generation: number }>(
-        `SELECT operation.restore_id, operation.fence_generation
+      const missedRestore = this.one<{ restore_id: string; fence_generation: number; cutoff: string }>(
+        `SELECT operation.restore_id, operation.fence_generation, operation.cutoff
          FROM restore_operations AS operation
          LEFT JOIN restore_coordinator_work AS work
            ON work.restore_id = operation.restore_id AND work.coordinator_id = ?
@@ -572,6 +587,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
           registered_at: now,
           restore_id: missedRestore.restore_id,
           generation: missedRestore.fence_generation,
+          cutoff: missedRestore.cutoff,
         });
       }
     }
@@ -675,7 +691,8 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     const shardIds = new Set<string>();
     let topologyEpoch = 1;
     let coverageStartMs = 0;
-    for (let i = 0; i < this.catalogShardCount(); i += 1) {
+    const expectedCatalogCount = this.catalogShardCount();
+    for (let i = 0; i < expectedCatalogCount; i += 1) {
       const catalogId = `catalog-${i}`;
       const result = await postToStub(this.env.CATALOG.getByName(catalogId), "/restore-proof", {
         cutoff: operation.cutoff,
@@ -697,6 +714,20 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       const epoch = numberField(proof, "topology_epoch", "topologyEpoch", "metadata_version", "metadataVersion");
       if (epoch === null || epoch < 1) throw failure("RESTORE_ENUMERATION_INCOMPLETE", "Catalog topology epoch is missing.");
       topologyEpoch = Math.max(topologyEpoch, epoch);
+      const topologyVector = isObject(proof.topology_vector)
+        ? proof.topology_vector
+        : isObject(proof.topologyVector) ? proof.topologyVector : null;
+      const topologyConfig = topologyVector && isObject(topologyVector.config) ? topologyVector.config : null;
+      const durableCatalogCount = topologyConfig === null
+        ? null
+        : numberField(topologyConfig, "catalog_shard_count", "catalogShardCount");
+      if (durableCatalogCount !== expectedCatalogCount) {
+        throw failure(
+          "RESTORE_ENUMERATION_INCOMPLETE",
+          "Configured catalog fan-out does not match the durable topology.",
+          { catalog_id: catalogId, configured_count: expectedCatalogCount, durable_count: durableCatalogCount ?? -1 },
+        );
+      }
       const coverage = canonicalTimestamp(proof.coverage_start ?? proof.coverageStart);
       if (coverage === null) throw failure("RESTORE_ENUMERATION_INCOMPLETE", "Catalog restore evidence coverage is missing.");
       coverageStartMs = Math.max(coverageStartMs, new Date(coverage).getTime());
@@ -940,8 +971,12 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
 
   private participantStub(participant: ParticipantRow): DurableObjectStub {
     return participant.participant_kind === "shard"
-      ? this.env.SHARD.getByName(participant.object_name)
+      ? this.shardStub(participant.object_name)
       : this.env.COORDINATOR.getByName(participant.object_name);
+  }
+
+  private shardStub(objectName: string): DurableObjectStub {
+    return this.env.SHARD.getByName(objectName);
   }
 
   private async previewNextParticipant(operation: OperationRow): Promise<boolean> {
@@ -962,7 +997,8 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     const target = stringField(result, "target_bookmark", "targetBookmark");
     const current = stringField(result, "preview_bookmark", "previewBookmark", "current_bookmark", "currentBookmark");
     const coverage = canonicalTimestamp(result.coverage_start ?? result.coverageStart);
-    if (!target || !current || !coverage) {
+    const targetCheckpointAt = canonicalTimestamp(result.checkpoint_at ?? result.checkpointAt);
+    if (!target || !current || !coverage || !targetCheckpointAt) {
       throw failure("RESTORE_BOOKMARK_MISSING", "Participant did not return certified exact bookmark evidence.", {
         participant_id: participant.participant_id,
       });
@@ -974,9 +1010,10 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       });
     }
     this.sql.exec(
-      `UPDATE restore_participants SET target_bookmark = ?, preview_bookmark = ?, coverage_start = ?, status = 'previewed'
+      `UPDATE restore_participants SET target_bookmark = ?, target_checkpoint_at = ?, preview_bookmark = ?, coverage_start = ?, status = 'previewed'
        WHERE restore_id = ? AND participant_id = ?`,
       target,
+      targetCheckpointAt,
       current,
       coverage,
       operation.restore_id,
@@ -995,12 +1032,15 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       "SELECT * FROM restore_participants WHERE restore_id = ? ORDER BY participant_id",
       restoreId,
     );
-    if (participants.length === 0 || participants.some((p) => !p.target_bookmark || !p.preview_bookmark || p.status !== "previewed")) {
+    if (participants.length === 0 || participants.some((p) => !p.target_bookmark || !p.target_checkpoint_at || !p.preview_bookmark || p.status !== "previewed")) {
       throw failure("RESTORE_BOOKMARK_MISSING", "Restore plan is missing participant bookmarks.");
     }
     const manifest = JSON.parse(operation.manifest_pin_json) as RestorePlanBodyV1["manifest"];
     const previewedAt = new Date().toISOString();
     const executeBefore = new Date(Date.now() + PLAN_EXECUTION_WINDOW_MS).toISOString();
+    const intentionalLossFrom = participants
+      .map((participant) => participant.target_checkpoint_at!)
+      .sort()[0]!;
     const limitations = [
       "PITR rewinds each physical participant independently; reconciliation is required before the fleet is released.",
       "Rollback is available only while the original fleet fence remains held and before post-cutoff coordinators are discarded.",
@@ -1027,7 +1067,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       impact: {
         participant_count: participants.length,
         transaction_count: manifest.record_count,
-        intentional_loss_from: operation.cutoff,
+        intentional_loss_from: intentionalLossFrom,
         intentional_loss_through: executeBefore,
       },
       rollback: {
@@ -1162,6 +1202,10 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       operation.restore_id,
     );
     if (!participant) {
+      if (Date.now() >= new Date(operation.execute_before).getTime()) {
+        await this.failBeforeRestore(operation, "RESTORE_PLAN_STALE", "Restore fencing exceeded the immutable execution window.");
+        return;
+      }
       this.sql.exec(
         "UPDATE restore_operations SET stage = 'revalidating_participants', updated_at = ? WHERE restore_id = ?",
         new Date().toISOString(),
@@ -1219,7 +1263,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     });
     const target = stringField(current, "target_bookmark", "targetBookmark");
     const head = stringField(current, "preview_bookmark", "previewBookmark", "current_bookmark", "currentBookmark");
-    if (target !== participant.target_bookmark || participant.pre_fence_bookmark !== participant.preview_bookmark || head === null) {
+    if (target !== participant.target_bookmark || head !== participant.pre_fence_bookmark) {
       await this.failBeforeRestore(operation, "RESTORE_PLAN_STALE", `Participant ${participant.participant_id} changed after preview.`);
       return;
     }
@@ -1285,7 +1329,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
         fleet_id: operation.fleet_id,
         restore_id: operation.restore_id,
         generation: operation.fence_generation,
-        cutoff: operation.cutoff,
+        cutoff: participant.target_checkpoint_at,
         through: participant.closed_through,
         limit: LOSS_PAGE_SIZE,
         after: participant.loss_cursor_json === null ? 0 : JSON.parse(participant.loss_cursor_json),
@@ -1568,7 +1612,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       if (!isObject(rawParticipant) || typeof rawParticipant.participant_id !== "string") {
         throw failure("RESTORE_HASH_CONTRADICTION", "Redo participant is invalid.", { tx_id: record.tx_id });
       }
-      const stub = this.env.SHARD.getByName(rawParticipant.participant_id);
+      const stub = this.shardStub(rawParticipant.participant_id);
       const statusMessage = this.participantMessage(operation, envelope, "status", rawParticipant);
       const status = await postToStub(stub, "/tx-status", statusMessage);
       const exactPrepareProof = typeof rawParticipant.prepare_bookmark === "string";
@@ -1578,7 +1622,13 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
           participant_id: rawParticipant.participant_id,
         });
       }
-      if (exactPrepareProof && status.found !== status.prepare_bookmark_present) {
+      // `prepare_bookmark_present=false, found=true` is the expected durable
+      // checkpoint after an earlier replayed /prepare whose response was lost.
+      // /tx-status has already validated the incoming operation hash against
+      // that found state, so it is safe to continue with /recover. The inverse
+      // (the cutoff bookmark proves prepare, but the tx row is absent) is a
+      // real restored-state contradiction.
+      if (exactPrepareProof && status.prepare_bookmark_present === true && status.found !== true) {
         throw failure("RESTORE_HASH_CONTRADICTION", "Participant prepare marker contradicts its restored transaction state.", {
           tx_id: record.tx_id,
           participant_id: rawParticipant.participant_id,
@@ -1590,7 +1640,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
           participant_id: rawParticipant.participant_id,
         });
       }
-      if (exactPrepareProof ? status.prepare_bookmark_present === false : status.found !== true) {
+      if (status.found !== true && (exactPrepareProof ? status.prepare_bookmark_present === false : true)) {
         const prepare = this.participantMessage(operation, envelope, "prepare", rawParticipant);
         prepare.intents = this.redoIntents(rawParticipant);
         await postToStub(stub, "/prepare", prepare);
@@ -1873,6 +1923,13 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     }
     if (operation.stage === "complete") {
       throw failure("RESTORE_CONFLICT", "A completed restore cannot be rolled back after its fleet fence is released.");
+    }
+    const releasedParticipants = this.one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM restore_participants WHERE restore_id = ? AND status = 'released'",
+      operation.restore_id,
+    )?.n ?? 0;
+    if (releasedParticipants > 0) {
+      throw failure("RESTORE_CONFLICT", "Rollback is unavailable after any participant restore fence has been released.");
     }
     const discardedCoordinators = this.one<{ n: number }>(
       "SELECT COUNT(*) AS n FROM restore_coordinator_work WHERE restore_id = ? AND status = 'discarded'",

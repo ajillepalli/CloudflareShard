@@ -1455,6 +1455,7 @@ The broader production metric set remains:
   shard provider bookmarks with retained undo bookmarks, cutoff manifest redo,
   shard verification, ordered post-cutoff coordinator discard, complete
   discarded-write reporting, and fenced reconciliation/rollback.
-  Release qualification still requires 3/3 successful live provider
-  rehearsals meeting declared RPO/RTO; see the
-  [fleet PITR runbook](runbooks/fleet-pitr.md).
+  Release qualification was satisfied by 3/3 successful live provider
+  rehearsals plus an interrupted rollback, meeting declared RPO/RTO; see the
+  [fleet PITR runbook](runbooks/fleet-pitr.md) and
+  [qualification evidence](rehearsals/t6-2026-08-07.md).

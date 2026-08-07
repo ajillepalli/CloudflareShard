@@ -185,6 +185,13 @@ export async function run(argv: string[]): Promise<number> {
 
   const result = await dispatch(client, command, values);
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (
+    command === "restore-status"
+    && result !== null
+    && typeof result === "object"
+    && "phase" in result
+    && ["manual_repair_required", "failed"].includes(String(result.phase))
+  ) return 4;
   return 0;
 }
 
@@ -200,6 +207,15 @@ export function requireSha256Flag(values: Record<string, unknown>, flag: string)
   const value = requireFlag(values, flag);
   if (!/^[a-f0-9]{64}$/.test(value)) {
     throw new Error(`--${flag} must be a lowercase SHA-256 hexadecimal digest.`);
+  }
+  return value;
+}
+
+export function requireCanonicalUtcFlag(values: Record<string, unknown>, flag: string): string {
+  const value = requireFlag(values, flag);
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
+    throw new Error(`--${flag} must be a canonical UTC timestamp (for example 2026-08-05T12:00:00.000Z).`);
   }
   return value;
 }
@@ -247,7 +263,7 @@ export async function dispatch(client: CloudflareShardAdminClient, command: Admi
     case "restore-preview":
       return client.restorePreview({
         fleetId: requireFlag(values, "fleet-id"),
-        cutoff: requireFlag(values, "cutoff"),
+        cutoff: requireCanonicalUtcFlag(values, "cutoff"),
         idempotencyKey: requireFlag(values, "idempotency-key"),
       });
     case "restore-execute":

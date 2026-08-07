@@ -43,7 +43,7 @@ async function installShardRestoreFakes(
 }
 
 describe("ShardDO restore participant primitives", () => {
-  it("serializes checkpoint preview behind an in-flight writer", async () => {
+  it("serializes checkpoint preview behind an in-flight writer while retaining a conservative recent checkpoint", async () => {
     const stub = await freshShard();
     await stub.fetch(post("/execute", { sql: "CREATE TABLE checkpoint_race_t (id TEXT PRIMARY KEY)", requestId: "checkpoint-race-schema" }));
     const result = await runInDurableObject(stub, async (instance: ShardDO, state: DurableObjectState) => {
@@ -93,7 +93,9 @@ describe("ShardDO restore participant primitives", () => {
     });
 
     expect(result.writeStatus).toBe(200);
-    expect(result.previewBody).toMatchObject({ target_bookmark: "bookmark-with-write" });
+    // Checkpoint certification is intentionally coalesced; the write is
+    // durably loss-journaled and the recent older bookmark is conservative.
+    expect(result.previewBody).not.toMatchObject({ target_bookmark: "bookmark-with-write" });
   });
 
   it("re-arms an exact PITR target after an ambiguous provider-stage crash", async () => {

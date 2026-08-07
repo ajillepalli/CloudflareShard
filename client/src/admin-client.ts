@@ -301,7 +301,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
       cutoff: request.cutoff,
       idempotency_key: request.idempotencyKey,
     });
-    return validateRestorePreviewResponse(response);
+    return validateRestorePreviewResponse(response, { fleetId: request.fleetId, cutoff: request.cutoff });
   }
 
   /** Executes only the server-stored plan identified by restoreId. The
@@ -313,7 +313,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
       restore_id: request.restoreId,
       plan_hash: request.planHash,
     });
-    return validateRestoreAcceptedResponse(response);
+    return validateRestoreAcceptedResponse(response, request);
   }
 
   async restoreStatus(request: RestoreStatusRequest): Promise<RestoreStatusResponse> {
@@ -322,7 +322,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
       format_version: 1,
       restore_id: request.restoreId,
     });
-    return validateRestoreStatusResponse(response);
+    return validateRestoreStatusResponse(response, request.restoreId);
   }
 
   /** Idempotently resumes reconciliation for the same immutable plan. */
@@ -333,7 +333,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
       restore_id: request.restoreId,
       plan_hash: request.planHash,
     });
-    return validateRestoreAcceptedResponse(response);
+    return validateRestoreAcceptedResponse(response, request);
   }
 
   /** Rolls the fleet back to the undo bookmarks retained by the exact
@@ -346,7 +346,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
       restore_id: request.restoreId,
       plan_hash: request.planHash,
     });
-    return validateRestoreAcceptedResponse(response);
+    return validateRestoreAcceptedResponse(response, request);
   }
 
   /** Polls preview, execution, and reconciliation phases until the operation
@@ -361,7 +361,7 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
     const deadline = Date.now() + maxWaitMs;
     for (;;) {
       const status = await this.restoreStatus({ restoreId });
-      if (["complete", "rolled_back", "manual_repair_required", "failed"].includes(status.phase)) return status;
+      if (["previewed", "parked_lease_lost", "complete", "rolled_back", "manual_repair_required", "failed"].includes(status.phase)) return status;
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out after ${maxWaitMs}ms waiting for restore ${restoreId} to become terminal (still '${status.phase}').`,

@@ -1468,7 +1468,9 @@ export class CatalogDO extends DurableObject {
     const activeOperations = this.activeRestoreOperations();
     const changes = this.many<{ id: number; endpoint: string; request_summary: string; created_at: string }>(
       `SELECT id, endpoint, request_summary, created_at FROM audit_log
-        WHERE created_at > ? ORDER BY id LIMIT ?`,
+        WHERE created_at > ?
+          AND endpoint NOT IN ('/restore-fence-install', '/restore-fence-release')
+        ORDER BY id LIMIT ?`,
       body.cutoff,
       RESTORE_PROOF_CHANGE_LIMIT + 1,
     );

@@ -3302,12 +3302,15 @@ describe("CatalogDO T6 restore topology proof and fence", () => {
   it("fails closed when the cutoff predates proof coverage or topology work is active", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/status", {}, `Bearer ${env.ADMIN_TOKEN}`));
+    const uncoveredCutoff = new Date(Date.now() - 60_000).toISOString();
+    const coverage = new Date(Date.now() - 30_000).toISOString();
     await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
       state.storage.sql.exec(
-        "UPDATE restore_proof_metadata SET coverage_start = '2026-08-06T12:00:00.000Z' WHERE singleton = 1",
+        "UPDATE restore_proof_metadata SET coverage_start = ? WHERE singleton = 1",
+        coverage,
       );
     });
-    const uncovered = await stub.fetch(post("/restore-proof", { cutoff: "2026-08-06T11:59:59.999Z" }));
+    const uncovered = await stub.fetch(post("/restore-proof", { cutoff: uncoveredCutoff }));
     expect(uncovered.status).toBe(409);
     expect(((await uncovered.json()) as { error: { code: string } }).error.code).toBe("RESTORE_PROOF_COVERAGE_INCOMPLETE");
 
@@ -3317,7 +3320,7 @@ describe("CatalogDO T6 restore topology proof and fence", () => {
         "UPDATE vbucket_map SET migration_status = 'backfilling', target_shard_id = 'shard-1' WHERE vbucket = 0",
       );
     });
-    const active = await stub.fetch(post("/restore-proof", { cutoff: "2026-08-06T12:00:00.000Z" }));
+    const active = await stub.fetch(post("/restore-proof", { cutoff: coverage }));
     expect(active.status).toBe(409);
     const activeBody = (await active.json()) as { error: { code: string }; activeOperations: Array<{ kind: string }> };
     expect(activeBody.error.code).toBe("RESTORE_TOPOLOGY_UNSTABLE");
@@ -3327,7 +3330,8 @@ describe("CatalogDO T6 restore topology proof and fence", () => {
   it("installs idempotently, blocks all topology entry points, and rejects stale release", async () => {
     const stub = await freshCatalog();
     await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
-    const cutoff = await coverageStart(stub);
+    const cutoff = new Date().toISOString();
+    await new Promise((resolve) => setTimeout(resolve, 2));
     const proof = (await (await stub.fetch(post("/restore-proof", { cutoff }))).json()) as {
       topologyHash: string;
       topologyEpoch: number;
@@ -3362,6 +3366,9 @@ describe("CatalogDO T6 restore topology proof and fence", () => {
     const released = await stub.fetch(post("/restore-fence", { restoreId: "restore-fence-1", generation: 3, action: "release" }));
     expect(released.status).toBe(200);
     expect((await released.json()) as object).toEqual(expect.objectContaining({ ok: true, released: true }));
+    const proofAfterRetry = await stub.fetch(post("/restore-proof", { cutoff, restoreId: "restore-fence-1" }));
+    expect(proofAfterRetry.status).toBe(200);
+    expect(await proofAfterRetry.json()).toMatchObject({ postCutoffChanges: [] });
     expect((await stub.fetch(post("/acquire-topology-lock", { operationType: "split-vbucket" }))).status).toBe(200);
   });
 });

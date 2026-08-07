@@ -154,6 +154,18 @@ describe("immutable restore plan", () => {
     }))).toBe("RESTORE_INVALID_REQUEST");
   });
 
+  it("accepts a conservative checkpoint-based loss start but rejects one after cutoff", () => {
+    const body = planBody();
+    expect(() => validateRestorePlanBody({
+      ...body,
+      impact: { ...body.impact, intentional_loss_from: "2026-08-05T11:59:59.000Z" },
+    })).not.toThrow();
+    expect(code(() => validateRestorePlanBody({
+      ...body,
+      impact: { ...body.impact, intentional_loss_from: "2026-08-05T12:00:01.000Z" },
+    }))).toBe("RESTORE_INVALID_REQUEST");
+  });
+
   it("reads only V1 today and rejects N+1 before hashing", async () => {
     const candidate = { ...planBody(), format_version: 2 };
     expect(code(() => validateRestorePlanBody(candidate))).toBe("RESTORE_VERSION_UNSUPPORTED");

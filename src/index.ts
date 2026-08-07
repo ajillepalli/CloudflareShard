@@ -2,7 +2,8 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { CatalogDO } from "./catalog";
 import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
 import { CoordinatorDO, type TransactionManifestService } from "./coordinator";
-import { RestoreCoordinatorDO, type FleetRestoreManifestService } from "./restore";
+import { RestoreCoordinatorDO } from "./restore";
+import type { RestoreManifestService } from "../workers/control-plane/src/manifest-types";
 import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth, isValidBearerToken } from "./auth";
@@ -32,7 +33,7 @@ export interface Env {
   /** Route-less service-binding seam for the mandatory commit manifest.
    * Optional in the TypeScript seam only for expand-first deployment; an
    * absent runtime binding fails admission before any participant prepares. */
-  CONTROL_PLANE?: TransactionManifestService & FleetRestoreManifestService;
+  CONTROL_PLANE?: TransactionManifestService & RestoreManifestService;
   ADMIN_TOKEN?: string;
   CATALOG_SHARD_COUNT?: string;
   /** One deployment is one physical restore domain. */
@@ -3814,13 +3815,14 @@ async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
 }
 
 type RestoreAdminPath = "/preview" | "/execute" | "/status" | "/reconcile" | "/rollback";
+const RESTORE_AUTHORITY_OBJECT_NAME = "deployment-restore-authority";
 
 function deploymentFleetId(env: Env): string {
   return env.DEPLOYMENT_FLEET_ID?.trim() || "default";
 }
 
 async function restoreAdminCore(env: Env, path: RestoreAdminPath, body: unknown): Promise<Response> {
-  const stub = env.RESTORE_COORDINATOR.getByName(`fleet:${deploymentFleetId(env)}`);
+  const stub = env.RESTORE_COORDINATOR.getByName(RESTORE_AUTHORITY_OBJECT_NAME);
   return stub.fetch(new Request(`https://restore.internal${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -3855,7 +3857,7 @@ const handleAdminRestoreRollback = makeRestoreHandler("/rollback");
  */
 async function activeFleetRestoreResponse(env: Env): Promise<Response | null> {
   try {
-    const stub = env.RESTORE_COORDINATOR.getByName(`fleet:${deploymentFleetId(env)}`);
+    const stub = env.RESTORE_COORDINATOR.getByName(RESTORE_AUTHORITY_OBJECT_NAME);
     const response = await stub.fetch(new Request("https://restore.internal/gate", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -3868,8 +3870,6 @@ async function activeFleetRestoreResponse(env: Env): Promise<Response | null> {
           error: {
             code: "FLEET_RESTORE_IN_PROGRESS",
             message: "The fleet is fenced while point-in-time recovery is in progress.",
-            restoreId: gate.restore_id,
-            phase: gate.phase,
           },
         }, 503)
       : null;
@@ -3938,6 +3938,11 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     }
   }
 
+  private async assertAdminFleetAvailable(adminToken: string): Promise<void> {
+    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertFleetAvailable();
+  }
+
   async mutate(tenantToken: string, body: StructuredMutation & { requestId?: string }): Promise<MutateRpcResult> {
     await this.assertFleetAvailable();
     return unwrapForRpc<MutateRpcResult>(await mutateCore(this.env, this.ctx, body, `Bearer ${tenantToken}`));
@@ -3976,132 +3981,132 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
   // README.md/docs/SPEC.md.
 
   async adminInit(adminToken: string, payload: Parameters<typeof adminInitCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminInitCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminRegisterTable(adminToken: string, payload: Parameters<typeof adminRegisterTableCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminRegisterTableCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminCreateTable(adminToken: string, body: Parameters<typeof adminCreateTableCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminCreateTableCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminSetPartitionKeyColumn(adminToken: string, body: Parameters<typeof adminSetPartitionKeyColumnCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminSetPartitionKeyColumnCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminCreateIndex(adminToken: string, body: Parameters<typeof adminCreateIndexCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminCreateIndexCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminDropIndex(adminToken: string, body: Parameters<typeof adminDropIndexCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminDropIndexCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminListIndexes(adminToken: string): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminListIndexesCore(this.env, `Bearer ${adminToken}`));
   }
 
   async adminSplitVbucket(adminToken: string, payload: Parameters<typeof adminSplitVbucketCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminSplitVbucketCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminMigrateVbucket(adminToken: string, payload: Parameters<typeof adminMigrateVbucketCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminMigrateVbucketCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminMigrateVbucketStatus(adminToken: string, payload: Parameters<typeof adminMigrateVbucketStatusCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminMigrateVbucketStatusCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminMigrateVbucketAbort(adminToken: string, payload: Parameters<typeof adminMigrateVbucketAbortCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminMigrateVbucketAbortCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminStatus(adminToken: string): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminStatusCore(this.env, `Bearer ${adminToken}`));
   }
 
   async adminVbucketMap(adminToken: string): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminVbucketMapCore(this.env, `Bearer ${adminToken}`));
   }
 
   async adminListTables(adminToken: string): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminListTablesCore(this.env, `Bearer ${adminToken}`));
   }
 
   async adminDrainShard(adminToken: string, payload: Parameters<typeof adminDrainShardCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminDrainShardCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminDrainShardStatus(adminToken: string, payload: Parameters<typeof adminDrainShardStatusCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminDrainShardStatusCore(this.env, payload, `Bearer ${adminToken}`));
   }
 
   async adminShardStats(adminToken: string, body: Parameters<typeof adminShardStatsCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminShardStatsCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminAuditLog(adminToken: string): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminAuditLogCore(this.env, `Bearer ${adminToken}`));
   }
 
   async adminRegisterTenant(adminToken: string, body: Parameters<typeof adminRegisterTenantCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminRegisterTenantCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminRevokeTenant(adminToken: string, body: Parameters<typeof adminRevokeTenantCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminRevokeTenantCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminBackfillProvenance(adminToken: string, body: Parameters<typeof adminBackfillProvenanceCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminBackfillProvenanceCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminSetRowOwner(adminToken: string, body: Parameters<typeof adminSetRowOwnerCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminSetRowOwnerCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminTxStatus(adminToken: string, body: Parameters<typeof adminTxStatusCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminTxStatusCore(this.env, body));
   }
 
   async adminTxForceAbort(adminToken: string, body: Parameters<typeof adminTxForceAbortCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminTxForceAbortCore(this.env, body));
   }
 
   async adminTopologyLockStatus(adminToken: string): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminTopologyLockStatusCore(this.env, `Bearer ${adminToken}`));
   }
 
   async adminForceReleaseTopologyLock(adminToken: string, body: Parameters<typeof adminForceReleaseTopologyLockCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminForceReleaseTopologyLockCore(this.env, body, `Bearer ${adminToken}`));
   }
 
@@ -4133,15 +4138,13 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
   /** Operator-only raw SQL — see sqlCore's doc comment for why this is
    * admin-gated rather than tenant-gated. */
   async sql(adminToken: string, body: Parameters<typeof sqlCore>[2]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
-    await this.assertFleetAvailable();
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await sqlCore(this.env, this.ctx, body, `Bearer ${adminToken}`));
   }
 
   /** Cross-tenant fan-out read — admin-gated for the same reason sql() is. */
   async scatter(adminToken: string, body: Parameters<typeof scatterCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
-    await this.assertFleetAvailable();
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await scatterCore(this.env, body, `Bearer ${adminToken}`));
   }
 
@@ -4153,12 +4156,12 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
    * same "flag gate, then admin gate" enforcement as the HTTP path, just with
    * assertAdminRpcAuth's uniform admin pre-check ahead of it too. */
   async adminFaultInject(adminToken: string, body: Parameters<typeof adminFaultInjectCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminFaultInjectCore(this.env, body, `Bearer ${adminToken}`));
   }
 
   async adminFaultClear(adminToken: string, body: Parameters<typeof adminFaultClearCore>[1]): Promise<unknown> {
-    assertAdminRpcAuth(this.env, adminToken);
+    await this.assertAdminFleetAvailable(adminToken);
     return unwrapForRpc(await adminFaultClearCore(this.env, body, `Bearer ${adminToken}`));
   }
 }

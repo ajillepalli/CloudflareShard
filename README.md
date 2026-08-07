@@ -133,8 +133,9 @@ While the original fence remains active and before that irreversible discard,
 the same plan retains time-bounded shard undo bookmarks for an exact-hash
 rollback of a partial restore.
 Use the [fleet PITR runbook](docs/runbooks/fleet-pitr.md);
-do not execute from a quickstart snippet. Production readiness requires 3/3
-successful live provider rehearsals.
+do not execute from a quickstart snippet. The 3/3 live provider rehearsal and
+interrupted rollback gate is recorded in the
+[T6 qualification evidence](docs/rehearsals/t6-2026-08-07.md).
 
 Full deploy/init/teardown walkthrough:
 [docs/REFERENCE.md § Deploy your own cluster](docs/REFERENCE.md#deploy-your-own-cluster).
@@ -187,6 +188,8 @@ npm run verify      # aggregate root, SPA, client, contracts, control-plane, and
 - **[docs/runbooks/fleet-pitr.md](docs/runbooks/fleet-pitr.md)**: destructive
   fleet restore preview, exact-hash execution, monitoring, fenced reconciliation,
   loss reporting, and the 3/3 live rehearsal gate.
+- **[docs/rehearsals/t6-2026-08-07.md](docs/rehearsals/t6-2026-08-07.md)**:
+  live 8-Shard restore and interrupted-rollback qualification evidence.
 - **[client/README.md](client/README.md)**: the typed TypeScript SDK + CLI reference.
 - **[examples/rpc-consumer/README.md](examples/rpc-consumer/README.md)**: calling this API over
   a Durable Object RPC / Worker service binding instead of HTTP.

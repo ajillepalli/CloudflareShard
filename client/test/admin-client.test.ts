@@ -200,7 +200,7 @@ describe("CloudflareShardAdminClient", () => {
   });
 
   describe("fleet restore", () => {
-    const status = (phase: "previewing" | "reconciling" | "complete" | "rolled_back" | "manual_repair_required") => ({
+    const status = (phase: "previewing" | "previewed" | "reconciling" | "parked_lease_lost" | "complete" | "rolled_back" | "manual_repair_required") => ({
       protocol_version: 1,
       format_version: 1,
       restore_id: "restore-1",
@@ -290,6 +290,24 @@ describe("CloudflareShardAdminClient", () => {
         .rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
     });
 
+    it("rejects successful responses that are bound to a different restore request", async () => {
+      const accepted = new CloudflareShardAdminClient({
+        baseUrl: "http://x",
+        token: "t",
+        fetchImpl: mockFetch(202, { ok: true, status: "accepted", restore_id: "restore-other", plan_hash: "a".repeat(64) }).fetchImpl,
+      });
+      await expect(accepted.restoreExecute({ restoreId: "restore-1", planHash: "a".repeat(64) }))
+        .rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
+
+      const mismatchedStatus = new CloudflareShardAdminClient({
+        baseUrl: "http://x",
+        token: "t",
+        fetchImpl: mockFetch(200, { ...status("reconciling"), restore_id: "restore-other" }).fetchImpl,
+      });
+      await expect(mismatchedStatus.restoreStatus({ restoreId: "restore-1" }))
+        .rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
+    });
+
     it("waitForRestore polls previewing work and returns complete", async () => {
       const { fetchImpl } = mockFetchSequence([
         { status: 200, body: status("previewing") },
@@ -306,6 +324,14 @@ describe("CloudflareShardAdminClient", () => {
       const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
       await expect(client.waitForRestore("restore-1", { intervalMs: 1 })).resolves.toMatchObject({ phase: "rolled_back" });
+    });
+
+    it.each(["previewed", "parked_lease_lost"] as const)("waitForRestore returns %s without polling forever", async (phase) => {
+      const { fetchImpl, calls } = mockFetch(200, status(phase));
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.waitForRestore("restore-1", { intervalMs: 1 })).resolves.toMatchObject({ phase });
+      expect(calls).toHaveLength(1);
     });
 
     it("returns manual_repair_required as a visible terminal result", async () => {
