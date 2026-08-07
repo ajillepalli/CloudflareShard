@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
-import type { ShardDO } from "./shard";
+import { describe, expect, it, vi } from "vitest";
+import type { ParticipantPitrPort, ShardDO } from "./shard";
 import type { CoordinatorDO } from "./coordinator";
 
 async function freshShard() {
@@ -15,6 +15,323 @@ function post(path: string, body: unknown) {
     body: JSON.stringify(body),
   });
 }
+
+async function installShardRestoreFakes(
+  stub: Awaited<ReturnType<typeof freshShard>>,
+  state: "open" | "fenced",
+  pitr: ParticipantPitrPort,
+): Promise<void> {
+  await runInDurableObject(stub, async (instance: ShardDO) => {
+    const mutable = instance as unknown as {
+      pitrPort: ParticipantPitrPort;
+      restoreCoordinatorOverride: unknown;
+    };
+    mutable.restoreCoordinatorOverride = {
+      getByName: () => ({
+        fetch: async () => Response.json({
+          ok: true,
+          active: state === "fenced",
+          allowed: state === "open",
+          restore_id: state === "fenced" ? "restore-1" : null,
+          generation: state === "fenced" ? 7 : 0,
+          phase: state === "fenced" ? "restoring" : undefined,
+        }),
+      }),
+    };
+    mutable.pitrPort = pitr;
+  });
+}
+
+describe("ShardDO restore participant primitives", () => {
+  it("serializes checkpoint preview behind an in-flight writer while retaining a conservative recent checkpoint", async () => {
+    const stub = await freshShard();
+    await stub.fetch(post("/execute", { sql: "CREATE TABLE checkpoint_race_t (id TEXT PRIMARY KEY)", requestId: "checkpoint-race-schema" }));
+    const result = await runInDurableObject(stub, async (instance: ShardDO, state: DurableObjectState) => {
+      const mutable = instance as unknown as {
+        handle: (request: Request) => Promise<Response>;
+        requestHash: (sql: string, params: unknown[]) => Promise<string>;
+        pitrPort: ParticipantPitrPort;
+        restoreCoordinatorOverride: unknown;
+      };
+      let releaseHash!: () => void;
+      let hashEntered!: () => void;
+      const hashBlocked = new Promise<void>((resolve) => { releaseHash = resolve; });
+      const hashStarted = new Promise<void>((resolve) => { hashEntered = resolve; });
+      mutable.restoreCoordinatorOverride = {
+        getByName: () => ({
+          fetch: async () => Response.json({ ok: true, active: false, allowed: true, restore_id: null, generation: 0 }),
+        }),
+      };
+      mutable.requestHash = async () => {
+        hashEntered();
+        await hashBlocked;
+        return "a".repeat(64);
+      };
+      mutable.pitrPort = {
+        async getCurrentBookmark() {
+          const present = Array.from(state.storage.sql.exec(
+            "SELECT id FROM checkpoint_race_t WHERE id = 'committed'",
+          )).length > 0;
+          return present ? "bookmark-with-write" : "bookmark-without-write";
+        },
+        async getBookmarkForTime() { return "unused"; },
+        async stageRestoreBookmark() { return "unused"; },
+        abort() {},
+      };
+
+      const write = mutable.handle(post("/execute", {
+        sql: "INSERT INTO checkpoint_race_t (id) VALUES ('committed')",
+        requestId: "checkpoint-race-write",
+      }));
+      await hashStarted;
+      const preview = mutable.handle(post("/pitr-preview", { cutoff: Date.now() + 60_000 }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releaseHash();
+      const writeResponse = await write;
+      const previewResponse = await preview;
+      return { writeStatus: writeResponse.status, previewBody: await previewResponse.json() };
+    });
+
+    expect(result.writeStatus).toBe(200);
+    // Checkpoint certification is intentionally coalesced; the write is
+    // durably loss-journaled and the recent older bookmark is conservative.
+    expect(result.previewBody).not.toMatchObject({ target_bookmark: "bookmark-with-write" });
+  });
+
+  it("re-arms an exact PITR target after an ambiguous provider-stage crash", async () => {
+    const stub = await freshShard();
+    let attempts = 0;
+    await installShardRestoreFakes(stub, "fenced", {
+      async getCurrentBookmark() { return "current"; },
+      async getBookmarkForTime() { return "unused"; },
+      async stageRestoreBookmark(bookmark) {
+        attempts += 1;
+        if (attempts === 1) throw new Error("simulated crash after provider arming");
+        return `undo:${bookmark}`;
+      },
+      abort() {},
+    });
+
+    const first = await stub.fetch(post("/pitr-stage", {
+      restore_id: "restore-1", generation: 7, target_bookmark: "target-after-crash",
+    }));
+    expect(first.status).toBe(500);
+
+    const retry = await stub.fetch(post("/pitr-stage", {
+      restore_id: "restore-1", generation: 7, target_bookmark: "target-after-crash",
+    }));
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({
+      rearmed: true,
+      target_bookmark: "target-after-crash",
+      undo_bookmark: "undo:target-after-crash",
+    });
+    expect(attempts).toBe(2);
+  });
+
+  it("timestamps direct-write loss evidence after the mutation work", async () => {
+    const stub = await freshShard();
+    await stub.fetch(post("/execute", { sql: "CREATE TABLE loss_clock_t (id TEXT PRIMARY KEY)", requestId: "loss-clock-schema" }));
+    await installShardRestoreFakes(stub, "open", {
+      async getCurrentBookmark() { return "loss-clock-bookmark"; },
+      async getBookmarkForTime() { return "unused"; },
+      async stageRestoreBookmark() { return "unused"; },
+      abort() {},
+    });
+
+    let clock = 10_000;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => ++clock);
+    try {
+      const response = await stub.fetch(post("/execute", {
+        sql: "INSERT INTO loss_clock_t (id) VALUES ('a')",
+        requestId: "loss-clock-write",
+      }));
+      expect(response.status).toBe(200);
+    } finally {
+      now.mockRestore();
+    }
+
+    const appliedAt = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec<{ applied_at_ms: number }>(
+        "SELECT applied_at_ms FROM __cf_direct_write_loss_journal WHERE request_id = 'loss-clock-write'",
+      ))[0].applied_at_ms
+    );
+    // execStart and executeMs consume the first two clock ticks. The journal
+    // timestamp must be the later, post-mutation tick rather than the old
+    // pre-hash tick.
+    expect(appliedAt).toBe(10_003);
+  });
+
+  it("materializes only hashed direct-write loss evidence and drives staged PITR through a fake provider port", async () => {
+    const stub = await freshShard();
+    await stub.fetch(post("/execute", { sql: "CREATE TABLE restore_t (id TEXT PRIMARY KEY)", requestId: "restore-schema" }));
+    await stub.fetch(post("/execute", { sql: "INSERT INTO restore_t (id) VALUES (?)", params: ["a"], requestId: "restore-write" }));
+
+    const journalWindow = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      const coverage = Array.from(state.storage.sql.exec<{ coverage_start_ms: number }>(
+        "SELECT coverage_start_ms FROM __cf_direct_write_loss_coverage WHERE singleton = 1",
+      ))[0];
+      const applied = Array.from(state.storage.sql.exec<{ min_ms: number; max_ms: number }>(
+        "SELECT MIN(applied_at_ms) AS min_ms, MAX(applied_at_ms) AS max_ms FROM __cf_direct_write_loss_journal",
+      ))[0];
+      const journalColumns = Array.from(state.storage.sql.exec<{ name: string }>("PRAGMA table_info(__cf_direct_write_loss_journal)"));
+      expect(journalColumns.map((column) => column.name)).not.toContain("sql");
+      expect(journalColumns.map((column) => column.name)).not.toContain("params_json");
+      return { coverageStart: coverage.coverage_start_ms, min: applied.min_ms, max: applied.max_ms };
+    });
+
+    let aborted = 0;
+    const staged: string[] = [];
+    await installShardRestoreFakes(stub, "fenced", {
+      async getCurrentBookmark() { return "current-exact"; },
+      async getBookmarkForTime() { return "time-approximate"; },
+      async stageRestoreBookmark(bookmark) { staged.push(bookmark); return `undo:${bookmark}`; },
+      abort() { aborted += 1; },
+    });
+
+    const gap = await stub.fetch(post("/pitr-preview", {
+      restoreId: "restore-1", generation: 7, cutoff: journalWindow.coverageStart - 1,
+    }));
+    expect(gap.status).toBe(409);
+
+    const fenceResponse = await stub.fetch(post("/restore-fence", { restore_id: "restore-1", generation: 7 }));
+    expect(fenceResponse.status).toBe(200);
+    const fence = await fenceResponse.json() as { closed_through: string };
+
+    const page = await stub.fetch(post("/restore-loss-page", {
+      restore_id: "restore-1",
+      generation: 7,
+      after: 0,
+      cutoff: journalWindow.min - 1,
+      through: Math.min(journalWindow.max, Date.parse(fence.closed_through)),
+      limit: 10,
+    }));
+    expect(page.status).toBe(200);
+    const pageBody = await page.json() as { entries: Array<Record<string, unknown>>; complete: boolean };
+    expect(pageBody.entries.length).toBe(2);
+    expect(pageBody.complete).toBe(true);
+    expect(pageBody.entries[0]).toHaveProperty("request_hash");
+    expect(pageBody.entries[0]).toHaveProperty("write_hash");
+    expect(pageBody.entries[0]).not.toHaveProperty("sql");
+    expect(pageBody.entries[0]).not.toHaveProperty("params");
+
+    const exactCheckpoint = await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) =>
+      Array.from(state.storage.sql.exec<{ checkpoint_at_ms: number; bookmark: string }>(
+        "SELECT checkpoint_at_ms, bookmark FROM __cf_restore_checkpoints ORDER BY checkpoint_at_ms DESC LIMIT 1",
+      ))[0]
+    );
+    const preview = await stub.fetch(post("/pitr-preview", {
+      restore_id: "restore-1", generation: 7, cutoff: exactCheckpoint.checkpoint_at_ms,
+    }));
+    expect(await preview.json()).toMatchObject({
+      target_bookmark: exactCheckpoint.bookmark,
+    });
+    const stage = await stub.fetch(post("/pitr-stage", { restore_id: "restore-1", generation: 7, target_bookmark: "target-1" }));
+    expect(await stage.json()).toMatchObject({ undo_bookmark: "undo:target-1" });
+    const repeatedStage = await stub.fetch(post("/pitr-stage", { restore_id: "restore-1", generation: 7, target_bookmark: "target-1" }));
+    expect(await repeatedStage.json()).toMatchObject({ idempotent: true, undo_bookmark: "undo:target-1" });
+    expect(staged).toEqual(["target-1"]);
+    expect((await stub.fetch(post("/pitr-stage", { restore_id: "restore-1", generation: 7, target_bookmark: "other-target" }))).status).toBe(409);
+    expect((await stub.fetch(post("/pitr-apply", { restore_id: "restore-1", generation: 7 }))).status).toBe(202);
+    expect(staged).toEqual(["target-1"]);
+    expect(aborted).toBe(1);
+    const notApplied = await stub.fetch(post("/pitr-verify", { restore_id: "restore-1", generation: 7, target_bookmark: "target-1" }));
+    expect(notApplied.status).toBe(202);
+    expect(await notApplied.json()).toMatchObject({ verified: false, pending: true });
+    const undoBeforeActivation = await stub.fetch(post("/pitr-undo", {
+      restore_id: "restore-1", generation: 7, target_bookmark: "undo:target-1", mode: "undo",
+    }));
+    expect(undoBeforeActivation.status).toBe(200);
+    expect(await undoBeforeActivation.json()).toMatchObject({ target_bookmark: "undo:target-1" });
+    expect(staged).toEqual(["target-1", "undo:target-1"]);
+    expect((await stub.fetch(post("/pitr-apply", { restore_id: "restore-1", generation: 7 }))).status).toBe(202);
+    const rollbackNotRestarted = await stub.fetch(post("/pitr-verify", {
+      restore_id: "restore-1", generation: 7, target_bookmark: "undo:target-1", mode: "undo",
+    }));
+    expect(rollbackNotRestarted.status).toBe(202);
+    // A real undo returns to the original head. The provider captures that
+    // head after /pitr-stage persisted its "staged" marker (the production
+    // provider may anchor before the later /pitr-apply write), so verification
+    // must recognize the old target plus the exact externally retained undo
+    // bookmark. The not-yet-restarted marker above has target_bookmark === the
+    // undo target and therefore cannot satisfy this proof.
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE __cf_restore_state SET phase = 'staged', target_bookmark = 'target-1', undo_bookmark = 'undo:target-1' WHERE singleton = 1",
+      );
+    });
+    const rollbackVerified = await stub.fetch(post("/pitr-verify", {
+      restore_id: "restore-1", generation: 7, target_bookmark: "undo:target-1", mode: "undo",
+    }));
+    expect(await rollbackVerified.json()).toMatchObject({ verified: true, mode: "undo" });
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM __cf_restore_state");
+    });
+    const rollbackVerifiedWithoutMarker = await stub.fetch(post("/pitr-verify", {
+      restore_id: "restore-1", generation: 7, target_bookmark: "undo:target-1", mode: "undo",
+    }));
+    expect(await rollbackVerifiedWithoutMarker.json()).toMatchObject({
+      verified: true,
+      mode: "undo",
+      certification: "provider-next-session-plus-absent-durable-marker",
+    });
+    const verify = await stub.fetch(post("/pitr-verify", { restore_id: "restore-1", generation: 7, target_bookmark: "target-1" }));
+    expect(await verify.json()).toMatchObject({ verified: true, bookmark_equality_assumed: false });
+    expect((await stub.fetch(post("/pitr-release", { restore_id: "restore-1", generation: 7 }))).status).toBe(200);
+  });
+
+  it("returns an exact provider-current bookmark after prepare when restore integration is active", async () => {
+    const stub = await freshShard();
+    await installShardRestoreFakes(stub, "open", {
+      async getCurrentBookmark() { return "prepare-exact"; },
+      async getBookmarkForTime() { return "unused"; },
+      async stageRestoreBookmark() { return "unused"; },
+      abort() {},
+    });
+    await stub.fetch(post("/execute", { sql: "CREATE TABLE prepare_t (id TEXT PRIMARY KEY)", requestId: "prepare-schema" }));
+    const response = await stub.fetch(post("/prepare", {
+      coordinatorTxId: "prepare-bookmark-tx",
+      intents: [{ sql: "INSERT INTO prepare_t (id) VALUES (?)", params: ["a"], tenantId: "t1", table: "prepare_t", partitionKey: "a" }],
+    }));
+    expect(response.status).toBe(200);
+    const prepared = await response.json() as { prepareBookmark: string; prepareCheckpointExact: boolean };
+    expect(prepared).toMatchObject({ prepareBookmark: "prepare-exact", prepareCheckpointExact: true });
+    const proof = await stub.fetch(post("/tx-status", {
+      coordinatorTxId: "prepare-bookmark-tx",
+      prepare_bookmark: prepared.prepareBookmark,
+    }));
+    expect(await proof.json()).toMatchObject({ prepare_bookmark_present: true });
+    await runInDurableObject(stub, async (_instance: ShardDO, state: DurableObjectState) => {
+      state.storage.sql.exec("DELETE FROM __cf_prepare_bookmark_markers WHERE tx_id = 'prepare-bookmark-tx'");
+    });
+    const beforePrepare = await stub.fetch(post("/tx-status", {
+      coordinatorTxId: "prepare-bookmark-tx",
+      prepare_bookmark: prepared.prepareBookmark,
+    }));
+    expect(await beforePrepare.json()).toMatchObject({ prepare_bookmark_present: false });
+  });
+
+  it("allows only matching restore reconciliation credentials through an active fence", async () => {
+    const stub = await freshShard();
+    const pitr = {
+      async getCurrentBookmark() { return "restore-replay-exact"; },
+      async getBookmarkForTime() { return "unused"; },
+      async stageRestoreBookmark() { return "unused"; },
+      abort() {},
+    };
+    await installShardRestoreFakes(stub, "open", pitr);
+    await stub.fetch(post("/execute", { sql: "CREATE TABLE replay_t (id TEXT PRIMARY KEY)", requestId: "replay-schema" }));
+    await installShardRestoreFakes(stub, "fenced", pitr);
+    expect((await stub.fetch(post("/restore-fence", { restore_id: "restore-1", generation: 7 }))).status).toBe(200);
+    const prepare = {
+      coordinatorTxId: "restore-replay-tx",
+      intents: [{ sql: "INSERT INTO replay_t (id) VALUES (?)", params: ["a"], tenantId: "t1", table: "replay_t", partitionKey: "a" }],
+    };
+    expect((await stub.fetch(post("/prepare", prepare))).status).toBe(503);
+    expect((await stub.fetch(post("/prepare", { ...prepare, restore_id: "restore-wrong", generation: 7 }))).status).toBe(409);
+    expect((await stub.fetch(post("/prepare", { ...prepare, restore_id: "restore-1", generation: 7 }))).status).toBe(200);
+  });
+});
 
 /** Directly seeds a transactions row in the one CoordinatorDO instance that
  * owns this coordinatorTxId (one-DO-per-transaction — see Chunk 3's

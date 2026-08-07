@@ -37,6 +37,28 @@ const ADMIN_GATED_ROUTES = new Set([
   "/index-backfill-status",
 ]);
 
+// A restore fence is a durable, fail-closed topology freeze. These routes can
+// change the participant inventory, placement vector, or recovery semantics
+// and therefore must not run while an in-place participant restore is active.
+const RESTORE_FENCE_BLOCKED_ROUTES = new Set([
+  "/init",
+  "/register-table",
+  "/drain-shard",
+  "/split-vbucket",
+  "/set-partition-key-column",
+  "/create-index",
+  "/drop-index",
+  "/mark-index-ready",
+  "/start-index-backfill",
+  "/mark-table-provenance-complete",
+  "/migrate-vbucket",
+  "/migrate-vbucket-abort",
+  "/update-index-ring",
+]);
+
+const RESTORE_PROOF_FORMAT_VERSION = 1;
+const RESTORE_PROOF_CHANGE_LIMIT = 1_000;
+
 // Milestone 3, Chunk 4: cadence of the alarm-driven migration orchestration
 // loop — each tick advances every in-flight migration one step (a bounded
 // backfill slice, or one cutover attempt that may be waiting on the mirror
@@ -147,6 +169,14 @@ type IndexBackfillRow = {
   topology_lock_operation_id: string | null;
 };
 
+type RestoreFenceRow = {
+  restore_id: string;
+  generation: number;
+  topology_hash: string;
+  topology_epoch: number;
+  installed_at: string;
+};
+
 export class CatalogDO extends DurableObject {
   private readonly sql: SqlStorage;
   private readonly adminToken?: string;
@@ -209,6 +239,8 @@ export class CatalogDO extends DurableObject {
       "/release-topology-lock": this.handleReleaseTopologyLock.bind(this),
       "/topology-lock-status": this.handleTopologyLockStatus.bind(this),
       "/holds-topology-lock": this.handleHoldsTopologyLock.bind(this),
+      "/restore-proof": this.handleRestoreProof.bind(this),
+      "/restore-fence": this.handleRestoreFence.bind(this),
     };
   }
 
@@ -548,6 +580,30 @@ export class CatalogDO extends DurableObject {
         heartbeat_at   TEXT NOT NULL
       )
     `);
+
+    // This marker starts when this version first observes the catalog. Older
+    // catalogs did not promise exhaustive config-change audit coverage, so a
+    // cutoff before this durable boundary is deliberately unprovable.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS restore_proof_metadata (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        coverage_start TEXT NOT NULL
+      )
+    `);
+    this.sql.exec(
+      "INSERT OR IGNORE INTO restore_proof_metadata (singleton, coverage_start) VALUES (1, ?)",
+      new Date().toISOString(),
+    );
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS restore_fence (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        restore_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        topology_hash TEXT NOT NULL,
+        topology_epoch INTEGER NOT NULL,
+        installed_at TEXT NOT NULL
+      )
+    `);
   }
 
   private audit(endpoint: string, requestSummary: Record<string, unknown>): void {
@@ -587,7 +643,12 @@ export class CatalogDO extends DurableObject {
       WHERE singleton = 1
       `,
     );
-    return this.metadataVersion();
+    const version = this.metadataVersion();
+    // Endpoint-specific audit rows are useful context, but this invariant row
+    // guarantees every metadata epoch transition is represented even when a
+    // new mutation path forgets to add its own descriptive audit call.
+    this.audit("/metadata-version", { metadataVersion: version });
+    return version;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -615,6 +676,21 @@ export class CatalogDO extends DurableObject {
       if (authError) {
         return json({ error: authError.error }, authError.status);
       }
+    }
+
+    const restoreFence = this.restoreFenceRow();
+    if (restoreFence && RESTORE_FENCE_BLOCKED_ROUTES.has(url.pathname)) {
+      return json(
+        {
+          error: {
+            code: "RESTORE_FENCE_ACTIVE",
+            message: "Topology/configuration mutation is blocked by an active fleet restore.",
+            restoreId: restoreFence.restore_id,
+            generation: restoreFence.generation,
+          },
+        },
+        409,
+      );
     }
 
     const handler = this.routes[url.pathname];
@@ -1200,11 +1276,364 @@ export class CatalogDO extends DurableObject {
 
   // ─── Topology-operation lock (held on catalog-0) ───────────────────────────
 
+  private restoreFenceRow(): RestoreFenceRow | null {
+    return this.one<RestoreFenceRow>(
+      "SELECT restore_id, generation, topology_hash, topology_epoch, installed_at FROM restore_fence WHERE singleton = 1",
+    );
+  }
+
+  private topologyVector(): {
+    readonly formatVersion: number;
+    readonly config: {
+      readonly totalVBuckets: number;
+      readonly metadataVersion: number;
+      readonly catalogShardId: string | null;
+      readonly catalogShardCount: number | null;
+    };
+    readonly shards: readonly { readonly shardId: string; readonly status: string }[];
+    readonly vbuckets: readonly {
+      readonly vbucket: number;
+      readonly shardId: string;
+      readonly mapVersion: number;
+      readonly migrationStatus: string;
+      readonly targetShardId: string | null;
+      readonly cleanupPending: boolean;
+      readonly cleanupSourceShardId: string | null;
+    }[];
+    readonly indexRings: readonly {
+      readonly indexName: string;
+      readonly placementRing: readonly string[];
+      readonly evacuationSources: readonly string[];
+    }[];
+    readonly ringEvacuations: readonly {
+      readonly shardId: string;
+      readonly indexName: string;
+      readonly substitute: string;
+    }[];
+  } | null {
+    const config = this.one<{
+      total_vbuckets: number;
+      metadata_version: number;
+      catalog_shard_id: string | null;
+      catalog_shard_count: number | null;
+    }>(
+      "SELECT total_vbuckets, metadata_version, catalog_shard_id, catalog_shard_count FROM cluster_config WHERE singleton = 1",
+    );
+    if (!config) return null;
+
+    const shards = this.many<{ shard_id: string; status: string }>(
+      "SELECT shard_id, status FROM shards ORDER BY shard_id",
+    ).map((row) => ({ shardId: row.shard_id, status: row.status }));
+    const vbuckets = this.many<{
+      vbucket: number;
+      shard_id: string;
+      map_version: number;
+      migration_status: string;
+      target_shard_id: string | null;
+      cleanup_pending: number;
+      cleanup_source_shard_id: string | null;
+    }>(
+      `SELECT vbucket, shard_id, map_version, migration_status, target_shard_id,
+              cleanup_pending, cleanup_source_shard_id
+         FROM vbucket_map ORDER BY vbucket`,
+    ).map((row) => ({
+      vbucket: row.vbucket,
+      shardId: row.shard_id,
+      mapVersion: row.map_version,
+      migrationStatus: row.migration_status,
+      targetShardId: row.target_shard_id,
+      cleanupPending: row.cleanup_pending === 1,
+      cleanupSourceShardId: row.cleanup_source_shard_id,
+    }));
+    const indexRings = this.many<{
+      index_name: string;
+      placement_ring_json: string;
+      evac_from_shards_json: string;
+    }>(
+      "SELECT index_name, placement_ring_json, evac_from_shards_json FROM index_rules ORDER BY index_name",
+    ).map((row) => ({
+      indexName: row.index_name,
+      placementRing: JSON.parse(row.placement_ring_json) as string[],
+      evacuationSources: [...(JSON.parse(row.evac_from_shards_json) as string[])].sort(),
+    }));
+    const ringEvacuations = this.many<{ shard_id: string; index_name: string; substitute: string }>(
+      "SELECT shard_id, index_name, substitute FROM drain_ring_evac ORDER BY shard_id, index_name",
+    ).map((row) => ({ shardId: row.shard_id, indexName: row.index_name, substitute: row.substitute }));
+
+    return {
+      formatVersion: RESTORE_PROOF_FORMAT_VERSION,
+      config: {
+        totalVBuckets: config.total_vbuckets,
+        metadataVersion: config.metadata_version,
+        catalogShardId: config.catalog_shard_id,
+        catalogShardCount: config.catalog_shard_count,
+      },
+      shards,
+      vbuckets,
+      indexRings,
+      ringEvacuations,
+    };
+  }
+
+  private physicalShardInventory(vector: NonNullable<ReturnType<CatalogDO["topologyVector"]>>): string[] {
+    const ids = new Set<string>();
+    for (const shard of vector.shards) ids.add(shard.shardId);
+    for (const vbucket of vector.vbuckets) {
+      ids.add(vbucket.shardId);
+      if (vbucket.targetShardId) ids.add(vbucket.targetShardId);
+      if (vbucket.cleanupSourceShardId) ids.add(vbucket.cleanupSourceShardId);
+    }
+    for (const index of vector.indexRings) {
+      for (const shardId of index.placementRing) ids.add(shardId);
+      for (const shardId of index.evacuationSources) ids.add(shardId);
+    }
+    for (const evacuation of vector.ringEvacuations) {
+      ids.add(evacuation.shardId);
+      ids.add(evacuation.substitute);
+    }
+    return [...ids].sort();
+  }
+
+  private activeRestoreOperations(): Array<Record<string, unknown>> {
+    const active: Array<Record<string, unknown>> = [];
+    for (const row of this.many<{
+      vbucket: number;
+      migration_status: string;
+      target_shard_id: string | null;
+      cleanup_pending: number;
+      cleanup_source_shard_id: string | null;
+    }>(
+      `SELECT vbucket, migration_status, target_shard_id, cleanup_pending, cleanup_source_shard_id
+         FROM vbucket_map
+        WHERE migration_status != 'none' OR cleanup_pending = 1
+        ORDER BY vbucket`,
+    )) {
+      if (row.migration_status !== "none") {
+        active.push({ kind: "vbucket_migration", vbucket: row.vbucket, status: row.migration_status, targetShardId: row.target_shard_id });
+      }
+      if (row.cleanup_pending === 1) {
+        active.push({ kind: "vbucket_cleanup", vbucket: row.vbucket, sourceShardId: row.cleanup_source_shard_id });
+      }
+    }
+    for (const row of this.many<{ shard_id: string; drain_stall_reason: string | null }>(
+      "SELECT shard_id, drain_stall_reason FROM shards WHERE status = 'draining' ORDER BY shard_id",
+    )) {
+      active.push({ kind: "shard_drain", shardId: row.shard_id, stallReason: row.drain_stall_reason });
+    }
+    for (const row of this.many<{ index_name: string; status: string }>(
+      "SELECT index_name, status FROM index_rules WHERE status != 'ready' ORDER BY index_name",
+    )) {
+      active.push({ kind: "index_build", indexName: row.index_name, status: row.status });
+    }
+    for (const row of this.many<{ shard_id: string; index_name: string; substitute: string }>(
+      "SELECT shard_id, index_name, substitute FROM drain_ring_evac ORDER BY shard_id, index_name",
+    )) {
+      active.push({ kind: "index_ring_evacuation", shardId: row.shard_id, indexName: row.index_name, substitute: row.substitute });
+    }
+    const lock = this.topologyLockRow();
+    if (lock && !this.topologyLockExpired(lock, Date.now())) {
+      active.push({ kind: "topology_lock", operationId: lock.operation_id, operationType: lock.operation_type });
+    }
+    return active;
+  }
+
+  private async handleRestoreProof(request: Request): Promise<Response> {
+    const body = (await request.json()) as { cutoff?: string; restoreId?: string; restore_id?: string };
+    const restoreId = body.restoreId ?? body.restore_id;
+    if (typeof body.cutoff !== "string" || (restoreId !== undefined && (typeof restoreId !== "string" || restoreId.length === 0))) {
+      return json({ error: { code: "MISSING_FIELDS", message: "A canonical cutoff and optional non-empty restoreId are required." } }, 400);
+    }
+    const cutoff = new Date(body.cutoff);
+    if (!Number.isFinite(cutoff.getTime()) || cutoff.toISOString() !== body.cutoff || cutoff.getTime() > Date.now()) {
+      return json({ error: { code: "RESTORE_CUTOFF_INVALID", message: "cutoff must be a canonical, non-future UTC millisecond timestamp." } }, 400);
+    }
+    const coverage = this.one<{ coverage_start: string }>(
+      "SELECT coverage_start FROM restore_proof_metadata WHERE singleton = 1",
+    );
+    if (!coverage || cutoff.getTime() < new Date(coverage.coverage_start).getTime()) {
+      return json(
+        {
+          ok: false,
+          error: { code: "RESTORE_PROOF_COVERAGE_INCOMPLETE", message: "Catalog change audit coverage does not reach the requested cutoff." },
+          coverageStart: coverage?.coverage_start ?? null,
+        },
+        409,
+      );
+    }
+    const vector = this.topologyVector();
+    if (!vector) {
+      return json({ ok: false, error: { code: "CATALOG_NOT_INITIALIZED", message: "Catalog must be initialized before restore proofing." } }, 409);
+    }
+    const topologyHash = await sha256Hex(JSON.stringify(vector));
+    const activeOperations = this.activeRestoreOperations();
+    const changes = this.many<{ id: number; endpoint: string; request_summary: string; created_at: string }>(
+      `SELECT id, endpoint, request_summary, created_at FROM audit_log
+        WHERE created_at > ?
+          AND endpoint NOT IN ('/restore-fence-install', '/restore-fence-release')
+        ORDER BY id LIMIT ?`,
+      body.cutoff,
+      RESTORE_PROOF_CHANGE_LIMIT + 1,
+    );
+    if (changes.length > RESTORE_PROOF_CHANGE_LIMIT) {
+      return json(
+        { ok: false, error: { code: "RESTORE_PROOF_TOO_LARGE", message: "Post-cutoff catalog change proof exceeds the bounded response limit." } },
+        409,
+      );
+    }
+    const postCutoffChanges = await Promise.all(changes.map(async (change) => ({
+      auditId: change.id,
+      endpoint: change.endpoint,
+      createdAt: change.created_at,
+      summaryHash: await sha256Hex(change.request_summary),
+    })));
+    const proof = {
+      ok: activeOperations.length === 0,
+      restoreId: restoreId ?? null,
+      topologyHash,
+      topologyEpoch: vector.config.metadataVersion,
+      topologyVector: vector,
+      shardIds: this.physicalShardInventory(vector),
+      coverageStart: coverage.coverage_start,
+      postCutoffChanges,
+      activeOperations,
+    };
+    if (activeOperations.length > 0) {
+      return json(
+        {
+          ...proof,
+          error: { code: "RESTORE_TOPOLOGY_UNSTABLE", message: "Restore proof is blocked by active topology work." },
+        },
+        409,
+      );
+    }
+    return json(proof);
+  }
+
+  private async handleRestoreFence(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      restoreId?: string;
+      restore_id?: string;
+      generation?: number;
+      action?: "install" | "release";
+      expectedTopologyHash?: string;
+      expectedTopologyEpoch?: number;
+    };
+    const restoreId = body.restoreId ?? body.restore_id;
+    if (
+      typeof restoreId !== "string" || restoreId.length === 0
+      || !Number.isSafeInteger(body.generation) || body.generation! < 1
+      || (body.action !== "install" && body.action !== "release")
+    ) {
+      return json({ error: { code: "RESTORE_FENCE_INVALID", message: "restoreId, positive generation, and install/release action are required." } }, 400);
+    }
+    const existing = this.restoreFenceRow();
+    if (body.action === "release") {
+      if (!existing) return json({ ok: true, released: false });
+      if (existing.restore_id !== restoreId || existing.generation !== body.generation) {
+        return json(
+          { error: { code: "RESTORE_FENCE_MISMATCH", message: "A stale release cannot remove another restore's fence." } },
+          409,
+        );
+      }
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec("DELETE FROM restore_fence WHERE singleton = 1 AND restore_id = ? AND generation = ?", restoreId, body.generation);
+        this.sql.exec("DELETE FROM topology_lock WHERE singleton = 1 AND operation_id = ? AND operation_type = 'restore'", restoreId);
+      });
+      this.audit("/restore-fence-release", { restoreId, generation: body.generation });
+      return json({ ok: true, released: true });
+    }
+
+    if (existing) {
+      if (existing.restore_id !== restoreId || existing.generation !== body.generation) {
+        return json(
+          { error: { code: "RESTORE_FENCE_CONFLICT", message: "Another restore fence is already active." } },
+          409,
+        );
+      }
+      // The fence is authoritative. Repair its companion lock if a stale
+      // administrative path removed it, preserving fail-closed semantics.
+      this.sql.exec(
+        `INSERT OR REPLACE INTO topology_lock
+          (singleton, operation_id, operation_type, acquired_at, expires_at, heartbeat_at)
+         VALUES (1, ?, 'restore', ?, ?, ?)`,
+        existing.restore_id,
+        existing.installed_at,
+        "9999-12-31T23:59:59.999Z",
+        new Date().toISOString(),
+      );
+      return json({
+        ok: true,
+        installed: true,
+        idempotent: true,
+        restoreId: existing.restore_id,
+        generation: existing.generation,
+        topologyHash: existing.topology_hash,
+        topologyEpoch: existing.topology_epoch,
+      });
+    }
+
+    const activeOperations = this.activeRestoreOperations();
+    if (activeOperations.length > 0) {
+      return json(
+        { error: { code: "RESTORE_TOPOLOGY_UNSTABLE", message: "Cannot install a restore fence while topology work is active.", activeOperations } },
+        409,
+      );
+    }
+    const vector = this.topologyVector();
+    if (!vector) return json({ error: { code: "CATALOG_NOT_INITIALIZED", message: "Catalog is not initialized." } }, 409);
+    const topologyHash = await sha256Hex(JSON.stringify(vector));
+    const topologyEpoch = vector.config.metadataVersion;
+    if (
+      (body.expectedTopologyHash !== undefined && body.expectedTopologyHash !== topologyHash)
+      || (body.expectedTopologyEpoch !== undefined && body.expectedTopologyEpoch !== topologyEpoch)
+    ) {
+      return json(
+        { error: { code: "RESTORE_TOPOLOGY_MISMATCH", message: "Topology changed after preview; no restore fence was installed.", topologyHash, topologyEpoch } },
+        409,
+      );
+    }
+    const installedAt = new Date().toISOString();
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO restore_fence
+          (singleton, restore_id, generation, topology_hash, topology_epoch, installed_at)
+         VALUES (1, ?, ?, ?, ?, ?)`,
+        restoreId,
+        body.generation,
+        topologyHash,
+        topologyEpoch,
+        installedAt,
+      );
+      this.sql.exec(
+        `INSERT OR REPLACE INTO topology_lock
+          (singleton, operation_id, operation_type, acquired_at, expires_at, heartbeat_at)
+         VALUES (1, ?, 'restore', ?, ?, ?)`,
+        restoreId,
+        installedAt,
+        "9999-12-31T23:59:59.999Z",
+        installedAt,
+      );
+    });
+    this.audit("/restore-fence-install", { restoreId, generation: body.generation, topologyHash, topologyEpoch });
+    return json({
+      ok: true,
+      installed: true,
+      idempotent: false,
+      restoreId,
+      generation: body.generation,
+      topologyHash,
+      topologyEpoch,
+    });
+  }
+
   private topologyLockRow(): { operation_id: string; operation_type: string; acquired_at: string; expires_at: string; heartbeat_at: string } | null {
     return this.one("SELECT operation_id, operation_type, acquired_at, expires_at, heartbeat_at FROM topology_lock WHERE singleton = 1");
   }
 
   private topologyLockExpired(row: { expires_at: string }, nowMs: number): boolean {
+    const lock = row as { operation_id?: string; operation_type?: string; expires_at: string };
+    const fence = this.restoreFenceRow();
+    if (lock.operation_type === "restore" && fence?.restore_id === lock.operation_id) return false;
     return nowMs > new Date(row.expires_at).getTime();
   }
 
@@ -1214,6 +1643,20 @@ export class CatalogDO extends DurableObject {
     const body = (await request.json()) as { operationType?: string };
     if (!body.operationType) {
       return json({ error: { code: "MISSING_FIELDS", message: "Missing operationType." } }, 400);
+    }
+    const restoreFence = this.restoreFenceRow();
+    if (restoreFence) {
+      return json(
+        {
+          error: {
+            code: "RESTORE_FENCE_ACTIVE",
+            message: "Topology operations are blocked by an active fleet restore.",
+            restoreId: restoreFence.restore_id,
+            generation: restoreFence.generation,
+          },
+        },
+        409,
+      );
     }
     const now = Date.now();
     const existing = this.topologyLockRow();
@@ -1280,6 +1723,13 @@ export class CatalogDO extends DurableObject {
       return json({ error: { code: "MISSING_FIELDS", message: "Missing operationId." } }, 400);
     }
     const existing = this.topologyLockRow();
+    const restoreFence = this.restoreFenceRow();
+    if (existing?.operation_type === "restore" && restoreFence?.restore_id === existing.operation_id) {
+      return json(
+        { error: { code: "RESTORE_FENCE_ACTIVE", message: "Release the matching restore fence; topology-lock release cannot bypass it." } },
+        409,
+      );
+    }
     const held = existing?.operation_id === body.operationId;
     if (held) {
       this.sql.exec("DELETE FROM topology_lock WHERE singleton = 1 AND operation_id = ?", body.operationId);

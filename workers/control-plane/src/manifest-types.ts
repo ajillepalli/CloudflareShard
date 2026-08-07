@@ -6,7 +6,7 @@ import {
   type TransactionProtocolError,
   type ManifestCancelIntentV1,
   type ManifestFinalizeIntentV1,
-  type ManifestEnumerationResultV1,
+  type ManifestEnumerationResultV2,
   type ManifestLocalPageCursorV1,
   type ManifestRecordV2,
   type ManifestReservationV1,
@@ -336,8 +336,11 @@ export type ManifestFleetCloseResult =
       readonly status: "complete";
       readonly cutoff_ms: number;
       readonly snapshot_generation: number;
+      readonly catalog_close_key: string;
       readonly snapshot_hash: string;
       readonly fleet_root_hash: string;
+      readonly partition_config_hash: string;
+      readonly coverage_start: string;
       readonly completed_buckets: number;
       readonly total_buckets: number;
     }
@@ -349,10 +352,17 @@ export type ManifestFleetCloseResult =
     };
 
 export type ManifestFleetEnumerationServiceResult =
-  | ManifestEnumerationResultV1
+  | ManifestEnumerationResultV2
   | {
       readonly ok: false;
       readonly status: "rejected" | "unavailable";
       readonly http_status: number;
       readonly error: ManifestRpcError;
     };
+
+/** Narrow recovery-facing RPC surface exported for the root restore
+ * coordinator. Implementations must only emit current, root-bound pages. */
+export interface RestoreManifestService {
+  closeFleetThrough(request: ManifestFleetCloseRequestV1): Promise<ManifestFleetCloseResult>;
+  enumerateManifest(input: unknown): Promise<ManifestFleetEnumerationServiceResult>;
+}

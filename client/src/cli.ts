@@ -20,11 +20,18 @@ const ADMIN_COMMANDS = [
   "shard-stats",
   "list-tables",
   "list-indexes",
+  "restore-preview",
+  "restore-execute",
+  "restore-status",
+  "restore-reconcile",
+  "restore-rollback",
 ] as const;
 const ONBOARDING_COMMANDS = ["doctor", "verify"] as const;
 const COMMANDS = [...ONBOARDING_COMMANDS, ...ADMIN_COMMANDS] as const;
 type Command = (typeof COMMANDS)[number];
 type AdminCommand = (typeof ADMIN_COMMANDS)[number];
+
+class CliInputError extends Error {}
 
 export function usage(): string {
   return `cloudflareshard <command> [options]
@@ -42,6 +49,11 @@ Commands:
   shard-stats --shard-id ID
   list-tables
   list-indexes
+  restore-preview --fleet-id ID --cutoff ISO-8601 --idempotency-key KEY
+  restore-execute --restore-id ID --plan-hash SHA256
+  restore-status --restore-id ID
+  restore-reconcile --restore-id ID --plan-hash SHA256
+  restore-rollback --restore-id ID --plan-hash SHA256
 
 Connection (required, via flags or env vars):
   --url URL         or CLOUDFLARESHARD_URL       e.g. http://127.0.0.1:8787
@@ -53,6 +65,7 @@ Onboarding output:
   --receipt-dir PATH receipt directory (default: .cloudflareshard/receipts)
   Exit codes         0 success, 2 invalid/unsafe input, 3 prerequisite failure,
                      4 verification failure, 5 pending reconciliation
+  Restore status     parked/manual-repair/failed states exit 4 after printing
 
 Examples:
   cloudflareshard doctor
@@ -99,6 +112,11 @@ export async function run(argv: string[]): Promise<number> {
       "receipt-dir": { type: "string" },
       "disposable-target": { type: "boolean" },
       "max-route-probes": { type: "string" },
+      "fleet-id": { type: "string" },
+      cutoff: { type: "string" },
+      "idempotency-key": { type: "string" },
+      "restore-id": { type: "string" },
+      "plan-hash": { type: "string" },
     },
     allowPositionals: false,
   });
@@ -168,15 +186,48 @@ export async function run(argv: string[]): Promise<number> {
     return exitCodeFor(result);
   }
 
-  const result = await dispatch(client, command, values);
+  let result: unknown;
+  try {
+    result = await dispatch(client, command, values);
+  } catch (error) {
+    if (error instanceof CliInputError) {
+      process.stderr.write(`${error.message}\n`);
+      return 2;
+    }
+    throw error;
+  }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (
+    command === "restore-status"
+    && result !== null
+    && typeof result === "object"
+    && "phase" in result
+    && ["parked_lease_lost", "manual_repair_required", "failed"].includes(String(result.phase))
+  ) return 4;
   return 0;
 }
 
 export function requireFlag(values: Record<string, unknown>, flag: string): string {
   const value = values[flag];
   if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`Missing required flag: --${flag}`);
+    throw new CliInputError(`Missing required flag: --${flag}`);
+  }
+  return value;
+}
+
+export function requireSha256Flag(values: Record<string, unknown>, flag: string): string {
+  const value = requireFlag(values, flag);
+  if (!/^[a-f0-9]{64}$/.test(value)) {
+    throw new CliInputError(`--${flag} must be a lowercase SHA-256 hexadecimal digest.`);
+  }
+  return value;
+}
+
+export function requireCanonicalUtcFlag(values: Record<string, unknown>, flag: string): string {
+  const value = requireFlag(values, flag);
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
+    throw new CliInputError(`--${flag} must be a canonical UTC timestamp (for example 2026-08-05T12:00:00.000Z).`);
   }
   return value;
 }
@@ -221,6 +272,29 @@ export async function dispatch(client: CloudflareShardAdminClient, command: Admi
       return client.listTables();
     case "list-indexes":
       return client.listIndexes();
+    case "restore-preview":
+      return client.restorePreview({
+        fleetId: requireFlag(values, "fleet-id"),
+        cutoff: requireCanonicalUtcFlag(values, "cutoff"),
+        idempotencyKey: requireFlag(values, "idempotency-key"),
+      });
+    case "restore-execute":
+      return client.restoreExecute({
+        restoreId: requireFlag(values, "restore-id"),
+        planHash: requireSha256Flag(values, "plan-hash"),
+      });
+    case "restore-status":
+      return client.restoreStatus({ restoreId: requireFlag(values, "restore-id") });
+    case "restore-reconcile":
+      return client.restoreReconcile({
+        restoreId: requireFlag(values, "restore-id"),
+        planHash: requireSha256Flag(values, "plan-hash"),
+      });
+    case "restore-rollback":
+      return client.restoreRollback({
+        restoreId: requireFlag(values, "restore-id"),
+        planHash: requireSha256Flag(values, "plan-hash"),
+      });
   }
 }
 

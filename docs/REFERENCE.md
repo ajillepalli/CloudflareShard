@@ -24,6 +24,11 @@ schemas, the routing algorithm, transaction semantics), see [`SPEC.md`](SPEC.md)
   routes' request/response shapes.
 - Mutation idempotency via `requestId`, rejecting replay with a mismatched SQL/params pair
   instead of returning a stale result.
+- Fleet point-in-time restore with an immutable preview plan, exact plan-hash
+  execution confirmation, deployment-wide fencing, manifest redo reconciliation,
+  shard verification, ordered post-cutoff coordinator discard, and a hash-bound
+  discarded-write report. See the
+  [operator runbook](runbooks/fleet-pitr.md).
 
 ## Deploy your own cluster
 
@@ -32,13 +37,15 @@ applications from one repository together. It therefore cannot create this
 complete topology; clone the repository and run the ordered aggregate command
 below instead of using a one-Worker deploy button.
 
-The complete topology is two Workers and four SQLite Durable Object classes:
+The complete topology is two Workers and six SQLite Durable Object classes:
 
 1. The required route-less `cloudflare-shard-control-plane` Worker owns
-   `JOURNAL_MANIFEST` (`JournalManifestDO`).
+   `JOURNAL_MANIFEST` (`JournalManifestDO`) and `FLEET_MANIFEST_CATALOG`
+   (`FleetManifestCatalogDO`).
 2. The public `cloudflare-shard-mvp` Worker owns `CATALOG` (`CatalogDO`),
-   `SHARD` (`ShardDO`), and `COORDINATOR` (`CoordinatorDO`), and reaches the
-   first Worker through its mandatory `CONTROL_PLANE` service binding.
+   `SHARD` (`ShardDO`), `COORDINATOR` (`CoordinatorDO`), and the non-restored
+   restore authority `RESTORE_COORDINATOR` (`RestoreCoordinatorDO`), and reaches
+   the first Worker through its mandatory `CONTROL_PLANE` service binding.
 
 There are no KV/D1/R2 resources; the cluster is self-contained. From a fresh
 clone, `npm run deploy` enforces the safe creation order by running
@@ -47,6 +54,14 @@ commands in that order if deploying manually. For local development,
 `npm run dev` loads both Wrangler configs together, so the route-less service
 is available to the root Worker's `CONTROL_PLANE` binding before transaction
 traffic is handled.
+
+Set `DEPLOYMENT_FLEET_ID` before admitting transactions and keep it stable for
+the life of these namespaces. The checked-in default is `default`. One
+deployment is one physical restore domain: a restore preview must name this
+exact fleet, and two logical fleet IDs cannot safely share the same Durable
+Object namespaces and later be restored independently. The fleet PITR runbook
+uses `RESTORE_FLEET_ID` only as an operator-side shell variable whose value must
+equal `DEPLOYMENT_FLEET_ID`; it is not a second Worker setting.
 
 **Cost:** SQLite-backed Durable Objects are available on Workers Free and Paid.
 The Free plan is suitable for a bounded evaluation, not an implied production
@@ -103,9 +118,14 @@ still deployed. Full operational details and confirm-gated teardown guidance:
 - `src/shard.ts`: Shard durable object (SQLite execution + idempotency).
 - `src/coordinator.ts`: Transaction coordinator durable object (decision,
   manifest admission, participant reconciliation, and recovery).
+- `src/restore.ts`: Non-restored fleet restore authority, durable gate,
+  immutable plan, shard PITR orchestration, coordinator discard, and
+  verification report.
 - `workers/control-plane/`: Required route-less Worker and
-  `JournalManifestDO` commit-manifest service.
+  `JournalManifestDO` plus fleet manifest catalog/close service.
 - `docs/SPEC.md`: Concrete architecture and protocol spec.
+- `docs/runbooks/fleet-pitr.md`: Destructive fleet PITR operator procedure and
+  live rehearsal gate.
 - `client/`: Typed TypeScript SDK + CLI for the HTTP API, see `client/README.md`. Recommended over hand-writing raw HTTP calls.
 - `examples/rpc-consumer/`: Demo Worker calling the tenant data path over a Durable Object RPC / service binding instead of HTTP.
 - `examples/tpc-c-benchmark/`: TPC-C-derived OLTP benchmark and demo project.
@@ -173,6 +193,28 @@ node client/dist/cli.js init --num-shards 4 --total-vbuckets 256
 node client/dist/cli.js create-table --table events --schema "CREATE TABLE events (id TEXT PRIMARY KEY, body TEXT)" --partition-key-column id
 node client/dist/cli.js status
 ```
+
+Fleet restore has five additional admin commands:
+
+```bash
+node client/dist/cli.js restore-preview --fleet-id default --cutoff 2026-08-06T18:30:00.000Z --idempotency-key incident-a
+node client/dist/cli.js restore-status --restore-id <restore_id>
+node client/dist/cli.js restore-execute --restore-id <restore_id> --plan-hash <exact_plan_hash>
+node client/dist/cli.js restore-reconcile --restore-id <restore_id> --plan-hash <exact_plan_hash>
+node client/dist/cli.js restore-rollback --restore-id <restore_id> --plan-hash <exact_plan_hash>
+```
+
+Preview may remain durably `previewing`; use status to observe the phase, then
+replay the exact preview request with the same idempotency key to retrieve the
+immutable plan. Execute is destructive and requires the exact hash from that plan.
+During execution all ordinary ingress is fenced. A post-fence failure remains
+`manual_repair_required` with the fence active until the named blocker is
+repaired and the same plan is resumed with `restore-reconcile`. Provider PITR
+and undo apply to physical shards. Post-cutoff coordinators are durably discarded
+only after shard restore and verification; that discard is the irreversible
+boundary after which `restore-rollback` is rejected. Local shard and catalog
+fences release before the external fleet gate releases last. Full procedure:
+[fleet PITR runbook](runbooks/fleet-pitr.md).
 
 `doctor` is read-only. `verify` is intentionally mutating and refuses to run
 without `--disposable-target`; it never passes `force:true`. On a TTY these

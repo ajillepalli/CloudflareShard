@@ -28,4 +28,23 @@ describe("CloudflareShardError", () => {
     const err = new CloudflareShardError(400, body);
     expect(err.body).toBe(body);
   });
+
+  it("preserves retry, overload, delay, and typed detail metadata", () => {
+    const err = new CloudflareShardError(503, {
+      error: {
+        code: "RESTORE_UNAVAILABLE",
+        message: "Participant is temporarily unavailable.",
+        retryable: true,
+        overloaded: true,
+        retry_after_ms: 30_000,
+        details: { participant_id: "shard-a" },
+      },
+    });
+    expect(err).toMatchObject({
+      retryable: true,
+      overloaded: true,
+      retryAfterMs: 30_000,
+      details: { participant_id: "shard-a" },
+    });
+  });
 });

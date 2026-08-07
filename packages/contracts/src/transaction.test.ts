@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   COORDINATOR_RETENTION_DAYS,
+  CURRENT_REDO_ENVELOPE_FORMAT_VERSION,
   CURRENT_PROTOCOL_VERSION,
   DEFAULT_DURABLE_OBJECT_OVERLOAD_RETRY_AFTER_MS,
   MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
   MANIFEST_CATALOG_FORMAT_VERSION,
   MANIFEST_CURSOR_FORMAT_VERSION,
+  MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
+  CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
+  MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
   MANIFEST_PARTITION_COUNT,
   MANIFEST_PAGE_FORMAT_VERSION,
   MANIFEST_RECORD_V2_FORMAT_VERSION,
@@ -39,6 +43,7 @@ import {
   hashManifestRecordV2,
   hashManifestRequest,
   hashManifestReservation,
+  hashRedoEnvelope,
   isCommitDecidedOrLater,
   isTransactionTransitionAllowed,
   manifestRoute,
@@ -69,12 +74,16 @@ import {
   validateParticipantTombstone,
   validateRedoEnvelope,
   validateRedoEnvelopeStructure,
+  validateWritableManifestEnumerationRequest,
+  validateWritableRedoEnvelopeStructure,
   type ParticipantDecisionTombstoneV1,
   type ParticipantPhaseMessageV1,
   type RedoEnvelopeV1,
+  type RedoEnvelopeV2,
   type ManifestCancelIntentV1,
-  type ManifestEnumerationCursorV1,
+  type ManifestEnumerationCursorV2,
   type ManifestEnumerationRequestV1,
+  type ManifestEnumerationRequestV2,
   type ManifestFinalizeIntentV1,
   type ManifestLocalPageCursorV1,
   type ManifestLocalPageRequestV1,
@@ -92,11 +101,11 @@ function afterDays(timestamp: string, days: number): string {
   return new Date(new Date(timestamp).getTime() + days * DAY_MS).toISOString();
 }
 
-function envelope(overrides: Partial<RedoEnvelopeV1> = {}): RedoEnvelopeV1 {
+function envelope(overrides: Partial<RedoEnvelopeV2> = {}): RedoEnvelopeV2 {
   const commitDecidedAt = "2026-08-05T12:34:56.000Z";
   return {
     protocol_version: CURRENT_PROTOCOL_VERSION,
-    format_version: REDO_ENVELOPE_FORMAT_VERSION,
+    format_version: CURRENT_REDO_ENVELOPE_FORMAT_VERSION,
     tx_id: "tx-001",
     fleet_id: "fleet-test",
     coordinator_id: "coordinator-tx-001",
@@ -109,6 +118,7 @@ function envelope(overrides: Partial<RedoEnvelopeV1> = {}): RedoEnvelopeV1 {
       {
         participant_id: "shard-a",
         epoch: 1,
+        prepare_bookmark: "bookmark-prepare-shard-a",
         intents: [
           {
             intent_seq: 0,
@@ -438,6 +448,33 @@ describe("canonical redo envelope", () => {
 
   it("accepts a complete, sorted, reconstructable envelope with a matching operation hash", async () => {
     await expect(validateRedoEnvelope(envelope())).resolves.toBeUndefined();
+  });
+
+  it("addresses the V2 immutable redo intent while the manifest separately commits service timestamps", async () => {
+    const original = envelope();
+    const shiftedDecision = "2026-08-06T12:34:56.000Z";
+    const shifted = envelope({
+      commit_decided_at: shiftedDecision,
+      retention_deadline: afterDays(shiftedDecision, COORDINATOR_RETENTION_DAYS),
+    });
+    await expect(hashRedoEnvelope(original)).resolves.toBe(await hashRedoEnvelope(shifted));
+    await expect(hashRedoEnvelope({
+      ...original,
+      participants: [{ ...original.participants[0], prepare_bookmark: "different-prepare-bookmark" }],
+    })).resolves.not.toBe(await hashRedoEnvelope(original));
+  });
+
+  it("reads V1, writes V2, and fails closed outside N/N-1", async () => {
+    const current = envelope();
+    const legacy: RedoEnvelopeV1 = {
+      ...current,
+      format_version: REDO_ENVELOPE_FORMAT_VERSION,
+      participants: current.participants.map(({ prepare_bookmark: _bookmark, ...participant }) => participant),
+    };
+    await expect(validateRedoEnvelope(legacy)).resolves.toBeUndefined();
+    expect(errorCode(() => validateWritableRedoEnvelopeStructure(legacy))).toBe("TX_VERSION_UNSUPPORTED");
+    expect(() => validateWritableRedoEnvelopeStructure(current)).not.toThrow();
+    expect(errorCode(() => validateRedoEnvelopeStructure({ ...current, format_version: 3 }))).toBe("TX_VERSION_UNSUPPORTED");
   });
 
   it("separates the physical-shard ceiling from the eight caller-key budget", () => {
@@ -887,23 +924,29 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
   });
 
   it("validates fleet cursors, enumeration requests, per-bucket evidence, and completeness consistency", async () => {
-    const request: ManifestEnumerationRequestV1 = {
+    expect(MANIFEST_ENUMERATION_FORMAT_VERSION).toBe(1);
+    expect(CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION).toBe(2);
+    const request: ManifestEnumerationRequestV2 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      format_version: CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: "fleet-test",
       coverage_start: RESERVED_AT,
       cutoff: CUTOFF,
       partition_config_hash: "a".repeat(64),
       catalog_generation: 1,
       catalog_snapshot_hash: "b".repeat(64),
+      catalog_close_key: "c".repeat(64),
+      fleet_root_hash: "f".repeat(64),
       limit: 100,
       cursor: null,
     };
     const requestHash = await hashManifestRequest(request);
-    const cursor: ManifestEnumerationCursorV1 = {
+    const cursor: ManifestEnumerationCursorV2 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_CURSOR_FORMAT_VERSION,
+      format_version: MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
       request_hash: requestHash,
+      catalog_close_key: request.catalog_close_key,
+      fleet_root_hash: request.fleet_root_hash,
       catalog_generation: request.catalog_generation,
       catalog_snapshot_hash: request.catalog_snapshot_hash,
       reservation_utc_day: "2026-08-05",
@@ -912,11 +955,12 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
     };
     expect(() => validateManifestEnumerationCursor(cursor)).not.toThrow();
     expect(() => validateManifestEnumerationRequest({ ...request, cursor })).not.toThrow();
+    expect(() => validateWritableManifestEnumerationRequest({ ...request, cursor })).not.toThrow();
 
     const route = await manifestReservationRoute("tx-001", RESERVED_AT, request.partition_config_hash);
     const evidence = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      format_version: MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
       ...route,
       cutoff: CUTOFF,
       seal_generation: 1,
@@ -929,8 +973,10 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
     const record = await finalizedRecord();
     const result = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      format_version: CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
       request_hash: requestHash,
+      catalog_close_key: request.catalog_close_key,
+      fleet_root_hash: request.fleet_root_hash,
       coverage: "complete",
       complete: true,
       records: [record],
@@ -946,6 +992,24 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
       ...result,
       diagnostics: { ...result.diagnostics, returned_records: 0 },
     }))).toBe("MANIFEST_INVALID_REQUEST");
+
+    const legacyRequest: ManifestEnumerationRequestV1 = {
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
+      fleet_id: request.fleet_id,
+      coverage_start: request.coverage_start,
+      cutoff: request.cutoff,
+      partition_config_hash: request.partition_config_hash,
+      catalog_generation: request.catalog_generation,
+      catalog_snapshot_hash: request.catalog_snapshot_hash,
+      limit: request.limit,
+      cursor: null,
+    };
+    expect(() => validateManifestEnumerationRequest(legacyRequest)).not.toThrow();
+    expect(errorCode(() => validateWritableManifestEnumerationRequest(legacyRequest))).toBe("MANIFEST_VERSION_UNSUPPORTED");
+    expect(errorCode(() => validateManifestEnumerationRequest({ ...request, format_version: 3 }))).toBe(
+      "MANIFEST_VERSION_UNSUPPORTED",
+    );
   });
 
   it("assigns stable HTTP and retry metadata to manifest failures", () => {

@@ -171,6 +171,12 @@ particular shard, from application-side timeout/error logs carrying the
 progress: `{shardId, vbucketsRemaining, ringsRemaining, status}` where
 `status` is `active | migrating-vbuckets | evacuating-rings | complete`.
 
+During fleet PITR, ordinary health routes are deliberately fenced with 503 so
+they cannot observe a torn fleet. `POST /admin/restore-status {protocol_version:
+1, format_version: 1, restore_id}` remains available and is the authoritative
+health/progress view until the gate reopens. See
+[§5](#5-fleet-point-in-time-restore).
+
 ### 2.2 Logs: what's already there, and what to watch for
 
 The reference doc's [**Observability**](../REFERENCE.md#observability) section
@@ -226,6 +232,14 @@ This means: **only one topology-reshaping operation can run at a time,
 cluster-wide** (not just per-catalog-shard) — attempting a second one while
 the lock is held fails until the first completes or the lock is released.
 
+Fleet restore adds a stronger lock class. Once restore execution installs its
+catalog fences, topology mutation remains blocked for the restore generation
+until verified completion or a safe pre-restore failure path releases it. That
+restore-owned lock does not become releasable merely because the ordinary 30s
+topology TTL elapsed, and `/admin/force-release-topology-lock` cannot bypass the
+active restore fence. Use the [fleet PITR runbook](../runbooks/fleet-pitr.md)
+and exact-plan reconciliation instead.
+
 ### 3.2 Checking lock state
 
 ```
@@ -260,6 +274,11 @@ working (e.g. a large migration whose checksum pass over hundreds of pages
 is just taking a while) can let a second topology operation start
 concurrently against state the first one is still mutating — exactly the
 race the lock exists to prevent.
+
+Never use this endpoint for an `operationType: "restore"` holder. A restore
+failure after fencing is `manual_repair_required`; its fences are the safety
+boundary preventing traffic from observing a torn fleet. Repair the blocker
+and call `restore-reconcile` with the original `restore_id` and `plan_hash`.
 
 **Only force-release when you've confirmed the lock is actually stuck, not
 just slow:**
@@ -476,42 +495,49 @@ should finish.
    destructive option "expire" in value the way delaying a production
    outage response would.
 
-## 5. Backup and disaster-recovery posture — the honest version
+## 5. Fleet point-in-time restore
 
-**There is no built-in backup or snapshot mechanism in this project today.**
-This isn't an oversight buried somewhere hard to find — `docs/SPEC.md` §15
-("Migration Path to Production") lists "Add backups and restore drills per
-shard" as an explicit, still-open, un-struck-through item, distinct from
-the other §15 items that have since shipped (secondary indexes, the
-split/drain controller) and are marked with strikethrough. `TODOS.md` does
-not track it as a planned increment either.
+Fleet PITR is built in, but it is intentionally not a casual backup button. It
+rewinds every physical `ShardDO` to one UTC cutoff, then replays
+manifest-committed cross-shard work at or before that cutoff and verifies shard
+invariants. `CoordinatorDO`s are not provider-rewound: post-cutoff coordinators
+are durably discarded only after all shards are restored and verified, and the
+final report commits to the intentionally discarded writes.
 
-What this means concretely for an operator:
+The full destructive procedure is the dedicated
+[fleet PITR runbook](../runbooks/fleet-pitr.md). Its non-negotiable operator
+rules are:
 
-- Cluster state lives entirely in each `ShardDO`/`CatalogDO`'s own SQLite
-  storage. Durable Objects storage is itself durable and replicated by
-  Cloudflare's infrastructure — this is not "data on a laptop that
-  disappears on crash" — but that is infrastructure-level durability
-  against hardware failure, **not** an application-level backup/restore
-  story. It protects you against Cloudflare losing your data; it does
-  nothing for a bad migration, a mistaken `DROP TABLE` via `/v1/sql`, a
-  drain that goes wrong, or wanting to restore to a point five minutes ago
-  after a bug corrupted rows.
-- There is no export/snapshot route, no point-in-time-restore mechanism, and
-  no documented restore drill anywhere in this codebase.
-- If you need recoverability beyond "Cloudflare's own storage durability,"
-  you have to build it yourself today — e.g. periodically exporting rows
-  via `/v1/scatter` or `/v1/table-scan` per tenant/table into external
-  storage, or scripting your own snapshot process against `/v1/sql` reads.
-  Nothing in this repo does that for you.
-- Treat any destructive admin operation (`/v1/sql` `DROP`/`DELETE` against
-  application tables, an aggressive drain) as unrecoverable via any
-  built-in mechanism. Test destructive operations against a throwaway
-  cluster first, not production.
+- One deployment is one physical restore domain. The requested fleet ID must
+  equal `DEPLOYMENT_FLEET_ID`; never attempt to restore a logical subset of
+  shared Durable Object namespaces.
+- Preview first. It is non-mutating, fail-closed on incomplete coverage,
+  active topology work, incomplete manifest evidence, or missing shard
+  bookmarks, and returns an immutable plan with a 15-minute execution window.
+- Execute only with the exact SHA-256 `plan_hash` reviewed from that preview.
+  Execution fences all ordinary reads/writes before any shard rewind.
+- Shard PITR is two-phase: stage the provider target and capture an undo
+  bookmark, then activate the next session and verify it. The public
+  `restore-rollback` command uses those retained bookmarks under the same fleet
+  fence and exact plan hash. Undo is also staged before activation and verified
+  in the next session; never rewind one shard manually.
+- Coordinator discard occurs only after every shard restores and verifies. It
+  is irreversible, closes the rollback window, and precedes local fence release;
+  external root ingress opens last.
+- A post-fence error becomes `manual_repair_required`. The fleet, catalogs,
+  and shards remain fenced, while coordinator mutation/recovery remains blocked
+  by the active external gate. Fix the typed blocker and call
+  `restore-reconcile` with the same restore ID and plan hash; never force-release
+  the topology lock or delete restore state.
+- `complete` requires every shard restored, every manifest transaction
+  reconciled, no blockers, and a complete hash-bound discarded-write report.
+- Production release is gated on 3/3 independent live provider rehearsals
+  meeting declared RPO/RTO. Workerd/unit success alone does not qualify PITR.
 
-If this gap matters for your deployment, it's worth raising as a feature
-request rather than assuming it's handled — as of this writing it plainly
-is not.
+This mechanism is bounded by the provider PITR window (currently treated as 30
+days with a 24-hour safety margin) and by the project's own catalog,
+coordinator, direct-write journal, checkpoint, and manifest evidence coverage.
+Missing coverage blocks preview rather than silently reducing recovery scope.
 
 ## 6. Cost management
 
@@ -527,8 +553,9 @@ is not.
   before a run because those allowances can change.
 - Usage belongs to the Cloudflare account that deployed the cluster. Account
   for both Workers — the route-less `cloudflare-shard-control-plane` service and
-  the public `cloudflare-shard-mvp` gateway — plus all four SQLite Durable Object
-  classes: `JOURNAL_MANIFEST`, `CATALOG`, `SHARD`, and `COORDINATOR`. Worker
+  the public `cloudflare-shard-mvp` gateway — plus all six SQLite Durable Object
+  classes: `JOURNAL_MANIFEST`, `FLEET_MANIFEST_CATALOG`, `CATALOG`, `SHARD`,
+  `COORDINATOR`, and `RESTORE_COORDINATOR`. Worker
   requests, Durable Object requests/duration/storage, and enabled observability
   all contribute to the account's applicable limits and billing.
 - This is a real, metered resource in your account from the moment it's
@@ -539,6 +566,14 @@ is not.
   do not reverse the order.
 
 ### 6.2 What's request-heavy — be deliberate about these
+
+- **Fleet PITR** closes/enumerates the manifest, inventories every physical
+  shard and coordinator, pages every direct-write loss journal, restarts each
+  shard at a provider bookmark, replays cutoff-eligible cross-shard transactions,
+  verifies all shards, and durably discards post-cutoff coordinators before
+  release. Rehearse and budget it at realistic fleet size; its request/duration
+  cost scales with shards/coordinators, retained evidence, and transactions
+  through the cutoff.
 
 - **`/admin/drain-shard`** touches every row on the shard being drained
   (every vbucket migrates, each involving a full backfill copy plus a

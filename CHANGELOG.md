@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.17.0.0] - 2026-08-06: Cutoff-consistent fleet point-in-time recovery
+
+### Added
+- Added versioned fleet restore preview, execute, status, reconcile, and exact-plan rollback contracts across the admin API, TypeScript client, and CLI.
+- Added an external `RestoreCoordinatorDO` that pins exact manifest and topology evidence, installs fleet-wide write fences, resumes participant work through alarms, reconciles committed transactions, records intentional loss, and fails closed into operator-visible manual repair.
+- Added Shard exact checkpoints, closed-through barriers, privacy-safe 35-day direct-write loss journals, provider bookmark stage/apply/verify/undo handling, prepare-bookmark evidence, and restore-authorized redo replay.
+- Added immutable V2 manifest enumeration and Coordinator redo-envelope recovery outside the rewound participant set, plus a complete operator runbook and retained live qualification evidence.
+
+### Changed
+- Catalog topology work now conflicts atomically with active restore generations, and root transaction routing carries the configured deployment fleet through manifest reservation and recovery.
+- V2 redo hashes now cover immutable transaction intent while the manifest record separately commits service-assigned decision and retention timestamps; recovery cross-checks both before replay.
+- Worker configuration now provisions the SQLite-backed restore coordinator and its binding, while documentation explicitly limits PITR to Shards and describes rollback, loss, and manual-repair semantics.
+
+Three independent live Cloudflare restore rehearsals restored 8/8 Shards and their manifest-backed transaction with measured RPO below 31 seconds and RTO below 35 seconds. A separately interrupted restore reached `manual_repair_required`, rolled back all touched Shards from provider undo bookmarks in 17.49 seconds, and independently recovered the exact pre-execution head.
+
 ## [2.16.0.0] - 2026-08-05: Overload-safe reliability foundations
 
 ### Added

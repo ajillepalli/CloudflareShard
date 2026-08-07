@@ -22,6 +22,8 @@ import { indexShardIdForKey } from "./hash";
 import { INTERNAL_TABLE_NAMES, isDeleteStatement, isMutation } from "./sql-safety";
 import { indexNameFromSyntheticTable, rowKey } from "./structured-op";
 
+const RESTORE_AUTHORITY_OBJECT_NAME = "deployment-restore-authority";
+
 type ExecutePayload = {
   sql: string;
   params?: unknown[];
@@ -179,7 +181,15 @@ const PARTICIPANT_TOMBSTONE_RETENTION_MS = PARTICIPANT_TOMBSTONE_RETENTION_DAYS 
 
 // Single source of truth in sql-safety.ts (INTERNAL_TABLE_NAMES), so the
 // tenant-facing internal-table write guard and this /stats filter can't drift.
-const INTERNAL_TABLES = new Set<string>(INTERNAL_TABLE_NAMES);
+const INTERNAL_TABLES = new Set<string>([
+  ...INTERNAL_TABLE_NAMES,
+  "__cf_direct_write_loss_journal",
+  "__cf_direct_write_loss_coverage",
+  "__cf_restore_state",
+  "__cf_restore_checkpoints",
+  "__cf_restore_checkpoint_meta",
+  "__cf_prepare_bookmark_markers",
+]);
 
 // Milestone 3, Chunk 4: page size shared by /migrate-export and
 // /migrate-checksum — the spec's checksum definition is "streamed in the
@@ -245,6 +255,66 @@ export const FAULT_MAX_MS = 30000;
  * later, separate fault starts a fresh window from a fresh firstInjectedAt. */
 type FaultMarker = { mode: "unreachable"; expiresAt: number; firstInjectedAt: number };
 
+/** Provider PITR is unavailable in local workerd, so the storage calls live
+ * behind this deliberately tiny port. Tests replace the port on a live DO;
+ * production uses the Durable Object storage implementation below. */
+export interface ParticipantPitrPort {
+  getCurrentBookmark(): Promise<string>;
+  getBookmarkForTime(timestamp: number | Date): Promise<string>;
+  stageRestoreBookmark(bookmark: string): Promise<string>;
+  abort(): void;
+}
+
+type RestoreGateSnapshot = {
+  ok: true;
+  state: "open" | "fenced";
+  fleetId: string;
+  restoreId: string | null;
+  generation: number;
+  phase?: string;
+  targetBookmark?: string;
+};
+
+type RestoreCoordinatorStub = { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> };
+type RestoreCoordinatorNamespace = { getByName(name: string): RestoreCoordinatorStub };
+type RestoreAwareShardEnv = Cloudflare.Env & {
+  RESTORE_COORDINATOR?: RestoreCoordinatorNamespace;
+  RESTORE_FLEET_ID?: string;
+  DEPLOYMENT_FLEET_ID?: string;
+};
+
+const DIRECT_WRITE_LOSS_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
+const SHARD_RESTORE_CONTROL_PATHS = new Set([
+  "/restore-fence",
+  "/pitr-preview",
+  "/pitr-stage",
+  "/pitr-undo",
+  "/pitr-apply",
+  "/pitr-verify",
+  "/pitr-release",
+  "/restore-loss-page",
+]);
+const SHARD_MUTATING_PATHS = new Set([
+  "/execute", "/prepare", "/commit", "/abort", "/recover", "/invalidate-request",
+  "/enqueue-index-job", "/flush-index-jobs-for-target", "/enqueue-mirror-job", "/drain-mirror-jobs",
+  "/migrate-import", "/fence-vbucket", "/unfence-vbucket", "/fence-index-ring", "/unfence-index-ring",
+  "/delete-vbucket-rows", "/purge-mirror-jobs", "/index-entries-import",
+]);
+const SHARD_BARRIER_PATHS = new Set([
+  ...SHARD_MUTATING_PATHS,
+  "/restore-fence",
+  // Preview certifies and clears the shared checkpoint dirty marker. It must
+  // therefore serialize with writers even though it does not mutate tenant
+  // data; otherwise it can certify the pre-write head and make the writer's
+  // final certification incorrectly take the dirty=0 fast path.
+  "/pitr-preview",
+  "/pitr-stage",
+  "/pitr-undo",
+  "/pitr-apply",
+  "/pitr-release",
+  "/restore-loss-page",
+]);
+
 /** Escapes a SQL identifier's inner double-quotes for interpolation inside a
  * quoted identifier (`"..."`). Callers still wrap the result in quotes. Shared
  * by every place that builds a dynamic table/column reference (review Tier 3
@@ -282,8 +352,14 @@ class CollationProbeRollback extends Error {}
 
 export class ShardDO extends DurableObject {
   private readonly sql: SqlStorage;
-  private readonly shardEnv: Cloudflare.Env;
+  private readonly shardEnv: RestoreAwareShardEnv;
   private readonly routes: Record<string, (request: Request) => Promise<Response>>;
+  private mutationBarrier: Promise<void> = Promise.resolve();
+  /** Mutable only so workerd tests can install a deterministic fake. */
+  private pitrPort: ParticipantPitrPort;
+  /** Test-only per-instance adapter; unlike mutating env bindings this cannot
+   * leak a fake authority into sibling Durable Objects. */
+  private restoreCoordinatorOverride: RestoreCoordinatorNamespace | null = null;
   /** ensureSchema() is idempotent but not free (a dozen-plus DDL/PRAGMA
    * statements) — running it once per in-memory instance instead of once
    * per request is safe because the schema lives in durable storage: a
@@ -297,7 +373,13 @@ export class ShardDO extends DurableObject {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.shardEnv = env;
+    this.shardEnv = env as RestoreAwareShardEnv;
+    this.pitrPort = {
+      getCurrentBookmark: () => ctx.storage.getCurrentBookmark(),
+      getBookmarkForTime: (timestamp) => ctx.storage.getBookmarkForTime(timestamp),
+      stageRestoreBookmark: (bookmark) => ctx.storage.onNextSessionRestoreBookmark(bookmark),
+      abort: () => ctx.abort(),
+    };
     // NOTE: /fault-inject and /fault-clear are intentionally NOT in this map —
     // handle() short-circuits them BEFORE the map lookup (and before
     // ensureSchema) so they touch zero this.sql; see handle().
@@ -333,6 +415,14 @@ export class ShardDO extends DurableObject {
       "/index-entries-export": this.handleIndexEntriesExport.bind(this),
       "/index-entries-import": this.handleIndexEntriesImport.bind(this),
       "/probe-partition-key-collation": this.handleProbePartitionKeyCollation.bind(this),
+      "/restore-fence": this.handleRestoreFence.bind(this),
+      "/pitr-preview": this.handlePitrPreview.bind(this),
+      "/pitr-stage": this.handlePitrStage.bind(this),
+      "/pitr-undo": this.handlePitrUndo.bind(this),
+      "/pitr-apply": this.handlePitrApply.bind(this),
+      "/pitr-verify": this.handlePitrVerify.bind(this),
+      "/pitr-release": this.handlePitrRelease.bind(this),
+      "/restore-loss-page": this.handleRestoreLossPage.bind(this),
     };
     ctx.blockConcurrencyWhile(async () => {
       if ((await ctx.storage.getAlarm()) === null) {
@@ -357,17 +447,70 @@ export class ShardDO extends DurableObject {
       await this.ctx.storage.setAlarm(faultExpiry + 1);
       return;
     }
+    const mutationRelease = await this.acquireMutationBarrier();
+    try {
+    // Alarms can commit stale 2PC intents and deliver queued writes to other
+    // shards. Treat them as writers and fail closed behind the same external
+    // authority as request-driven mutations.
+    const restoreGateResponse = await this.requireRestoreGateOpen();
+    if (restoreGateResponse) {
+      await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+      return;
+    }
     this.ensureSchema();
+    if (this.restoreState()) {
+      await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+      return;
+    }
+    this.markRestoreCheckpointDirty();
     const cutoff = new Date(Date.now() - APPLIED_REQUESTS_TTL_MS).toISOString();
     this.sql.exec("DELETE FROM applied_requests WHERE applied_at < ?", cutoff);
     this.sql.exec("DELETE FROM participant_decision_tombstones WHERE retention_deadline < ?", new Date().toISOString());
+    this.pruneDirectWriteLossJournal();
     await this.sweepStalePendingIntents();
+    await this.certifyRestoreCheckpoint();
+    } finally {
+      mutationRelease();
+    }
+    // Never hold the local mutation barrier across delivery to another Shard:
+    // self-targeting jobs and reciprocal A→B/B→A alarms would deadlock. Each
+    // local queue mutation below reacquires the barrier after the remote await.
     const nextIndexJobRetry = await this.processIndexPendingJobs();
     const nextMirrorJobRetry = await this.processMirrorPendingJobs();
     const candidates = [Date.now() + PRUNE_INTERVAL_MS, nextIndexJobRetry, nextMirrorJobRetry].filter(
       (t): t is number => t !== null,
     );
-    await this.ctx.storage.setAlarm(Math.min(...candidates));
+    const nextAlarm = Math.min(...candidates);
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > nextAlarm) {
+      await this.ctx.storage.setAlarm(nextAlarm);
+    }
+  }
+
+  private async mutateAlarmQueue(work: () => void): Promise<boolean> {
+    const release = await this.acquireMutationBarrier();
+    try {
+      const gateResponse = await this.requireRestoreGateOpen();
+      if (gateResponse || this.restoreState()) return false;
+      this.markRestoreCheckpointDirty();
+      work();
+      await this.certifyRestoreCheckpoint();
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  private async alarmDeliveryBlocked(): Promise<boolean> {
+    return (await this.requireRestoreGateOpen()) !== null || this.restoreState() !== null;
+  }
+
+  private async commitQueueMutation(fromAlarm: boolean, work: () => void): Promise<boolean> {
+    if (fromAlarm) return this.mutateAlarmQueue(work);
+    // Request-driven drain/flush routes already hold the shard barrier and
+    // their common fetch wrapper certifies the resulting checkpoint.
+    work();
+    return true;
   }
 
   /** Milestone 2, Chunk 2: retries index writes that failed on their first
@@ -383,13 +526,23 @@ export class ShardDO extends DurableObject {
       INDEX_JOB_BATCH_SIZE,
     );
 
+    let blocked = false;
     for (const job of due) {
-      await this.deliverIndexJob(job);
+      if (await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
+      const delivered = await this.deliverIndexJob(job, true);
+      if (!delivered && await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
     }
 
     const next = this.one<{ next_attempt_at: string }>(
       "SELECT next_attempt_at FROM index_pending_jobs ORDER BY next_attempt_at ASC LIMIT 1",
     );
+    if (blocked) return Date.now() + INDEX_JOB_BASE_DELAY_MS;
     return next ? new Date(next.next_attempt_at).getTime() : null;
   }
 
@@ -422,7 +575,7 @@ export class ShardDO extends DurableObject {
    * from the catalog and deliver to the newly-resolved shard (the substitute)
    * instead of uselessly retrying the draining target — converting a
    * stale-target retry into a correct write. */
-  private async deliverIndexJob(job: IndexJobRow): Promise<boolean> {
+  private async deliverIndexJob(job: IndexJobRow, fromAlarm = false): Promise<boolean> {
     try {
       let res = await this.postIndexJobExecute(job, job.target_shard_id);
       if (!res.ok && res.status === 409 && job.index_name && job.index_table && job.index_key_json) {
@@ -439,8 +592,9 @@ export class ShardDO extends DurableObject {
             if (resolved !== job.target_shard_id) {
               const retryRes = await this.postIndexJobExecute(job, resolved);
               if (retryRes.ok) {
-                this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
-                return true;
+                return this.commitQueueMutation(fromAlarm, () => {
+                  this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+                });
               }
               res = retryRes;
             }
@@ -448,19 +602,22 @@ export class ShardDO extends DurableObject {
         }
       }
       if (res.ok) {
-        this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
-        return true;
+        return this.commitQueueMutation(fromAlarm, () => {
+          this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+        });
       }
       throw new Error(`shard responded ${res.status}`);
     } catch (error) {
       const attemptCount = job.attempt_count + 1;
       const delay = Math.min(INDEX_JOB_MAX_DELAY_MS, INDEX_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
-      this.sql.exec(
-        "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
-        attemptCount,
-        new Date(Date.now() + delay).toISOString(),
-        job.job_id,
-      );
+      await this.commitQueueMutation(fromAlarm, () => {
+        this.sql.exec(
+          "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+          attemptCount,
+          new Date(Date.now() + delay).toISOString(),
+          job.job_id,
+        );
+      });
       log("shard.index_job_retry_failed", {
         jobId: job.job_id,
         targetShardId: job.target_shard_id,
@@ -582,7 +739,7 @@ export class ShardDO extends DurableObject {
     partition_key: string | null;
     client_request_id: string | null;
     attempt_count: number;
-  }): Promise<boolean> {
+  }, fromAlarm = false): Promise<boolean> {
     try {
       const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
       const stub = this.shardEnv.SHARD.get(id);
@@ -608,19 +765,22 @@ export class ShardDO extends DurableObject {
         }),
       });
       if (res.ok) {
-        this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
-        return true;
+        return this.commitQueueMutation(fromAlarm, () => {
+          this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
+        });
       }
       throw new Error(`shard responded ${res.status}`);
     } catch (error) {
       const attemptCount = job.attempt_count + 1;
       const delay = Math.min(MIRROR_JOB_MAX_DELAY_MS, MIRROR_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
-      this.sql.exec(
-        "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
-        attemptCount,
-        new Date(Date.now() + delay).toISOString(),
-        job.job_id,
-      );
+      await this.commitQueueMutation(fromAlarm, () => {
+        this.sql.exec(
+          "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+          attemptCount,
+          new Date(Date.now() + delay).toISOString(),
+          job.job_id,
+        );
+      });
       log("shard.mirror_job_retry_failed", {
         jobId: job.job_id,
         targetShardId: job.target_shard_id,
@@ -640,12 +800,22 @@ export class ShardDO extends DurableObject {
       new Date().toISOString(),
       MIRROR_JOB_BATCH_SIZE,
     );
+    let blocked = false;
     for (const job of due) {
-      await this.deliverMirrorJob(job);
+      if (await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
+      const delivered = await this.deliverMirrorJob(job, true);
+      if (!delivered && await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
     }
     const next = this.one<{ next_attempt_at: string }>(
       "SELECT next_attempt_at FROM __cf_mirror_pending ORDER BY next_attempt_at ASC LIMIT 1",
     );
+    if (blocked) return Date.now() + MIRROR_JOB_BASE_DELAY_MS;
     return next ? new Date(next.next_attempt_at).getTime() : null;
   }
 
@@ -1382,7 +1552,7 @@ export class ShardDO extends DurableObject {
         body: JSON.stringify({ txId: coordinatorTxId }),
       });
       if (!res.ok) return { decision: "unreachable" };
-      const body = (await res.json()) as { found: boolean; status?: string; epoch?: number; operationHash?: string; commitAuthorized?: boolean };
+      const body = (await res.json()) as { found: boolean; status?: string; epoch?: number; operationHash?: string; commitAuthorized?: boolean; discarded_by_restore?: boolean };
       if (!body.found) return { decision: "unreachable" };
       const operationHash = typeof body.operationHash === "string" && /^[a-f0-9]{64}$/.test(body.operationHash)
         ? body.operationHash
@@ -1391,6 +1561,9 @@ export class ShardDO extends DurableObject {
         return { decision: "committed", epoch: body.epoch, operationHash };
       }
       if (body.status === "abort_decided" || body.status === "aborting" || body.status === "aborted") {
+        return { decision: "aborted", epoch: body.epoch, operationHash };
+      }
+      if (body.discarded_by_restore === true) {
         return { decision: "aborted", epoch: body.epoch, operationHash };
       }
       return { decision: "pending", epoch: body.epoch, operationHash };
@@ -1620,6 +1793,79 @@ export class ShardDO extends DurableObject {
         fenced_at  TEXT NOT NULL
       )
     `);
+
+    // Direct (non-2PC) writes do not have a RedoEnvelope. Record their
+    // immutable identity in the SAME transaction as the write so restore
+    // planning can prove exactly which request hashes fall after a cutoff.
+    // SQL and params stay participant-private and are never returned by the
+    // loss materialization endpoint.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_direct_write_loss_journal (
+        sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id     TEXT NOT NULL,
+        request_hash   TEXT NOT NULL,
+        write_hash     TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        applied_at_ms   INTEGER NOT NULL,
+        expires_at_ms   INTEGER NOT NULL
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS __cf_direct_write_loss_journal_time
+      ON __cf_direct_write_loss_journal(applied_at_ms, sequence)
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_direct_write_loss_coverage (
+        singleton                  INTEGER PRIMARY KEY CHECK (singleton = 1),
+        coverage_start_ms          INTEGER NOT NULL,
+        journaled_through_ms       INTEGER NOT NULL,
+        journaled_through_sequence INTEGER NOT NULL
+      )
+    `);
+    const coverageNow = Date.now();
+    this.sql.exec(
+      `INSERT OR IGNORE INTO __cf_direct_write_loss_coverage
+        (singleton, coverage_start_ms, journaled_through_ms, journaled_through_sequence)
+       VALUES (1, ?, ?, 0)`,
+      coverageNow,
+      coverageNow,
+    );
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_restore_state (
+        singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+        restore_id      TEXT NOT NULL,
+        generation      INTEGER NOT NULL,
+        phase           TEXT NOT NULL,
+        target_bookmark TEXT,
+        undo_bookmark   TEXT,
+        closed_through_ms INTEGER,
+        closed_through_bookmark TEXT,
+        updated_at_ms   INTEGER NOT NULL
+      )
+    `);
+    this.ensureColumn("__cf_restore_state", "closed_through_ms", "INTEGER");
+    this.ensureColumn("__cf_restore_state", "closed_through_bookmark", "TEXT");
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_restore_checkpoints (
+        checkpoint_at_ms INTEGER PRIMARY KEY,
+        bookmark         TEXT NOT NULL
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_restore_checkpoint_meta (
+        singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
+        dirty             INTEGER NOT NULL,
+        coverage_start_ms INTEGER
+      )
+    `);
+    this.sql.exec("INSERT OR IGNORE INTO __cf_restore_checkpoint_meta (singleton, dirty, coverage_start_ms) VALUES (1, 1, NULL)");
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS __cf_prepare_bookmark_markers (
+        tx_id               TEXT PRIMARY KEY,
+        pre_marker_bookmark TEXT NOT NULL,
+        recorded_at_ms      INTEGER NOT NULL
+      )
+    `);
   }
 
   /** Add a column if a table predating it doesn't have it yet — mirrors
@@ -1644,6 +1890,14 @@ export class ShardDO extends DurableObject {
     return Array.from(new Uint8Array(digest))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
+  }
+
+  private async acquireMutationBarrier(): Promise<() => void> {
+    const previous = this.mutationBarrier;
+    let release!: () => void;
+    this.mutationBarrier = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    return release;
   }
 
   private one<T extends object>(sql: string, ...params: unknown[]): T | null {
@@ -1922,6 +2176,566 @@ export class ShardDO extends DurableObject {
     return tombstone;
   }
 
+  private restoreFleetId(): string {
+    return this.shardEnv.DEPLOYMENT_FLEET_ID || this.shardEnv.RESTORE_FLEET_ID || "default";
+  }
+
+  private restoreCoordinatorStub(): RestoreCoordinatorStub | null {
+    const namespace = this.restoreCoordinatorOverride ?? this.shardEnv.RESTORE_COORDINATOR;
+    return namespace ? namespace.getByName(RESTORE_AUTHORITY_OBJECT_NAME) : null;
+  }
+
+  /** A configured authority is fail-closed: network errors, non-2xx replies,
+   * and malformed bodies all deny writes. The binding is optional only for
+   * expand-first deployment; once wired, there is no local-open fallback. */
+  private async restoreGateSnapshot(claim?: { restoreId: string; generation: number }): Promise<RestoreGateSnapshot | null> {
+    const stub = this.restoreCoordinatorStub();
+    if (!stub) return null;
+    const response = await stub.fetch("https://restore.internal/gate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        fleet_id: this.restoreFleetId(),
+        participant_kind: "shard",
+        ...(claim ? { restore_id: claim.restoreId, generation: claim.generation } : {}),
+      }),
+    });
+    if (!response.ok) throw new Error(`restore gate responded ${response.status}`);
+    const body = await response.json() as {
+      ok?: unknown;
+      active?: unknown;
+      allowed?: unknown;
+      restore_id?: unknown;
+      generation?: unknown;
+      phase?: unknown;
+    };
+    if (
+      body.ok !== true
+      || typeof body.active !== "boolean"
+      || typeof body.allowed !== "boolean"
+      || typeof body.generation !== "number"
+      || !Number.isSafeInteger(body.generation)
+      || (body.restore_id !== null && typeof body.restore_id !== "string")
+    ) {
+      throw new Error("restore gate returned a malformed snapshot");
+    }
+    return {
+      ok: true,
+      state: body.active ? "fenced" : "open",
+      fleetId: this.restoreFleetId(),
+      restoreId: body.restore_id as string | null,
+      generation: body.generation,
+      ...(typeof body.phase === "string" ? { phase: body.phase } : {}),
+    };
+  }
+
+  private restoreGateUnavailable(message = "The fleet restore gate is unavailable; writes are denied."): Response {
+    return json({ error: { code: "RESTORE_GATE_UNAVAILABLE", message, retryable: true } }, 503);
+  }
+
+  private async requireRestoreGateOpen(): Promise<Response | null> {
+    try {
+      const gate = await this.restoreGateSnapshot();
+      if (!gate || gate.state === "open") return null;
+      return json({
+        error: {
+          code: "FLEET_RESTORE_IN_PROGRESS",
+          message: "The fleet is fenced for point-in-time restore.",
+          restoreId: gate.restoreId,
+          generation: gate.generation,
+          retryable: true,
+        },
+      }, 503);
+    } catch (error) {
+      log("shard.restore_gate_unavailable", { message: error instanceof Error ? error.message : String(error) });
+      return this.restoreGateUnavailable();
+    }
+  }
+
+  private async matchingRestoreFence(
+    restoreId: unknown,
+    generation: unknown,
+  ): Promise<{ gate: RestoreGateSnapshot } | { response: Response }> {
+    if (typeof restoreId !== "string" || !restoreId || !Number.isSafeInteger(generation) || (generation as number) < 1) {
+      return { response: json({ error: "Missing/invalid restoreId or generation." }, 400) };
+    }
+    try {
+      const gate = await this.restoreGateSnapshot({ restoreId, generation: generation as number });
+      if (!gate) {
+        return { response: this.restoreGateUnavailable("RESTORE_COORDINATOR is not configured for restore control operations.") };
+      }
+      if (gate.state !== "fenced" || gate.restoreId !== restoreId || gate.generation !== generation) {
+        return { response: json({ error: { code: "RESTORE_FENCE_MISMATCH", message: "External restore authority does not hold the requested fence." } }, 409) };
+      }
+      return { gate };
+    } catch (error) {
+      log("shard.restore_gate_unavailable", { message: error instanceof Error ? error.message : String(error) });
+      return { response: this.restoreGateUnavailable() };
+    }
+  }
+
+  private restoreState(): {
+    restore_id: string;
+    generation: number;
+    phase: string;
+    target_bookmark: string | null;
+    undo_bookmark: string | null;
+    closed_through_ms: number | null;
+    closed_through_bookmark: string | null;
+  } | null {
+    return this.one("SELECT restore_id, generation, phase, target_bookmark, undo_bookmark, closed_through_ms, closed_through_bookmark FROM __cf_restore_state WHERE singleton = 1");
+  }
+
+  private writeRestoreState(
+    restoreId: string,
+    generation: number,
+    phase: string,
+    targetBookmark: string | null,
+    undoBookmark: string | null,
+  ): void {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO __cf_restore_state
+        (singleton, restore_id, generation, phase, target_bookmark, undo_bookmark, updated_at_ms)
+       VALUES (1, ?, ?, ?, ?, ?, ?)`,
+      restoreId,
+      generation,
+      phase,
+      targetBookmark,
+      undoBookmark,
+      Date.now(),
+    );
+  }
+
+  private async handleRestoreFence(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; action?: string };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    const existing = this.restoreState();
+    if (existing && (existing.restore_id !== restoreId || existing.generation !== body.generation)) {
+      return json({ error: { code: "RESTORE_FENCE_CONFLICT", message: "A different restore generation is already recorded locally." } }, 409);
+    }
+    if (body.action === "release") {
+      if (existing && !["fenced", "install"].includes(existing.phase)) {
+        return json({ error: { code: "RESTORE_RELEASE_REQUIRES_PITR_RELEASE", message: "PITR staging has begun; use /pitr-release after verification." } }, 409);
+      }
+      this.sql.exec("DELETE FROM __cf_restore_state WHERE singleton = 1");
+      return json({ ok: true, restore_id: restoreId, generation: body.generation, released: true });
+    }
+    const preFenceBookmark = await this.pitrPort.getCurrentBookmark();
+    this.writeRestoreState(restoreId!, body.generation!, body.action || "fenced", existing?.target_bookmark ?? null, existing?.undo_bookmark ?? null);
+    const closedThroughBookmark = await this.pitrPort.getCurrentBookmark();
+    const closedThroughMs = Date.now();
+    this.sql.exec(
+      "UPDATE __cf_restore_state SET closed_through_ms = ?, closed_through_bookmark = ?, updated_at_ms = ? WHERE singleton = 1",
+      closedThroughMs,
+      closedThroughBookmark,
+      closedThroughMs,
+    );
+    return json({
+      ok: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      externally_fenced: true,
+      pre_fence_bookmark: preFenceBookmark,
+      closed_through: new Date(closedThroughMs).toISOString(),
+      closed_through_bookmark: closedThroughBookmark,
+    });
+  }
+
+  private directWriteCoverage(): { coverage_start_ms: number; journaled_through_ms: number; journaled_through_sequence: number } {
+    const row = this.one<{ coverage_start_ms: number; journaled_through_ms: number; journaled_through_sequence: number }>(
+      "SELECT coverage_start_ms, journaled_through_ms, journaled_through_sequence FROM __cf_direct_write_loss_coverage WHERE singleton = 1",
+    );
+    if (!row) throw new Error("Direct-write loss coverage watermark is missing.");
+    return row;
+  }
+
+  private pruneDirectWriteLossJournal(now = Date.now()): void {
+    const retentionFloor = now - DIRECT_WRITE_LOSS_RETENTION_MS;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM __cf_direct_write_loss_journal WHERE expires_at_ms <= ?", now);
+      this.sql.exec(
+        `UPDATE __cf_direct_write_loss_coverage
+            SET coverage_start_ms = MAX(coverage_start_ms, ?)
+          WHERE singleton = 1`,
+        retentionFloor,
+      );
+    });
+  }
+
+  private markRestoreCheckpointDirty(): void {
+    this.sql.exec("UPDATE __cf_restore_checkpoint_meta SET dirty = 1 WHERE singleton = 1");
+  }
+
+  /** Certifies provider-current state at a bounded cadence while dirty. The
+   * wall-clock timestamp is captured only AFTER the
+   * provider returned the exact bookmark, so `checkpoint_at_ms <= cutoff` is
+   * a conservative selection rule. */
+  private async certifyRestoreCheckpoint(): Promise<{ bookmark: string; checkpointAtMs: number }> {
+    const meta = this.one<{ dirty: number; coverage_start_ms: number | null }>(
+      "SELECT dirty, coverage_start_ms FROM __cf_restore_checkpoint_meta WHERE singleton = 1",
+    );
+    if (!meta) throw new Error("Restore checkpoint metadata is missing.");
+    const latest = this.one<{ checkpoint_at_ms: number; bookmark: string }>(
+      "SELECT checkpoint_at_ms, bookmark FROM __cf_restore_checkpoints ORDER BY checkpoint_at_ms DESC LIMIT 1",
+    );
+    if (meta.dirty === 0) {
+      if (latest) return { bookmark: latest.bookmark, checkpointAtMs: latest.checkpoint_at_ms };
+    }
+    if (latest && Date.now() - latest.checkpoint_at_ms < 1_000) {
+      // Leave dirty set: a later mutation boundary will certify the accumulated
+      // changes. The direct-write journal remains the conservative loss proof.
+      return { bookmark: latest.bookmark, checkpointAtMs: latest.checkpoint_at_ms };
+    }
+    const bookmark = await this.pitrPort.getCurrentBookmark();
+    const checkpointAtMs = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("INSERT OR REPLACE INTO __cf_restore_checkpoints (checkpoint_at_ms, bookmark) VALUES (?, ?)", checkpointAtMs, bookmark);
+      this.sql.exec(
+        `UPDATE __cf_restore_checkpoint_meta
+            SET dirty = 0, coverage_start_ms = COALESCE(coverage_start_ms, ?)
+          WHERE singleton = 1`,
+        checkpointAtMs,
+      );
+      const retentionFloor = checkpointAtMs - DIRECT_WRITE_LOSS_RETENTION_MS;
+      this.sql.exec("DELETE FROM __cf_restore_checkpoints WHERE checkpoint_at_ms < ?", retentionFloor);
+      this.sql.exec(
+        "UPDATE __cf_restore_checkpoint_meta SET coverage_start_ms = MAX(coverage_start_ms, ?) WHERE singleton = 1",
+        retentionFloor,
+      );
+    });
+    return { bookmark, checkpointAtMs };
+  }
+
+  private checkpointCoverageStart(): number {
+    const value = this.one<{ coverage_start_ms: number | null }>(
+      "SELECT coverage_start_ms FROM __cf_restore_checkpoint_meta WHERE singleton = 1",
+    )?.coverage_start_ms;
+    if (value === null || value === undefined) throw new Error("Restore checkpoint coverage has not been certified.");
+    return value;
+  }
+
+  private async handlePitrPreview(request: Request): Promise<Response> {
+    const body = await request.json() as {
+      cutoff?: string | number;
+      restoreId?: string;
+      restore_id?: string;
+      generation?: number;
+    };
+    const restoreId = body.restore_id ?? body.restoreId;
+    if (body.generation !== undefined) {
+      const match = await this.matchingRestoreFence(restoreId, body.generation);
+      if ("response" in match) return match.response;
+    } else {
+      const gateResponse = await this.requireRestoreGateOpen();
+      if (gateResponse) return gateResponse;
+    }
+    const cutoffMs = typeof body.cutoff === "number" ? body.cutoff : Date.parse(body.cutoff ?? "");
+    if (!Number.isFinite(cutoffMs)) return json({ error: "cutoff must be an ISO timestamp or epoch milliseconds." }, 400);
+    this.pruneDirectWriteLossJournal();
+    await this.certifyRestoreCheckpoint();
+    const coverage = this.directWriteCoverage();
+    const checkpointCoverageStart = this.checkpointCoverageStart();
+    const coverageStart = Math.max(coverage.coverage_start_ms, checkpointCoverageStart);
+    if (cutoffMs < coverageStart) {
+      return json({
+        error: {
+          code: "DIRECT_WRITE_LOSS_COVERAGE_GAP",
+          message: "The requested cutoff predates certified direct-write journal coverage.",
+          coverageStart: new Date(coverageStart).toISOString(),
+        },
+      }, 409);
+    }
+    // Provider time lookup is intentionally not called: Cloudflare defines it
+    // as approximate and it contributes no evidence to exact selection.
+    const target = this.one<{ bookmark: string; checkpoint_at_ms: number }>(
+      "SELECT bookmark, checkpoint_at_ms FROM __cf_restore_checkpoints WHERE checkpoint_at_ms >= ? AND checkpoint_at_ms <= ? ORDER BY checkpoint_at_ms DESC LIMIT 1",
+      coverageStart,
+      cutoffMs,
+    );
+    if (!target) return json({ error: { code: "RESTORE_BOOKMARK_MISSING", message: "No certified exact checkpoint exists at or before cutoff." } }, 409);
+    const currentBookmark = await this.pitrPort.getCurrentBookmark();
+    return json({
+      ok: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      target_bookmark: target.bookmark,
+      preview_bookmark: currentBookmark,
+      coverage_start: new Date(coverageStart).toISOString(),
+      checkpoint_at: new Date(target.checkpoint_at_ms).toISOString(),
+      journaled_through: new Date(coverage.journaled_through_ms).toISOString(),
+      journaled_through_sequence: coverage.journaled_through_sequence,
+    });
+  }
+
+  private async stagePitrBookmark(
+    body: { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string },
+    phase: "staging" | "undo-staging",
+  ): Promise<Response> {
+    const restoreId = body.restore_id ?? body.restoreId;
+    const targetBookmark = body.target_bookmark ?? body.targetBookmark;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    if (typeof targetBookmark !== "string" || !targetBookmark) return json({ error: "Missing target_bookmark." }, 400);
+    const existing = this.restoreState();
+    if (existing && (existing.restore_id !== restoreId || existing.generation !== body.generation)) {
+      return json({ error: { code: "RESTORE_FENCE_CONFLICT", message: "A different restore generation is already recorded locally." } }, 409);
+    }
+    const targetAlreadyAuthoritative = phase === "staging"
+      || existing?.phase === "undo-staging"
+      || existing?.phase === "undo-staged";
+    if (targetAlreadyAuthoritative && existing?.target_bookmark && existing.target_bookmark !== targetBookmark) {
+      return json({ error: { code: "RESTORE_TARGET_CONFLICT", message: "A different target is already staged for this restore generation." } }, 409);
+    }
+    const completedPhase = phase === "staging" ? "staged" : "undo-staged";
+    if (existing && (
+      existing.phase === completedPhase
+      || (existing.phase === "applying" && existing.target_bookmark === targetBookmark)
+    )) {
+      return json({
+        ok: true,
+        idempotent: true,
+        restore_id: restoreId,
+        generation: body.generation,
+        target_bookmark: targetBookmark,
+        undo_bookmark: existing.undo_bookmark,
+      });
+    }
+    // `phase` is written before the provider call below. Seeing it on retry
+    // means the prior invocation may have crashed after the provider armed
+    // the bookmark but before we durably stored its undo bookmark. Re-arm the
+    // exact same target: the participant barrier prevents concurrent calls,
+    // and the target-conflict check above prevents changing the recovery.
+    const rearmingAmbiguousStage = existing?.phase === phase;
+    const allowedExternalPhase = phase === "staging" ? "restoring" : "rolling_back";
+    if ((!existing || rearmingAmbiguousStage) && match.gate.phase && match.gate.phase !== allowedExternalPhase) {
+      return json({ error: { code: "RESTORE_STAGE_PHASE_INVALID", message: "External restore phase does not permit arming this bookmark." } }, 409);
+    }
+    this.writeRestoreState(restoreId!, body.generation!, phase, targetBookmark, existing?.undo_bookmark ?? null);
+    const undoBookmark = await this.pitrPort.stageRestoreBookmark(targetBookmark);
+    const revalidated = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in revalidated) return revalidated.response;
+    this.writeRestoreState(restoreId!, body.generation!, phase === "staging" ? "staged" : "undo-staged", targetBookmark, undoBookmark);
+    return json({
+      ok: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      target_bookmark: targetBookmark,
+      undo_bookmark: undoBookmark,
+      ...(rearmingAmbiguousStage ? { rearmed: true } : {}),
+    });
+  }
+
+  private async handlePitrStage(request: Request): Promise<Response> {
+    return this.stagePitrBookmark(await request.json(), "staging");
+  }
+
+  private async handlePitrUndo(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string; mode?: "undo" };
+    if (!body.target_bookmark && !body.targetBookmark) body.target_bookmark = this.restoreState()?.undo_bookmark ?? undefined;
+    return this.stagePitrBookmark(body, "undo-staging");
+  }
+
+  private async handlePitrApply(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    const state = this.restoreState();
+    if (!state || state.restore_id !== restoreId || state.generation !== body.generation || !["staged", "undo-staged"].includes(state.phase)) {
+      return json({ error: { code: "RESTORE_NOT_STAGED", message: "No staged bookmark exists for this restore generation." } }, 409);
+    }
+    this.writeRestoreState(state.restore_id, state.generation, "applying", state.target_bookmark, state.undo_bookmark);
+    this.pitrPort.abort();
+    // The real port aborts the current session and never reaches this line;
+    // deterministic workerd fakes return so the transition remains testable.
+    return json({ ok: true, restarting: true, restore_id: restoreId, generation: body.generation }, 202);
+  }
+
+  private restoreInvariantFailure(): Response | null {
+    const quick = this.one<Record<string, unknown>>("PRAGMA quick_check");
+    const quickResult = quick ? Object.values(quick)[0] : null;
+    const foreignKeyFailures = this.many<Record<string, unknown>>("PRAGMA foreign_key_check");
+    if (quickResult === "ok" && foreignKeyFailures.length === 0) return null;
+    return json({
+      error: {
+        code: "RESTORE_INVARIANT_FAILED",
+        message: "Restored SQLite state failed integrity or foreign-key verification.",
+      },
+      verified: false,
+    }, 409);
+  }
+
+  private async handlePitrVerify(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string; mode?: "undo"; require_invariants?: boolean };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const targetBookmark = body.target_bookmark ?? body.targetBookmark;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    if (typeof targetBookmark !== "string" || !targetBookmark) return json({ error: "Missing target_bookmark." }, 400);
+    const state = this.restoreState();
+    if (state) {
+      if (state.restore_id !== restoreId || state.generation !== body.generation) {
+        return json({ error: { code: "RESTORE_FENCE_CONFLICT", message: "Local restore probe belongs to a different restore generation." } }, 409);
+      }
+      const restoredOriginalStageMarker = body.mode === "undo"
+        && ["staged", "applying"].includes(state.phase)
+        && state.target_bookmark !== targetBookmark
+        && state.undo_bookmark === targetBookmark;
+      if (body.mode === "undo" && (state.phase === "staging" || restoredOriginalStageMarker)) {
+        const currentBookmark = await this.pitrPort.getCurrentBookmark();
+        if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+        if (body.require_invariants === true) {
+          const invariantFailure = this.restoreInvariantFailure();
+          if (invariantFailure) return invariantFailure;
+        }
+        return json({
+          ok: true,
+          verified: true,
+          mode: "undo",
+          restore_id: restoreId,
+          generation: body.generation,
+          target_bookmark: targetBookmark,
+          preview_bookmark: currentBookmark,
+          invariants_verified: body.require_invariants === true,
+        });
+      }
+      log("shard.restore_verify_pending", {
+        mode: body.mode ?? "forward",
+        phase: state.phase,
+        target_matches: state.target_bookmark === targetBookmark,
+        undo_matches: state.undo_bookmark === targetBookmark,
+      });
+      return json({
+        ok: true,
+        verified: false,
+        pending: true,
+        restore_id: restoreId,
+        generation: body.generation,
+        phase: state.phase,
+      }, 202);
+    }
+    if (body.mode === "undo") {
+      // The forward restore target normally predates __cf_restore_state, so
+      // the exact undo bookmark can legitimately restore a database in which
+      // the local marker is absent. This is still a positive restart proof:
+      // /pitr-undo durably writes undo-staging before it can acknowledge the
+      // coordinator, and /pitr-apply advances that marker before aborting the
+      // session. An absent marker here therefore means the armed recovery
+      // crossed the provider session boundary and restored the pre-recovery
+      // head. If activation has not happened, either marker remains visible
+      // and the stateful branch above returns pending.
+      const currentBookmark = await this.pitrPort.getCurrentBookmark();
+      if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+      if (body.require_invariants === true) {
+        const invariantFailure = this.restoreInvariantFailure();
+        if (invariantFailure) return invariantFailure;
+      }
+      return json({
+        ok: true,
+        verified: true,
+        mode: "undo",
+        restore_id: restoreId,
+        generation: body.generation,
+        target_bookmark: targetBookmark,
+        preview_bookmark: currentBookmark,
+        certification: "provider-next-session-plus-absent-durable-marker",
+        invariants_verified: body.require_invariants === true,
+      });
+    }
+    const currentBookmark = await this.pitrPort.getCurrentBookmark();
+    if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+    if (body.require_invariants === true) {
+      const invariantFailure = this.restoreInvariantFailure();
+      if (invariantFailure) return invariantFailure;
+    }
+    return json({
+      ok: true,
+      verified: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      target_bookmark: targetBookmark,
+      preview_bookmark: currentBookmark,
+      // A recovery creates a new point in object history; its current bookmark
+      // is not expected to equal the target bookmark.
+      bookmark_equality_assumed: false,
+      certification: "provider-next-session-plus-external-fence",
+      invariants_verified: body.require_invariants === true,
+    });
+  }
+
+  private async handlePitrRelease(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    this.sql.exec("DELETE FROM __cf_restore_state WHERE singleton = 1");
+    return json({ ok: true, restore_id: restoreId, generation: body.generation, externally_fenced: true });
+  }
+
+  private async handleRestoreLossPage(request: Request): Promise<Response> {
+    const body = await request.json() as {
+      restore_id?: string;
+      restoreId?: string;
+      generation?: number;
+      after?: number;
+      cutoff?: string | number;
+      through?: string | number;
+      limit?: number;
+    };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    const cutoffMs = typeof body.cutoff === "number" ? body.cutoff : Date.parse(body.cutoff ?? "");
+    const throughMs = typeof body.through === "number" ? body.through : Date.parse(body.through ?? "");
+    if (!Number.isFinite(cutoffMs) || !Number.isFinite(throughMs) || throughMs < cutoffMs) {
+      return json({ error: "cutoff/through must be a valid ordered time window." }, 400);
+    }
+    const fence = this.restoreState();
+    if (!fence || fence.restore_id !== restoreId || fence.generation !== body.generation || fence.closed_through_ms === null) {
+      return json({ error: { code: "RESTORE_CLOSED_THROUGH_MISSING", message: "Loss enumeration requires the matching participant close watermark." } }, 409);
+    }
+    if (throughMs > fence.closed_through_ms) {
+      return json({ error: { code: "RESTORE_THROUGH_EXCEEDS_FENCE", message: "Requested loss window exceeds the participant close watermark." } }, 409);
+    }
+    const effectiveThroughMs = fence.closed_through_ms;
+    const coverage = this.directWriteCoverage();
+    if (cutoffMs < coverage.coverage_start_ms) {
+      return json({ error: { code: "DIRECT_WRITE_LOSS_COVERAGE_GAP", coverageStart: new Date(coverage.coverage_start_ms).toISOString() } }, 409);
+    }
+    const after = Number.isSafeInteger(body.after) && (body.after as number) >= 0 ? body.after as number : 0;
+    const limit = Number.isSafeInteger(body.limit) ? Math.min(500, Math.max(1, body.limit as number)) : 100;
+    const rows = this.many<{ sequence: number; request_hash: string; write_hash: string; kind: string; applied_at_ms: number }>(
+      `SELECT sequence, request_hash, write_hash, kind, applied_at_ms
+         FROM __cf_direct_write_loss_journal
+        WHERE sequence > ? AND applied_at_ms > ? AND applied_at_ms <= ?
+        ORDER BY sequence ASC LIMIT ?`,
+      after,
+      cutoffMs,
+      effectiveThroughMs,
+      limit + 1,
+    );
+    const page = rows.slice(0, limit);
+    const complete = rows.length <= limit;
+    return json({
+      ok: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      entries: page.map((row) => ({
+        sequence: row.sequence,
+        request_hash: row.request_hash,
+        write_hash: row.write_hash,
+        kind: row.kind,
+        applied_at: new Date(row.applied_at_ms).toISOString(),
+      })),
+      next_cursor: page.length === 0 ? after : page[page.length - 1].sequence,
+      complete,
+      coverage_start: new Date(coverage.coverage_start_ms).toISOString(),
+      closed_through: new Date(fence.closed_through_ms).toISOString(),
+    });
+  }
+
   async fetch(request: Request): Promise<Response> {
     try {
       return await this.handle(request);
@@ -1964,13 +2778,55 @@ export class ShardDO extends DurableObject {
     const faultResponse = this.checkFaultInjection();
     if (faultResponse) return faultResponse;
 
+    const mutationRelease = SHARD_BARRIER_PATHS.has(url.pathname) ? await this.acquireMutationBarrier() : null;
+    try {
+    let restoreReplayAuthorized = false;
+    if (SHARD_MUTATING_PATHS.has(url.pathname) && !SHARD_RESTORE_CONTROL_PATHS.has(url.pathname)) {
+      if (["/prepare", "/recover"].includes(url.pathname)) {
+        const claim = await request.clone().json().catch(() => ({})) as {
+          restore_id?: string;
+          restoreId?: string;
+          generation?: number;
+        };
+        const restoreId = claim.restore_id ?? claim.restoreId;
+        if (restoreId !== undefined || claim.generation !== undefined) {
+          const match = await this.matchingRestoreFence(restoreId, claim.generation);
+          if ("response" in match) return match.response;
+          restoreReplayAuthorized = true;
+        } else {
+          const restoreGateResponse = await this.requireRestoreGateOpen();
+          if (restoreGateResponse) return restoreGateResponse;
+        }
+      } else {
+        const restoreGateResponse = await this.requireRestoreGateOpen();
+        if (restoreGateResponse) return restoreGateResponse;
+      }
+    }
+
     this.ensureSchema();
+    if (
+      SHARD_MUTATING_PATHS.has(url.pathname)
+      && !SHARD_RESTORE_CONTROL_PATHS.has(url.pathname)
+      && !restoreReplayAuthorized
+      && this.restoreState()
+    ) {
+      return json({ error: { code: "RESTORE_FENCE_ACTIVE", message: "The participant-local restore fence blocks mutation." } }, 503);
+    }
 
     const handler = this.routes[url.pathname];
     if (handler) {
-      return handler(request);
+      if (!SHARD_MUTATING_PATHS.has(url.pathname)) return handler(request);
+      this.markRestoreCheckpointDirty();
+      try {
+        return await handler(request);
+      } finally {
+        await this.certifyRestoreCheckpoint();
+      }
     }
     return json({ error: `Unknown shard route: ${url.pathname}` }, 404);
+    } finally {
+      mutationRelease?.();
+    }
   }
 
   /** The active fault's expiry timestamp if a fault is CURRENTLY in effect
@@ -2122,6 +2978,16 @@ export class ShardDO extends DurableObject {
 
       if (mutating) {
         const incomingHash = await this.requestHash(payload.sql, payload.params ?? []);
+        const directWriteKind = payload.isMirror ? "mirror" : payload.indexName ? "index" : "direct";
+        const writeHash = await hashCanonicalJson({
+          request_id: payload.requestId,
+          request_hash: incomingHash,
+          kind: directWriteKind,
+          tenant_id: payload.tenantId ?? null,
+          table_name: payload.table ?? null,
+          partition_key: payload.partitionKey ?? null,
+          vbucket: payload.vbucket ?? null,
+        });
         const prior = this.one<{ result_json: string; request_hash: string }>(
           "SELECT result_json, request_hash FROM applied_requests WHERE request_id = ?",
           payload.requestId,
@@ -2275,6 +3141,32 @@ export class ShardDO extends DurableObject {
               });
             }
           }
+
+          // Capture the loss-evidence timestamp at the final synchronous
+          // commit boundary, after the tenant mutation and all coupled local
+          // effects. Capturing it before the awaited write-hash calculation
+          // can classify a write as pre-cutoff even though it commits later.
+          const appliedAtMs = Date.now();
+          this.sql.exec(
+            `INSERT INTO __cf_direct_write_loss_journal
+              (request_id, request_hash, write_hash, kind, applied_at_ms, expires_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            payload.requestId,
+            incomingHash,
+            writeHash,
+            directWriteKind,
+            appliedAtMs,
+            appliedAtMs + DIRECT_WRITE_LOSS_RETENTION_MS,
+          );
+          const journalSequence = this.one<{ sequence: number }>("SELECT last_insert_rowid() AS sequence")?.sequence ?? 0;
+          this.sql.exec(
+            `UPDATE __cf_direct_write_loss_coverage
+                SET journaled_through_ms = MAX(journaled_through_ms, ?),
+                    journaled_through_sequence = MAX(journaled_through_sequence, ?)
+              WHERE singleton = 1`,
+            appliedAtMs,
+            journalSequence,
+          );
 
           return txResult;
         });
@@ -2719,6 +3611,31 @@ export class ShardDO extends DurableObject {
     );
   }
 
+  private async certifiedPrepareResponse(txId: string, body: Record<string, unknown>): Promise<Response> {
+    // This checkpoint is taken only after the prepare transaction has
+    // committed. It is an exact provider-current bookmark; no wall-clock
+    // lookup or lexical lower-bound assumption is involved.
+    if (!this.restoreCoordinatorOverride && !this.shardEnv.RESTORE_COORDINATOR) {
+      // Expand-first compatibility until the external authority binding is
+      // deployed. Coordinator admission also remains in legacy mode in this
+      // configuration and must not create a V2 checkpoint-certified envelope.
+      return json({ ...body, prepareBookmark: null, prepareCheckpointExact: false });
+    }
+    const preMarkerBookmark = await this.pitrPort.getCurrentBookmark();
+    this.sql.exec(
+      `INSERT OR IGNORE INTO __cf_prepare_bookmark_markers (tx_id, pre_marker_bookmark, recorded_at_ms)
+       VALUES (?, ?, ?)`,
+      txId,
+      preMarkerBookmark,
+      Date.now(),
+    );
+    // This second exact bookmark includes the durable marker. Returning the
+    // earlier bookmark would make an exact restore to the advertised point
+    // lose the proof row itself.
+    const prepareBookmark = await this.pitrPort.getCurrentBookmark();
+    return json({ ...body, prepareBookmark, prepareCheckpointExact: true });
+  }
+
   private async handlePrepare(request: Request): Promise<Response> {
     const raw = (await request.json()) as Record<string, unknown>;
     const intents = Array.isArray(raw.intents) ? raw.intents as PrepareIntent[] : undefined;
@@ -2742,12 +3659,12 @@ export class ShardDO extends DurableObject {
         // invented hash can never bless an old unhashed prepared row.
         if (raw.protocol_version !== undefined) {
           const adopted = this.adoptLegacyPrepared(message, intents);
-          return json({ ok: true, prepared: adopted, legacyAdopted: true });
+          return this.certifiedPrepareResponse(coordinatorTxId, { ok: true, prepared: adopted, legacyAdopted: true });
         }
-        return json({ ok: true, prepared: existing.length, legacyAdopted: false });
+        return this.certifiedPrepareResponse(coordinatorTxId, { ok: true, prepared: existing.length, legacyAdopted: false });
       }
       this.assertMessageCompatible(message);
-      return json({ ok: true, prepared: existing.length });
+      return this.certifiedPrepareResponse(coordinatorTxId, { ok: true, prepared: existing.length });
     }
     this.assertMessageCompatible(message);
 
@@ -2945,7 +3862,7 @@ export class ShardDO extends DurableObject {
       });
     });
 
-    return json({ ok: true, prepared: intents.length });
+    return this.certifiedPrepareResponse(coordinatorTxId, { ok: true, prepared: intents.length });
   }
 
   private async handleCommit(request: Request): Promise<Response> {
@@ -3095,12 +4012,15 @@ export class ShardDO extends DurableObject {
       "SELECT status FROM pending_intents WHERE coordinator_tx_id = ?",
       message.tx_id,
     );
+    const prepareBookmarkPresent = typeof raw.prepare_bookmark === "string"
+      ? !!this.one("SELECT tx_id FROM __cf_prepare_bookmark_markers WHERE tx_id = ?", message.tx_id)
+      : undefined;
     if (intents.length === 0) {
       return durable
-        ? json({ found: true, status: durable.decision === "commit" ? "committed" : "aborted", decision: durable.decision, epoch: durable.highest_epoch })
-        : json({ found: false });
+        ? json({ found: true, status: durable.decision === "commit" ? "committed" : "aborted", decision: durable.decision, epoch: durable.highest_epoch, ...(prepareBookmarkPresent !== undefined ? { prepare_bookmark_present: prepareBookmarkPresent } : {}) })
+        : json({ found: false, ...(prepareBookmarkPresent !== undefined ? { prepare_bookmark_present: prepareBookmarkPresent } : {}) });
     }
-    return json({ found: true, status: intents[0].status, decision: durable?.decision ?? "undecided", epoch: message.epoch });
+    return json({ found: true, status: intents[0].status, decision: durable?.decision ?? "undecided", epoch: message.epoch, ...(prepareBookmarkPresent !== undefined ? { prepare_bookmark_present: prepareBookmarkPresent } : {}) });
   }
 
   private async handleRecover(request: Request): Promise<Response> {

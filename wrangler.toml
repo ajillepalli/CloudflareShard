@@ -27,6 +27,18 @@ class_name = "ShardDO"
 name = "COORDINATOR"
 class_name = "CoordinatorDO"
 
+# Fleet-scoped PITR authority. This Durable Object is deliberately outside
+# every participant database that it can rewind, so its restore generation,
+# undo bookmarks, evidence pins, and progress survive participant PITR.
+[[durable_objects.bindings]]
+name = "RESTORE_COORDINATOR"
+class_name = "RestoreCoordinatorDO"
+
+[vars]
+# One deployment is one physical PITR domain. Logical fleet IDs may not share
+# these Durable Object namespaces and then be restored independently.
+DEPLOYMENT_FLEET_ID = "default"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CatalogDO", "ShardDO"]
@@ -34,3 +46,7 @@ new_sqlite_classes = ["CatalogDO", "ShardDO"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["CoordinatorDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RestoreCoordinatorDO"]

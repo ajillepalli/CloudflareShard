@@ -8,7 +8,13 @@ export const CURRENT_PROTOCOL_VERSION = 1 as const;
 export const MIN_READABLE_PROTOCOL_VERSION = 1 as const;
 export const TRANSACTION_STATE_MODEL_VERSION = 2 as const;
 export const MIN_READABLE_TRANSACTION_STATE_MODEL_VERSION = 1 as const;
+/** @deprecated V1 reader/source-compatibility alias. New writers use
+ * CURRENT_REDO_ENVELOPE_FORMAT_VERSION. */
 export const REDO_ENVELOPE_FORMAT_VERSION = 1 as const;
+export const REDO_ENVELOPE_V1_FORMAT_VERSION = REDO_ENVELOPE_FORMAT_VERSION;
+export const REDO_ENVELOPE_V2_FORMAT_VERSION = 2 as const;
+export const CURRENT_REDO_ENVELOPE_FORMAT_VERSION = REDO_ENVELOPE_V2_FORMAT_VERSION;
+export const MIN_READABLE_REDO_ENVELOPE_FORMAT_VERSION = REDO_ENVELOPE_V1_FORMAT_VERSION;
 export const MANIFEST_RECORD_FORMAT_VERSION = 1 as const;
 export const MANIFEST_RESERVATION_FORMAT_VERSION = 1 as const;
 export const MANIFEST_TERMINAL_INTENT_FORMAT_VERSION = 1 as const;
@@ -17,7 +23,10 @@ export const MANIFEST_CATALOG_FORMAT_VERSION = 1 as const;
 export const MANIFEST_SEAL_FORMAT_VERSION = 1 as const;
 export const MANIFEST_PAGE_FORMAT_VERSION = 1 as const;
 export const MANIFEST_ENUMERATION_FORMAT_VERSION = 1 as const;
+export const MANIFEST_ENUMERATION_V1_FORMAT_VERSION = MANIFEST_ENUMERATION_FORMAT_VERSION;
+export const CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION = 2 as const;
 export const MANIFEST_CURSOR_FORMAT_VERSION = 1 as const;
+export const MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION = 2 as const;
 export const PARTICIPANT_TOMBSTONE_FORMAT_VERSION = 1 as const;
 export const TRANSACTION_ERROR_SCHEMA_VERSION = 1 as const;
 export const RELIABILITY_EVENT_SCHEMA_VERSION = 1 as const;
@@ -466,9 +475,15 @@ export interface RedoParticipantV1 {
   readonly intents: readonly RedoIntentV1[];
 }
 
+export interface RedoParticipantV2 extends RedoParticipantV1 {
+  /** Provider PITR bookmark observed immediately after this participant's
+   * prepared mutation. Restore uses it to decide whether replay is required. */
+  readonly prepare_bookmark: string;
+}
+
 export interface RedoEnvelopeV1 {
   readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
-  readonly format_version: typeof REDO_ENVELOPE_FORMAT_VERSION;
+  readonly format_version: typeof REDO_ENVELOPE_V1_FORMAT_VERSION;
   readonly tx_id: string;
   readonly fleet_id: string;
   readonly coordinator_id: string;
@@ -479,6 +494,13 @@ export interface RedoEnvelopeV1 {
   readonly operation_hash: string;
   readonly participants: readonly RedoParticipantV1[];
 }
+
+export interface RedoEnvelopeV2 extends Omit<RedoEnvelopeV1, "format_version" | "participants"> {
+  readonly format_version: typeof REDO_ENVELOPE_V2_FORMAT_VERSION;
+  readonly participants: readonly RedoParticipantV2[];
+}
+
+export type ReadableRedoEnvelope = RedoEnvelopeV1 | RedoEnvelopeV2;
 
 export interface ManifestRecordV1 {
   readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
@@ -646,18 +668,45 @@ export async function hashCanonicalJson(value: unknown): Promise<string> {
   return sha256Hex(canonicalJson(value));
 }
 
-export async function hashRedoEnvelope(envelope: RedoEnvelopeV1): Promise<string> {
+export async function hashRedoEnvelope(envelope: ReadableRedoEnvelope): Promise<string> {
+  // V2 is finalized through the fleet manifest service. The Coordinator
+  // commits to every caller-controlled redo byte (including exact prepare
+  // bookmarks) before that service assigns commit_decided_at and the
+  // retention deadline. Those two service-assigned fields are committed by
+  // ManifestRecordV2 itself, so the V2 content address is the immutable
+  // envelope intent without them. V1 predates terminal finalization and
+  // continues to address the complete envelope byte-for-byte.
+  if (envelope.format_version === REDO_ENVELOPE_V2_FORMAT_VERSION) {
+    return hashFinalizedRedoEnvelope(envelope);
+  }
   return hashCanonicalJson(envelope);
 }
 
-export async function hashParticipantOperations(participants: readonly RedoParticipantV1[]): Promise<string> {
-  return hashCanonicalJson(participants);
+/** Content address for envelopes finalized through the V2 manifest service.
+ * The service-assigned terminal timestamps are committed by ManifestRecordV2,
+ * while the address remains the coordinator's pre-finalization intent. This
+ * also covers expand-first model-2 rows whose participant payload is V1. */
+export async function hashFinalizedRedoEnvelope(envelope: ReadableRedoEnvelope): Promise<string> {
+  const { commit_decided_at: _commitDecidedAt, retention_deadline: _retentionDeadline, ...intent } = envelope;
+  return hashCanonicalJson(intent);
 }
 
-export function validateRedoEnvelopeStructure(value: unknown): asserts value is RedoEnvelopeV1 {
+export async function hashParticipantOperations(
+  participants: readonly (RedoParticipantV1 | RedoParticipantV2)[],
+): Promise<string> {
+  // A V2 prepare bookmark is recovery evidence, not part of the transaction's
+  // requested operations. Excluding it preserves the operation hash calculated
+  // before prepare while the enclosing envelope hash still commits to it.
+  return hashCanonicalJson(participants.map(({ participant_id, epoch, intents }) => ({ participant_id, epoch, intents })));
+}
+
+export function validateRedoEnvelopeStructure(value: unknown): asserts value is ReadableRedoEnvelope {
   assertPlainObject(value, "redo_envelope");
-  assertWritableProtocolVersion(value.protocol_version);
-  if (value.format_version !== REDO_ENVELOPE_FORMAT_VERSION) {
+  assertReadableProtocolVersion(value.protocol_version);
+  if (
+    value.format_version !== REDO_ENVELOPE_V1_FORMAT_VERSION
+    && value.format_version !== REDO_ENVELOPE_V2_FORMAT_VERSION
+  ) {
     fail("TX_VERSION_UNSUPPORTED", `Redo envelope format ${String(value.format_version)} is unsupported.`);
   }
   assertNonEmptyString(value.tx_id, "tx_id");
@@ -685,6 +734,11 @@ export function validateRedoEnvelopeStructure(value: unknown): asserts value is 
       fail("TX_ENVELOPE_INVALID", "Participants must be unique and sorted by participant_id.");
     }
     priorParticipant = participant.participant_id;
+    if (value.format_version === REDO_ENVELOPE_V2_FORMAT_VERSION) {
+      assertNonEmptyString(participant.prepare_bookmark, "prepare_bookmark");
+    } else if ("prepare_bookmark" in participant) {
+      fail("TX_ENVELOPE_INVALID", "RedoEnvelopeV1 cannot contain a prepare_bookmark.");
+    }
     assertEpoch(participant.epoch, "participant_epoch");
     if (participant.epoch !== value.decision_epoch) {
       fail("TX_EPOCH_CONFLICT", "Every participant epoch must equal the envelope decision_epoch.");
@@ -719,6 +773,16 @@ export function validateRedoEnvelopeStructure(value: unknown): asserts value is 
   }
 }
 
+export function validateWritableRedoEnvelopeStructure(value: unknown): asserts value is RedoEnvelopeV2 {
+  validateRedoEnvelopeStructure(value);
+  if (value.format_version !== CURRENT_REDO_ENVELOPE_FORMAT_VERSION) {
+    fail(
+      "TX_VERSION_UNSUPPORTED",
+      `Redo envelope format ${String(value.format_version)} is read-only; new writes require ${CURRENT_REDO_ENVELOPE_FORMAT_VERSION}.`,
+    );
+  }
+}
+
 export async function validateRedoEnvelope(value: unknown): Promise<void> {
   validateRedoEnvelopeStructure(value);
   const expectedOperationHash = await hashParticipantOperations(value.participants);
@@ -744,7 +808,7 @@ export async function manifestRoute(
   };
 }
 
-export async function createManifestRegistration(envelope: RedoEnvelopeV1): Promise<ManifestRegistrationV1> {
+export async function createManifestRegistration(envelope: ReadableRedoEnvelope): Promise<ManifestRegistrationV1> {
   await validateRedoEnvelope(envelope);
   const route = await manifestRoute(envelope.tx_id, envelope.commit_decided_at);
   const record: ManifestRecordV1 = {
@@ -1048,9 +1112,22 @@ export interface ManifestEnumerationCursorV1 {
   readonly local_cursor: ManifestLocalPageCursorV1 | null;
 }
 
+export interface ManifestEnumerationCursorV2 {
+  readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
+  readonly format_version: typeof MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION;
+  readonly request_hash: string;
+  readonly catalog_close_key: string;
+  readonly fleet_root_hash: string;
+  readonly catalog_generation: number;
+  readonly catalog_snapshot_hash: string;
+  readonly reservation_utc_day: string;
+  readonly partition: number;
+  readonly local_cursor: ManifestLocalPageCursorV1 | null;
+}
+
 export interface ManifestEnumerationRequestV1 {
   readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
-  readonly format_version: typeof MANIFEST_ENUMERATION_FORMAT_VERSION;
+  readonly format_version: typeof MANIFEST_ENUMERATION_V1_FORMAT_VERSION;
   readonly fleet_id: string;
   readonly coverage_start: string;
   readonly cutoff: string;
@@ -1061,9 +1138,26 @@ export interface ManifestEnumerationRequestV1 {
   readonly cursor: ManifestEnumerationCursorV1 | null;
 }
 
+export interface ManifestEnumerationRequestV2 {
+  readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
+  readonly format_version: typeof CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION;
+  readonly fleet_id: string;
+  readonly coverage_start: string;
+  readonly cutoff: string;
+  readonly partition_config_hash: string;
+  readonly catalog_close_key: string;
+  readonly fleet_root_hash: string;
+  readonly catalog_generation: number;
+  readonly catalog_snapshot_hash: string;
+  readonly limit: number;
+  readonly cursor: ManifestEnumerationCursorV2 | null;
+}
+
+export type ReadableManifestEnumerationRequest = ManifestEnumerationRequestV1 | ManifestEnumerationRequestV2;
+
 export interface ManifestCoverageEvidenceV1 extends ManifestRouteV2 {
   readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
-  readonly format_version: typeof MANIFEST_ENUMERATION_FORMAT_VERSION;
+  readonly format_version: typeof MANIFEST_ENUMERATION_V1_FORMAT_VERSION;
   readonly cutoff: string;
   readonly seal_generation: number;
   readonly seal_receipt_hash: string;
@@ -1089,7 +1183,7 @@ export interface ManifestEnumerationDiagnosticsV1 {
 
 export interface ManifestEnumerationResultV1 {
   readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
-  readonly format_version: typeof MANIFEST_ENUMERATION_FORMAT_VERSION;
+  readonly format_version: typeof MANIFEST_ENUMERATION_V1_FORMAT_VERSION;
   readonly request_hash: string;
   readonly coverage: ManifestCoverageStatus;
   readonly complete: boolean;
@@ -1098,6 +1192,22 @@ export interface ManifestEnumerationResultV1 {
   readonly next_cursor: ManifestEnumerationCursorV1 | null;
   readonly diagnostics: ManifestEnumerationDiagnosticsV1;
 }
+
+export interface ManifestEnumerationResultV2 {
+  readonly protocol_version: typeof CURRENT_PROTOCOL_VERSION;
+  readonly format_version: typeof CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION;
+  readonly request_hash: string;
+  readonly catalog_close_key: string;
+  readonly fleet_root_hash: string;
+  readonly coverage: ManifestCoverageStatus;
+  readonly complete: boolean;
+  readonly records: readonly ManifestRecordV2[];
+  readonly evidence: readonly ManifestCoverageEvidenceV1[];
+  readonly next_cursor: ManifestEnumerationCursorV2 | null;
+  readonly diagnostics: ManifestEnumerationDiagnosticsV1;
+}
+
+export type ReadableManifestEnumerationResult = ManifestEnumerationResultV1 | ManifestEnumerationResultV2;
 
 export type ManifestMemberCandidate = Readonly<{
   state: string;
@@ -1480,13 +1590,30 @@ export function validateManifestLocalPageRequest(value: unknown): asserts value 
   if (value.cursor !== null) validateManifestLocalPageCursor(value.cursor);
 }
 
-export function validateManifestEnumerationCursor(value: unknown): asserts value is ManifestEnumerationCursorV1 {
+export function validateManifestEnumerationCursor(
+  value: unknown,
+): asserts value is ManifestEnumerationCursorV1 | ManifestEnumerationCursorV2 {
   assertPlainObject(value, "manifest_enumeration_cursor");
-  assertExactKeys(value, "manifest_enumeration_cursor", [
-    "protocol_version", "format_version", "request_hash", "catalog_generation", "catalog_snapshot_hash",
-    "reservation_utc_day", "partition", "local_cursor",
-  ]);
-  assertManifestVersion(value, MANIFEST_CURSOR_FORMAT_VERSION, "manifest_enumeration_cursor");
+  if (value.protocol_version !== CURRENT_PROTOCOL_VERSION) {
+    fail("MANIFEST_VERSION_UNSUPPORTED", "manifest_enumeration_cursor uses an unsupported protocol version.");
+  }
+  if (value.format_version === MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION) {
+    assertExactKeys(value, "manifest_enumeration_cursor", [
+      "protocol_version", "format_version", "request_hash", "catalog_close_key", "fleet_root_hash",
+      "catalog_generation", "catalog_snapshot_hash", "reservation_utc_day", "partition", "local_cursor",
+    ]);
+    assertManifestHash(value.catalog_close_key, "catalog_close_key");
+    assertManifestHash(value.fleet_root_hash, "fleet_root_hash");
+  } else if (value.format_version === MANIFEST_CURSOR_FORMAT_VERSION) {
+    assertExactKeys(value, "manifest_enumeration_cursor", [
+      "protocol_version", "format_version", "request_hash", "catalog_generation", "catalog_snapshot_hash",
+      "reservation_utc_day", "partition", "local_cursor",
+    ]);
+  } else {
+    fail("MANIFEST_VERSION_UNSUPPORTED", "manifest_enumeration_cursor uses an unsupported format version.", {
+      format_version: String(value.format_version),
+    });
+  }
   assertManifestHash(value.request_hash, "request_hash");
   assertSafeInteger(value.catalog_generation, "catalog_generation", 1);
   assertManifestHash(value.catalog_snapshot_hash, "catalog_snapshot_hash");
@@ -1496,13 +1623,30 @@ export function validateManifestEnumerationCursor(value: unknown): asserts value
   if (value.local_cursor !== null) validateManifestLocalPageCursor(value.local_cursor);
 }
 
-export function validateManifestEnumerationRequest(value: unknown): asserts value is ManifestEnumerationRequestV1 {
+export function validateManifestEnumerationRequest(
+  value: unknown,
+): asserts value is ReadableManifestEnumerationRequest {
   assertPlainObject(value, "manifest_enumeration_request");
-  assertExactKeys(value, "manifest_enumeration_request", [
-    "protocol_version", "format_version", "fleet_id", "coverage_start", "cutoff", "partition_config_hash",
-    "catalog_generation", "catalog_snapshot_hash", "limit", "cursor",
-  ]);
-  assertManifestVersion(value, MANIFEST_ENUMERATION_FORMAT_VERSION, "manifest_enumeration_request");
+  if (value.protocol_version !== CURRENT_PROTOCOL_VERSION) {
+    fail("MANIFEST_VERSION_UNSUPPORTED", "manifest_enumeration_request uses an unsupported protocol version.");
+  }
+  if (value.format_version === CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION) {
+    assertExactKeys(value, "manifest_enumeration_request", [
+      "protocol_version", "format_version", "fleet_id", "coverage_start", "cutoff", "partition_config_hash",
+      "catalog_close_key", "fleet_root_hash", "catalog_generation", "catalog_snapshot_hash", "limit", "cursor",
+    ]);
+    assertManifestHash(value.catalog_close_key, "catalog_close_key");
+    assertManifestHash(value.fleet_root_hash, "fleet_root_hash");
+  } else if (value.format_version === MANIFEST_ENUMERATION_V1_FORMAT_VERSION) {
+    assertExactKeys(value, "manifest_enumeration_request", [
+      "protocol_version", "format_version", "fleet_id", "coverage_start", "cutoff", "partition_config_hash",
+      "catalog_generation", "catalog_snapshot_hash", "limit", "cursor",
+    ]);
+  } else {
+    fail("MANIFEST_VERSION_UNSUPPORTED", "manifest_enumeration_request uses an unsupported format version.", {
+      format_version: String(value.format_version),
+    });
+  }
   assertManifestString(value.fleet_id, "fleet_id");
   const coverageStart = parseManifestTimestamp(value.coverage_start, "coverage_start");
   const cutoff = parseManifestTimestamp(value.cutoff, "cutoff");
@@ -1511,10 +1655,41 @@ export function validateManifestEnumerationRequest(value: unknown): asserts valu
   assertSafeInteger(value.catalog_generation, "catalog_generation", 1);
   assertManifestHash(value.catalog_snapshot_hash, "catalog_snapshot_hash");
   assertManifestPageLimit(value.limit);
-  if (value.cursor !== null) validateManifestEnumerationCursor(value.cursor);
+  if (value.cursor !== null) {
+    validateManifestEnumerationCursor(value.cursor);
+    if (
+      (value.format_version === CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION
+        && value.cursor.format_version !== MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION)
+      || (value.format_version === MANIFEST_ENUMERATION_V1_FORMAT_VERSION
+        && value.cursor.format_version !== MANIFEST_CURSOR_FORMAT_VERSION)
+    ) {
+      fail("MANIFEST_CURSOR_MISMATCH", "Enumeration request and cursor format versions do not match.");
+    }
+    if (
+      value.format_version === CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION
+      && value.cursor.format_version === MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION
+      && (value.cursor.catalog_close_key !== value.catalog_close_key || value.cursor.fleet_root_hash !== value.fleet_root_hash)
+    ) {
+      fail("MANIFEST_CURSOR_MISMATCH", "Enumeration cursor does not match the root-bound close identity.");
+    }
+  }
 }
 
-export async function hashManifestRequest(value: ManifestLocalPageRequestV1 | ManifestEnumerationRequestV1): Promise<string> {
+export function validateWritableManifestEnumerationRequest(
+  value: unknown,
+): asserts value is ManifestEnumerationRequestV2 {
+  validateManifestEnumerationRequest(value);
+  if (value.format_version !== CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION) {
+    fail(
+      "MANIFEST_VERSION_UNSUPPORTED",
+      `Manifest enumeration format ${String(value.format_version)} is read-only; new requests require ${CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION}.`,
+    );
+  }
+}
+
+export async function hashManifestRequest(
+  value: ManifestLocalPageRequestV1 | ReadableManifestEnumerationRequest,
+): Promise<string> {
   if ("expected_retention_epoch" in value) {
     validateManifestLocalPageRequest(value);
     const { expected_retention_epoch: _liveRetentionEpoch, ...stableRequest } = value;
@@ -1525,7 +1700,7 @@ export async function hashManifestRequest(value: ManifestLocalPageRequestV1 | Ma
 }
 
 export function assertManifestCursorMatchesRequest(
-  cursor: ManifestLocalPageCursorV1 | ManifestEnumerationCursorV1,
+  cursor: ManifestLocalPageCursorV1 | ManifestEnumerationCursorV1 | ManifestEnumerationCursorV2,
   requestHash: string,
 ): void {
   assertManifestHash(requestHash, "request_hash");
@@ -1540,7 +1715,7 @@ export function validateManifestCoverageEvidence(value: unknown): asserts value 
     "protocol_version", "format_version", ...ROUTE_KEYS, "cutoff", "seal_generation", "seal_receipt_hash",
     "retention_epoch", "records_deleted_through_ms", "local_legacy_certificate_hash",
   ]);
-  assertManifestVersion(value, MANIFEST_ENUMERATION_FORMAT_VERSION, "manifest_coverage_evidence");
+  assertManifestVersion(value, MANIFEST_ENUMERATION_V1_FORMAT_VERSION, "manifest_coverage_evidence");
   validateManifestRouteFields(value);
   parseManifestTimestamp(value.cutoff, "cutoff");
   assertSafeInteger(value.seal_generation, "seal_generation", 1);
@@ -1550,13 +1725,30 @@ export function validateManifestCoverageEvidence(value: unknown): asserts value 
   assertManifestHash(value.local_legacy_certificate_hash, "local_legacy_certificate_hash");
 }
 
-export function validateManifestEnumerationResult(value: unknown): asserts value is ManifestEnumerationResultV1 {
+export function validateManifestEnumerationResult(
+  value: unknown,
+): asserts value is ReadableManifestEnumerationResult {
   assertPlainObject(value, "manifest_enumeration_result");
-  assertExactKeys(value, "manifest_enumeration_result", [
-    "protocol_version", "format_version", "request_hash", "coverage", "complete", "records", "evidence",
-    "next_cursor", "diagnostics",
-  ]);
-  assertManifestVersion(value, MANIFEST_ENUMERATION_FORMAT_VERSION, "manifest_enumeration_result");
+  if (value.protocol_version !== CURRENT_PROTOCOL_VERSION) {
+    fail("MANIFEST_VERSION_UNSUPPORTED", "manifest_enumeration_result uses an unsupported protocol version.");
+  }
+  if (value.format_version === CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION) {
+    assertExactKeys(value, "manifest_enumeration_result", [
+      "protocol_version", "format_version", "request_hash", "catalog_close_key", "fleet_root_hash",
+      "coverage", "complete", "records", "evidence", "next_cursor", "diagnostics",
+    ]);
+    assertManifestHash(value.catalog_close_key, "catalog_close_key");
+    assertManifestHash(value.fleet_root_hash, "fleet_root_hash");
+  } else if (value.format_version === MANIFEST_ENUMERATION_V1_FORMAT_VERSION) {
+    assertExactKeys(value, "manifest_enumeration_result", [
+      "protocol_version", "format_version", "request_hash", "coverage", "complete", "records", "evidence",
+      "next_cursor", "diagnostics",
+    ]);
+  } else {
+    fail("MANIFEST_VERSION_UNSUPPORTED", "manifest_enumeration_result uses an unsupported format version.", {
+      format_version: String(value.format_version),
+    });
+  }
   assertManifestHash(value.request_hash, "request_hash");
   if (typeof value.coverage !== "string" || !(MANIFEST_COVERAGE_STATUSES as readonly string[]).includes(value.coverage)) {
     fail("MANIFEST_INVALID_REQUEST", "coverage must be a supported manifest coverage status.");
@@ -1568,7 +1760,25 @@ export function validateManifestEnumerationResult(value: unknown): asserts value
   value.records.forEach(validateManifestRecordV2);
   if (!Array.isArray(value.evidence)) fail("MANIFEST_INVALID_REQUEST", "evidence must be an array.");
   value.evidence.forEach(validateManifestCoverageEvidence);
-  if (value.next_cursor !== null) validateManifestEnumerationCursor(value.next_cursor);
+  if (value.next_cursor !== null) {
+    validateManifestEnumerationCursor(value.next_cursor);
+    if (
+      (value.format_version === CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION
+        && value.next_cursor.format_version !== MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION)
+      || (value.format_version === MANIFEST_ENUMERATION_V1_FORMAT_VERSION
+        && value.next_cursor.format_version !== MANIFEST_CURSOR_FORMAT_VERSION)
+    ) {
+      fail("MANIFEST_CURSOR_MISMATCH", "Enumeration result and cursor format versions do not match.");
+    }
+    if (
+      value.format_version === CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION
+      && value.next_cursor.format_version === MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION
+      && (value.next_cursor.catalog_close_key !== value.catalog_close_key
+        || value.next_cursor.fleet_root_hash !== value.fleet_root_hash)
+    ) {
+      fail("MANIFEST_CURSOR_MISMATCH", "Enumeration result cursor does not match its root-bound close identity.");
+    }
+  }
   if (value.complete && value.next_cursor !== null) {
     fail("MANIFEST_INVALID_REQUEST", "A complete enumeration cannot include a continuation cursor.");
   }
