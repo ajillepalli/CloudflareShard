@@ -5,7 +5,8 @@ import {
   DEFAULT_DURABLE_OBJECT_RETRY_AFTER_MS,
   MANIFEST_TERMINAL_INTENT_FORMAT_VERSION,
   MAX_DURABLE_OBJECT_RETRY_AFTER_MS,
-  REDO_ENVELOPE_FORMAT_VERSION,
+  CURRENT_REDO_ENVELOPE_FORMAT_VERSION,
+  REDO_ENVELOPE_V1_FORMAT_VERSION,
   TransactionContractViolation,
   assertReadableTransactionStateModelVersion,
   assertReadableProtocolVersion,
@@ -18,6 +19,7 @@ import {
   hashManifestFinalizeIntent,
   hashManifestRecordV2,
   hashManifestReservation,
+  hashRedoEnvelope,
   hashParticipantOperations,
   isCommitDecidedOrLater,
   isTransactionState,
@@ -26,6 +28,7 @@ import {
   transactionError,
   validateRedoEnvelope,
   validateRedoEnvelopeStructure,
+  validateWritableRedoEnvelopeStructure,
   validateManifestCancelIntent,
   validateManifestFinalizeIntent,
   validateManifestRegistration,
@@ -40,7 +43,10 @@ import {
   type ParticipantPhase,
   type ParticipantPhaseMessageV1,
   type RedoEnvelopeV1,
+  type RedoEnvelopeV2,
+  type ReadableRedoEnvelope,
   type RedoParticipantV1,
+  type RedoParticipantV2,
   type TransactionProtocolError,
   type TransactionState,
 } from "../packages/contracts/src/index.js";
@@ -94,8 +100,31 @@ type _GeneratedControlPlaneBindingIsCompatible = Assert<
     : false
 >;
 
+type RestoreCoordinatorStub = { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> };
+type RestoreCoordinatorNamespace = { getByName(name: string): RestoreCoordinatorStub };
+type CoordinatorRegistrationResult =
+  | { disposition: "registered" }
+  | { disposition: "discard_required"; restoreId: string; generation: number };
+type RestoreGateSnapshot = {
+  ok: true;
+  state: "open" | "fenced";
+  fleetId: string;
+  restoreId: string | null;
+  generation: number;
+  phase?: string;
+};
+
+export interface CoordinatorPitrPort {
+  getCurrentBookmark(): Promise<string>;
+  getBookmarkForTime(timestamp: number | Date): Promise<string>;
+  stageRestoreBookmark(bookmark: string): Promise<string>;
+  abort(): void;
+}
+
 type CoordinatorEnv = Omit<Cloudflare.Env, "CONTROL_PLANE"> & {
   CONTROL_PLANE?: TransactionManifestService;
+  RESTORE_COORDINATOR?: RestoreCoordinatorNamespace;
+  DEPLOYMENT_FLEET_ID?: string;
 };
 
 type BeginIntent = {
@@ -120,6 +149,7 @@ type BeginPayload = {
 type TxRow = {
   tx_id: string;
   status: string;
+  created_at: string;
   participant_shards_json: string;
   operation_json: string;
   operation_hash: string;
@@ -170,12 +200,15 @@ const STATE_MODEL_1_STATES: ReadonlySet<TransactionState> = new Set([
   "committed",
   "quarantined",
 ]);
+const COORDINATOR_GATE_MUTATING_PATHS = new Set(["/begin", "/force-abort", "/resolve-manifest-quarantine"]);
 
 class CoordinatorCasLost extends Error {
   constructor(readonly state: TransactionState) {
     super(`Coordinator state changed to ${state}.`);
   }
 }
+
+class RestoreGateDenied extends Error {}
 
 function protocolResponse(error: TransactionProtocolError): Response {
   return json({ error }, error.http_status);
@@ -197,17 +230,35 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private readonly coordinatorEnv: CoordinatorEnv;
   private readonly routes: Record<string, (request: Request) => Promise<Response>>;
   private schemaEnsured = false;
+  // Unreachable compatibility helpers below retain this adapter until their
+  // private implementation is removed; no Coordinator PITR route is exposed.
+  private pitrPort: CoordinatorPitrPort;
+  private restoreCoordinatorOverride: RestoreCoordinatorNamespace | null = null;
+  private activeMutations = 0;
+  private mutationDrainWaiters: Array<() => void> = [];
+  private recoveryInFlight = new Set<string>();
+  private releaseRecoveryInFlight = new Map<string, Promise<void>>();
 
   constructor(ctx: DurableObjectState, env: CoordinatorEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.coordinatorEnv = env;
+    this.pitrPort = {
+      getCurrentBookmark: () => ctx.storage.getCurrentBookmark(),
+      getBookmarkForTime: (timestamp) => ctx.storage.getBookmarkForTime(timestamp),
+      stageRestoreBookmark: (bookmark) => ctx.storage.onNextSessionRestoreBookmark(bookmark),
+      abort: () => ctx.abort(),
+    };
     this.routes = {
       "/tx-status": this.handleTxStatus.bind(this),
       "/begin": this.handleBegin.bind(this),
       "/force-abort": this.handleForceAbort.bind(this),
       "/resolve-manifest-quarantine": this.handleResolveManifestQuarantine.bind(this),
       "/stats": this.handleStats.bind(this),
+      "/redo-envelope": this.handleRedoEnvelope.bind(this),
+      "/recovery-envelope": this.handleRedoEnvelope.bind(this),
+      "/restore-loss-page": this.handleRestoreLossPage.bind(this),
+      "/restore-discard": this.handleRestoreDiscard.bind(this),
     };
   }
 
@@ -265,6 +316,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     `);
     this.ensureColumn("transaction_participants", "epoch", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("transaction_participants", "operation_hash", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("transaction_participants", "prepare_bookmark", "TEXT");
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS recovery_queue (
         tx_id TEXT PRIMARY KEY,
@@ -289,6 +341,14 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         (singleton, failure_count, failure_window_started_at_ms, open_until_ms, open_count, half_open_probe, half_open_probe_until_ms)
        VALUES (1, 0, 0, 0, 0, 0, 0)`,
     );
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS coordinator_restore_discard (
+        singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+        restore_id      TEXT NOT NULL,
+        generation      INTEGER NOT NULL,
+        discarded_at_ms INTEGER NOT NULL
+      )
+    `);
   }
 
   private one<T extends object>(statement: string, ...params: unknown[]): T | null {
@@ -298,7 +358,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private loadTx(txId: string): TxRow | null {
     return this.one<TxRow>(
-      `SELECT tx_id, status, participant_shards_json, operation_json, operation_hash,
+      `SELECT tx_id, status, created_at, participant_shards_json, operation_json, operation_hash,
               protocol_version, state_model_version, epoch, decision, fleet_id,
               coordinator_id, redo_envelope_json, manifest_registration_json,
               manifest_route_assignment_request_json, manifest_reservation_json,
@@ -611,6 +671,168 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       }));
   }
 
+  private enterMutation(): void {
+    this.activeMutations += 1;
+  }
+
+  private leaveMutation(): void {
+    this.activeMutations -= 1;
+    if (this.activeMutations === 0) {
+      for (const resolve of this.mutationDrainWaiters.splice(0)) resolve();
+    }
+  }
+
+  private async awaitMutationDrain(): Promise<void> {
+    if (this.activeMutations === 0) return;
+    await new Promise<void>((resolve) => this.mutationDrainWaiters.push(resolve));
+  }
+
+  private async runRecoveryExclusive(txId: string, status: string, work: () => Promise<Response>): Promise<Response> {
+    if (this.recoveryInFlight.has(txId)) return json({ ok: true, txId, status }, 202);
+    this.recoveryInFlight.add(txId);
+    try {
+      return await work();
+    } finally {
+      this.recoveryInFlight.delete(txId);
+    }
+  }
+
+  private deploymentFleetId(): string {
+    return this.coordinatorEnv.DEPLOYMENT_FLEET_ID || "default";
+  }
+
+  private restoreCoordinatorStub(fleetId = this.deploymentFleetId()): RestoreCoordinatorStub | null {
+    const namespace = this.restoreCoordinatorOverride ?? this.coordinatorEnv.RESTORE_COORDINATOR;
+    return namespace ? namespace.getByName(`fleet:${fleetId}`) : null;
+  }
+
+  private async restoreGateSnapshot(
+    fleetId = this.deploymentFleetId(),
+    claim?: { restoreId: string; generation: number },
+  ): Promise<RestoreGateSnapshot | null> {
+    const stub = this.restoreCoordinatorStub(fleetId);
+    if (!stub) return null;
+    const response = await stub.fetch("https://restore.internal/gate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        fleet_id: fleetId,
+        participant_kind: "coordinator",
+        ...(claim ? { restore_id: claim.restoreId, generation: claim.generation } : {}),
+      }),
+    });
+    if (!response.ok) throw new RestoreGateDenied(`restore gate responded ${response.status}`);
+    const body = await response.json() as {
+      ok?: unknown;
+      active?: unknown;
+      allowed?: unknown;
+      restore_id?: unknown;
+      generation?: unknown;
+      phase?: unknown;
+    };
+    if (
+      body.ok !== true
+      || typeof body.active !== "boolean"
+      || typeof body.allowed !== "boolean"
+      || typeof body.generation !== "number"
+      || !Number.isSafeInteger(body.generation)
+      || (body.restore_id !== null && typeof body.restore_id !== "string")
+    ) {
+      throw new RestoreGateDenied("restore gate returned a malformed snapshot");
+    }
+    return {
+      ok: true,
+      state: body.active ? "fenced" : "open",
+      fleetId,
+      restoreId: body.restore_id as string | null,
+      generation: body.generation,
+      ...(typeof body.phase === "string" ? { phase: body.phase } : {}),
+    };
+  }
+
+  private async assertRestoreGateOpen(fleetId = this.deploymentFleetId()): Promise<void> {
+    try {
+      const gate = await this.restoreGateSnapshot(fleetId);
+      if (gate && gate.state !== "open") throw new RestoreGateDenied("fleet restore is in progress");
+    } catch (error) {
+      if (error instanceof RestoreGateDenied) throw error;
+      throw new RestoreGateDenied(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private restoreGateResponse(error: unknown): Response {
+    log("coordinator.restore_gate_denied", { message: error instanceof Error ? error.message : String(error) });
+    return json({ error: { code: "RESTORE_GATE_UNAVAILABLE", message: "The external fleet restore gate denied coordinator mutation.", retryable: true } }, 503);
+  }
+
+  private async registerPhysicalCoordinator(
+    fleetId: string,
+    coordinatorId: string,
+    txId: string,
+    existingCreatedAt?: string,
+  ): Promise<CoordinatorRegistrationResult> {
+    const stub = this.restoreCoordinatorStub(fleetId);
+    if (!stub) return { disposition: "registered" }; // expand-first compatibility until the binding is deployed
+    let response: Response;
+    try {
+      response = await stub.fetch("https://restore.internal/register-coordinator", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          fleetId,
+          coordinatorId,
+          txId,
+          ...(existingCreatedAt === undefined ? {} : { existing_created_at: existingCreatedAt }),
+        }),
+      });
+    } catch (error) {
+      throw new RestoreGateDenied(error instanceof Error ? error.message : String(error));
+    }
+    if (!response.ok) throw new RestoreGateDenied(`coordinator registry responded ${response.status}`);
+    const body = await response.json().catch(() => null) as {
+      ok?: unknown;
+      registered_at?: unknown;
+      disposition?: unknown;
+      restore_id?: unknown;
+      generation?: unknown;
+    } | null;
+    if (body?.disposition === "discard_required") {
+      if (
+        typeof body.restore_id !== "string"
+        || body.restore_id.length === 0
+        || typeof body.generation !== "number"
+        || !Number.isSafeInteger(body.generation)
+        || body.generation < 0
+      ) {
+        throw new RestoreGateDenied("coordinator registry returned a malformed discard directive");
+      }
+      return { disposition: "discard_required", restoreId: body.restore_id, generation: body.generation };
+    }
+    if (!body || body.ok !== true || typeof body.registered_at !== "string") throw new RestoreGateDenied("coordinator registry returned malformed acknowledgement");
+    // Registration is an external await. Re-read the gate so a restore that
+    // started concurrently cannot race admission after inventory capture.
+    await this.assertRestoreGateOpen(fleetId);
+    return { disposition: "registered" };
+  }
+
+  private redoParticipantsV2(row: TxRow): RedoParticipantV2[] {
+    const bookmarks = new Map(
+      Array.from(this.sql.exec<{ shard_id: string; prepare_bookmark: string | null }>(
+        "SELECT shard_id, prepare_bookmark FROM transaction_participants WHERE tx_id = ? ORDER BY shard_id ASC",
+        row.tx_id,
+      )).map((participant) => [participant.shard_id, participant.prepare_bookmark]),
+    );
+    return this.redoParticipants(this.participants(row), row.epoch).map((participant) => {
+      const prepareBookmark = bookmarks.get(participant.participant_id);
+      if (!prepareBookmark) {
+        throw new TransactionContractViolation(
+          transactionError("TX_ENVELOPE_INVALID", `Participant ${participant.participant_id} is missing its exact post-prepare bookmark.`),
+        );
+      }
+      return { ...participant, prepare_bookmark: prepareBookmark };
+    });
+  }
+
   private async envelopeFor(
     txId: string,
     fleetId: string,
@@ -622,7 +844,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const redoParticipants = this.redoParticipants(participants, epoch);
     const envelope: RedoEnvelopeV1 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: REDO_ENVELOPE_FORMAT_VERSION,
+      format_version: REDO_ENVELOPE_V1_FORMAT_VERSION,
       tx_id: txId,
       fleet_id: fleetId,
       coordinator_id: coordinatorId,
@@ -712,6 +934,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileReservation(row: TxRow): Promise<Response> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     if (this.stateOf(row) !== "manifest_reserving") return this.resume(row);
     const { reservation, reservationHash } = await this.reservationFor(row);
     const request: ManifestReserveRequestV1 = { reservation, reservation_hash: reservationHash };
@@ -767,6 +990,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async persistAbortDecision(row: TxRow, legacyPredecisionAbort = false): Promise<TxRow> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     await this.ensureAlarmScheduled(Date.now());
     const now = new Date().toISOString();
     let cancelRequestJson: string | null = null;
@@ -804,6 +1028,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileAbort(row: TxRow, knownLegacyPredecisionAbort?: boolean): Promise<Response> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     let current = row;
     const state = this.stateOf(current);
     if (state === "abort_decided") {
@@ -884,6 +1109,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileCancel(row: TxRow): Promise<Response> {
+    return this.runRecoveryExclusive(row.tx_id, "aborted_pending_manifest_cancel", () => this.reconcileCancelOnce(row));
+  }
+
+  private async reconcileCancelOnce(row: TxRow): Promise<Response> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     if (this.stateOf(row) === "aborted") return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
     if (this.stateOf(row) !== "aborted_pending_manifest_cancel") return this.resume(row);
     const queued = this.one<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", row.tx_id);
@@ -969,6 +1199,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async persistCommitDecision(row: TxRow): Promise<TxRow> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     if (this.isV2(row)) return this.persistCommitDeciding(row);
     await this.ensureAlarmScheduled(Date.now());
     const commitDecidedAt = new Date().toISOString();
@@ -1002,19 +1233,29 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async persistCommitDeciding(row: TxRow): Promise<TxRow> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     await this.ensureAlarmScheduled(Date.now());
     const { reservation, reservationHash } = await this.reservationFor(row);
+    const checkpointCertified = !!(this.restoreCoordinatorOverride ?? this.coordinatorEnv.RESTORE_COORDINATOR);
     const redoEnvelopeIntent = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: REDO_ENVELOPE_FORMAT_VERSION,
+      format_version: checkpointCertified ? CURRENT_REDO_ENVELOPE_FORMAT_VERSION : REDO_ENVELOPE_V1_FORMAT_VERSION,
       tx_id: row.tx_id,
       fleet_id: row.fleet_id,
       coordinator_id: row.coordinator_id || row.tx_id,
       decision: "commit" as const,
       decision_epoch: row.epoch,
       operation_hash: row.operation_hash,
-      participants: this.redoParticipants(this.participants(row), row.epoch),
+      participants: checkpointCertified ? this.redoParticipantsV2(row) : this.redoParticipants(this.participants(row), row.epoch),
     };
+    if (checkpointCertified) {
+      const validationDecisionTime = new Date().toISOString();
+      validateWritableRedoEnvelopeStructure({
+        ...redoEnvelopeIntent,
+        commit_decided_at: validationDecisionTime,
+        retention_deadline: retentionDeadline(validationDecisionTime),
+      });
+    }
     const computedOperationHash = await hashParticipantOperations(redoEnvelopeIntent.participants);
     if (computedOperationHash !== row.operation_hash) {
       throw new TransactionContractViolation(
@@ -1083,6 +1324,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileFinalize(row: TxRow): Promise<Response> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     const state = this.stateOf(row);
     if (state !== "commit_deciding" && state !== "commit_pending_manifest") return this.resume(row);
     const request = await this.finalizeRequestFor(row);
@@ -1145,7 +1387,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
             commit_decided_at: result.record.commit_decided_at,
             retention_deadline: result.record.retention_deadline,
           }
-    ) as unknown as RedoEnvelopeV1;
+    ) as unknown as ReadableRedoEnvelope;
     await validateRedoEnvelope(completedEnvelope);
     try {
       this.transition(row.tx_id, [state], "manifest_registered", () => {
@@ -1340,6 +1582,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileManifest(row: TxRow): Promise<Response> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     if (this.isV2(row)) return this.reconcileFinalize(row);
     const state = this.stateOf(row);
     if (state !== "commit_decided" && state !== "commit_pending_manifest") {
@@ -1434,6 +1677,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileCommit(row: TxRow): Promise<Response> {
+    return this.runRecoveryExclusive(row.tx_id, "committed_pending_ack", () => this.reconcileCommitOnce(row));
+  }
+
+  private async reconcileCommitOnce(row: TxRow): Promise<Response> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     let current = row;
     const state = this.stateOf(current);
     if (state === "manifest_registered") {
@@ -1538,6 +1786,19 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileManifestRelease(row: TxRow): Promise<void> {
+    const existing = this.releaseRecoveryInFlight.get(row.tx_id);
+    if (existing) return existing;
+    const work = this.reconcileManifestReleaseOnce(row);
+    this.releaseRecoveryInFlight.set(row.tx_id, work);
+    try {
+      await work;
+    } finally {
+      if (this.releaseRecoveryInFlight.get(row.tx_id) === work) this.releaseRecoveryInFlight.delete(row.tx_id);
+    }
+  }
+
+  private async reconcileManifestReleaseOnce(row: TxRow): Promise<void> {
+    await this.assertRestoreGateOpen(row.fleet_id);
     if (this.stateOf(row) !== "committed") {
       throw new TransactionContractViolation(
         transactionError("TX_INVALID_TRANSITION", "Manifest retention can be released only after terminal commit."),
@@ -1738,6 +1999,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async resume(row: TxRow): Promise<Response> {
+    if (this.restoreDiscard()) return this.discardedByRestoreResponse();
     const state = this.stateOf(row);
     switch (state) {
       case "new":
@@ -1782,13 +2044,17 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private async prepare(row: TxRow): Promise<Response> {
     const participants = this.participants(row);
+    const checkpointCertificationRequired = !!this.coordinatorEnv.RESTORE_COORDINATOR;
     const outcomes = await Promise.all(
       participants.map(async (participant) => {
         try {
           const response = await this.callShard(row, participant, "prepare");
-          return { participant, ok: response.ok, body: await response.json().catch(() => ({})) };
+          const body = await response.json().catch(() => ({})) as { prepareBookmark?: unknown; prepareCheckpointExact?: unknown };
+          const checkpointOk = !checkpointCertificationRequired
+            || (typeof body.prepareBookmark === "string" && body.prepareBookmark.length > 0 && body.prepareCheckpointExact === true);
+          return { participant, ok: response.ok && checkpointOk, body, prepareBookmark: checkpointOk && typeof body.prepareBookmark === "string" ? body.prepareBookmark : null };
         } catch (error) {
-          return { participant, ok: false, body: { error: error instanceof Error ? error.message : String(error) } };
+          return { participant, ok: false, body: { error: error instanceof Error ? error.message : String(error) }, prepareBookmark: null };
         }
       }),
     );
@@ -1815,7 +2081,17 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     try {
       this.transition(row.tx_id, ["preparing"], "prepared", () => {
         const now = new Date().toISOString();
-        this.sql.exec("UPDATE transaction_participants SET phase_status = 'prepared', updated_at = ? WHERE tx_id = ?", now, row.tx_id);
+        for (const outcome of outcomes) {
+          this.sql.exec(
+            `UPDATE transaction_participants
+                SET phase_status = 'prepared', prepare_bookmark = ?, updated_at = ?
+              WHERE tx_id = ? AND shard_id = ?`,
+            outcome.prepareBookmark,
+            now,
+            row.tx_id,
+            outcome.participant.shardId,
+          );
+        }
       });
     } catch (error) {
       if (!(error instanceof CoordinatorCasLost)) throw error;
@@ -1826,19 +2102,41 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   async alarm(): Promise<void> {
+    // Recovery can cross the commit decision and mutate every participant.
+    // Register the durable row before any recovery mutation so coordinators
+    // created before inventory rollout cannot escape a concurrent restore.
+    // A closed or unavailable external gate must otherwise make the alarm a
+    // no-op; throwing preserves work for the platform's alarm retry.
+    await this.awaitMutationDrain();
+    this.enterMutation();
+    try {
     this.ensureSchema();
+    if (this.restoreDiscard()) return;
     const work = this.one<{ tx_id: string; action: string; next_attempt_at: string; attempt_count: number }>(
       "SELECT tx_id, action, next_attempt_at, attempt_count FROM recovery_queue ORDER BY next_attempt_at LIMIT 1",
     );
     if (!work) return;
+    const row = this.loadTx(work.tx_id);
+    if (!row) {
+      await this.assertRestoreGateOpen();
+      this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", work.tx_id);
+      return;
+    }
+    const registration = await this.registerPhysicalCoordinator(
+      row.fleet_id || this.deploymentFleetId(),
+      row.coordinator_id || row.tx_id,
+      row.tx_id,
+      row.created_at,
+    );
+    if (registration.disposition === "discard_required") {
+      const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
+      if (!discarded.ok) throw new RestoreGateDenied("coordinator registry discard directive conflicts with local restore state");
+      return;
+    }
+    await this.assertRestoreGateOpen(row.fleet_id || this.deploymentFleetId());
     const due = new Date(work.next_attempt_at).getTime();
     if (due > Date.now()) {
       await this.ctx.storage.setAlarm(due);
-      return;
-    }
-    const row = this.loadTx(work.tx_id);
-    if (!row) {
-      this.sql.exec("DELETE FROM recovery_queue WHERE tx_id = ?", work.tx_id);
       return;
     }
     try {
@@ -1876,6 +2174,386 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         : "manifest";
       await this.reschedule(work.tx_id, normalizedAction);
     }
+    } finally {
+      this.leaveMutation();
+    }
+  }
+
+  private coordinatorRestoreState(): {
+    restore_id: string;
+    generation: number;
+    phase: string;
+    target_bookmark: string | null;
+    undo_bookmark: string | null;
+  } | null {
+    return this.one("SELECT restore_id, generation, phase, target_bookmark, undo_bookmark FROM coordinator_restore_state WHERE singleton = 1");
+  }
+
+  private writeCoordinatorRestoreState(
+    restoreId: string,
+    generation: number,
+    phase: string,
+    targetBookmark: string | null,
+    undoBookmark: string | null,
+  ): void {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO coordinator_restore_state
+        (singleton, restore_id, generation, phase, target_bookmark, undo_bookmark, updated_at_ms)
+       VALUES (1, ?, ?, ?, ?, ?, ?)`,
+      restoreId,
+      generation,
+      phase,
+      targetBookmark,
+      undoBookmark,
+      Date.now(),
+    );
+  }
+
+  private async matchingRestoreFence(
+    restoreId: unknown,
+    generation: unknown,
+  ): Promise<{ gate: RestoreGateSnapshot } | { response: Response }> {
+    if (typeof restoreId !== "string" || !restoreId || !Number.isSafeInteger(generation) || (generation as number) < 1) {
+      return { response: json({ error: "Missing/invalid restoreId or generation." }, 400) };
+    }
+    try {
+      const gate = await this.restoreGateSnapshot(this.deploymentFleetId(), { restoreId, generation: generation as number });
+      if (!gate) return { response: json({ error: { code: "RESTORE_GATE_UNAVAILABLE", message: "RESTORE_COORDINATOR is not configured." } }, 503) };
+      if (gate.state !== "fenced" || gate.restoreId !== restoreId || gate.generation !== generation) {
+        return { response: json({ error: { code: "RESTORE_FENCE_MISMATCH", message: "External restore authority does not hold the requested fence." } }, 409) };
+      }
+      return { gate };
+    } catch (error) {
+      return { response: this.restoreGateResponse(error) };
+    }
+  }
+
+  private async handleRestoreFence(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; action?: string };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    const existing = this.coordinatorRestoreState();
+    if (existing && (existing.restore_id !== restoreId || existing.generation !== body.generation)) {
+      return json({ error: { code: "RESTORE_FENCE_CONFLICT", message: "A different restore generation is already recorded locally." } }, 409);
+    }
+    if (body.action === "release") {
+      if (existing && !["fenced", "install"].includes(existing.phase)) {
+        return json({ error: { code: "RESTORE_RELEASE_REQUIRES_PITR_RELEASE", message: "PITR staging has begun; use /pitr-release after verification." } }, 409);
+      }
+      this.sql.exec("DELETE FROM coordinator_restore_state WHERE singleton = 1");
+      return json({ ok: true, restore_id: restoreId, generation: body.generation, released: true });
+    }
+    this.writeCoordinatorRestoreState(restoreId!, body.generation!, body.action || "fenced", existing?.target_bookmark ?? null, existing?.undo_bookmark ?? null);
+    return json({ ok: true, restore_id: restoreId, generation: body.generation, externally_fenced: true });
+  }
+
+  private async handlePitrPreview(request: Request): Promise<Response> {
+    const body = await request.json() as { cutoff?: string | number; restore_id?: string; restoreId?: string; generation?: number };
+    const restoreId = body.restore_id ?? body.restoreId;
+    if (body.generation !== undefined) {
+      const match = await this.matchingRestoreFence(restoreId, body.generation);
+      if ("response" in match) return match.response;
+    } else {
+      await this.assertRestoreGateOpen();
+    }
+    const cutoffMs = typeof body.cutoff === "number" ? body.cutoff : Date.parse(body.cutoff ?? "");
+    if (!Number.isFinite(cutoffMs)) return json({ error: "cutoff must be an ISO timestamp or epoch milliseconds." }, 400);
+    const preview = { bookmark: await this.pitrPort.getCurrentBookmark() };
+    // Provider time lookup is deliberately not called. It is approximate and
+    // contributes no evidence to exact checkpoint selection.
+    let target = this.one<{ checkpoint_at_ms: number; bookmark: string }>(
+      `SELECT checkpoint_at_ms, bookmark FROM coordinator_restore_checkpoints
+        WHERE checkpoint_at_ms <= ? ORDER BY checkpoint_at_ms DESC LIMIT 1`,
+      cutoffMs,
+    );
+    const meta = this.one<{
+      coverage_start_ms: number | null;
+      initial_empty_bookmark: string | null;
+      initial_empty_at_ms: number | null;
+    }>(
+      `SELECT coverage_start_ms, initial_empty_bookmark, initial_empty_at_ms
+         FROM coordinator_restore_checkpoint_meta WHERE singleton = 1`,
+    );
+    if (!meta?.coverage_start_ms) {
+      return json({ error: { code: "RESTORE_COVERAGE_MISSING", message: "Coordinator exact-checkpoint coverage is unavailable." } }, 409);
+    }
+    let emptyAtCutoff = false;
+    if (!target && meta.initial_empty_bookmark && meta.initial_empty_at_ms !== null) {
+      const firstTx = this.one<{ created_at: string }>("SELECT created_at FROM transactions ORDER BY created_at ASC LIMIT 1");
+      const firstTxAt = firstTx ? Date.parse(firstTx.created_at) : Number.POSITIVE_INFINITY;
+      if (meta.initial_empty_at_ms > cutoffMs && firstTxAt > cutoffMs) {
+        target = { checkpoint_at_ms: meta.initial_empty_at_ms, bookmark: meta.initial_empty_bookmark };
+        emptyAtCutoff = true;
+      }
+    }
+    if (!target) {
+      return json({ error: { code: "RESTORE_BOOKMARK_MISSING", message: "No certified exact coordinator checkpoint exists at or before cutoff." } }, 409);
+    }
+    return json({
+      ok: true,
+      restore_id: restoreId ?? null,
+      generation: body.generation,
+      target_bookmark: target.bookmark,
+      preview_bookmark: preview.bookmark,
+      checkpoint_at: new Date(target.checkpoint_at_ms).toISOString(),
+      coverage_start: new Date(meta.coverage_start_ms).toISOString(),
+      exact: true,
+      empty_at_cutoff: emptyAtCutoff,
+    });
+  }
+
+  private async stageCoordinatorBookmark(
+    body: { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string },
+    phase: "staging" | "undo-staging",
+  ): Promise<Response> {
+    const restoreId = body.restore_id ?? body.restoreId;
+    const targetBookmark = body.target_bookmark ?? body.targetBookmark;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    if (typeof targetBookmark !== "string" || !targetBookmark) return json({ error: "Missing target_bookmark." }, 400);
+    const existing = this.coordinatorRestoreState();
+    if (existing && (existing.restore_id !== restoreId || existing.generation !== body.generation)) {
+      return json({ error: { code: "RESTORE_FENCE_CONFLICT", message: "A different restore generation is already recorded locally." } }, 409);
+    }
+    this.writeCoordinatorRestoreState(restoreId!, body.generation!, phase, targetBookmark, existing?.undo_bookmark ?? null);
+    const undoBookmark = await this.pitrPort.stageRestoreBookmark(targetBookmark);
+    const revalidated = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in revalidated) return revalidated.response;
+    this.writeCoordinatorRestoreState(restoreId!, body.generation!, phase === "staging" ? "staged" : "undo-staged", targetBookmark, undoBookmark);
+    return json({ ok: true, restore_id: restoreId, generation: body.generation, target_bookmark: targetBookmark, undo_bookmark: undoBookmark });
+  }
+
+  private async handlePitrStage(request: Request): Promise<Response> {
+    return this.stageCoordinatorBookmark(await request.json(), "staging");
+  }
+
+  private async handlePitrUndo(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string; mode?: "undo" };
+    if (!body.target_bookmark && !body.targetBookmark) body.target_bookmark = this.coordinatorRestoreState()?.undo_bookmark ?? undefined;
+    return this.stageCoordinatorBookmark(body, "undo-staging");
+  }
+
+  private async handlePitrApply(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    const state = this.coordinatorRestoreState();
+    if (!state || state.restore_id !== restoreId || state.generation !== body.generation || !["staged", "undo-staged"].includes(state.phase)) {
+      return json({ error: { code: "RESTORE_NOT_STAGED", message: "No staged bookmark exists for this restore generation." } }, 409);
+    }
+    this.writeCoordinatorRestoreState(state.restore_id, state.generation, "applying", state.target_bookmark, state.undo_bookmark);
+    this.pitrPort.abort();
+    return json({ ok: true, restarting: true, restore_id: restoreId, generation: body.generation }, 202);
+  }
+
+  private async handlePitrVerify(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number; target_bookmark?: string; targetBookmark?: string; mode?: "undo" };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const targetBookmark = body.target_bookmark ?? body.targetBookmark;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    if (typeof targetBookmark !== "string" || !targetBookmark) return json({ error: "Missing target_bookmark." }, 400);
+    const state = this.coordinatorRestoreState();
+    if (state) {
+      if (state.restore_id !== restoreId || state.generation !== body.generation) {
+        return json({ error: { code: "RESTORE_FENCE_CONFLICT", message: "Local restore probe belongs to a different restore generation." } }, 409);
+      }
+      if (body.mode === "undo" && state.phase === "staging") {
+        const currentBookmark = await this.pitrPort.getCurrentBookmark();
+        if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+        return json({
+          ok: true,
+          verified: true,
+          mode: "undo",
+          restore_id: restoreId,
+          generation: body.generation,
+          target_bookmark: targetBookmark,
+          preview_bookmark: currentBookmark,
+        });
+      }
+      return json({
+        ok: true,
+        verified: false,
+        pending: true,
+        restore_id: restoreId,
+        generation: body.generation,
+        phase: state.phase,
+      }, 202);
+    }
+    if (body.mode === "undo") {
+      return json({ ok: true, verified: false, pending: true, mode: "undo", restore_id: restoreId, generation: body.generation }, 202);
+    }
+    const currentBookmark = await this.pitrPort.getCurrentBookmark();
+    if (!currentBookmark) return json({ error: { code: "RESTORE_VERIFY_FAILED", message: "Provider current bookmark is unavailable." } }, 409);
+    return json({
+      ok: true,
+      verified: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      target_bookmark: targetBookmark,
+      preview_bookmark: currentBookmark,
+      bookmark_equality_assumed: false,
+      certification: "provider-next-session-plus-external-fence",
+    });
+  }
+
+  private async handlePitrRelease(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    this.sql.exec("DELETE FROM coordinator_restore_state WHERE singleton = 1");
+    return json({ ok: true, restore_id: restoreId, generation: body.generation, externally_fenced: true });
+  }
+
+  private async handleRestoreLossPage(request: Request): Promise<Response> {
+    const body = await request.json() as {
+      restore_id?: string;
+      restoreId?: string;
+      generation?: number;
+      cutoff?: string | number;
+      through?: string | number;
+    };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    await this.awaitMutationDrain();
+    const closedThroughMs = Date.now();
+    const cutoffMs = typeof body.cutoff === "number" ? body.cutoff : Date.parse(body.cutoff ?? "");
+    const throughMs = typeof body.through === "number" ? body.through : Date.parse(body.through ?? "");
+    if (!Number.isFinite(cutoffMs) || !Number.isFinite(throughMs) || throughMs < cutoffMs) {
+      return json({ error: "cutoff/through must be a valid ordered time window." }, 400);
+    }
+    const row = this.one<{
+      tx_id: string;
+      operation_hash: string;
+      decision: string;
+      created_at: string;
+      commit_decided_at_ms: number | null;
+      redo_envelope_json: string | null;
+    }>(
+      `SELECT tx_id, operation_hash, decision, created_at, commit_decided_at_ms, redo_envelope_json
+         FROM transactions LIMIT 1`,
+    );
+    const entries = [] as Array<{
+      tx_id: string;
+      operation_hash: string;
+      decision: string;
+      commit_decided_at: string;
+      envelope_hash: string | null;
+    }>;
+    const aborted = row?.decision === "abort";
+    // A transaction belongs to the restored snapshot only when it has a
+    // durable commit decision at or before the cutoff. Every other non-aborted
+    // coordinator must be quarantined, including work created before the
+    // cutoff that was still preparing/prepared when the fence arrived.
+    const requiresDiscard = !!row
+      && !aborted
+      && (row.commit_decided_at_ms === null || row.commit_decided_at_ms > cutoffMs);
+    if (row && requiresDiscard) {
+      let envelopeHash: string | null = null;
+      if (row.redo_envelope_json) {
+        const envelope: unknown = JSON.parse(row.redo_envelope_json);
+        await validateRedoEnvelope(envelope);
+        validateRedoEnvelopeStructure(envelope);
+        envelopeHash = await hashRedoEnvelope(envelope);
+      }
+      entries.push({
+        tx_id: row.tx_id,
+        operation_hash: row.operation_hash,
+        decision: row.decision,
+        commit_decided_at: row.commit_decided_at_ms === null ? row.created_at : new Date(row.commit_decided_at_ms).toISOString(),
+        envelope_hash: envelopeHash,
+      });
+    }
+    return json({
+      ok: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      closed_through: new Date(closedThroughMs).toISOString(),
+      requires_discard: requiresDiscard,
+      entries,
+      complete: true,
+    });
+  }
+
+  private restoreDiscard(): { restore_id: string; generation: number; discarded_at_ms: number } | null {
+    return this.one("SELECT restore_id, generation, discarded_at_ms FROM coordinator_restore_discard WHERE singleton = 1");
+  }
+
+  private persistRestoreDiscard(
+    restoreId: string,
+    generation: number,
+  ): { ok: true; discardedAtMs: number } | { ok: false } {
+    const existing = this.restoreDiscard();
+    if (existing && (existing.restore_id !== restoreId || existing.generation !== generation)) return { ok: false };
+    const discardedAtMs = existing?.discarded_at_ms ?? Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT OR IGNORE INTO coordinator_restore_discard (singleton, restore_id, generation, discarded_at_ms)
+         VALUES (1, ?, ?, ?)`,
+        restoreId,
+        generation,
+        discardedAtMs,
+      );
+      this.sql.exec("DELETE FROM recovery_queue");
+      this.sql.exec(
+        `UPDATE transactions
+            SET status = 'quarantined', decision = 'quarantined',
+                last_error = ?, updated_at = ?`,
+        JSON.stringify({ code: "TX_DISCARDED_BY_RESTORE", restore_id: restoreId, generation }),
+        new Date(discardedAtMs).toISOString(),
+      );
+    });
+    return { ok: true, discardedAtMs };
+  }
+
+  private discardedByRestoreResponse(discard = this.restoreDiscard()): Response {
+    return json({
+      error: {
+        code: "TX_DISCARDED_BY_RESTORE",
+        message: "This post-cutoff coordinator was durably discarded by fleet restore.",
+        restore_id: discard?.restore_id ?? null,
+        generation: discard?.generation ?? null,
+      },
+    }, 409);
+  }
+
+  private async handleRestoreDiscard(request: Request): Promise<Response> {
+    const body = await request.json() as { restore_id?: string; restoreId?: string; generation?: number };
+    const restoreId = body.restore_id ?? body.restoreId;
+    const match = await this.matchingRestoreFence(restoreId, body.generation);
+    if ("response" in match) return match.response;
+    await this.awaitMutationDrain();
+    const discarded = this.persistRestoreDiscard(restoreId!, body.generation!);
+    if (!discarded.ok) {
+      return json({ error: { code: "RESTORE_DISCARD_CONFLICT", message: "Coordinator was already discarded by a different restore generation." } }, 409);
+    }
+    return json({
+      ok: true,
+      discarded_by_restore: true,
+      restore_id: restoreId,
+      generation: body.generation,
+      discarded_at: new Date(discarded.discardedAtMs).toISOString(),
+    });
+  }
+
+  private async handleRedoEnvelope(request: Request): Promise<Response> {
+    const body = await request.json() as { txId?: string; envelopeHash?: string; tx_id?: string; envelope_hash?: string };
+    const txId = body.tx_id ?? body.txId;
+    const envelopeHash = body.envelope_hash ?? body.envelopeHash;
+    if (!txId || !envelopeHash) return json({ error: "Missing tx_id or envelope_hash." }, 400);
+    const row = this.loadTx(txId);
+    if (!row?.redo_envelope_json) return json({ found: false }, 404);
+    const envelope = JSON.parse(row.redo_envelope_json) as ReadableRedoEnvelope;
+    await validateRedoEnvelope(envelope);
+    const actualHash = await hashRedoEnvelope(envelope);
+    if (actualHash !== envelopeHash) {
+      return json({ error: { code: "TX_ENVELOPE_HASH_MISMATCH", message: "Requested content address does not match the durable validated envelope." } }, 409);
+    }
+    return json({ ok: true, envelope });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1884,22 +2562,42 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     } catch (error) {
       const typed = contractResponse(error);
       if (typed) return typed;
+      if (error instanceof RestoreGateDenied) return this.restoreGateResponse(error);
       log("coordinator.unhandled_error", { path: new URL(request.url).pathname, message: error instanceof Error ? error.message : String(error) });
       return json({ error: "Internal error." }, 500);
     }
   }
 
   private async handle(request: Request): Promise<Response> {
-    this.ensureSchema();
     if (request.method.toUpperCase() !== "POST") return json({ error: "Only POST allowed for coordinator endpoints." }, 405);
     const path = new URL(request.url).pathname;
+    if (COORDINATOR_GATE_MUTATING_PATHS.has(path)) this.enterMutation();
+    try {
+    if (COORDINATOR_GATE_MUTATING_PATHS.has(path)) await this.assertRestoreGateOpen();
+    this.ensureSchema();
+    if (COORDINATOR_GATE_MUTATING_PATHS.has(path) && this.restoreDiscard()) return this.discardedByRestoreResponse();
     const handler = this.routes[path];
     return handler ? handler(request) : json({ error: `Unknown coordinator route: ${path}` }, 404);
+    } finally {
+      if (COORDINATOR_GATE_MUTATING_PATHS.has(path)) this.leaveMutation();
+    }
   }
 
   private async handleTxStatus(request: Request): Promise<Response> {
     const body = (await request.json()) as { txId?: string };
     if (!body.txId) return json({ error: "Missing txId" }, 400);
+    const discard = this.restoreDiscard();
+    if (discard) {
+      return json({
+        found: true,
+        status: "quarantined",
+        decision: "quarantined",
+        discarded_by_restore: true,
+        restore_id: discard.restore_id,
+        generation: discard.generation,
+        discarded_at: new Date(discard.discarded_at_ms).toISOString(),
+      });
+    }
     const row = this.loadTx(body.txId);
     if (!row) return json({ found: false });
     const state = this.stateOf(row);
@@ -1932,7 +2630,33 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const participants = [...body.participants].sort((a, b) => a.shardId.localeCompare(b.shardId));
     const fleetId = body.fleetId || "default";
     const coordinatorId = body.coordinatorId || body.txId;
+    if (this.coordinatorEnv.RESTORE_COORDINATOR && fleetId !== this.deploymentFleetId()) {
+      return json({
+        error: {
+          code: "RESTORE_FLEET_MISMATCH",
+          message: `Transaction fleet ${fleetId} does not match deployment PITR domain ${this.deploymentFleetId()}.`,
+        },
+      }, 409);
+    }
     const existing = this.loadTx(body.txId);
+    // The external inventory is outside this coordinator's PITR domain. Its
+    // atomic registration acknowledgement is required before any local
+    // transaction row can be admitted or resumed. Existing rows carry their
+    // original creation time so the inventory can detect pre-rollout work.
+    const registration = await this.registerPhysicalCoordinator(
+      existing?.fleet_id || fleetId,
+      existing?.coordinator_id || coordinatorId,
+      body.txId,
+      existing?.created_at,
+    );
+    if (registration.disposition === "discard_required") {
+      if (!existing) throw new RestoreGateDenied("coordinator registry returned a discard directive for a new transaction");
+      const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
+      if (!discarded.ok) {
+        return json({ error: { code: "RESTORE_DISCARD_CONFLICT", message: "Coordinator was already discarded by a different restore generation." } }, 409);
+      }
+      return this.discardedByRestoreResponse();
+    }
     if (existing && await this.coordinatorIdentity(existing) === "legacy") {
       const state = this.stateOf(existing);
       const exactRetry = canonicalJson(this.normalizedParticipants(this.participants(existing))) === canonicalJson(participants);
@@ -2200,7 +2924,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
               commit_decided_at: resolvedRecord.commit_decided_at,
               retention_deadline: resolvedRecord.retention_deadline,
             }
-      ) as unknown as RedoEnvelopeV1;
+      ) as unknown as ReadableRedoEnvelope;
       await validateRedoEnvelope(completedEnvelope);
       try {
         this.ctx.storage.transactionSync(() => {

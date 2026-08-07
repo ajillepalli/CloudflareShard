@@ -1,7 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   CURRENT_PROTOCOL_VERSION,
-  MANIFEST_CURSOR_FORMAT_VERSION,
+  MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
+  MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_PAGE_FORMAT_VERSION,
   MANIFEST_SEAL_FORMAT_VERSION,
@@ -9,9 +10,9 @@ import {
   hashCanonicalJson,
   hashManifestRequest,
   assertManifestCursorMatchesRequest,
-  validateManifestEnumerationRequest,
-  type ManifestEnumerationRequestV1,
-  type ManifestEnumerationResultV1,
+  validateWritableManifestEnumerationRequest,
+  type ManifestEnumerationRequestV2,
+  type ManifestEnumerationResultV2,
   type ManifestRecordV2,
   transactionError,
   type ManifestRegistrationV1,
@@ -354,7 +355,10 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       }
       const catalog = this.env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${request.fleet_id}`);
       const coverageState = await catalog.coverageState(request.fleet_id);
-      if (coverageState.reservation_required_since_day === null) {
+      if (
+        coverageState.reservation_required_since_day === null
+        || coverageState.reservation_required_since_ms === null
+      ) {
         throw new TransactionContractViolation(
           transactionError("MANIFEST_UNPROVEN_LEGACY_WINDOW", "Fleet has no durable reservation coverage boundary."),
         );
@@ -525,8 +529,11 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         status: "complete",
         cutoff_ms: cutoffMs,
         snapshot_generation: snapshot.generation,
+        catalog_close_key: operation.close_key,
         snapshot_hash: operation.snapshot_hash,
         fleet_root_hash: operation.fleet_root_hash,
+        partition_config_hash: config.config_hash,
+        coverage_start: new Date(coverageState.reservation_required_since_ms).toISOString(),
         completed_buckets: operation.completed_entries,
         total_buckets: operation.total_entries,
       };
@@ -543,9 +550,16 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
 
   async enumerateManifest(input: unknown): Promise<ManifestFleetEnumerationServiceResult> {
     try {
-      validateManifestEnumerationRequest(input);
-      const request: ManifestEnumerationRequestV1 = input;
+      validateWritableManifestEnumerationRequest(input);
+      const request: ManifestEnumerationRequestV2 = input;
       const requestHash = await hashManifestRequest(request);
+      const responseIdentity = {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+        request_hash: requestHash,
+        catalog_close_key: request.catalog_close_key,
+        fleet_root_hash: request.fleet_root_hash,
+      } as const;
       if (request.cursor !== null) assertManifestCursorMatchesRequest(request.cursor, requestHash);
       const catalog = this.env.FLEET_MANIFEST_CATALOG.getByName(`fleet:${request.fleet_id}`);
       type PriorEvidencePin = {
@@ -579,9 +593,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         || request.cutoff.slice(0, 10) > coverageState.legacy_scanned_through_day
       ) {
         return {
-          protocol_version: CURRENT_PROTOCOL_VERSION,
-          format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-          request_hash: requestHash,
+          ...responseIdentity,
           coverage: "unproven_legacy_window",
           complete: false,
           records: [],
@@ -591,7 +603,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         };
       }
       const snapshot = await catalog.snapshotByGeneration(request.catalog_generation);
-      const close = await catalog.closeForSnapshot(request.catalog_generation);
+      const close = await catalog.closeByKey(request.catalog_close_key);
       const cutoffConfig = await catalog.partitionConfigForDay(request.fleet_id, request.cutoff.slice(0, 10));
       if (
         snapshot.status !== "complete"
@@ -600,19 +612,14 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         || cutoffConfig.config_hash !== request.partition_config_hash
         || close === null
         || close.status !== "complete"
+        || close.close_key !== request.catalog_close_key
+        || close.snapshot_generation !== request.catalog_generation
         || close.snapshot_hash !== request.catalog_snapshot_hash
+        || close.fleet_root_hash !== request.fleet_root_hash
       ) {
-        return {
-          protocol_version: CURRENT_PROTOCOL_VERSION,
-          format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-          request_hash: requestHash,
-          coverage: "incomplete",
-          complete: false,
-          records: [],
-          evidence: [],
-          next_cursor: null,
-          diagnostics: { inspected_buckets: 0, incomplete_buckets: 1, returned_records: 0 },
-        };
+        throw new TransactionContractViolation(
+          transactionError("TX_MANIFEST_CONFLICT", "Enumeration close identity/root does not match the completed exact fleet close."),
+        );
       }
       const cursor = request.cursor;
       const afterDay = cursor?.reservation_utc_day ?? "";
@@ -623,15 +630,16 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
           : cursor.partition - 1;
       const entries = await catalog.enumerationEntries(
         request.catalog_generation,
+        request.catalog_close_key,
         afterDay,
         afterPartition,
         128,
       );
       const records: ManifestRecordV2[] = [];
-      const evidence: ManifestEnumerationResultV1["evidence"][number][] = [];
+      const evidence: ManifestEnumerationResultV2["evidence"][number][] = [];
       const newEvidencePins: PriorEvidencePin[] = [];
       let inspectedBuckets = 0;
-      let nextCursor: ManifestEnumerationResultV1["next_cursor"] = null;
+      let nextCursor: ManifestEnumerationResultV2["next_cursor"] = null;
       for (const entry of entries) {
         if (entry.partition_count !== 16) {
           throw new TransactionContractViolation(
@@ -640,9 +648,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         }
         if (entry.exact_receipt_hash === null) {
           return {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-            request_hash: requestHash,
+            ...responseIdentity,
             coverage: "incomplete",
             complete: false,
             records,
@@ -657,9 +663,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         const receipt = await bucket.sealReceipt(entry.exact_receipt_hash);
         if (receipt === null) {
           return {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-            request_hash: requestHash,
+            ...responseIdentity,
             coverage: "incomplete",
             complete: false,
             records,
@@ -699,9 +703,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
               ? "quarantined"
               : "incomplete";
           return {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-            request_hash: requestHash,
+            ...responseIdentity,
             coverage,
             complete: false,
             records,
@@ -713,7 +715,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         records.push(...local.records);
         evidence.push({
           protocol_version: CURRENT_PROTOCOL_VERSION,
-          format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+          format_version: MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
           reservation_utc_day: entry.reservation_day,
           partition: entry.partition,
           partition_count: entry.partition_count,
@@ -736,8 +738,10 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         if (local.next_cursor !== null || local.records.length > 0) {
           nextCursor = {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            format_version: MANIFEST_CURSOR_FORMAT_VERSION,
+            format_version: MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
             request_hash: requestHash,
+            catalog_close_key: request.catalog_close_key,
+            fleet_root_hash: request.fleet_root_hash,
             catalog_generation: request.catalog_generation,
             catalog_snapshot_hash: request.catalog_snapshot_hash,
             reservation_utc_day: entry.reservation_day,
@@ -751,8 +755,10 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
         const lastEntry = entries.at(-1)!;
         nextCursor = {
           protocol_version: CURRENT_PROTOCOL_VERSION,
-          format_version: MANIFEST_CURSOR_FORMAT_VERSION,
+          format_version: MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
           request_hash: requestHash,
+          catalog_close_key: request.catalog_close_key,
+          fleet_root_hash: request.fleet_root_hash,
           catalog_generation: request.catalog_generation,
           catalog_snapshot_hash: request.catalog_snapshot_hash,
           reservation_utc_day: lastEntry.reservation_day,
@@ -776,9 +782,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       }
       const exhaustedCatalog = nextCursor === null && entries.length < 128;
       return {
-        protocol_version: CURRENT_PROTOCOL_VERSION,
-        format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
-        request_hash: requestHash,
+        ...responseIdentity,
         coverage: exhaustedCatalog ? "complete" : "incomplete",
         complete: exhaustedCatalog,
         records,

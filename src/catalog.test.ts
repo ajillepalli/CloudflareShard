@@ -3240,3 +3240,128 @@ describe("CatalogDO ring evacuation — round-16 defense-in-depth: re-read the r
     expect(ringAfter[1]).toBe("shard-1");
   });
 });
+
+describe("CatalogDO T6 restore topology proof and fence", () => {
+  async function coverageStart(stub: Awaited<ReturnType<typeof freshCatalog>>): Promise<string> {
+    return runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      const row = Array.from(
+        state.storage.sql.exec<{ coverage_start: string }>(
+          "SELECT coverage_start FROM restore_proof_metadata WHERE singleton = 1",
+        ),
+      )[0];
+      return row.coverage_start;
+    });
+  }
+
+  it("returns a stable canonical topology digest and exhaustive physical shard inventory", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET target_shard_id = 'target-residual', cleanup_source_shard_id = 'cleanup-residual' WHERE vbucket = 0",
+      );
+      state.storage.sql.exec(
+        "INSERT INTO shards (shard_id, status, created_at) VALUES ('draining-physical', 'draining-complete', ?)",
+        new Date().toISOString(),
+      );
+    });
+    const cutoff = await coverageStart(stub);
+
+    const first = await stub.fetch(post("/restore-proof", { cutoff, restoreId: "restore-proof-1" }));
+    expect(first.status).toBe(200);
+    const body = (await first.json()) as {
+      ok: boolean;
+      topologyHash: string;
+      topologyEpoch: number;
+      shardIds: string[];
+      topologyVector: { formatVersion: number; vbuckets: Array<{ vbucket: number }> };
+      postCutoffChanges: Array<{ endpoint: string; summaryHash: string }>;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.topologyHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(body.topologyEpoch).toBeGreaterThan(0);
+    expect(body.topologyVector.formatVersion).toBe(1);
+    expect(body.topologyVector.vbuckets).toHaveLength(64);
+    expect(body.topologyVector.vbuckets.map((row) => row.vbucket)).toEqual(
+      Array.from({ length: 64 }, (_, vbucket) => vbucket),
+    );
+    expect(body.shardIds).toEqual([
+      "cleanup-residual",
+      "draining-physical",
+      "shard-0",
+      "shard-1",
+      "target-residual",
+    ]);
+    expect(body.postCutoffChanges.every((change) => /^[a-f0-9]{64}$/.test(change.summaryHash))).toBe(true);
+
+    const second = await stub.fetch(post("/restore-proof", { cutoff, restoreId: "restore-proof-1" }));
+    expect(second.status).toBe(200);
+    expect(((await second.json()) as { topologyHash: string }).topologyHash).toBe(body.topologyHash);
+  });
+
+  it("fails closed when the cutoff predates proof coverage or topology work is active", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/status", {}, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE restore_proof_metadata SET coverage_start = '2026-08-06T12:00:00.000Z' WHERE singleton = 1",
+      );
+    });
+    const uncovered = await stub.fetch(post("/restore-proof", { cutoff: "2026-08-06T11:59:59.999Z" }));
+    expect(uncovered.status).toBe(409);
+    expect(((await uncovered.json()) as { error: { code: string } }).error.code).toBe("RESTORE_PROOF_COVERAGE_INCOMPLETE");
+
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    await runInDurableObject(stub, async (_instance: CatalogDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        "UPDATE vbucket_map SET migration_status = 'backfilling', target_shard_id = 'shard-1' WHERE vbucket = 0",
+      );
+    });
+    const active = await stub.fetch(post("/restore-proof", { cutoff: "2026-08-06T12:00:00.000Z" }));
+    expect(active.status).toBe(409);
+    const activeBody = (await active.json()) as { error: { code: string }; activeOperations: Array<{ kind: string }> };
+    expect(activeBody.error.code).toBe("RESTORE_TOPOLOGY_UNSTABLE");
+    expect(activeBody.activeOperations).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "vbucket_migration" })]));
+  });
+
+  it("installs idempotently, blocks all topology entry points, and rejects stale release", async () => {
+    const stub = await freshCatalog();
+    await stub.fetch(post("/init", { numShards: 2, totalVBuckets: 4 }, `Bearer ${env.ADMIN_TOKEN}`));
+    const cutoff = await coverageStart(stub);
+    const proof = (await (await stub.fetch(post("/restore-proof", { cutoff }))).json()) as {
+      topologyHash: string;
+      topologyEpoch: number;
+    };
+    const installBody = {
+      restore_id: "restore-fence-1",
+      generation: 3,
+      action: "install",
+      expectedTopologyHash: proof.topologyHash,
+      expectedTopologyEpoch: proof.topologyEpoch,
+    };
+    const installed = await stub.fetch(post("/restore-fence", installBody));
+    expect(installed.status).toBe(200);
+    expect((await installed.json()) as object).toEqual(expect.objectContaining({ ok: true, installed: true, idempotent: false }));
+
+    const retry = await stub.fetch(post("/restore-fence", installBody));
+    expect(retry.status).toBe(200);
+    expect((await retry.json()) as object).toEqual(expect.objectContaining({ idempotent: true }));
+
+    const acquire = await stub.fetch(post("/acquire-topology-lock", { operationType: "split-vbucket" }));
+    expect(acquire.status).toBe(409);
+    expect(((await acquire.json()) as { error: { code: string } }).error.code).toBe("RESTORE_FENCE_ACTIVE");
+    const directMutation = await stub.fetch(post("/split-vbucket", { vbucket: 0 }, `Bearer ${env.ADMIN_TOKEN}`));
+    expect(directMutation.status).toBe(409);
+    expect(((await directMutation.json()) as { error: { code: string } }).error.code).toBe("RESTORE_FENCE_ACTIVE");
+
+    const conflict = await stub.fetch(post("/restore-fence", { restoreId: "restore-fence-2", generation: 1, action: "install" }));
+    expect(conflict.status).toBe(409);
+    const staleRelease = await stub.fetch(post("/restore-fence", { restoreId: "restore-fence-1", generation: 2, action: "release" }));
+    expect(staleRelease.status).toBe(409);
+
+    const released = await stub.fetch(post("/restore-fence", { restoreId: "restore-fence-1", generation: 3, action: "release" }));
+    expect(released.status).toBe(200);
+    expect((await released.json()) as object).toEqual(expect.objectContaining({ ok: true, released: true }));
+    expect((await stub.fetch(post("/acquire-topology-lock", { operationType: "split-vbucket" }))).status).toBe(200);
+  });
+});

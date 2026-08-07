@@ -1295,12 +1295,24 @@ export class FleetManifestCatalogStore {
       .toArray()[0] ?? null;
   }
 
+  closeByKey(closeKey: string): CatalogCloseOperation | null {
+    assertHash(closeKey, "close_key");
+    return this.storage.sql
+      .exec<CatalogCloseOperation & { readonly [key: string]: SqlStorageValue }>(
+        "SELECT * FROM catalog_close_operations WHERE close_key = ?",
+        closeKey,
+      )
+      .toArray()[0] ?? null;
+  }
+
   enumerationEntries(
     generation: number,
+    closeKey: string,
     afterDay = "",
     afterPartition = -1,
     requestedPageSize = DEFAULT_CATALOG_PAGE_SIZE,
   ): readonly CatalogEnumerationEntry[] {
+    assertHash(closeKey, "close_key");
     const limit = pageSize(requestedPageSize);
     return this.storage.sql
       .exec<CatalogEnumerationEntry & { readonly [key: string]: SqlStorageValue }>(
@@ -1308,13 +1320,14 @@ export class FleetManifestCatalogStore {
                 s.partition_config_hash, s.activation_sequence, s.entry_hash,
                 p.exact_receipt_hash
            FROM catalog_snapshot_entries AS s
-           LEFT JOIN catalog_close_operations AS o
-             ON o.snapshot_generation = s.generation AND o.status = 'complete'
+            LEFT JOIN catalog_close_operations AS o
+              ON o.close_key = ? AND o.snapshot_generation = s.generation AND o.status = 'complete'
            LEFT JOIN catalog_close_progress AS p
              ON p.close_key = o.close_key AND p.activation_sequence = s.activation_sequence
           WHERE s.generation = ?
             AND (s.reservation_day > ? OR (s.reservation_day = ? AND s.partition > ?))
           ORDER BY s.reservation_day, s.partition LIMIT ?`,
+        closeKey,
         generation,
         afterDay,
         afterDay,
@@ -1925,13 +1938,18 @@ export class FleetManifestCatalogDO extends DurableObject<FleetManifestCatalogEn
     return this.catalog.closeForSnapshot(generation);
   }
 
+  async closeByKey(closeKey: string): Promise<CatalogCloseOperation | null> {
+    return this.catalog.closeByKey(closeKey);
+  }
+
   async enumerationEntries(
     generation: number,
+    closeKey: string,
     afterDay?: string,
     afterPartition?: number,
     requestedPageSize?: number,
   ): Promise<readonly CatalogEnumerationEntry[]> {
-    return this.catalog.enumerationEntries(generation, afterDay, afterPartition, requestedPageSize);
+    return this.catalog.enumerationEntries(generation, closeKey, afterDay, afterPartition, requestedPageSize);
   }
 
   async issueEnumerationCursor(cursor: unknown, evidence: unknown): Promise<void> {

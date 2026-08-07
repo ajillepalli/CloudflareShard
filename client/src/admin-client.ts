@@ -1,5 +1,10 @@
 import { CloudflareShardClient } from "./client.js";
 import type { ClientOptions } from "./http.js";
+import {
+  validateRestoreAcceptedResponse,
+  validateRestorePreviewResponse,
+  validateRestoreStatusResponse,
+} from "./restore-validation.js";
 import type {
   BackfillProvenanceRequest,
   BackfillProvenanceResponse,
@@ -24,6 +29,14 @@ import type {
   RegisterTableResponse,
   RegisterTenantRequest,
   RegisterTenantResponse,
+  RestoreAcceptedResponse,
+  RestoreExecuteRequest,
+  RestorePreviewRequest,
+  RestorePreviewResponse,
+  RestoreReconcileRequest,
+  RestoreRollbackRequest,
+  RestoreStatusRequest,
+  RestoreStatusResponse,
   RouteProbeResponse,
   SetPartitionKeyColumnRequest,
   SetRowOwnerRequest,
@@ -275,5 +288,86 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
    * for the recovery loop. */
   async txForceAbort(request: TxForceAbortRequest): Promise<TxForceAbortResponse> {
     return this.post<TxForceAbortResponse>("/admin/tx-force-abort", request);
+  }
+
+  /** Creates or resumes an immutable cutoff preview. A `previewing`
+   * response means manifest close/enumeration is still durably progressing;
+   * poll restoreStatus() or use waitForRestore(). */
+  async restorePreview(request: RestorePreviewRequest): Promise<RestorePreviewResponse> {
+    const response = await this.post<unknown>("/admin/restore-preview", {
+      protocol_version: 1,
+      format_version: 1,
+      fleet_id: request.fleetId,
+      cutoff: request.cutoff,
+      idempotency_key: request.idempotencyKey,
+    });
+    return validateRestorePreviewResponse(response);
+  }
+
+  /** Executes only the server-stored plan identified by restoreId. The
+   * exact plan hash is required as the destructive operator confirmation. */
+  async restoreExecute(request: RestoreExecuteRequest): Promise<RestoreAcceptedResponse> {
+    const response = await this.post<unknown>("/admin/restore-execute", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: request.restoreId,
+      plan_hash: request.planHash,
+    });
+    return validateRestoreAcceptedResponse(response);
+  }
+
+  async restoreStatus(request: RestoreStatusRequest): Promise<RestoreStatusResponse> {
+    const response = await this.post<unknown>("/admin/restore-status", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: request.restoreId,
+    });
+    return validateRestoreStatusResponse(response);
+  }
+
+  /** Idempotently resumes reconciliation for the same immutable plan. */
+  async restoreReconcile(request: RestoreReconcileRequest): Promise<RestoreAcceptedResponse> {
+    const response = await this.post<unknown>("/admin/restore-reconcile", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: request.restoreId,
+      plan_hash: request.planHash,
+    });
+    return validateRestoreAcceptedResponse(response);
+  }
+
+  /** Rolls the fleet back to the undo bookmarks retained by the exact
+   * immutable restore plan. The server keeps the fleet fenced until every
+   * participant is activated, verified, and reconciled. */
+  async restoreRollback(request: RestoreRollbackRequest): Promise<RestoreAcceptedResponse> {
+    const response = await this.post<unknown>("/admin/restore-rollback", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: request.restoreId,
+      plan_hash: request.planHash,
+    });
+    return validateRestoreAcceptedResponse(response);
+  }
+
+  /** Polls preview, execution, and reconciliation phases until the operation
+   * reaches a visible terminal state. manual_repair_required and failed are
+   * returned rather than hidden behind a generic exception. */
+  async waitForRestore(
+    restoreId: string,
+    options: { intervalMs?: number; maxWaitMs?: number } = {},
+  ): Promise<RestoreStatusResponse> {
+    const intervalMs = options.intervalMs ?? 500;
+    const maxWaitMs = options.maxWaitMs ?? 30 * 60 * 1000;
+    const deadline = Date.now() + maxWaitMs;
+    for (;;) {
+      const status = await this.restoreStatus({ restoreId });
+      if (["complete", "rolled_back", "manual_repair_required", "failed"].includes(status.phase)) return status;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out after ${maxWaitMs}ms waiting for restore ${restoreId} to become terminal (still '${status.phase}').`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
   }
 }

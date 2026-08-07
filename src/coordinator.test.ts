@@ -9,11 +9,13 @@ import {
   hashManifestRecordV2,
   hashManifestReservation,
   hashParticipantOperations,
+  hashRedoEnvelope,
   sha256Hex,
   type ManifestRecordV2,
   type RedoEnvelopeV1,
+  type RedoEnvelopeV2,
 } from "../packages/contracts/src/index.js";
-import type { CoordinatorDO, TransactionManifestService } from "./coordinator";
+import type { CoordinatorDO, CoordinatorPitrPort, TransactionManifestService } from "./coordinator";
 import type { ShardDO } from "./shard";
 
 async function freshCoordinator() {
@@ -33,6 +35,407 @@ function post(path: string, body: unknown) {
     body: JSON.stringify(body),
   });
 }
+
+async function installCoordinatorRestoreFakes(
+  stub: Awaited<ReturnType<typeof freshCoordinator>>,
+  options: {
+    state: "open" | "fenced";
+    registrationStatus?: number;
+    registrationDisposition?: { restoreId: string; generation: number };
+    onRegistration?: (body: Record<string, unknown>) => void;
+    pitr?: CoordinatorPitrPort;
+  },
+): Promise<void> {
+  await runInDurableObject(stub, async (instance: CoordinatorDO) => {
+    const mutable = instance as unknown as {
+      pitrPort: CoordinatorPitrPort;
+      restoreCoordinatorOverride: unknown;
+    };
+    mutable.restoreCoordinatorOverride = {
+      getByName: () => ({
+        fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(typeof input === "string" ? input : input.toString()).pathname;
+          if (path === "/register-coordinator") {
+            const registration = JSON.parse(String(init?.body)) as Record<string, unknown>;
+            options.onRegistration?.(registration);
+            const status = options.registrationStatus ?? 200;
+            if (options.registrationDisposition && status === 200) {
+              return Response.json({
+                disposition: "discard_required",
+                restore_id: options.registrationDisposition.restoreId,
+                generation: options.registrationDisposition.generation,
+              });
+            }
+            return Response.json({ ok: status === 200, registered_at: status === 200 ? new Date().toISOString() : undefined }, { status });
+          }
+          return Response.json({
+            ok: true,
+            active: options.state === "fenced",
+            allowed: options.state === "open",
+            restore_id: options.state === "fenced" ? "restore-c" : null,
+            generation: options.state === "fenced" ? 11 : 0,
+          });
+        },
+      }),
+    };
+    if (options.pitr) mutable.pitrPort = options.pitr;
+  });
+}
+
+describe("CoordinatorDO restore integration", () => {
+  it("fails begin admission before local persistence when external coordinator registration is unavailable", async () => {
+    const stub = await freshCoordinator();
+    await installCoordinatorRestoreFakes(stub, { state: "open", registrationStatus: 503 });
+    const response = await stub.fetch(post("/begin", {
+      txId: "tx-registry-fail",
+      participants: [{ shardId: "s1", intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: ["a"], tenantId: "t1", table: "t", partitionKey: "a" }] }],
+    }));
+    expect(response.status).toBe(503);
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      const rows = Array.from(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM transactions"));
+      expect(rows[0].n).toBe(0);
+    });
+  });
+
+  it("remains outside participant PITR so its recovery authority is never rewound", async () => {
+    const stub = await freshCoordinator();
+    await installCoordinatorRestoreFakes(stub, { state: "fenced" });
+    for (const path of ["/pitr-preview", "/restore-fence", "/pitr-stage", "/pitr-apply", "/pitr-verify", "/pitr-release"]) {
+      expect((await stub.fetch(post(path, {}))).status).toBe(404);
+    }
+  });
+
+  it("serves a validated redo envelope only at its canonical content address", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm" }));
+    const participants = [{
+      participant_id: "s1",
+      epoch: 1,
+      intents: [{
+        intent_seq: 0,
+        sql: "INSERT INTO t (id) VALUES (?)",
+        params: ["a"],
+        tenant_id: "t1",
+        table_name: "t",
+        partition_key: "a",
+        vbucket: null,
+        operation: "insert" as const,
+        mirror_target_participant_id: null,
+      }],
+    }];
+    const decided = new Date().toISOString();
+    const envelope: RedoEnvelopeV1 = {
+      protocol_version: 1,
+      format_version: 1,
+      tx_id: "tx-envelope-read",
+      fleet_id: "default",
+      coordinator_id: "tx-envelope-read",
+      decision: "commit",
+      decision_epoch: 1,
+      commit_decided_at: decided,
+      retention_deadline: new Date(new Date(decided).getTime() + COORDINATOR_RETENTION_DAYS * 86_400_000).toISOString(),
+      operation_hash: await hashParticipantOperations(participants),
+      participants,
+    };
+    const envelopeHash = await hashCanonicalJson(envelope);
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at, redo_envelope_json)
+         VALUES (?, 'committed', '["s1"]', '[]', ?, ?, ?, ?)`,
+        envelope.tx_id,
+        envelope.operation_hash,
+        decided,
+        decided,
+        JSON.stringify(envelope),
+      );
+    });
+    const found = await stub.fetch(post("/recovery-envelope", { tx_id: envelope.tx_id, envelope_hash: envelopeHash }));
+    expect(found.status).toBe(200);
+    expect(await found.json()).toEqual({ ok: true, envelope });
+    const mismatch = await stub.fetch(post("/recovery-envelope", { tx_id: envelope.tx_id, envelope_hash: "0".repeat(64) }));
+    expect(mismatch.status).toBe(409);
+  });
+
+  it("reports hash-only post-cutoff impact and durably discards the coordinator", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm" }));
+    const decidedAtMs = Date.now();
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+           decision, commit_decided_at_ms)
+         VALUES ('tx-post-cutoff', 'commit_pending_manifest', '[]', '[]', ?, ?, ?, 'commit', ?)`,
+        "a".repeat(64),
+        new Date(decidedAtMs).toISOString(),
+        new Date(decidedAtMs).toISOString(),
+        decidedAtMs,
+      );
+      state.storage.sql.exec(
+        "INSERT INTO recovery_queue (tx_id, action, next_attempt_at, attempt_count) VALUES ('tx-post-cutoff', 'finalize', ?, 0)",
+        new Date().toISOString(),
+      );
+    });
+    await installCoordinatorRestoreFakes(stub, { state: "fenced" });
+    const loss = await stub.fetch(post("/restore-loss-page", {
+      restore_id: "restore-c",
+      generation: 11,
+      cutoff: decidedAtMs - 1,
+      through: decidedAtMs + 1,
+    }));
+    expect(await loss.json()).toMatchObject({
+      requires_discard: true,
+      complete: true,
+      entries: [{ tx_id: "tx-post-cutoff", operation_hash: "a".repeat(64), decision: "commit" }],
+    });
+    const discard = await stub.fetch(post("/restore-discard", { restore_id: "restore-c", generation: 11 }));
+    expect(discard.status).toBe(200);
+    expect(await discard.json()).toMatchObject({ discarded_by_restore: true });
+    expect((await stub.fetch(post("/restore-discard", { restore_id: "restore-c", generation: 11 }))).status).toBe(200);
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue"))).toHaveLength(0);
+    });
+    await installCoordinatorRestoreFakes(stub, { state: "open" });
+    const resumed = await stub.fetch(post("/begin", {
+      txId: "tx-post-cutoff",
+      participants: [{ shardId: "s1", intents: [{ sql: "SELECT 1", tenantId: "t", table: "t", partitionKey: "k" }] }],
+    }));
+    expect(resumed.status).toBe(409);
+    expect(await resumed.json()).toMatchObject({ error: { code: "TX_DISCARDED_BY_RESTORE" } });
+  });
+
+  it("uses the canonical V2 content address in coordinator loss evidence", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm-v2-loss" }));
+    const decidedAtMs = Date.now();
+    const participants = [{
+      participant_id: "s1",
+      prepare_bookmark: "prepare-bookmark-1",
+      epoch: 1,
+      intents: [{
+        intent_seq: 0,
+        sql: "INSERT INTO t (id) VALUES (?)",
+        params: ["v2-loss"],
+        tenant_id: "t1",
+        table_name: "t",
+        partition_key: "v2-loss",
+        vbucket: null,
+        operation: "insert" as const,
+        mirror_target_participant_id: null,
+      }],
+    }];
+    const envelope: RedoEnvelopeV2 = {
+      protocol_version: 1,
+      format_version: 2,
+      tx_id: "tx-v2-loss-hash",
+      fleet_id: "default",
+      coordinator_id: "tx-v2-loss-hash",
+      decision: "commit",
+      decision_epoch: 1,
+      commit_decided_at: new Date(decidedAtMs).toISOString(),
+      retention_deadline: new Date(decidedAtMs + COORDINATOR_RETENTION_DAYS * 86_400_000).toISOString(),
+      operation_hash: await hashParticipantOperations(participants),
+      participants,
+    };
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+           decision, commit_decided_at_ms, redo_envelope_json)
+         VALUES (?, 'committed', '["s1"]', '[]', ?, ?, ?, 'commit', ?, ?)`,
+        envelope.tx_id,
+        envelope.operation_hash,
+        envelope.commit_decided_at,
+        envelope.commit_decided_at,
+        decidedAtMs,
+        JSON.stringify(envelope),
+      );
+    });
+    await installCoordinatorRestoreFakes(stub, { state: "fenced" });
+
+    const response = await stub.fetch(post("/restore-loss-page", {
+      restore_id: "restore-c",
+      generation: 11,
+      cutoff: decidedAtMs - 1,
+      through: decidedAtMs + 1,
+    }));
+    const body = await response.json() as { entries: Array<{ envelope_hash: string }> };
+
+    expect(response.status).toBe(200);
+    expect(body.entries[0].envelope_hash).toBe(await hashRedoEnvelope(envelope));
+    expect(body.entries[0].envelope_hash).not.toBe(await hashCanonicalJson(envelope));
+  });
+
+  it("classifies a pre-cutoff in-flight transaction without a durable commit decision for discard", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm-in-flight-loss" }));
+    const cutoffMs = Date.now();
+    const createdAt = new Date(cutoffMs - 60_000).toISOString();
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at, decision)
+         VALUES ('tx-pre-cutoff-in-flight', 'prepared', '[]', '[]', ?, ?, ?, 'undecided')`,
+        "b".repeat(64),
+        createdAt,
+        createdAt,
+      );
+    });
+    await installCoordinatorRestoreFakes(stub, { state: "fenced" });
+
+    const loss = await stub.fetch(post("/restore-loss-page", {
+      restore_id: "restore-c",
+      generation: 11,
+      cutoff: cutoffMs,
+      through: cutoffMs + 1,
+    }));
+
+    expect(await loss.json()).toMatchObject({
+      requires_discard: true,
+      complete: true,
+      entries: [{
+        tx_id: "tx-pre-cutoff-in-flight",
+        decision: "undecided",
+        commit_decided_at: createdAt,
+      }],
+    });
+  });
+
+  it("retains aborted work and transactions durably committed by the cutoff", async () => {
+    const cutoffMs = Date.now();
+    for (const fixture of [
+      { txId: "tx-pre-cutoff-aborted", status: "aborted", decision: "abort", decidedAt: null },
+      { txId: "tx-pre-cutoff-committed", status: "committed", decision: "commit", decidedAt: cutoffMs - 1 },
+    ]) {
+      const stub = await freshCoordinator();
+      await stub.fetch(post("/tx-status", { txId: "warm-retained-loss" }));
+      const createdAt = new Date(cutoffMs - 60_000).toISOString();
+      await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+        state.storage.sql.exec(
+          `INSERT INTO transactions
+            (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+             decision, commit_decided_at_ms)
+           VALUES (?, ?, '[]', '[]', ?, ?, ?, ?, ?)`,
+          fixture.txId,
+          fixture.status,
+          "c".repeat(64),
+          createdAt,
+          createdAt,
+          fixture.decision,
+          fixture.decidedAt,
+        );
+      });
+      await installCoordinatorRestoreFakes(stub, { state: "fenced" });
+
+      const loss = await stub.fetch(post("/restore-loss-page", {
+        restore_id: "restore-c",
+        generation: 11,
+        cutoff: cutoffMs,
+        through: cutoffMs + 1,
+      }));
+
+      expect(await loss.json()).toMatchObject({ requires_discard: false, complete: true, entries: [] });
+    }
+  });
+
+  it("registers an idempotent begin retry with its original creation time and obeys a discard directive", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm-begin-registration" }));
+    const txId = "tx-existing-begin-registration";
+    const createdAt = new Date(Date.now() - 60_000).toISOString();
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+           fleet_id, coordinator_id)
+         VALUES (?, 'prepared', '[]', '[]', 'existing-hash', ?, ?, 'default', ?)`,
+        txId,
+        createdAt,
+        createdAt,
+        txId,
+      );
+      state.storage.sql.exec(
+        "INSERT INTO recovery_queue (tx_id, action, next_attempt_at, attempt_count) VALUES (?, 'finalize', ?, 0)",
+        txId,
+        createdAt,
+      );
+    });
+    const registrations: Array<Record<string, unknown>> = [];
+    await installCoordinatorRestoreFakes(stub, {
+      state: "open",
+      registrationDisposition: { restoreId: "restore-from-begin", generation: 21 },
+      onRegistration: (body) => registrations.push(body),
+    });
+
+    const response = await stub.fetch(post("/begin", {
+      txId,
+      participants: [{ shardId: "s1", intents: [{ sql: "SELECT 1", tenantId: "t", table: "t", partitionKey: "k" }] }],
+    }));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "TX_DISCARDED_BY_RESTORE", restore_id: "restore-from-begin", generation: 21 },
+    });
+    expect(registrations).toEqual([{
+      fleetId: "default",
+      coordinatorId: txId,
+      txId,
+      existing_created_at: createdAt,
+    }]);
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId))[0].status).toBe("quarantined");
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue"))).toHaveLength(0);
+    });
+  });
+
+  it("registers existing alarm work before recovery and durably stops on a discard directive", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm-alarm-registration" }));
+    const txId = "tx-existing-alarm-registration";
+    const createdAt = new Date(Date.now() - 60_000).toISOString();
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+           fleet_id, coordinator_id)
+         VALUES (?, 'prepared', '[]', '[]', 'existing-hash', ?, ?, 'default', ?)`,
+        txId,
+        createdAt,
+        createdAt,
+        txId,
+      );
+      state.storage.sql.exec(
+        "INSERT INTO recovery_queue (tx_id, action, next_attempt_at, attempt_count) VALUES (?, 'finalize', ?, 0)",
+        txId,
+        createdAt,
+      );
+    });
+    const registrations: Array<Record<string, unknown>> = [];
+    await installCoordinatorRestoreFakes(stub, {
+      state: "open",
+      registrationDisposition: { restoreId: "restore-from-alarm", generation: 22 },
+      onRegistration: (body) => registrations.push(body),
+    });
+
+    await runInDurableObject(stub, async (instance: CoordinatorDO) => instance.alarm());
+
+    expect(registrations).toEqual([{
+      fleetId: "default",
+      coordinatorId: txId,
+      txId,
+      existing_created_at: createdAt,
+    }]);
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      const row = Array.from(state.storage.sql.exec<{ status: string; decision: string }>(
+        "SELECT status, decision FROM transactions WHERE tx_id = ?",
+        txId,
+      ))[0];
+      expect(row).toEqual({ status: "quarantined", decision: "quarantined" });
+      expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue"))).toHaveLength(0);
+    });
+  });
+});
 
 function shardPost(path: string, body: unknown) {
   return new Request(`https://shard.internal${path}`, {
@@ -1053,7 +1456,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         mutable.coordinatorEnv.CONTROL_PLANE = service;
         mutable.callShard = async (_row, _participant, phase) => {
           phases.push(phase);
-          return new Response("{}", { status: 200 });
+          return new Response(phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}", { status: 200 });
         };
 
         const response = await instance.fetch(post("/begin", { txId, participants }));
@@ -1131,7 +1534,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       mutable.coordinatorEnv.CONTROL_PLANE = service;
       mutable.callShard = async (_row, _participant, phase) => {
         phases.push(phase);
-        return new Response("{}", { status: 200 });
+        return new Response(phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}", { status: 200 });
       };
       const response = await instance.fetch(post("/begin", { txId, participants }));
       expect(response.status).toBe(202);
@@ -1155,7 +1558,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       (instance as unknown as { coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService } }).coordinatorEnv.CONTROL_PLANE = service;
       (instance as unknown as { callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response> }).callShard = async (_row, _participant, phase) => {
         phases.push(phase);
-        return new Response("{}", { status: 200 });
+        return new Response(phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}", { status: 200 });
       };
       state.storage.sql.exec("UPDATE recovery_queue SET next_attempt_at = ? WHERE tx_id = ?", new Date(0).toISOString(), txId);
       await instance.alarm();
@@ -1200,7 +1603,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       mutable.coordinatorEnv.CONTROL_PLANE = service;
       mutable.callShard = async (_row, _participant, phase) => {
         if (phase === "prepare") prepareCalls += 1;
-        return new Response("{}", { status: 200 });
+        return new Response(phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}", { status: 200 });
       };
 
       const pending = instance.fetch(post("/begin", {
@@ -1223,7 +1626,8 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       expect(prepareCalls).toBe(0);
 
       releaseReserve();
-      expect((await pending).status).toBe(200);
+      const completed = await pending;
+      expect(completed.status).toBe(200);
       expect(prepareCalls).toBe(1);
     });
   });
@@ -1231,6 +1635,10 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
   it("persists irreversible commit_deciding before finalize and stores the bucket-issued record before participant commit", async () => {
     const txId = `tx-finalize-boundary-${crypto.randomUUID()}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    // This test deliberately issues a concurrent /force-abort while /begin is
+    // paused inside the same object. Keep its external restore authority local
+    // so the assertion exercises only the coordinator's commit boundary.
+    await installCoordinatorRestoreFakes(coordinator, { state: "open" });
     await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
       const v2 = defaultV2ManifestMethods();
       let releaseFinalize!: () => void;
@@ -1262,7 +1670,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       mutable.coordinatorEnv.CONTROL_PLANE = service;
       mutable.callShard = async (_row, _participant, phase) => {
         if (phase === "commit") commitCalls += 1;
-        return new Response("{}", { status: 200 });
+        return new Response(phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}", { status: 200 });
       };
 
       const pending = instance.fetch(post("/begin", {
@@ -1613,7 +2021,10 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
       };
       mutable.coordinatorEnv.CONTROL_PLANE = service;
-      mutable.callShard = async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      mutable.callShard = async (_row, _participant, phase) => new Response(
+        phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}",
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
       const payload = {
         txId,
         participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
@@ -1628,9 +2039,8 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         instance.fetch(post("/begin", payload)),
         instance.fetch(post("/begin", payload)),
       ]);
-      expect([retryA.status, retryB.status]).toEqual([200, 200]);
-      expect((await retryA.json()) as { status: string }).toMatchObject({ status: "committed" });
-      expect((await retryB.json()) as { status: string }).toMatchObject({ status: "committed" });
+      expect([retryA.status, retryB.status].sort()).toEqual([200, 202]);
+      expect((await instance.fetch(post("/begin", payload))).status).toBe(200);
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("committed");
       expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");
     });
@@ -1639,6 +2049,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
   it("concurrent identical retries waiting on participant acknowledgements converge instead of returning a CAS 500", async () => {
     const txId = `tx-ack-race-${crypto.randomUUID()}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await installCoordinatorRestoreFakes(coordinator, { state: "open" });
 
     await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
       const service: TransactionManifestService = {
@@ -1663,10 +2074,10 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       };
       mutable.coordinatorEnv.CONTROL_PLANE = service;
       mutable.callShard = async (_row, _participant, phase) => {
-        if (phase !== "commit") return new Response("{}", { status: 200 });
+        if (phase !== "commit") return new Response(phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}", { status: 200 });
         if (commitMode === "fail") return new Response("{}", { status: 503 });
         barrierCalls += 1;
-        if (barrierCalls === 2) releaseBarrier();
+        if (barrierCalls === 1) releaseBarrier();
         await barrier;
         return new Response("{}", { status: 200 });
       };
@@ -1684,9 +2095,8 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         instance.fetch(post("/begin", payload)),
         instance.fetch(post("/begin", payload)),
       ]);
-      expect([retryA.status, retryB.status]).toEqual([200, 200]);
-      expect((await retryA.json()) as { status: string }).toMatchObject({ status: "committed" });
-      expect((await retryB.json()) as { status: string }).toMatchObject({ status: "committed" });
+      expect([retryA.status, retryB.status].sort()).toEqual([200, 202]);
+      expect((await instance.fetch(post("/begin", payload))).status).toBe(200);
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("committed");
       expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");
     });
@@ -1695,6 +2105,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
   it("preserves monotonic recovery backoff across repeated committed-pending-ack failures", async () => {
     const txId = `tx-ack-backoff-${crypto.randomUUID()}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await installCoordinatorRestoreFakes(coordinator, { state: "open" });
 
     await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
       const service: TransactionManifestService = {
@@ -1714,7 +2125,10 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
       };
       mutable.coordinatorEnv.CONTROL_PLANE = service;
-      mutable.callShard = async (_row, _participant, phase) => new Response("{}", { status: phase === "commit" ? 503 : 200 });
+      mutable.callShard = async (_row, _participant, phase) => new Response(
+        phase === "prepare" ? JSON.stringify({ prepareBookmark: "test-prepare-bookmark", prepareCheckpointExact: true }) : "{}",
+        { status: phase === "commit" ? 503 : 200 },
+      );
       const payload = {
         txId,
         participants: [{ shardId: `shard-${txId}`, intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }] }],
@@ -2065,6 +2479,7 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
       isMutation: true,
     }));
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await installCoordinatorRestoreFakes(coordinator, { state: "open" });
     let finalizations = 0;
     const v2 = defaultV2ManifestMethods();
     const service: TransactionManifestService = {

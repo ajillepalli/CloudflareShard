@@ -20,6 +20,11 @@ const ADMIN_COMMANDS = [
   "shard-stats",
   "list-tables",
   "list-indexes",
+  "restore-preview",
+  "restore-execute",
+  "restore-status",
+  "restore-reconcile",
+  "restore-rollback",
 ] as const;
 const ONBOARDING_COMMANDS = ["doctor", "verify"] as const;
 const COMMANDS = [...ONBOARDING_COMMANDS, ...ADMIN_COMMANDS] as const;
@@ -42,6 +47,11 @@ Commands:
   shard-stats --shard-id ID
   list-tables
   list-indexes
+  restore-preview --fleet-id ID --cutoff ISO-8601 --idempotency-key KEY
+  restore-execute --restore-id ID --plan-hash SHA256
+  restore-status --restore-id ID
+  restore-reconcile --restore-id ID --plan-hash SHA256
+  restore-rollback --restore-id ID --plan-hash SHA256
 
 Connection (required, via flags or env vars):
   --url URL         or CLOUDFLARESHARD_URL       e.g. http://127.0.0.1:8787
@@ -99,6 +109,11 @@ export async function run(argv: string[]): Promise<number> {
       "receipt-dir": { type: "string" },
       "disposable-target": { type: "boolean" },
       "max-route-probes": { type: "string" },
+      "fleet-id": { type: "string" },
+      cutoff: { type: "string" },
+      "idempotency-key": { type: "string" },
+      "restore-id": { type: "string" },
+      "plan-hash": { type: "string" },
     },
     allowPositionals: false,
   });
@@ -181,6 +196,14 @@ export function requireFlag(values: Record<string, unknown>, flag: string): stri
   return value;
 }
 
+export function requireSha256Flag(values: Record<string, unknown>, flag: string): string {
+  const value = requireFlag(values, flag);
+  if (!/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`--${flag} must be a lowercase SHA-256 hexadecimal digest.`);
+  }
+  return value;
+}
+
 export async function dispatch(client: CloudflareShardAdminClient, command: AdminCommand, values: Record<string, unknown>): Promise<unknown> {
   switch (command) {
     case "init":
@@ -221,6 +244,29 @@ export async function dispatch(client: CloudflareShardAdminClient, command: Admi
       return client.listTables();
     case "list-indexes":
       return client.listIndexes();
+    case "restore-preview":
+      return client.restorePreview({
+        fleetId: requireFlag(values, "fleet-id"),
+        cutoff: requireFlag(values, "cutoff"),
+        idempotencyKey: requireFlag(values, "idempotency-key"),
+      });
+    case "restore-execute":
+      return client.restoreExecute({
+        restoreId: requireFlag(values, "restore-id"),
+        planHash: requireSha256Flag(values, "plan-hash"),
+      });
+    case "restore-status":
+      return client.restoreStatus({ restoreId: requireFlag(values, "restore-id") });
+    case "restore-reconcile":
+      return client.restoreReconcile({
+        restoreId: requireFlag(values, "restore-id"),
+        planHash: requireSha256Flag(values, "plan-hash"),
+      });
+    case "restore-rollback":
+      return client.restoreRollback({
+        restoreId: requireFlag(values, "restore-id"),
+        planHash: requireSha256Flag(values, "plan-hash"),
+      });
   }
 }
 

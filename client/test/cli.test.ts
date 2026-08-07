@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CloudflareShardAdminClient } from "../src/admin-client.js";
-import { dispatch, isCommand, requireFlag, run, usage } from "../src/cli.js";
+import { dispatch, isCommand, requireFlag, requireSha256Flag, run, usage } from "../src/cli.js";
 import { mockFetch } from "./test-helpers.js";
 import { credentialUrl } from "./redaction-fixtures.js";
 
@@ -24,7 +24,7 @@ describe("CLI", () => {
 
   it("usage() documents every command", () => {
     const text = usage();
-    for (const cmd of ["doctor", "verify", "init", "create-table", "register-table", "register-tenant", "create-index", "create-index-status", "status", "shard-stats", "list-tables", "list-indexes"]) {
+    for (const cmd of ["doctor", "verify", "init", "create-table", "register-table", "register-tenant", "create-index", "create-index-status", "status", "shard-stats", "list-tables", "list-indexes", "restore-preview", "restore-execute", "restore-status", "restore-reconcile", "restore-rollback"]) {
       expect(text).toContain(cmd);
     }
     expect(text).toContain("0 success, 2 invalid/unsafe input, 3 prerequisite failure");
@@ -34,6 +34,11 @@ describe("CLI", () => {
   it("requireFlag() throws a helpful error naming the missing flag", () => {
     expect(() => requireFlag({}, "table")).toThrow(/--table/);
     expect(requireFlag({ table: "events" }, "table")).toBe("events");
+  });
+
+  it("requireSha256Flag() requires an exact lowercase plan digest", () => {
+    expect(requireSha256Flag({ "plan-hash": "a".repeat(64) }, "plan-hash")).toBe("a".repeat(64));
+    expect(() => requireSha256Flag({ "plan-hash": "ABC" }, "plan-hash")).toThrow(/lowercase SHA-256/);
   });
 
   it("converts receipt filesystem rejection into stable JSON and exit 3 without rejecting", async () => {
@@ -94,6 +99,50 @@ describe("CLI", () => {
       const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
       await expect(dispatch(client, "create-table", { table: "events" })).rejects.toThrow(/--schema/);
+    });
+
+    it("restore-preview maps required operator flags to the versioned wire body", async () => {
+      const { fetchImpl, calls } = mockFetch(202, { ok: true, status: "previewing", restore_id: "restore-1", retry_after_ms: 1000 });
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await dispatch(client, "restore-preview", {
+        "fleet-id": "default",
+        cutoff: "2026-08-05T12:00:00.000Z",
+        "idempotency-key": "preview-1",
+      });
+
+      expect(calls[0].body).toEqual({
+        protocol_version: 1,
+        format_version: 1,
+        fleet_id: "default",
+        cutoff: "2026-08-05T12:00:00.000Z",
+        idempotency_key: "preview-1",
+      });
+    });
+
+    it("restore-execute requires the exact plan hash as destructive confirmation", async () => {
+      const { fetchImpl, calls } = mockFetch(202, { ok: true, status: "accepted", restore_id: "restore-1", plan_hash: "a".repeat(64) });
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(dispatch(client, "restore-execute", { "restore-id": "restore-1" })).rejects.toThrow(/--plan-hash/);
+      await dispatch(client, "restore-execute", { "restore-id": "restore-1", "plan-hash": "a".repeat(64) });
+
+      expect(calls[0].body).toEqual({
+        protocol_version: 1, format_version: 1, restore_id: "restore-1", plan_hash: "a".repeat(64),
+      });
+    });
+
+    it("restore-rollback requires the exact plan hash as destructive confirmation", async () => {
+      const { fetchImpl, calls } = mockFetch(202, { ok: true, status: "accepted", restore_id: "restore-1", plan_hash: "a".repeat(64) });
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(dispatch(client, "restore-rollback", { "restore-id": "restore-1" })).rejects.toThrow(/--plan-hash/);
+      await dispatch(client, "restore-rollback", { "restore-id": "restore-1", "plan-hash": "a".repeat(64) });
+
+      expect(calls[0].url).toBe("http://x/admin/restore-rollback");
+      expect(calls[0].body).toEqual({
+        protocol_version: 1, format_version: 1, restore_id: "restore-1", plan_hash: "a".repeat(64),
+      });
     });
   });
 });

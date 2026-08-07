@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { CatalogDO } from "./catalog";
 import { ShardDO, TENANT_SCAN_PAGE_SIZE } from "./shard";
 import { CoordinatorDO, type TransactionManifestService } from "./coordinator";
+import { RestoreCoordinatorDO, type FleetRestoreManifestService } from "./restore";
 import { json } from "./http";
 import { hashKey, indexShardIdForKey } from "./hash";
 import { checkAdminAuth, isValidBearerToken } from "./auth";
@@ -19,19 +20,23 @@ import {
   type StructuredOperation,
 } from "./structured-op";
 import { sha256Hex } from "./auth";
+import { restoreError } from "../packages/contracts/src/index.js";
 
-export { CatalogDO, ShardDO, CoordinatorDO };
+export { CatalogDO, ShardDO, CoordinatorDO, RestoreCoordinatorDO };
 
 export interface Env {
   CATALOG: DurableObjectNamespace<CatalogDO>;
   SHARD: DurableObjectNamespace<ShardDO>;
   COORDINATOR: DurableObjectNamespace<CoordinatorDO>;
+  RESTORE_COORDINATOR: DurableObjectNamespace<RestoreCoordinatorDO>;
   /** Route-less service-binding seam for the mandatory commit manifest.
    * Optional in the TypeScript seam only for expand-first deployment; an
    * absent runtime binding fails admission before any participant prepares. */
-  CONTROL_PLANE?: TransactionManifestService;
+  CONTROL_PLANE?: TransactionManifestService & FleetRestoreManifestService;
   ADMIN_TOKEN?: string;
   CATALOG_SHARD_COUNT?: string;
+  /** One deployment is one physical restore domain. */
+  DEPLOYMENT_FLEET_ID?: string;
   /** SAFETY: demo-only fault-injection kill switch (Shardscope chaos mode —
    * see /admin/fault-inject, /admin/fault-clear, and ShardDO's
    * checkFaultInjection in shard.ts). Every fault-injection code path treats
@@ -2920,7 +2925,11 @@ async function txCore(env: Env, body: StructuredOperation, authorization: string
   const beginRes = await coordinatorStub.fetch("https://coordinator.internal/begin", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ txId, participants }),
+    // The Coordinator persists this identity into every manifest record and
+    // rejects a logical transaction that claims a different physical PITR
+    // domain. Omitting it silently selected "default", which only worked for
+    // the checked-in default deployment and broke any explicitly named fleet.
+    body: JSON.stringify({ txId, participants, fleetId: deploymentFleetId(env) }),
   });
   const beginBody = await beginRes.json();
   return new Response(JSON.stringify(beginBody), {
@@ -3804,6 +3813,71 @@ async function handleV1Scatter(request: Request, env: Env): Promise<Response> {
   return scatterCore(env, body, authorization);
 }
 
+type RestoreAdminPath = "/preview" | "/execute" | "/status" | "/reconcile" | "/rollback";
+
+function deploymentFleetId(env: Env): string {
+  return env.DEPLOYMENT_FLEET_ID?.trim() || "default";
+}
+
+async function restoreAdminCore(env: Env, path: RestoreAdminPath, body: unknown): Promise<Response> {
+  const stub = env.RESTORE_COORDINATOR.getByName(`fleet:${deploymentFleetId(env)}`);
+  return stub.fetch(new Request(`https://restore.internal${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }));
+}
+
+function makeRestoreHandler(path: RestoreAdminPath) {
+  return async (request: Request, env: Env): Promise<Response> => {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      const error = restoreError("RESTORE_INVALID_REQUEST", "Request body must be valid JSON.");
+      return json({ ok: false, status: "rejected", error }, error.http_status);
+    }
+    return restoreAdminCore(env, path, body);
+  };
+}
+
+const handleAdminRestorePreview = makeRestoreHandler("/preview");
+const handleAdminRestoreExecute = makeRestoreHandler("/execute");
+const handleAdminRestoreStatus = makeRestoreHandler("/status");
+const handleAdminRestoreReconcile = makeRestoreHandler("/reconcile");
+const handleAdminRestoreRollback = makeRestoreHandler("/rollback");
+
+/**
+ * Root ingress is fenced as well as every participant mutation boundary.
+ * This prevents reads from observing a torn fleet while participant PITR is
+ * in progress; participant-local checks independently close the admitted-
+ * before-fence race for writes and alarms.
+ */
+async function activeFleetRestoreResponse(env: Env): Promise<Response | null> {
+  try {
+    const stub = env.RESTORE_COORDINATOR.getByName(`fleet:${deploymentFleetId(env)}`);
+    const response = await stub.fetch(new Request("https://restore.internal/gate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fleet_id: deploymentFleetId(env) }),
+    }));
+    if (!response.ok) return json({ error: { code: "RESTORE_UNAVAILABLE", message: "Fleet restore gate is unavailable." } }, 503);
+    const gate = await response.json() as { active?: boolean; restore_id?: string | null; phase?: string | null };
+    return gate.active === true
+      ? json({
+          error: {
+            code: "FLEET_RESTORE_IN_PROGRESS",
+            message: "The fleet is fenced while point-in-time recovery is in progress.",
+            restoreId: gate.restore_id,
+            phase: gate.phase,
+          },
+        }, 503)
+      : null;
+  } catch {
+    return json({ error: { code: "RESTORE_UNAVAILABLE", message: "Fleet restore gate is unavailable." } }, 503);
+  }
+}
+
 /** mutateCore/tableScanCore/indexQueryCore return a Response (built via the
  * same json()/passthrough helpers the HTTP routes use, so HTTP and RPC can
  * never disagree on status/error shape) — an RPC method isn't allowed to
@@ -3857,7 +3931,15 @@ function assertAdminRpcAuth(env: Env, adminToken: string): void {
 }
 
 export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
+  private async assertFleetAvailable(): Promise<void> {
+    const fenced = await activeFleetRestoreResponse(this.env);
+    if (fenced) {
+      throw new Error(`CloudflareShard RPC error ${fenced.status}: ${JSON.stringify(await fenced.json())}`);
+    }
+  }
+
   async mutate(tenantToken: string, body: StructuredMutation & { requestId?: string }): Promise<MutateRpcResult> {
+    await this.assertFleetAvailable();
     return unwrapForRpc<MutateRpcResult>(await mutateCore(this.env, this.ctx, body, `Bearer ${tenantToken}`));
   }
 
@@ -3865,6 +3947,7 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     tenantToken: string,
     body: { tenantId: string; table: string; limit?: number; cursor?: string | null },
   ): Promise<TableScanRpcResult> {
+    await this.assertFleetAvailable();
     return unwrapForRpc<TableScanRpcResult>(await tableScanCore(this.env, body, `Bearer ${tenantToken}`));
   }
 
@@ -3872,6 +3955,7 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     tenantToken: string,
     body: { table: string; indexName: string; tenantId: string; values: Record<string, unknown>; limit?: number },
   ): Promise<IndexQueryRpcResult> {
+    await this.assertFleetAvailable();
     return unwrapForRpc<IndexQueryRpcResult>(await indexQueryCore(this.env, body, `Bearer ${tenantToken}`));
   }
 
@@ -3879,6 +3963,7 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
    * operation like mutate/tableScan/indexQuery above (takes a tenant token,
    * not an admin token), just not part of issue #14's original scope. */
   async tx(tenantToken: string, body: StructuredOperation): Promise<unknown> {
+    await this.assertFleetAvailable();
     return unwrapForRpc(await txCore(this.env, body, `Bearer ${tenantToken}`));
   }
 
@@ -4020,16 +4105,43 @@ export class CloudflareShardRpc extends WorkerEntrypoint<Env> {
     return unwrapForRpc(await adminForceReleaseTopologyLockCore(this.env, body, `Bearer ${adminToken}`));
   }
 
+  async adminRestorePreview(adminToken: string, body: unknown): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await restoreAdminCore(this.env, "/preview", body));
+  }
+
+  async adminRestoreExecute(adminToken: string, body: unknown): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await restoreAdminCore(this.env, "/execute", body));
+  }
+
+  async adminRestoreStatus(adminToken: string, body: unknown): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await restoreAdminCore(this.env, "/status", body));
+  }
+
+  async adminRestoreReconcile(adminToken: string, body: unknown): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await restoreAdminCore(this.env, "/reconcile", body));
+  }
+
+  async adminRestoreRollback(adminToken: string, body: unknown): Promise<unknown> {
+    assertAdminRpcAuth(this.env, adminToken);
+    return unwrapForRpc(await restoreAdminCore(this.env, "/rollback", body));
+  }
+
   /** Operator-only raw SQL — see sqlCore's doc comment for why this is
    * admin-gated rather than tenant-gated. */
   async sql(adminToken: string, body: Parameters<typeof sqlCore>[2]): Promise<unknown> {
     assertAdminRpcAuth(this.env, adminToken);
+    await this.assertFleetAvailable();
     return unwrapForRpc(await sqlCore(this.env, this.ctx, body, `Bearer ${adminToken}`));
   }
 
   /** Cross-tenant fan-out read — admin-gated for the same reason sql() is. */
   async scatter(adminToken: string, body: Parameters<typeof scatterCore>[1]): Promise<unknown> {
     assertAdminRpcAuth(this.env, adminToken);
+    await this.assertFleetAvailable();
     return unwrapForRpc(await scatterCore(this.env, body, `Bearer ${adminToken}`));
   }
 
@@ -4082,6 +4194,11 @@ const ROUTES: Record<string, (request: Request, env: Env, ctx: ExecutionContext)
   "/admin/force-release-topology-lock": handleAdminForceReleaseTopologyLock,
   "/admin/fault-inject": handleAdminFaultInject,
   "/admin/fault-clear": handleAdminFaultClear,
+  "/admin/restore-preview": handleAdminRestorePreview,
+  "/admin/restore-execute": handleAdminRestoreExecute,
+  "/admin/restore-status": handleAdminRestoreStatus,
+  "/admin/restore-reconcile": handleAdminRestoreReconcile,
+  "/admin/restore-rollback": handleAdminRestoreRollback,
   "/v1/sql": handleV1Sql,
   "/v1/mutate": handleV1Mutate,
   "/v1/tx": handleV1Tx,
@@ -4115,6 +4232,11 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext, 
     if (url.pathname.startsWith("/admin/")) {
       const authError = requireAdminAuth(env, request);
       if (authError) return authError;
+    }
+
+    if (!url.pathname.startsWith("/admin/restore-")) {
+      const restoreFence = await activeFleetRestoreResponse(env);
+      if (restoreFence) return restoreFence;
     }
 
     const handler = ROUTES[url.pathname];

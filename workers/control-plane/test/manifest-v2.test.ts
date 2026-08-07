@@ -993,7 +993,10 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       completed_buckets: 16,
       total_buckets: 16,
       snapshot_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      catalog_close_key: expect.stringMatching(/^[a-f0-9]{64}$/),
       fleet_root_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      partition_config_hash: route.reservation.partition_config_hash,
+      coverage_start: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
     });
     await expect(route.worker.closeFleetThrough({
       fleet_id: route.reservation.fleet_id,
@@ -1006,6 +1009,7 @@ describe("Manifest V2 reservation and terminal transitions", () => {
     const coverageState = await fleetCatalog.coverageState(route.reservation.fleet_id);
     if (coverageState.reservation_required_since_ms === null) throw new Error("Expected a V2 coverage boundary.");
     const coverageStart = new Date(coverageState.reservation_required_since_ms).toISOString();
+    expect(completed.coverage_start).toBe(coverageStart);
     const enumeration = await route.worker.enumerateManifest({
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
@@ -1013,21 +1017,65 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 10,
       cursor: null,
     });
     expect(enumeration).toMatchObject({
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       coverage: "incomplete",
       complete: false,
       records: [{ tx_id: route.reservation.tx_id }],
-      next_cursor: expect.objectContaining({ local_cursor: null }),
+      next_cursor: expect.objectContaining({
+        catalog_close_key: completed.catalog_close_key,
+        fleet_root_hash: completed.fleet_root_hash,
+        local_cursor: null,
+      }),
       diagnostics: { inspected_buckets: expect.any(Number), incomplete_buckets: 1, returned_records: 1 },
     });
     if ("ok" in enumeration) throw new Error(enumeration.error.message);
     expect(enumeration.evidence.length).toBeGreaterThan(0);
     expect(enumeration.evidence[0].seal_receipt_hash).toMatch(/^[a-f0-9]{64}$/);
+    await expect(route.worker.enumerateManifest({
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      fleet_id: route.reservation.fleet_id,
+      coverage_start: coverageStart,
+      cutoff: finalized.record.commit_decided_at,
+      partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: "0".repeat(64),
+      catalog_generation: completed.snapshot_generation,
+      catalog_snapshot_hash: completed.snapshot_hash,
+      limit: 10,
+      cursor: null,
+    })).resolves.toMatchObject({
+      ok: false,
+      status: "rejected",
+      error: { code: "TX_MANIFEST_CONFLICT" },
+    });
+    await expect(route.worker.enumerateManifest({
+      protocol_version: CURRENT_PROTOCOL_VERSION,
+      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      fleet_id: route.reservation.fleet_id,
+      coverage_start: coverageStart,
+      cutoff: finalized.record.commit_decided_at,
+      partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: "0".repeat(64),
+      fleet_root_hash: completed.fleet_root_hash,
+      catalog_generation: completed.snapshot_generation,
+      catalog_snapshot_hash: completed.snapshot_hash,
+      limit: 10,
+      cursor: null,
+    })).resolves.toMatchObject({
+      ok: false,
+      status: "rejected",
+      error: { code: "TX_MANIFEST_CONFLICT" },
+    });
     const completedEnumeration = await route.worker.enumerateManifest({
       protocol_version: CURRENT_PROTOCOL_VERSION,
       format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
@@ -1035,6 +1083,8 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 10,
@@ -1054,6 +1104,8 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       coverage_start: new Date(coverageState.reservation_required_since_ms - 1).toISOString(),
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 10,
@@ -1071,6 +1123,8 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 1,
@@ -1088,6 +1142,8 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 1,
@@ -1120,6 +1176,8 @@ describe("Manifest V2 reservation and terminal transitions", () => {
       coverage_start: coverageStart,
       cutoff: finalized.record.commit_decided_at,
       partition_config_hash: route.reservation.partition_config_hash,
+      catalog_close_key: completed.catalog_close_key,
+      fleet_root_hash: completed.fleet_root_hash,
       catalog_generation: completed.snapshot_generation,
       catalog_snapshot_hash: completed.snapshot_hash,
       limit: 1,

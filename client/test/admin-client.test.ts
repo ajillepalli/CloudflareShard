@@ -198,4 +198,124 @@ describe("CloudflareShardAdminClient", () => {
       await expect(client.waitForTransaction("tx-1", { intervalMs: 5, maxWaitMs: 20 })).rejects.toThrow(/commit_pending_manifest/);
     });
   });
+
+  describe("fleet restore", () => {
+    const status = (phase: "previewing" | "reconciling" | "complete" | "rolled_back" | "manual_repair_required") => ({
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: "restore-1",
+      plan_hash: phase === "previewing" ? null : "a".repeat(64),
+      fleet_id: "default",
+      cutoff: "2026-08-05T12:00:00.000Z",
+      phase,
+      started_at: phase === "previewing" ? null : "2026-08-05T12:10:00.000Z",
+      updated_at: "2026-08-05T12:20:00.000Z",
+      completed_at: phase === "complete" || phase === "rolled_back" || phase === "manual_repair_required" ? "2026-08-05T12:20:00.000Z" : null,
+      progress: { participants_total: 2, participants_restored: phase === "previewing" ? 0 : 2, transactions_total: 3, transactions_reconciled: phase === "complete" ? 3 : 1 },
+      blockers: phase === "manual_repair_required"
+        ? [{ code: "RESTORE_MANIFEST_GAP", message: "Missing evidence.", participant_id: null, tx_id: "tx-2" }]
+        : [],
+      report: phase === "complete"
+        ? { discarded_write_count: 1, discarded_write_report_hash: "b".repeat(64), discarded_write_report_complete: true, measured_rpo_ms: 1000, measured_rto_ms: 2000, verified_at: "2026-08-05T12:20:00.000Z" }
+        : null,
+    });
+
+    it("projects ergonomic preview input to the exact versioned wire request", async () => {
+      const response = { ok: true, status: "previewing", restore_id: "restore-1", retry_after_ms: 1000 };
+      const { fetchImpl, calls } = mockFetch(202, response);
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.restorePreview({
+        fleetId: "default",
+        cutoff: "2026-08-05T12:00:00.000Z",
+        idempotencyKey: "preview-1",
+      })).resolves.toEqual(response);
+
+      expect(calls[0].url).toBe("http://x/admin/restore-preview");
+      expect(calls[0].body).toEqual({
+        protocol_version: 1,
+        format_version: 1,
+        fleet_id: "default",
+        cutoff: "2026-08-05T12:00:00.000Z",
+        idempotency_key: "preview-1",
+      });
+    });
+
+    it("sends only restore identity and exact plan hash for execute/reconcile/rollback", async () => {
+      const { fetchImpl, calls } = mockFetch(202, { ok: true, status: "accepted", restore_id: "restore-1", plan_hash: "a".repeat(64) });
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+      const request = { restoreId: "restore-1", planHash: "a".repeat(64) };
+
+      await client.restoreExecute(request);
+      await client.restoreReconcile(request);
+      await client.restoreRollback(request);
+
+      expect(calls.map((call) => call.url)).toEqual([
+        "http://x/admin/restore-execute",
+        "http://x/admin/restore-reconcile",
+        "http://x/admin/restore-rollback",
+      ]);
+      expect(calls[0].body).toEqual({
+        protocol_version: 1, format_version: 1, restore_id: "restore-1", plan_hash: "a".repeat(64),
+      });
+      expect(calls[1].body).toEqual(calls[0].body);
+      expect(calls[2].body).toEqual(calls[0].body);
+    });
+
+    it("rejects malformed successful restore responses instead of trusting type casts", async () => {
+      const invalidPreview = new CloudflareShardAdminClient({
+        baseUrl: "http://x",
+        token: "t",
+        fetchImpl: mockFetch(200, { ok: true, status: "previewed", plan: { restore_id: "restore-1" } }).fetchImpl,
+      });
+      await expect(invalidPreview.restorePreview({
+        fleetId: "default", cutoff: "2026-08-05T12:00:00.000Z", idempotencyKey: "preview-1",
+      })).rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
+
+      const invalidAccepted = new CloudflareShardAdminClient({
+        baseUrl: "http://x",
+        token: "t",
+        fetchImpl: mockFetch(200, { ok: true, status: "queued", restore_id: "restore-1", plan_hash: "a".repeat(64) }).fetchImpl,
+      });
+      await expect(invalidAccepted.restoreExecute({
+        restoreId: "restore-1", planHash: "a".repeat(64),
+      })).rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
+
+      const invalidStatus = new CloudflareShardAdminClient({
+        baseUrl: "http://x",
+        token: "t",
+        fetchImpl: mockFetch(200, { ...status("reconciling"), phase: "unknown" }).fetchImpl,
+      });
+      await expect(invalidStatus.restoreStatus({ restoreId: "restore-1" }))
+        .rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
+    });
+
+    it("waitForRestore polls previewing work and returns complete", async () => {
+      const { fetchImpl } = mockFetchSequence([
+        { status: 200, body: status("previewing") },
+        { status: 200, body: status("reconciling") },
+        { status: 200, body: status("complete") },
+      ]);
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.waitForRestore("restore-1", { intervalMs: 1 })).resolves.toMatchObject({ phase: "complete" });
+    });
+
+    it("waitForRestore returns rolled_back as a terminal result", async () => {
+      const { fetchImpl } = mockFetch(200, status("rolled_back"));
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.waitForRestore("restore-1", { intervalMs: 1 })).resolves.toMatchObject({ phase: "rolled_back" });
+    });
+
+    it("returns manual_repair_required as a visible terminal result", async () => {
+      const { fetchImpl } = mockFetch(200, status("manual_repair_required"));
+      const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
+
+      await expect(client.waitForRestore("restore-1", { intervalMs: 1 })).resolves.toMatchObject({
+        phase: "manual_repair_required",
+        blockers: [expect.objectContaining({ code: "RESTORE_MANIFEST_GAP" })],
+      });
+    });
+  });
 });

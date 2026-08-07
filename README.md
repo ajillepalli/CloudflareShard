@@ -18,7 +18,7 @@ A self-hosted, sharded SQL layer built entirely on Cloudflare Workers and Durabl
 Objects (SQLite-backed). No external database, no KV/D1/R2. One logical SQL
 endpoint, tenant-scoped writes, cross-shard 2PC transactions, secondary
 indexes, and online resharding (split/drain with a zero-downtime,
-checksum-verified cutover).
+checksum-verified cutover), plus fail-closed fleet point-in-time restore.
 
 Sharding is the primitive. Everything else (routing, transactions, secondary
 indexes, resharding) sits on top of the same vBucket map.
@@ -52,9 +52,11 @@ npm run dev
 Needs Node.js 20+ and a Cloudflare account with Wrangler authenticated.
 `npm run dev` starts both required Workers from their two Wrangler configs: the
 route-less `cloudflare-shard-control-plane` Worker that owns
-`JournalManifestDO`, and the public `cloudflare-shard-mvp` Worker that owns
-`CatalogDO`, `ShardDO`, and `CoordinatorDO`. The public Worker must not be run
-without that local `CONTROL_PLANE` service-binding target.
+`JournalManifestDO` and `FleetManifestCatalogDO`, and the public
+`cloudflare-shard-mvp` Worker that owns `CatalogDO`, `ShardDO`,
+`CoordinatorDO`, and the non-restored `RestoreCoordinatorDO`. The public
+Worker must not be run without that local `CONTROL_PLANE` service-binding
+target.
 
 ## Deploy your own
 
@@ -63,10 +65,17 @@ applications from one repository together, so it cannot create this complete
 topology. Clone the repository and use the ordered deployment command below;
 do not use a one-Worker deploy button for this release.
 
-The deployment has two Workers and four SQLite Durable Object classes: a
-required route-less control-plane Worker owning `JOURNAL_MANIFEST`, followed
-by the public Worker owning `CATALOG`, `SHARD`, and `COORDINATOR`. No KV/D1/R2
-resources are required; the cluster is self-contained.
+The deployment has two Workers and six SQLite Durable Object classes: a
+required route-less control-plane Worker owning `JOURNAL_MANIFEST` and
+`FLEET_MANIFEST_CATALOG`, followed by the public Worker owning `CATALOG`,
+`SHARD`, `COORDINATOR`, and `RESTORE_COORDINATOR`. No KV/D1/R2 resources are
+required; the cluster is self-contained.
+
+One deployment is one physical restore domain. Set `DEPLOYMENT_FLEET_ID` in
+`wrangler.toml` (default `default`) before the first transaction and keep that
+value stable for the lifetime of the Durable Object namespaces. A restore
+preview whose `fleet_id` differs from it is rejected; logical fleets sharing
+these namespaces cannot be rewound independently.
 
 From a clone, use the ordered aggregate command:
 
@@ -113,6 +122,19 @@ whose manifest registration or participant acknowledgement remains outstanding
 after idempotent replay is reported as `PENDING_RECONCILIATION`, never
 `VERIFIED`. Verification defers strict readback until replay reports that the
 transaction has converged to committed.
+
+Fleet point-in-time restore is an explicit preview/confirm workflow. Preview
+produces an immutable plan and SHA-256 plan hash; execute requires that exact
+hash, fences all ordinary traffic, rewinds every physical shard, replays
+manifest-committed transactions through the cutoff, and verifies shard
+invariants. Only then does it durably discard post-cutoff transaction
+coordinators and report hash-bound evidence for intentionally discarded writes.
+While the original fence remains active and before that irreversible discard,
+the same plan retains time-bounded shard undo bookmarks for an exact-hash
+rollback of a partial restore.
+Use the [fleet PITR runbook](docs/runbooks/fleet-pitr.md);
+do not execute from a quickstart snippet. Production readiness requires 3/3
+successful live provider rehearsals.
 
 Full deploy/init/teardown walkthrough:
 [docs/REFERENCE.md § Deploy your own cluster](docs/REFERENCE.md#deploy-your-own-cluster).
@@ -162,6 +184,9 @@ npm run verify      # aggregate root, SPA, client, contracts, control-plane, and
 - **[docs/guides/](docs/guides/)**: perspective guides: [end-user](docs/guides/end-user.md),
   [infrastructure builder](docs/guides/infrastructure-builder.md),
   [operator](docs/guides/operator.md), [investor](docs/guides/investor.md).
+- **[docs/runbooks/fleet-pitr.md](docs/runbooks/fleet-pitr.md)**: destructive
+  fleet restore preview, exact-hash execution, monitoring, fenced reconciliation,
+  loss reporting, and the 3/3 live rehearsal gate.
 - **[client/README.md](client/README.md)**: the typed TypeScript SDK + CLI reference.
 - **[examples/rpc-consumer/README.md](examples/rpc-consumer/README.md)**: calling this API over
   a Durable Object RPC / Worker service binding instead of HTTP.

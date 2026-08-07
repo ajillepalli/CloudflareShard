@@ -49,6 +49,15 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
   - Never sends participant commit until the manifest service confirms the
     durable commit record.
 
+- RestoreCoordinatorDO (non-restored fleet recovery authority)
+  - One durable authority addressed by `fleet:<DEPLOYMENT_FLEET_ID>`.
+  - Lives outside the shard histories it rewinds, so restore generation,
+    immutable plan/evidence pins, undo bookmarks, progress, and the fleet gate
+    survive shard PITR.
+  - Owns preview, exact-hash execution, shard restore ordering, manifest redo
+    reconciliation, post-cutoff coordinator discard, final verification, and
+    fenced manual repair.
+
 - Route-less control-plane Worker (`cloudflare-shard-control-plane`)
   - Has no public HTTP routes and is deployed before the Gateway Worker.
   - Exposes manifest RPC methods through the Gateway Worker's
@@ -90,6 +99,44 @@ then publishes an immutable exact-cutoff receipt. Fleet enumeration can report
 for every candidate bucket and every required day has all 16 local legacy
 certificates. Retention deletion atomically advances the deleted-through
 watermark, retention epoch, and retention-evidence root; stale cursors fail.
+
+### 3.2 Fleet PITR boundary
+
+`DEPLOYMENT_FLEET_ID` defines the one physical restore domain for the root
+Worker's shared `CATALOG`, `SHARD`, `COORDINATOR`, and manifest namespaces. It
+defaults to `default`. A restore preview must supply that exact `fleet_id`;
+logical fleet IDs sharing those namespaces cannot be restored independently.
+An operator may use `RESTORE_FLEET_ID` as a shell variable when invoking the
+CLI, but it is not a runtime configuration key and must equal
+`DEPLOYMENT_FLEET_ID`.
+
+Preview is non-mutating and produces an immutable plan only after catalog
+coverage/topology proof, exact fleet close, root-bound bounded manifest
+enumeration, coordinator inventory/evidence, and every physical shard bookmark
+are complete. The plan expires 15 minutes after preview creation and is hashed
+over its exact canonical body. Execute requires the stored `restore_id` plus
+that exact `plan_hash`.
+
+Execution activates a non-restored root ingress gate, installs catalog and
+shard generation fences, revalidates the pinned topology/bookmarks,
+materializes the direct-write loss set, and performs shard PITR in two phases:
+stage the provider target while capturing an undo bookmark, then abort the
+current session so the next session activates the target and verify it.
+Manifest-committed cross-shard transactions at or before the cutoff are
+recovered from hash-verified redo envelopes after shard rewind. After every
+shard is restored and verified, post-cutoff `CoordinatorDO`s are durably
+discarded; this is the irreversible boundary after which rollback is refused.
+Only then are shard and catalog fences released, followed by the external root
+ingress gate last. `CoordinatorDO` mutation/recovery paths consult that external
+gate and fail closed while it is active or unavailable.
+
+A failure before shard restore safely releases installed fences and ends
+`failed`. A failure after fencing/restoration begins becomes
+`manual_repair_required`; the fleet and local fences remain active and
+ordinary ingress continues returning `503 FLEET_RESTORE_IN_PROGRESS`.
+Reconciliation can resume only the same `restore_id` with the same immutable
+`plan_hash` while its fleet gate is still active. The ordinary topology
+force-release route cannot bypass a restore-owned fence.
 
 ## 4) Logical Data Partitioning
 
@@ -357,6 +404,23 @@ FleetManifestCatalogDO alarm state:
   maintenance work is never discarded after an arbitrary retry count. Operators
   alert on a purpose's bounded `reliability.slo` label and rising
   `attempt_count`; a later `recovered` event closes the incident.
+
+RestoreCoordinatorDO state (owned by the non-restored root binding):
+- `restore_operations`: one immutable-parameter operation per `restore_id`,
+  including phase/stage, plan JSON/hash, topology and manifest pins, fence
+  generation/times, blockers, completion report, and timestamps.
+- `restore_participants`: sorted physical shard inventory with target, preview,
+  and undo bookmarks; coverage, progress state, and loss cursor.
+- `restore_coordinator_work`: inventoried transaction coordinators with bounded
+  loss cursor and retained/discard-required/discarded progress.
+- `restore_manifest_records` / `restore_manifest_evidence`: exact enumerated
+  commit records, evidence hashes, redo materialization, and reconciliation
+  status bound to the restore.
+- `restore_loss_entries`: hash-addressed direct-write loss evidence collected
+  for `(cutoff, fence_installed_at]` before shard rewind.
+- `fleet_restore_gate`: non-restored singleton `{active, restore_id,
+  generation, phase, activated_at}` consulted by root ingress and every
+  mutation boundary. Gate lookup failure is a 503 fail-closed outcome.
 
 ## 7) Public HTTP API (Gateway Worker)
 
@@ -671,6 +735,154 @@ exact `operationId` reads it from `/admin/topology-lock-status` first. Unlike mo
 NOT in `CatalogDO`'s own `ADMIN_GATED_ROUTES` double-check list, the Worker's structural
 `/admin/*` gate (`requireAdminAuth`, applied once to every `/admin/*` path before routing) is
 these two routes' only auth check, not defense-in-depth layered on top of a second one.
+
+Restore-owned topology locks are different: an active durable restore fence
+makes the lock non-expiring for safety and rejects generic lock acquisition,
+topology mutation, and generic release. `/admin/force-release-topology-lock`
+cannot bypass it. A post-fence restore failure remains
+`manual_repair_required`; only the exact restore generation's verified release
+path removes the catalog fence/companion lock.
+
+### Fleet point-in-time restore (admin token)
+
+These routes are the only public operations allowed through root ingress while
+the fleet restore gate is active. Requests use exact-key V1 contracts; unknown
+or missing fields fail validation.
+
+POST /admin/restore-preview
+Request:
+- protocol_version: 1
+- format_version: 1
+- fleet_id string (must equal `DEPLOYMENT_FLEET_ID`)
+- cutoff string (canonical UTC milliseconds, non-future, inside the safe PITR
+  window and every evidence coverage boundary)
+- idempotency_key string (same key/same parameters resumes; same key/different
+  parameters rejects `RESTORE_CONFLICT`)
+
+Response:
+- 200 `{ok:true, status:"previewed", plan}` when all proof is complete
+- 202 `{ok:true, status:"previewing", restore_id, retry_after_ms}` while
+  bounded close/enumeration/bookmark work is durably continuing
+
+The immutable `plan` contains protocol/format, restore/fleet identity, cutoff,
+`previewed_at`, `execute_before`, parameter hash, topology epoch/hash, exact
+manifest close/generation/snapshot/root/config pins and record count, a sorted
+shard target/preview bookmark list, intentional-loss bounds, rollback
+metadata/limitations, and `plan_hash`. The current plan execution window is 15
+minutes. Preview rejects future/out-of-window cutoffs, incomplete catalog or
+coordinator coverage, active or post-cutoff topology/config work, incomplete or
+mismatched manifest pages/evidence, missing redo envelopes, and missing
+shard bookmarks.
+
+POST /admin/restore-execute
+Request:
+- protocol_version: 1
+- format_version: 1
+- restore_id string
+- plan_hash string (lowercase SHA-256 of the exact stored plan body)
+
+Response:
+- 202 `{ok:true, status:"accepted"|"already_started", restore_id, plan_hash}`
+- 200 `already_started` when that exact restore is already complete
+
+Execution rejects an incomplete/expired/stale plan, a mismatched hash, or a
+different restore holding the fleet gate. It activates the deployment-wide
+gate before shard mutation, re-proves topology and bookmarks, installs
+generation fences, materializes the direct-write loss set, stages and activates
+provider PITR per shard, reconciles manifest transactions, and verifies every
+shard. It then durably discards coordinators without a commit decision at or
+before the cutoff before releasing local fences and the external fleet gate
+last. Existing coordinators register before alarm recovery; a coordinator
+missing from an active inventory is added to its loss pass, while one first
+discovered after a completed restore is quarantined before mutation. All non-restore HTTP
+routes return 503 `FLEET_RESTORE_IN_PROGRESS` while the gate is active; local
+catalog/shard gates and coordinator external-gate checks independently reject
+races and fail closed when the non-restored authority is unavailable.
+
+POST /admin/restore-status
+Request:
+- protocol_version: 1
+- format_version: 1
+- restore_id string
+
+Response:
+- protocol_version: 1
+- format_version: 1
+- restore_id, plan_hash, fleet_id, cutoff
+- phase: `previewing | previewed | fencing | restoring |
+  reconciliation_pending | reconciling | verifying | rolling_back |
+  parked_lease_lost | complete | rolled_back | manual_repair_required | failed`
+- started_at, updated_at, completed_at
+- progress `{participants_total, participants_restored, transactions_total,
+  transactions_reconciled}`
+- blockers: array of `{code, message, participant_id, tx_id}`
+- report: null or `{discarded_write_count, discarded_write_report_hash,
+  discarded_write_report_complete, measured_rpo_ms, measured_rto_ms,
+  verified_at}`
+
+The participant counters cover the planned physical shards. `complete` requires
+every progress counter complete, no blockers, a completion time, and
+`discarded_write_report_complete:true`. The report hash commits to
+the complete sorted loss-evidence hash set; raw direct-write details remain in
+the non-restored coordinator rather than the public response.
+
+POST /admin/restore-reconcile
+Request:
+- protocol_version: 1
+- format_version: 1
+- restore_id string
+- plan_hash string
+
+Response:
+- 202 `{ok:true, status:"already_started", restore_id, plan_hash}` while the
+  exact operation resumes
+- 200 `already_started` if already complete
+
+Used after repairing a typed blocker or an ambiguous accepted response.
+Reconcile is idempotent, requires the exact stored hash and the matching active
+fleet fence, and resumes the saved durable phase/stage only when every blocker
+is retryable `RESTORE_INTERRUPTED` or `RESTORE_UNAVAILABLE`. Other
+contradiction/invariant/evidence blockers require a reviewed versioned repair
+path or eligible rollback. If a retryable condition remains, the operation
+parks again and keeps all fences. Shard stage records provider undo
+bookmarks. Fleet rollback must still use the public exact-plan workflow below
+and must not be approximated by manually releasing or rewinding a subset of
+shards.
+
+POST /admin/restore-rollback
+Request:
+- protocol_version: 1
+- format_version: 1
+- restore_id string
+- plan_hash string
+
+Response:
+- 202 `{ok:true, status:"accepted"|"already_started", restore_id, plan_hash}`
+- 200 `already_started` when already `rolled_back`
+
+Rollback requires the exact immutable plan, `rollback.undo_supported:true`, an
+unexpired `rollback.undo_expires_at`, the original active fleet fence and
+generation, at least one captured shard undo bookmark, and zero
+coordinators already crossed through irreversible post-cutoff discard. It is
+rejected after `complete`, because successful completion released the original
+fence. Shards that never armed restore need no rollback; the coordinator
+stages every captured undo bookmark, durably records activation-requested
+before the potentially response-severing provider apply RPC, and verifies
+`mode=undo` in the next session. It releases shard/catalog fences after all
+shards converge and releases external ingress last. Status reports
+`rolling_back` while active and terminal
+`rolled_back` with a completion time and no blockers. An interrupted rollback
+remains fenced and must not be completed by manually releasing a subset of
+shards.
+
+Release qualification requires 3/3 independent live provider rehearsals on
+disposable complete two-Worker deployments, each meeting a declared RPO/RTO,
+exercising pre/post-cutoff single- and cross-shard writes, and ending with full
+progress, no blockers, complete loss reporting, and independent data checks.
+Separately, one live rollback rehearsal must induce a controlled fenced
+interruption after undo capture but before irreversible coordinator discard,
+then reach `rolled_back` before `undo_expires_at` and independently verify the
+captured pre-restore head. Workerd/unit tests do not satisfy these gates.
 
 POST /admin/register-tenant (ADMIN_TOKEN)
 Request:
@@ -1238,4 +1450,11 @@ The broader production metric set remains:
   migration with dual-write backfill and fenced cutover, split-as-migration, drain-shard
   evacuation. Automatic split *heuristics* (deciding when to split) remain future work.
   See TODOS.md "Automatic split heuristics".
-- Add backups and restore drills per shard.
+- ~~Add fleet point-in-time restore orchestration.~~ Shipped (T6): immutable
+  preview/plan hash, deployment/catalog/shard fences, two-phase
+  shard provider bookmarks with retained undo bookmarks, cutoff manifest redo,
+  shard verification, ordered post-cutoff coordinator discard, complete
+  discarded-write reporting, and fenced reconciliation/rollback.
+  Release qualification still requires 3/3 successful live provider
+  rehearsals meeting declared RPO/RTO; see the
+  [fleet PITR runbook](runbooks/fleet-pitr.md).

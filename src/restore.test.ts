@@ -1,0 +1,452 @@
+import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
+import { afterEach, describe, expect, it } from "vitest";
+import type { RestoreCoordinatorDO } from "./restore";
+import type { ParticipantPitrPort, ShardDO } from "./shard";
+
+function internal(path: string, body: unknown): Request {
+  return new Request(`https://restore.internal${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+function admin(path: string, body: unknown): Promise<Response> {
+  return SELF.fetch(`https://worker.internal${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.ADMIN_TOKEN}`,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+function restoreStub() {
+  return env.RESTORE_COORDINATOR.getByName("fleet:default");
+}
+
+afterEach(async () => {
+  await reset();
+});
+
+describe("RestoreCoordinatorDO external fleet gate", () => {
+  it("serializes mutating work across awaited operations", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO) => {
+      const order: string[] = [];
+      let releaseFirst!: () => void;
+      const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const runMutation = (instance as unknown as {
+        runMutation<T>(work: () => Promise<T>): Promise<T>;
+      }).runMutation.bind(instance);
+      const first = runMutation(async () => {
+        order.push("first:start");
+        await firstBlocked;
+        order.push("first:end");
+      });
+      const second = runMutation(async () => {
+        order.push("second:start");
+      });
+      await Promise.resolve();
+      expect(order).toEqual(["first:start"]);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(order).toEqual(["first:start", "first:end", "second:start"]);
+    });
+  });
+
+  it("registers coordinator inventory coverage and rejects another logical fleet", async () => {
+    const stub = restoreStub();
+    const rejected = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "another-fleet",
+      coordinator_id: "tx-1",
+    }));
+    expect(rejected.status).toBe(400);
+
+    const accepted = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "default",
+      coordinator_id: "tx-1",
+    }));
+    expect(accepted.status).toBe(200);
+
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const coordinators = Array.from(state.storage.sql.exec(
+        "SELECT coordinator_id, fleet_id FROM coordinator_registry",
+      ));
+      const coverage = Array.from(state.storage.sql.exec(
+        "SELECT value FROM restore_metadata WHERE key = 'coordinator_coverage_start'",
+      ));
+      expect(coordinators).toEqual([{ coordinator_id: "tx-1", fleet_id: "default" }]);
+      expect(coverage).toHaveLength(1);
+    });
+  });
+
+  it("adds an existing coordinator that wakes under the active fence to restore work", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at, updated_at)
+         VALUES ('restore-active', 'default', ?, 'active-registration', ?, 'verifying', 'releasing_participants',
+                 ?, ?, 4, ?, ?, ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "d".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+        now,
+      );
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-active', generation = 4,
+         phase = 'reconciling', activated_at = ? WHERE singleton = 1`,
+        now,
+      );
+    });
+
+    const existing = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "default",
+      tx_id: "tx-existing",
+      existing_created_at: new Date(Date.now() - 60_000).toISOString(),
+    }));
+    expect(existing.status).toBe(200);
+    expect(await existing.json()).toMatchObject({
+      disposition: "registered",
+      active_restore_id: "restore-active",
+      generation: 4,
+    });
+    const fresh = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "default",
+      tx_id: "tx-fresh",
+    }));
+    expect(fresh.status).toBe(409);
+
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec(
+        "SELECT coordinator_id, status FROM restore_coordinator_work WHERE restore_id = 'restore-active'",
+      ))).toEqual([{ coordinator_id: "tx-existing", status: "pending_loss" }]);
+      expect(Array.from(state.storage.sql.exec(
+        "SELECT phase, stage FROM restore_operations WHERE restore_id = 'restore-active'",
+      ))).toEqual([{ phase: "restoring", stage: "materializing_loss" }]);
+    });
+  });
+
+  it("quarantines a pre-existing coordinator omitted by a completed restore", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    const createdAt = new Date(Date.now() - 120_000).toISOString();
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at,
+           completed_at, updated_at)
+         VALUES ('restore-complete', 'default', ?, 'late-registration', ?, 'complete', 'complete',
+                 ?, ?, 8, ?, ?, ?, ?)`,
+        createdAt,
+        "a".repeat(64),
+        createdAt,
+        now,
+        new Date(Date.now() - 60_000).toISOString(),
+        createdAt,
+        now,
+        now,
+      );
+    });
+
+    const response = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "default",
+      tx_id: "tx-omitted",
+      existing_created_at: createdAt,
+    }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      disposition: "discard_required",
+      restore_id: "restore-complete",
+      generation: 8,
+    });
+  });
+
+  it("only authorizes the active restore generation while fenced", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-a', generation = 7,
+         phase = 'restoring', activated_at = ? WHERE singleton = 1`,
+        new Date().toISOString(),
+      );
+    });
+
+    const ordinary = await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    expect(await ordinary.json()).toMatchObject({ active: true, allowed: false, generation: 7 });
+
+    const owner = await stub.fetch(internal("/gate", {
+      fleet_id: "default",
+      restore_id: "restore-a",
+      generation: 7,
+    }));
+    expect(await owner.json()).toMatchObject({ active: true, allowed: true, generation: 7 });
+  });
+
+  it("blocks ordinary root ingress but leaves authenticated restore control reachable", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-a', generation = 1,
+         phase = 'manual_repair_required', activated_at = ? WHERE singleton = 1`,
+        new Date().toISOString(),
+      );
+    });
+
+    const ordinary = await admin("/admin/status", {});
+    expect(ordinary.status).toBe(503);
+    expect(await ordinary.json()).toMatchObject({ error: { code: "FLEET_RESTORE_IN_PROGRESS" } });
+
+    const restoreStatus = await admin("/admin/restore-status", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: "missing",
+    });
+    expect(restoreStatus.status).toBe(400);
+  });
+
+  it("uses the canonical shard fence wire shape and keeps coordinators out of PITR", async () => {
+    const authority = restoreStub();
+    await authority.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(authority, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-wire', generation = 9,
+         phase = 'fencing', activated_at = ? WHERE singleton = 1`,
+        new Date().toISOString(),
+      );
+    });
+
+    const body = { restore_id: "restore-wire", generation: 9, action: "install" };
+    const shard = env.SHARD.getByName("restore-wire-shard");
+    const shardResponse = await shard.fetch(internal("/restore-fence", body));
+    expect(shardResponse.status).toBe(200);
+    expect(await shardResponse.json()).toMatchObject({
+      restore_id: "restore-wire",
+      generation: 9,
+      externally_fenced: true,
+      pre_fence_bookmark: expect.any(String),
+      closed_through: expect.any(String),
+      closed_through_bookmark: expect.any(String),
+    });
+
+    const coordinator = env.COORDINATOR.getByName("restore-wire-tx");
+    const coordinatorResponse = await coordinator.fetch(internal("/restore-fence", body));
+    expect(coordinatorResponse.status).toBe(404);
+  });
+});
+
+describe("restore admin validation", () => {
+  it("authenticates before parsing and rejects unknown restore fields", async () => {
+    const unauthenticated = await SELF.fetch("https://worker.internal/admin/restore-preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json",
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    const response = await admin("/admin/restore-preview", {
+      protocol_version: 1,
+      format_version: 1,
+      fleet_id: "default",
+      cutoff: new Date().toISOString(),
+      idempotency_key: "preview-1",
+      replacement_plan: {},
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "RESTORE_INVALID_REQUEST" } });
+  });
+
+  it("rejects a future cutoff before any durable mutation", async () => {
+    const response = await admin("/admin/restore-preview", {
+      protocol_version: 1,
+      format_version: 1,
+      fleet_id: "default",
+      cutoff: new Date(Date.now() + 60_000).toISOString(),
+      idempotency_key: "preview-future",
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: "RESTORE_CUTOFF_IN_FUTURE" } });
+  });
+
+  it("exposes rollback only through the exact versioned plan identity", async () => {
+    const malformed = await admin("/admin/restore-rollback", {
+      restore_id: "restore-missing",
+      plan_hash: "0".repeat(64),
+    });
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toMatchObject({ error: { code: "RESTORE_INVALID_REQUEST" } });
+
+    const missing = await admin("/admin/restore-rollback", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: "restore-missing",
+      plan_hash: "0".repeat(64),
+    });
+    expect(missing.status).toBe(409);
+    expect(await missing.json()).toMatchObject({ error: { code: "RESTORE_PLAN_HASH_MISMATCH" } });
+  });
+
+  it("rejects every unsafe rollback precondition", async () => {
+    const authority = restoreStub();
+    await authority.fetch(internal("/gate", { fleet_id: "default" }));
+    const cases = [
+      { name: "expired", stage: "restoring_participants", expired: true, undo: true, gate: true, discarded: false, code: "RESTORE_PLAN_STALE" },
+      { name: "complete", stage: "complete", expired: false, undo: true, gate: false, discarded: false, code: "RESTORE_CONFLICT" },
+      { name: "discarded", stage: "reconciling", expired: false, undo: true, gate: true, discarded: true, code: "RESTORE_CONFLICT" },
+      { name: "gate-mismatch", stage: "restoring_participants", expired: false, undo: true, gate: false, discarded: false, code: "RESTORE_CONFLICT" },
+      { name: "no-undo", stage: "fencing_participants", expired: false, undo: false, gate: true, discarded: false, code: "RESTORE_CONFLICT" },
+    ] as const;
+
+    for (const scenario of cases) {
+      const restoreId = `restore-rollback-${scenario.name}`;
+      const planHash = "c".repeat(64);
+      await runInDurableObject(authority, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+        const now = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + (scenario.expired ? -60_000 : 60_000)).toISOString();
+        state.storage.sql.exec(
+          `INSERT INTO restore_operations
+            (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage, plan_json, plan_hash,
+             previewed_at, execute_before, fence_generation, fence_installed_at, started_at, completed_at, updated_at)
+           VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, 20, ?, ?, ?, ?)`,
+          restoreId,
+          new Date(Date.now() - 120_000).toISOString(),
+          `rollback-${scenario.name}`,
+          "b".repeat(64),
+          scenario.stage,
+          scenario.stage,
+          JSON.stringify({ rollback: { undo_supported: true, undo_expires_at: expiresAt } }),
+          planHash,
+          now,
+          new Date(Date.now() + 30_000).toISOString(),
+          now,
+          now,
+          scenario.stage === "complete" ? now : null,
+          now,
+        );
+        if (scenario.undo) {
+          state.storage.sql.exec(
+            `INSERT INTO restore_participants
+              (restore_id, participant_id, participant_kind, object_name, status, undo_bookmark)
+             VALUES (?, ?, 'shard', ?, 'restored', 'undo')`,
+            restoreId,
+            `shard:${scenario.name}`,
+            scenario.name,
+          );
+        }
+        if (scenario.discarded) {
+          state.storage.sql.exec(
+            `INSERT INTO restore_coordinator_work (restore_id, coordinator_id, status)
+             VALUES (?, 'tx-discarded', 'discarded')`,
+            restoreId,
+          );
+        }
+        state.storage.sql.exec(
+          `UPDATE fleet_restore_gate SET active = ?, restore_id = ?, generation = 20,
+           phase = ?, activated_at = ? WHERE singleton = 1`,
+          scenario.gate ? 1 : 0,
+          scenario.gate ? restoreId : null,
+          scenario.gate ? scenario.stage : null,
+          scenario.gate ? now : null,
+        );
+      });
+
+      const response = await authority.fetch(internal("/rollback", {
+        protocol_version: 1,
+        format_version: 1,
+        restore_id: restoreId,
+        plan_hash: planHash,
+      }));
+      expect(response.status, scenario.name).toBe(409);
+      expect(await response.json(), scenario.name).toMatchObject({ error: { code: scenario.code } });
+    }
+  });
+
+  it("durably stages participant undo under the original active fence", async () => {
+    const restoreId = "restore-rollback-stage";
+    const planHash = "a".repeat(64);
+    const shardName = "restore-rollback-shard";
+    const shard = env.SHARD.getByName(shardName);
+    const undoBookmark = "external-undo-bookmark";
+    await runInDurableObject(shard, async (instance: ShardDO) => {
+      (instance as unknown as { pitrPort: ParticipantPitrPort }).pitrPort = {
+        async getCurrentBookmark() { return "rollback-current"; },
+        async getBookmarkForTime() { return "unused-approximate"; },
+        async stageRestoreBookmark(bookmark) { return `redo:${bookmark}`; },
+        abort() {},
+      };
+    });
+    const authority = restoreStub();
+    await authority.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(authority, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage, plan_json, plan_hash,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at, blocker_json, updated_at)
+         VALUES (?, 'default', ?, 'rollback-stage-key', ?, 'manual_repair_required', 'manual_repair_required', ?, ?,
+                 ?, ?, 12, ?, ?, ?, ?)`,
+        restoreId,
+        new Date(Date.now() - 60_000).toISOString(),
+        "b".repeat(64),
+        JSON.stringify({ rollback: { undo_supported: true, undo_expires_at: new Date(Date.now() + 60_000).toISOString() } }),
+        planHash,
+        now,
+        new Date(Date.now() + 30_000).toISOString(),
+        now,
+        now,
+        JSON.stringify([{ code: "RESTORE_INTERRUPTED", message: "test", participant_id: null, tx_id: null }]),
+        now,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO restore_participants
+          (restore_id, participant_id, participant_kind, object_name, target_bookmark, preview_bookmark,
+           coverage_start, status, undo_bookmark)
+         VALUES (?, ?, 'shard', ?, ?, ?, ?, 'restored', ?)`,
+        restoreId,
+        `shard:${shardName}`,
+        shardName,
+        undoBookmark,
+        undoBookmark,
+        now,
+        undoBookmark,
+      );
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = ?, generation = 12,
+         phase = 'manual_repair_required', activated_at = ? WHERE singleton = 1`,
+        restoreId,
+        now,
+      );
+    });
+
+    const response = await admin("/admin/restore-rollback", {
+      protocol_version: 1,
+      format_version: 1,
+      restore_id: restoreId,
+      plan_hash: planHash,
+    });
+    expect(response.status).toBe(202);
+    await runInDurableObject(authority, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      expect(Array.from(state.storage.sql.exec(
+        "SELECT phase, stage FROM restore_operations WHERE restore_id = ?",
+        restoreId,
+      ))).toEqual([{ phase: "rolling_back", stage: "rollback_participants" }]);
+      expect(Array.from(state.storage.sql.exec(
+        "SELECT status FROM restore_participants WHERE restore_id = ?",
+        restoreId,
+      ))).toEqual([{ status: "rollback_staged" }]);
+    });
+  });
+});
