@@ -3,7 +3,7 @@ import {
   CURRENT_PROTOCOL_VERSION,
   MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
   MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
-  MANIFEST_ENUMERATION_FORMAT_VERSION,
+  CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_PAGE_FORMAT_VERSION,
   MANIFEST_SEAL_FORMAT_VERSION,
   TransactionContractViolation,
@@ -555,7 +555,7 @@ export default class ControlPlaneWorker extends WorkerEntrypoint<ControlPlaneEnv
       const requestHash = await hashManifestRequest(request);
       const responseIdentity = {
         protocol_version: CURRENT_PROTOCOL_VERSION,
-        format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+        format_version: CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
         request_hash: requestHash,
         catalog_close_key: request.catalog_close_key,
         fleet_root_hash: request.fleet_root_hash,

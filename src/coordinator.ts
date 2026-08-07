@@ -16,6 +16,7 @@ import {
   createManifestRegistration,
   durableObjectUnavailableError,
   hashCanonicalJson,
+  hashFinalizedRedoEnvelope,
   hashManifestFinalizeIntent,
   hashManifestRecordV2,
   hashManifestReservation,
@@ -237,7 +238,12 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   private restoreCoordinatorOverride: RestoreCoordinatorNamespace | null = null;
   private activeMutations = 0;
   private mutationDrainWaiters: Array<() => void> = [];
-  private recoveryInFlight = new Set<string>();
+  private recoveryInFlight = new Map<string, Promise<{
+    body: ArrayBuffer;
+    status: number;
+    statusText: string;
+    headers: Array<[string, string]>;
+  }>>();
   private releaseRecoveryInFlight = new Map<string, Promise<void>>();
 
   constructor(ctx: DurableObjectState, env: CoordinatorEnv) {
@@ -688,13 +694,34 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     await new Promise<void>((resolve) => this.mutationDrainWaiters.push(resolve));
   }
 
-  private async runRecoveryExclusive(txId: string, status: string, work: () => Promise<Response>): Promise<Response> {
-    if (this.recoveryInFlight.has(txId)) return json({ ok: true, txId, status }, 202);
-    this.recoveryInFlight.add(txId);
+  private async runRecoveryExclusive(txId: string, work: () => Promise<Response>): Promise<Response> {
+    const responseFrom = (snapshot: {
+      body: ArrayBuffer;
+      status: number;
+      statusText: string;
+      headers: Array<[string, string]>;
+    }) => new Response(snapshot.body.slice(0), {
+      status: snapshot.status,
+      statusText: snapshot.statusText,
+      headers: snapshot.headers,
+    });
+    const existing = this.recoveryInFlight.get(txId);
+    if (existing) return responseFrom(await existing);
+    const pending = work().then(async (response) => {
+      const headers: Array<[string, string]> = [];
+      response.headers.forEach((value, key) => headers.push([key, value]));
+      return {
+        body: await response.arrayBuffer(),
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      };
+    });
+    this.recoveryInFlight.set(txId, pending);
     try {
-      return await work();
+      return responseFrom(await pending);
     } finally {
-      this.recoveryInFlight.delete(txId);
+      if (this.recoveryInFlight.get(txId) === pending) this.recoveryInFlight.delete(txId);
     }
   }
 
@@ -859,7 +886,10 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     return row.commit_decided_at_ms === null || row.commit_decided_at_ms > Date.parse(cutoff);
   }
 
-  private async abortParticipantsForRestore(row: TxRow, restoreId: string, generation: number): Promise<void> {
+  private async abortParticipantsForRestore(
+    row: TxRow,
+    claim?: { restoreId: string; generation: number },
+  ): Promise<void> {
     await Promise.all(this.participants(row).map(async (participant) => {
       const stub = this.coordinatorEnv.SHARD.get(this.coordinatorEnv.SHARD.idFromName(participant.shardId));
       const response = await stub.fetch("https://shard.internal/recover", {
@@ -868,8 +898,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         body: JSON.stringify({
           ...this.participantMessage(row, "recover"),
           decision: "abort",
-          restore_id: restoreId,
-          generation,
+          ...(claim ? { restore_id: claim.restoreId, generation: claim.generation } : {}),
         }),
       });
       if (!response.ok) {
@@ -906,6 +935,15 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
 
   private isV2(row: TxRow): boolean {
     return row.state_model_version === 2;
+  }
+
+  private envelopeAddress(
+    row: Pick<TxRow, "state_model_version">,
+    envelope: ReadableRedoEnvelope,
+  ): Promise<string> {
+    return row.state_model_version === 2
+      ? hashFinalizedRedoEnvelope(envelope)
+      : hashRedoEnvelope(envelope);
   }
 
   private async routeAssignmentRequest(
@@ -1154,13 +1192,22 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileCancel(row: TxRow): Promise<Response> {
-    return this.runRecoveryExclusive(row.tx_id, "aborted_pending_manifest_cancel", () => this.reconcileCancelOnce(row));
+    return this.runRecoveryExclusive(row.tx_id, () => this.reconcileCancelOnce(row));
+  }
+
+  private resumeRecoveryOnce(row: TxRow): Promise<Response> {
+    const state = this.stateOf(row);
+    if (state === "aborted_pending_manifest_cancel") return this.reconcileCancelOnce(row);
+    if (["manifest_registered", "committing", "committed_pending_ack", "committed"].includes(state)) {
+      return this.reconcileCommitOnce(row);
+    }
+    return this.resume(row);
   }
 
   private async reconcileCancelOnce(row: TxRow): Promise<Response> {
     await this.assertRestoreGateOpen(row.fleet_id);
     if (this.stateOf(row) === "aborted") return protocolResponse(transactionError("TX_ABORTED", "Transaction was aborted."));
-    if (this.stateOf(row) !== "aborted_pending_manifest_cancel") return this.resume(row);
+    if (this.stateOf(row) !== "aborted_pending_manifest_cancel") return this.resumeRecoveryOnce(row);
     const queued = this.one<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", row.tx_id);
     if (!queued && row.last_error) {
       try {
@@ -1187,7 +1234,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
     let latest = this.loadTx(row.tx_id);
     if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
-    if (this.stateOf(latest) !== "aborted_pending_manifest_cancel") return this.resume(latest);
+    if (this.stateOf(latest) !== "aborted_pending_manifest_cancel") return this.resumeRecoveryOnce(latest);
     row = latest;
     if (!reserve || (!reserve.ok && reserve.status === "unavailable")) {
       await this.reschedule(row.tx_id, "cancel", ["aborted_pending_manifest_cancel"]);
@@ -1216,7 +1263,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     }
     latest = this.loadTx(row.tx_id);
     if (!latest) throw new Error(`Missing transaction ${row.tx_id}.`);
-    if (this.stateOf(latest) !== "aborted_pending_manifest_cancel") return this.resume(latest);
+    if (this.stateOf(latest) !== "aborted_pending_manifest_cancel") return this.resumeRecoveryOnce(latest);
     row = latest;
     if (!result || (!result.ok && result.status === "unavailable")) {
       await this.reschedule(row.tx_id, "cancel", ["aborted_pending_manifest_cancel"]);
@@ -1725,7 +1772,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
   }
 
   private async reconcileCommit(row: TxRow): Promise<Response> {
-    return this.runRecoveryExclusive(row.tx_id, "committed_pending_ack", () => this.reconcileCommitOnce(row));
+    return this.runRecoveryExclusive(row.tx_id, () => this.reconcileCommitOnce(row));
   }
 
   private async reconcileCommitOnce(row: TxRow): Promise<Response> {
@@ -1738,13 +1785,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       } catch (error) {
         if (error instanceof CoordinatorCasLost) {
           const latest = this.loadTx(current.tx_id);
-          if (latest) return this.reconcileCommit(latest);
+          if (latest) return this.reconcileCommitOnce(latest);
         }
         throw error;
       }
     }
     else if (state === "committed") return json({ ok: true, txId: current.tx_id, status: "committed" });
-    else if (state !== "committing" && state !== "committed_pending_ack") return this.resume(current);
+    else if (state !== "committing" && state !== "committed_pending_ack") return this.resumeRecoveryOnce(current);
 
     const participants = this.participants(current);
     const outcomes = await Promise.allSettled(participants.map((participant) => this.callShard(current, participant, "commit")));
@@ -1766,7 +1813,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       return json({ ok: true, txId: current.tx_id, status: "committed" });
     }
     if (latestState !== "committing" && latestState !== "committed_pending_ack") {
-      return this.resume(latestAfterAcknowledgments);
+      return this.resumeRecoveryOnce(latestAfterAcknowledgments);
     }
     current = latestAfterAcknowledgments;
 
@@ -1814,7 +1861,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     } catch (error) {
       if (error instanceof CoordinatorCasLost) {
         const latest = this.loadTx(current.tx_id);
-        if (latest) return this.resume(latest);
+        if (latest) {
+          const latestState = this.stateOf(latest);
+          if (["manifest_registered", "committing", "committed_pending_ack", "committed"].includes(latestState)) {
+            return this.reconcileCommitOnce(latest);
+          }
+          return this.resumeRecoveryOnce(latest);
+        }
       }
       throw error;
     }
@@ -1826,7 +1879,13 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       );
       if (!scheduled) {
         const latest = this.loadTx(current.tx_id);
-        if (latest) return this.resume(latest);
+        if (latest) {
+          const latestState = this.stateOf(latest);
+          if (["manifest_registered", "committing", "committed_pending_ack", "committed"].includes(latestState)) {
+            return this.reconcileCommitOnce(latest);
+          }
+          return this.resumeRecoveryOnce(latest);
+        }
       }
       return json({ ok: true, txId: current.tx_id, status: "committed_pending_ack" }, 202);
     }
@@ -2098,9 +2157,17 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         try {
           const response = await this.callShard(row, participant, "prepare");
           const body = await response.json().catch(() => ({})) as { prepareBookmark?: unknown; prepareCheckpointExact?: unknown };
-          const checkpointOk = !checkpointCertificationRequired
-            || (typeof body.prepareBookmark === "string" && body.prepareBookmark.length > 0 && body.prepareCheckpointExact === true);
-          return { participant, ok: response.ok && checkpointOk, body, prepareBookmark: checkpointOk && typeof body.prepareBookmark === "string" ? body.prepareBookmark : null };
+          const hasBookmark = typeof body.prepareBookmark === "string" && body.prepareBookmark.length > 0;
+          if (checkpointCertificationRequired && !hasBookmark) {
+            log("coordinator.prepare_checkpoint_degraded", {
+              txId: row.tx_id,
+              participantId: participant.shardId,
+              reason: "bookmark_capability_absent",
+            });
+          }
+          const checkpointContradiction = checkpointCertificationRequired && hasBookmark && body.prepareCheckpointExact !== true;
+          const prepareBookmark = hasBookmark && body.prepareCheckpointExact === true ? body.prepareBookmark as string : null;
+          return { participant, ok: response.ok && !checkpointContradiction, body, prepareBookmark };
         } catch (error) {
           return { participant, ok: false, body: { error: error instanceof Error ? error.message : String(error) }, prepareBookmark: null };
         }
@@ -2178,15 +2245,30 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     );
     if (registration.disposition === "discard_required") {
       if (this.registrationRequiresDiscard(row, registration.cutoff)) {
+        await this.abortParticipantsForRestore(row);
         const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
         if (!discarded.ok) throw new RestoreGateDenied("coordinator registry discard directive conflicts with local restore state");
         return;
       }
     }
     await this.assertRestoreGateOpen(row.fleet_id || this.deploymentFleetId());
-    const due = new Date(work.next_attempt_at).getTime();
+    // Another request may have completed or parked this work while the alarm
+    // was awaiting registration/gate I/O. Never replay a stale in-memory row.
+    const stillQueued = this.one<{ action: string; next_attempt_at: string }>(
+      "SELECT action, next_attempt_at FROM recovery_queue WHERE tx_id = ?",
+      work.tx_id,
+    );
+    if (!stillQueued) return;
+    if (stillQueued.action !== work.action || stillQueued.next_attempt_at !== work.next_attempt_at) {
+      const dueAt = Math.max(Date.now(), new Date(stillQueued.next_attempt_at).getTime());
+      const existingAlarm = await this.ctx.storage.getAlarm();
+      if (existingAlarm === null || existingAlarm > dueAt) await this.ctx.storage.setAlarm(dueAt);
+      return;
+    }
+    const due = new Date(stillQueued.next_attempt_at).getTime();
     if (due > Date.now()) {
-      await this.ctx.storage.setAlarm(due);
+      const existingAlarm = await this.ctx.storage.getAlarm();
+      if (existingAlarm === null || existingAlarm > due) await this.ctx.storage.setAlarm(due);
       return;
     }
     try {
@@ -2490,8 +2572,9 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
       created_at: string;
       commit_decided_at_ms: number | null;
       redo_envelope_json: string | null;
+      state_model_version: number;
     }>(
-      `SELECT tx_id, operation_hash, decision, created_at, commit_decided_at_ms, redo_envelope_json
+      `SELECT tx_id, operation_hash, decision, created_at, commit_decided_at_ms, redo_envelope_json, state_model_version
          FROM transactions LIMIT 1`,
     );
     const entries = [] as Array<{
@@ -2515,7 +2598,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
         const envelope: unknown = JSON.parse(row.redo_envelope_json);
         await validateRedoEnvelope(envelope);
         validateRedoEnvelopeStructure(envelope);
-        envelopeHash = await hashRedoEnvelope(envelope);
+        envelopeHash = await this.envelopeAddress(row, envelope);
       }
       entries.push({
         tx_id: row.tx_id,
@@ -2587,7 +2670,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     const row = this.one<{ tx_id: string }>("SELECT tx_id FROM transactions LIMIT 1");
     if (row) {
       const transaction = this.loadTx(row.tx_id);
-      if (transaction) await this.abortParticipantsForRestore(transaction, restoreId!, body.generation!);
+      if (transaction) await this.abortParticipantsForRestore(transaction, { restoreId: restoreId!, generation: body.generation! });
     }
     const discarded = this.persistRestoreDiscard(restoreId!, body.generation!);
     if (!discarded.ok) {
@@ -2611,11 +2694,11 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (!row?.redo_envelope_json) return json({ found: false }, 404);
     const envelope = JSON.parse(row.redo_envelope_json) as ReadableRedoEnvelope;
     await validateRedoEnvelope(envelope);
-    const actualHash = await hashRedoEnvelope(envelope);
+    const actualHash = await this.envelopeAddress(row, envelope);
     if (actualHash !== envelopeHash) {
       return json({ error: { code: "TX_ENVELOPE_HASH_MISMATCH", message: "Requested content address does not match the durable validated envelope." } }, 409);
     }
-    return json({ ok: true, envelope });
+    return json({ ok: true, state_model_version: row.state_model_version, envelope });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -2714,6 +2797,7 @@ export class CoordinatorDO extends DurableObject<CoordinatorEnv> {
     if (registration.disposition === "discard_required") {
       if (!existing) throw new RestoreGateDenied("coordinator registry returned a discard directive for a new transaction");
       if (this.registrationRequiresDiscard(existing, registration.cutoff)) {
+        await this.abortParticipantsForRestore(existing);
         const discarded = this.persistRestoreDiscard(registration.restoreId, registration.generation);
         if (!discarded.ok) {
           return json({ error: { code: "RESTORE_DISCARD_CONFLICT", message: "Coordinator was already discarded by a different restore generation." } }, 409);

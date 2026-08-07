@@ -6,6 +6,7 @@ import {
   createManifestRegistration,
   createManifestReservation,
   hashCanonicalJson,
+  hashFinalizedRedoEnvelope,
   hashManifestRecordV2,
   hashManifestReservation,
   hashParticipantOperations,
@@ -153,7 +154,7 @@ describe("CoordinatorDO restore integration", () => {
     });
     const found = await stub.fetch(post("/recovery-envelope", { tx_id: envelope.tx_id, envelope_hash: envelopeHash }));
     expect(found.status).toBe(200);
-    expect(await found.json()).toEqual({ ok: true, envelope });
+    expect(await found.json()).toEqual({ ok: true, state_model_version: 1, envelope });
     const mismatch = await stub.fetch(post("/recovery-envelope", { tx_id: envelope.tx_id, envelope_hash: "0".repeat(64) }));
     expect(mismatch.status).toBe(409);
   });
@@ -268,6 +269,68 @@ describe("CoordinatorDO restore integration", () => {
     expect(body.entries[0].envelope_hash).not.toBe(await hashCanonicalJson(envelope));
   });
 
+  it("serves a model-2 V1 fallback envelope at its finalized intent address", async () => {
+    const stub = await freshCoordinator();
+    await stub.fetch(post("/tx-status", { txId: "warm-model2-v1-address" }));
+    const decidedAt = new Date().toISOString();
+    const participants = [{
+      participant_id: "s1",
+      epoch: 1,
+      intents: [{
+        intent_seq: 0, sql: "INSERT INTO t (id) VALUES (?)", params: ["v1"], tenant_id: "t1",
+        table_name: "t", partition_key: "v1", vbucket: null, operation: "insert" as const,
+        mirror_target_participant_id: null,
+      }],
+    }];
+    const envelope: RedoEnvelopeV1 = {
+      protocol_version: 1,
+      format_version: 1,
+      tx_id: "tx-model2-v1-address",
+      fleet_id: "default",
+      coordinator_id: "tx-model2-v1-address",
+      decision: "commit",
+      decision_epoch: 1,
+      commit_decided_at: decidedAt,
+      retention_deadline: new Date(Date.now() + COORDINATOR_RETENTION_DAYS * 86_400_000).toISOString(),
+      operation_hash: await hashParticipantOperations(participants),
+      participants,
+    };
+    await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
+      state.storage.sql.exec(
+        `INSERT INTO transactions
+          (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
+           protocol_version, state_model_version, decision, commit_decided_at_ms, redo_envelope_json)
+         VALUES (?, 'committed', '["s1"]', '[]', ?, ?, ?, 1, 2, 'commit', ?, ?)`,
+        envelope.tx_id,
+        envelope.operation_hash,
+        decidedAt,
+        decidedAt,
+        Date.parse(decidedAt),
+        JSON.stringify(envelope),
+      );
+    });
+    await installCoordinatorRestoreFakes(stub, { state: "fenced" });
+    const lossResponse = await stub.fetch(post("/restore-loss-page", {
+      restore_id: "restore-c",
+      generation: 11,
+      cutoff: Date.parse(decidedAt) - 1,
+      through: Date.parse(decidedAt) + 1,
+    }));
+    expect(lossResponse.status).toBe(200);
+    const loss = await lossResponse.json() as { entries: Array<{ envelope_hash: string }> };
+    const address = loss.entries[0].envelope_hash;
+    expect(address).toBe(await hashFinalizedRedoEnvelope(envelope));
+
+    const response = await stub.fetch(post("/redo-envelope", { tx_id: envelope.tx_id, envelope_hash: address }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      state_model_version: 2,
+      envelope: { tx_id: envelope.tx_id, format_version: 1 },
+    });
+  });
+
   it("classifies a pre-cutoff in-flight transaction without a durable commit decision for discard", async () => {
     const stub = await freshCoordinator();
     await stub.fetch(post("/tx-status", { txId: "warm-in-flight-loss" }));
@@ -350,8 +413,11 @@ describe("CoordinatorDO restore integration", () => {
         `INSERT INTO transactions
           (tx_id, status, participant_shards_json, operation_json, operation_hash, created_at, updated_at,
            fleet_id, coordinator_id)
-         VALUES (?, 'prepared', '[]', '[]', 'existing-hash', ?, ?, 'default', ?)`,
+         VALUES (?, 'prepared', ?, ?, ?, ?, ?, 'default', ?)`,
         txId,
+        JSON.stringify(["s1"]),
+        JSON.stringify([{ shardId: "s1", intents: [{ sql: "SELECT 1", tenantId: "t", table: "t", partitionKey: "k" }] }]),
+        "a".repeat(64),
         createdAt,
         createdAt,
         txId,
@@ -387,6 +453,13 @@ describe("CoordinatorDO restore integration", () => {
     await runInDurableObject(stub, async (_instance: CoordinatorDO, state: DurableObjectState) => {
       expect(Array.from(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId))[0].status).toBe("quarantined");
       expect(Array.from(state.storage.sql.exec("SELECT * FROM recovery_queue"))).toHaveLength(0);
+    });
+    const participant = env.SHARD.get(env.SHARD.idFromName("s1"));
+    await runInDurableObject(participant, async (_instance: ShardDO, state: DurableObjectState) => {
+      expect(state.storage.sql.exec<{ decision: string }>(
+        "SELECT decision FROM participant_decision_tombstones WHERE tx_id = ?",
+        txId,
+      ).one().decision).toBe("abort");
     });
   });
 
@@ -2022,6 +2095,46 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
     });
   });
 
+  it("degrades to a model-2 V1 envelope when an older shard omits prepare checkpoint fields", async () => {
+    const txId = `tx-mixed-prepare-${crypto.randomUUID()}`;
+    const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
+    await runInDurableObject(coordinator, async (instance: CoordinatorDO, state: DurableObjectState) => {
+      const mutable = instance as unknown as {
+        coordinatorEnv: { CONTROL_PLANE?: TransactionManifestService };
+        callShard: (row: unknown, participant: unknown, phase: "prepare" | "commit" | "abort") => Promise<Response>;
+      };
+      mutable.coordinatorEnv.CONTROL_PLANE = {
+        ...defaultV2ManifestMethods(),
+        async checkManifestAdmission() {
+          return { ok: true as const, status: "ready" as const, circuit_policy: { failure_threshold: 3 as const, failure_window_ms: 30_000 as const, maximum_cooldown_ms: 300_000 as const } };
+        },
+        async registerManifest(registration) {
+          return { ok: true as const, status: "registered" as const, http_status: 200 as const, record_hash: registration.record_hash, quarantined: false as const };
+        },
+        async releaseManifestRetention() {
+          return { ok: true as const, status: "released" as const };
+        },
+      };
+      mutable.callShard = async () => Response.json({ ok: true });
+
+      const response = await instance.fetch(post("/begin", {
+        txId,
+        participants: [{
+          shardId: `shard-${txId}`,
+          intents: [{ sql: "INSERT INTO t (id) VALUES (?)", params: [txId], tenantId: "t1", table: "t", partitionKey: txId }],
+        }],
+      }));
+
+      expect(response.status).toBe(200);
+      const row = state.storage.sql.exec<{ state_model_version: number; redo_envelope_json: string }>(
+        "SELECT state_model_version, redo_envelope_json FROM transactions WHERE tx_id = ?",
+        txId,
+      ).one();
+      expect(row.state_model_version).toBe(2);
+      expect(JSON.parse(row.redo_envelope_json)).toMatchObject({ format_version: 1, tx_id: txId });
+    });
+  });
+
   it("concurrent identical retries waiting on manifest finalization converge instead of returning a CAS 500", async () => {
     const txId = `tx-manifest-race-${crypto.randomUUID()}`;
     const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(txId));
@@ -2081,7 +2194,11 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         instance.fetch(post("/begin", payload)),
         instance.fetch(post("/begin", payload)),
       ]);
-      expect([retryA.status, retryB.status].sort()).toEqual([200, 202]);
+      expect([retryA.status, retryB.status].sort()).toEqual([200, 200]);
+      expect(await Promise.all([retryA.json(), retryB.json()])).toEqual([
+        expect.objectContaining({ ok: true, txId, status: "committed" }),
+        expect.objectContaining({ ok: true, txId, status: "committed" }),
+      ]);
       expect((await instance.fetch(post("/begin", payload))).status).toBe(200);
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("committed");
       expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");
@@ -2137,7 +2254,11 @@ describe("CoordinatorDO manifest admission and lifecycle", () => {
         instance.fetch(post("/begin", payload)),
         instance.fetch(post("/begin", payload)),
       ]);
-      expect([retryA.status, retryB.status].sort()).toEqual([200, 202]);
+      expect([retryA.status, retryB.status].sort()).toEqual([200, 200]);
+      expect(await Promise.all([retryA.json(), retryB.json()])).toEqual([
+        expect.objectContaining({ ok: true, txId, status: "committed" }),
+        expect.objectContaining({ ok: true, txId, status: "committed" }),
+      ]);
       expect((await instance.fetch(post("/begin", payload))).status).toBe(200);
       expect(state.storage.sql.exec<{ status: string }>("SELECT status FROM transactions WHERE tx_id = ?", txId).one().status).toBe("committed");
       expect(state.storage.sql.exec<{ action: string }>("SELECT action FROM recovery_queue WHERE tx_id = ?", txId).one().action).toBe("release");

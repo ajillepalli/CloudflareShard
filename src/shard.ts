@@ -468,16 +468,49 @@ export class ShardDO extends DurableObject {
     this.sql.exec("DELETE FROM participant_decision_tombstones WHERE retention_deadline < ?", new Date().toISOString());
     this.pruneDirectWriteLossJournal();
     await this.sweepStalePendingIntents();
+    await this.certifyRestoreCheckpoint();
+    } finally {
+      mutationRelease();
+    }
+    // Never hold the local mutation barrier across delivery to another Shard:
+    // self-targeting jobs and reciprocal A→B/B→A alarms would deadlock. Each
+    // local queue mutation below reacquires the barrier after the remote await.
     const nextIndexJobRetry = await this.processIndexPendingJobs();
     const nextMirrorJobRetry = await this.processMirrorPendingJobs();
     const candidates = [Date.now() + PRUNE_INTERVAL_MS, nextIndexJobRetry, nextMirrorJobRetry].filter(
       (t): t is number => t !== null,
     );
-    await this.ctx.storage.setAlarm(Math.min(...candidates));
-    await this.certifyRestoreCheckpoint();
-    } finally {
-      mutationRelease();
+    const nextAlarm = Math.min(...candidates);
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null || existingAlarm > nextAlarm) {
+      await this.ctx.storage.setAlarm(nextAlarm);
     }
+  }
+
+  private async mutateAlarmQueue(work: () => void): Promise<boolean> {
+    const release = await this.acquireMutationBarrier();
+    try {
+      const gateResponse = await this.requireRestoreGateOpen();
+      if (gateResponse || this.restoreState()) return false;
+      this.markRestoreCheckpointDirty();
+      work();
+      await this.certifyRestoreCheckpoint();
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  private async alarmDeliveryBlocked(): Promise<boolean> {
+    return (await this.requireRestoreGateOpen()) !== null || this.restoreState() !== null;
+  }
+
+  private async commitQueueMutation(fromAlarm: boolean, work: () => void): Promise<boolean> {
+    if (fromAlarm) return this.mutateAlarmQueue(work);
+    // Request-driven drain/flush routes already hold the shard barrier and
+    // their common fetch wrapper certifies the resulting checkpoint.
+    work();
+    return true;
   }
 
   /** Milestone 2, Chunk 2: retries index writes that failed on their first
@@ -493,13 +526,23 @@ export class ShardDO extends DurableObject {
       INDEX_JOB_BATCH_SIZE,
     );
 
+    let blocked = false;
     for (const job of due) {
-      await this.deliverIndexJob(job);
+      if (await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
+      const delivered = await this.deliverIndexJob(job, true);
+      if (!delivered && await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
     }
 
     const next = this.one<{ next_attempt_at: string }>(
       "SELECT next_attempt_at FROM index_pending_jobs ORDER BY next_attempt_at ASC LIMIT 1",
     );
+    if (blocked) return Date.now() + INDEX_JOB_BASE_DELAY_MS;
     return next ? new Date(next.next_attempt_at).getTime() : null;
   }
 
@@ -532,7 +575,7 @@ export class ShardDO extends DurableObject {
    * from the catalog and deliver to the newly-resolved shard (the substitute)
    * instead of uselessly retrying the draining target — converting a
    * stale-target retry into a correct write. */
-  private async deliverIndexJob(job: IndexJobRow): Promise<boolean> {
+  private async deliverIndexJob(job: IndexJobRow, fromAlarm = false): Promise<boolean> {
     try {
       let res = await this.postIndexJobExecute(job, job.target_shard_id);
       if (!res.ok && res.status === 409 && job.index_name && job.index_table && job.index_key_json) {
@@ -549,8 +592,9 @@ export class ShardDO extends DurableObject {
             if (resolved !== job.target_shard_id) {
               const retryRes = await this.postIndexJobExecute(job, resolved);
               if (retryRes.ok) {
-                this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
-                return true;
+                return this.commitQueueMutation(fromAlarm, () => {
+                  this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+                });
               }
               res = retryRes;
             }
@@ -558,19 +602,22 @@ export class ShardDO extends DurableObject {
         }
       }
       if (res.ok) {
-        this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
-        return true;
+        return this.commitQueueMutation(fromAlarm, () => {
+          this.sql.exec("DELETE FROM index_pending_jobs WHERE job_id = ?", job.job_id);
+        });
       }
       throw new Error(`shard responded ${res.status}`);
     } catch (error) {
       const attemptCount = job.attempt_count + 1;
       const delay = Math.min(INDEX_JOB_MAX_DELAY_MS, INDEX_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
-      this.sql.exec(
-        "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
-        attemptCount,
-        new Date(Date.now() + delay).toISOString(),
-        job.job_id,
-      );
+      await this.commitQueueMutation(fromAlarm, () => {
+        this.sql.exec(
+          "UPDATE index_pending_jobs SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+          attemptCount,
+          new Date(Date.now() + delay).toISOString(),
+          job.job_id,
+        );
+      });
       log("shard.index_job_retry_failed", {
         jobId: job.job_id,
         targetShardId: job.target_shard_id,
@@ -692,7 +739,7 @@ export class ShardDO extends DurableObject {
     partition_key: string | null;
     client_request_id: string | null;
     attempt_count: number;
-  }): Promise<boolean> {
+  }, fromAlarm = false): Promise<boolean> {
     try {
       const id = this.shardEnv.SHARD.idFromName(job.target_shard_id);
       const stub = this.shardEnv.SHARD.get(id);
@@ -718,19 +765,22 @@ export class ShardDO extends DurableObject {
         }),
       });
       if (res.ok) {
-        this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
-        return true;
+        return this.commitQueueMutation(fromAlarm, () => {
+          this.sql.exec("DELETE FROM __cf_mirror_pending WHERE job_id = ?", job.job_id);
+        });
       }
       throw new Error(`shard responded ${res.status}`);
     } catch (error) {
       const attemptCount = job.attempt_count + 1;
       const delay = Math.min(MIRROR_JOB_MAX_DELAY_MS, MIRROR_JOB_BASE_DELAY_MS * 2 ** job.attempt_count);
-      this.sql.exec(
-        "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
-        attemptCount,
-        new Date(Date.now() + delay).toISOString(),
-        job.job_id,
-      );
+      await this.commitQueueMutation(fromAlarm, () => {
+        this.sql.exec(
+          "UPDATE __cf_mirror_pending SET attempt_count = ?, next_attempt_at = ? WHERE job_id = ?",
+          attemptCount,
+          new Date(Date.now() + delay).toISOString(),
+          job.job_id,
+        );
+      });
       log("shard.mirror_job_retry_failed", {
         jobId: job.job_id,
         targetShardId: job.target_shard_id,
@@ -750,12 +800,22 @@ export class ShardDO extends DurableObject {
       new Date().toISOString(),
       MIRROR_JOB_BATCH_SIZE,
     );
+    let blocked = false;
     for (const job of due) {
-      await this.deliverMirrorJob(job);
+      if (await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
+      const delivered = await this.deliverMirrorJob(job, true);
+      if (!delivered && await this.alarmDeliveryBlocked()) {
+        blocked = true;
+        break;
+      }
     }
     const next = this.one<{ next_attempt_at: string }>(
       "SELECT next_attempt_at FROM __cf_mirror_pending ORDER BY next_attempt_at ASC LIMIT 1",
     );
+    if (blocked) return Date.now() + MIRROR_JOB_BASE_DELAY_MS;
     return next ? new Date(next.next_attempt_at).getTime() : null;
   }
 

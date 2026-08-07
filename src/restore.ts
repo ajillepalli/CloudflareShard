@@ -1,16 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   CURRENT_PROTOCOL_VERSION,
-  MANIFEST_ENUMERATION_FORMAT_VERSION,
+  CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
   RESTORE_PLAN_FORMAT_VERSION,
   RESTORE_PROTOCOL_VERSION,
   RESTORE_REQUEST_FORMAT_VERSION,
   RESTORE_STATUS_FORMAT_VERSION,
   RestoreContractViolation,
   hashCanonicalJson,
+  hashFinalizedRedoEnvelope,
   hashManifestRecordV2,
   hashManifestRequest,
-  hashRedoEnvelope,
   hashRestorePlanBody,
   hashRestorePreviewParameters,
   restoreError,
@@ -50,6 +50,9 @@ const MANIFEST_PAGE_SIZE = 128;
 const LOSS_PAGE_SIZE = 128;
 const MAX_CATALOG_SHARDS = 128;
 const COORDINATOR_REGISTRY_RETENTION_MS = 35 * 24 * 60 * 60_000;
+const TERMINAL_RESTORE_STAGES = ["previewed", "complete", "rolled_back", "manual_repair_required", "failed"] as const;
+const MAX_RESTORE_RETRY_ATTEMPTS = 10;
+const MAX_RESTORE_RETRY_DELAY_MS = 30_000;
 
 type JsonObject = Record<string, unknown>;
 
@@ -90,6 +93,9 @@ type OperationRow = {
   report_json: string | null;
   resume_phase: string | null;
   resume_stage: string | null;
+  retry_count: number;
+  retry_started_at_ms: number | null;
+  retry_not_before_ms: number | null;
   updated_at: string;
 };
 
@@ -174,6 +180,18 @@ async function responseJson(response: Response, context: string): Promise<JsonOb
     const nested = isObject(body.error) ? body.error : body;
     const remoteCode = stringField(nested, "code") ?? "";
     const remoteMessage = stringField(nested, "message") ?? `${context} rejected the restore operation.`;
+    if ([408, 425, 429].includes(response.status)) {
+      throw failure("RESTORE_UNAVAILABLE", remoteMessage, { http_status: response.status, remote_code: remoteCode });
+    }
+    if (response.status === 404 && context === "/redo-envelope") {
+      throw failure("RESTORE_MANIFEST_GAP", "A manifest record references a redo envelope that is unavailable.");
+    }
+    if (response.status >= 400 && response.status < 500 && response.status !== 409) {
+      if (remoteCode === "RESTORE_VERSION_UNSUPPORTED" || remoteCode.endsWith("VERSION_UNSUPPORTED")) {
+        throw failure("RESTORE_VERSION_UNSUPPORTED", remoteMessage);
+      }
+      throw failure("RESTORE_INVALID_REQUEST", remoteMessage, { http_status: response.status, remote_code: remoteCode });
+    }
     if (response.status === 409) {
       if (remoteCode.includes("BOOKMARK")) throw failure("RESTORE_BOOKMARK_MISSING", remoteMessage);
       if (remoteCode.includes("COVERAGE") || remoteCode.includes("GAP") || remoteCode.includes("INCOMPLETE")) {
@@ -199,11 +217,16 @@ async function responseJson(response: Response, context: string): Promise<JsonOb
 }
 
 async function postToStub(stub: DurableObjectStub, path: string, body: unknown): Promise<JsonObject> {
-  const response = await stub.fetch(new Request(`https://restore.internal${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  }));
+  let response: Response;
+  try {
+    response = await stub.fetch(new Request(`https://restore.internal${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }));
+  } catch {
+    throw failure("RESTORE_UNAVAILABLE", `${path} is temporarily unavailable.`);
+  }
   return responseJson(response, path);
 }
 
@@ -251,9 +274,22 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
         report_json TEXT,
         resume_phase TEXT,
         resume_stage TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        retry_started_at_ms INTEGER,
+        retry_not_before_ms INTEGER,
         updated_at TEXT NOT NULL
       )
     `);
+    const operationColumns = this.many<{ name: string }>("PRAGMA table_info(restore_operations)");
+    if (!operationColumns.some((column) => column.name === "retry_count")) {
+      this.sql.exec("ALTER TABLE restore_operations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!operationColumns.some((column) => column.name === "retry_started_at_ms")) {
+      this.sql.exec("ALTER TABLE restore_operations ADD COLUMN retry_started_at_ms INTEGER");
+    }
+    if (!operationColumns.some((column) => column.name === "retry_not_before_ms")) {
+      this.sql.exec("ALTER TABLE restore_operations ADD COLUMN retry_not_before_ms INTEGER");
+    }
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS restore_participants (
         restore_id TEXT NOT NULL,
@@ -394,8 +430,10 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     );
   }
 
-  private async schedule(): Promise<void> {
-    await this.ctx.storage.setAlarm(Date.now() + RESTORE_ALARM_DELAY_MS);
+  private async schedule(delayMs = RESTORE_ALARM_DELAY_MS): Promise<void> {
+    const target = Date.now() + delayMs;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null || existing > target) await this.ctx.storage.setAlarm(target);
   }
 
   private runMutation<T>(work: () => Promise<T>): Promise<T> {
@@ -442,13 +480,19 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     this.ensureSchema();
     await this.runMutation(async () => {
       const gate = this.gate();
-      const operation = gate.active === 1 && gate.restore_id !== null
+      const gatedOperation = gate.active === 1 && gate.restore_id !== null
         ? this.operation(gate.restore_id)
+        : null;
+      if (gatedOperation && TERMINAL_RESTORE_STAGES.includes(gatedOperation.stage as typeof TERMINAL_RESTORE_STAGES[number])) {
+        return;
+      }
+      const operation = gatedOperation
+        ?? (gate.active === 1 ? null
         : this.one<OperationRow>(
           `SELECT * FROM restore_operations
            WHERE stage NOT IN ('previewed', 'complete', 'rolled_back', 'manual_repair_required', 'failed')
            ORDER BY updated_at ASC LIMIT 1`,
-        );
+        ));
       if (!operation) return;
       this.sql.exec(
         "UPDATE restore_operations SET updated_at = ? WHERE restore_id = ?",
@@ -458,13 +502,20 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       try {
         await this.advance(operation.restore_id);
       } catch (error) {
-        await this.parkForManualRepair(operation.restore_id, error, null, null);
+        await this.retryOrPark(operation.restore_id, error, null, null);
       }
-      const remaining = this.one<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM restore_operations
-         WHERE stage NOT IN ('previewed', 'complete', 'rolled_back', 'manual_repair_required', 'failed')`,
-      )?.n ?? 0;
-      if (remaining > 0) await this.schedule();
+      const refreshedGate = this.gate();
+      const pending = refreshedGate.active === 1 && refreshedGate.restore_id !== null
+        ? this.operation(refreshedGate.restore_id)
+        : this.one<OperationRow>(
+            `SELECT * FROM restore_operations
+             WHERE stage NOT IN ('previewed', 'complete', 'rolled_back', 'manual_repair_required', 'failed')
+             ORDER BY updated_at ASC LIMIT 1`,
+          );
+      if (pending && !TERMINAL_RESTORE_STAGES.includes(pending.stage as typeof TERMINAL_RESTORE_STAGES[number])) {
+        const delayMs = Math.max(RESTORE_ALARM_DELAY_MS, (pending.retry_not_before_ms ?? 0) - Date.now());
+        await this.schedule(delayMs);
+      }
     });
   }
 
@@ -505,6 +556,18 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       throw failure("RESTORE_INVALID_REQUEST", "Existing coordinator creation time is invalid.");
     }
     const gate = this.gate();
+    const gatedOperation = gate.active === 1 && gate.restore_id !== null ? this.operation(gate.restore_id) : null;
+    if (
+      existingCreatedAt !== null
+      && gatedOperation
+      && (gatedOperation.stage === "releasing_participants" || gatedOperation.resume_stage === "releasing_participants")
+    ) {
+      // Release is the inventory linearization point. A coordinator that
+      // missed the active restore retries after the gate opens, where the
+      // completed-restore lookup below returns a discard directive when its
+      // durable decision is post-cutoff.
+      throw failure("RESTORE_UNAVAILABLE", "Fleet restore is finalizing coordinator inventory; retry registration.");
+    }
     if (gate.active === 1 && existingCreatedAt === null) {
       throw failure("RESTORE_CONFLICT", "Fleet restore fence is active; new transactions are blocked.");
     }
@@ -640,7 +703,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       try {
         await this.advance(existing.restore_id);
       } catch (error) {
-        await this.parkForManualRepair(existing.restore_id, error, null, null);
+        await this.retryOrPark(existing.restore_id, error, null, null);
         throw error;
       }
       const refreshed = this.operation(existing.restore_id)!;
@@ -650,7 +713,14 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       if (refreshed.stage === "failed") {
         throw failure("RESTORE_CONFLICT", "This immutable preview attempt failed; correct the evidence gap and use a new idempotency key.");
       }
-      return json({ ok: true, status: "previewing", restore_id: existing.restore_id, retry_after_ms: RESTORE_ALARM_DELAY_MS }, 202);
+      return json({
+        ok: true,
+        status: "previewing",
+        restore_id: existing.restore_id,
+        fleet_id: existing.fleet_id,
+        cutoff: existing.cutoff,
+        retry_after_ms: RESTORE_ALARM_DELAY_MS,
+      }, 202);
     }
 
     const restoreIdentityHash = await hashCanonicalJson([parameterHash, body.idempotency_key]);
@@ -675,7 +745,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     try {
       await this.advance(restoreId);
     } catch (error) {
-      await this.parkForManualRepair(restoreId, error, null, null);
+      await this.retryOrPark(restoreId, error, null, null);
       throw error;
     }
     const operation = this.operation(restoreId)!;
@@ -683,7 +753,14 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       return json({ ok: true, status: "previewed", plan: JSON.parse(operation.plan_json) });
     }
     await this.schedule();
-    return json({ ok: true, status: "previewing", restore_id: restoreId, retry_after_ms: RESTORE_ALARM_DELAY_MS }, 202);
+    return json({
+      ok: true,
+      status: "previewing",
+      restore_id: restoreId,
+      fleet_id: body.fleet_id,
+      cutoff: body.cutoff,
+      retry_after_ms: RESTORE_ALARM_DELAY_MS,
+    }, 202);
   }
 
   private async readCatalogProof(operation: OperationRow): Promise<CatalogProof> {
@@ -817,7 +894,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       : JSON.parse(operation.manifest_cursor_json) as ManifestEnumerationCursorV2;
     const request: ManifestEnumerationRequestV2 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      format_version: CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: operation.fleet_id,
       coverage_start: String(pin.coverage_start),
       cutoff: operation.cutoff,
@@ -841,7 +918,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     }
     const result = raw as ManifestEnumerationResultV2;
     if (
-      result.format_version !== MANIFEST_ENUMERATION_FORMAT_VERSION
+      result.format_version !== CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION
       || result.request_hash !== requestHash
       || result.catalog_close_key !== pin.catalog_close_key
       || result.fleet_root_hash !== pin.fleet_root_hash
@@ -943,7 +1020,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       throw failure("RESTORE_HASH_CONTRADICTION", "Coordinator redo envelope failed canonical validation.", { tx_id: row.tx_id });
     }
     if (!isObject(envelope)) throw failure("RESTORE_HASH_CONTRADICTION", "Coordinator redo envelope is malformed.");
-    const actualHash = await hashRedoEnvelope(envelope as unknown as ReadableRedoEnvelope);
+    const actualHash = await hashFinalizedRedoEnvelope(envelope as unknown as ReadableRedoEnvelope);
     if (actualHash !== row.envelope_hash) {
       throw failure("RESTORE_HASH_CONTRADICTION", "Coordinator redo envelope does not match the manifest hash.", { tx_id: row.tx_id });
     }
@@ -1151,7 +1228,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     try {
       await this.advance(body.restore_id);
     } catch (error) {
-      await this.parkForManualRepair(body.restore_id, error, null, null);
+      await this.retryOrPark(body.restore_id, error, null, null);
     }
     await this.schedule();
     return json({ ok: true, status: "accepted", restore_id: body.restore_id, plan_hash: body.plan_hash }, 202);
@@ -1176,16 +1253,24 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       ? null
       : JSON.parse(operation.catalog_proof_json) as CatalogProof;
     const rawProofs = Array.isArray(pinned?.raw) ? pinned.raw : [];
-    for (let i = 0; i < this.catalogShardCount(); i += 1) {
-      const local = rawProofs.find((candidate) => isObject(candidate) && candidate.catalog_id === `catalog-${i}`);
-      if (!isObject(local)) throw failure("RESTORE_ENUMERATION_INCOMPLETE", "Pinned catalog proof is missing.");
-      await postToStub(this.env.CATALOG.getByName(`catalog-${i}`), "/restore-fence", {
-        restoreId: operation.restore_id,
-        generation: operation.fence_generation,
-        action: "install",
-        expectedTopologyHash: stringField(local, "topologyHash", "topology_hash"),
-        expectedTopologyEpoch: numberField(local, "topologyEpoch", "topology_epoch"),
-      });
+    try {
+      for (let i = 0; i < this.catalogShardCount(); i += 1) {
+        const local = rawProofs.find((candidate) => isObject(candidate) && candidate.catalog_id === `catalog-${i}`);
+        if (!isObject(local)) throw failure("RESTORE_ENUMERATION_INCOMPLETE", "Pinned catalog proof is missing.");
+        await postToStub(this.env.CATALOG.getByName(`catalog-${i}`), "/restore-fence", {
+          restoreId: operation.restore_id,
+          generation: operation.fence_generation,
+          action: "install",
+          expectedTopologyHash: stringField(local, "topologyHash", "topology_hash"),
+          expectedTopologyEpoch: numberField(local, "topologyEpoch", "topology_epoch"),
+        });
+      }
+    } catch (error) {
+      if (error instanceof RestoreContractViolation && !error.protocolError.retryable) {
+        await this.failBeforeRestore(operation, error.protocolError.code, error.protocolError.message);
+        return;
+      }
+      throw error;
     }
     this.sql.exec(
       "UPDATE restore_operations SET stage = 'fencing_participants', updated_at = ? WHERE restore_id = ?",
@@ -1213,12 +1298,21 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       );
       return;
     }
-    const result = await postToStub(this.participantStub(participant), "/restore-fence", {
-      fleet_id: operation.fleet_id,
-      restore_id: operation.restore_id,
-      generation: operation.fence_generation,
-      action: "install",
-    });
+    let result: JsonObject;
+    try {
+      result = await postToStub(this.participantStub(participant), "/restore-fence", {
+        fleet_id: operation.fleet_id,
+        restore_id: operation.restore_id,
+        generation: operation.fence_generation,
+        action: "install",
+      });
+    } catch (error) {
+      if (error instanceof RestoreContractViolation && !error.protocolError.retryable) {
+        await this.failBeforeRestore(operation, error.protocolError.code, error.protocolError.message);
+        return;
+      }
+      throw error;
+    }
     const closedThrough = canonicalTimestamp(result.closed_through ?? result.closedThrough);
     const preFenceBookmark = stringField(result, "pre_fence_bookmark", "preFenceBookmark");
     if (closedThrough === null || preFenceBookmark === null) {
@@ -1276,7 +1370,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
 
   private async failBeforeRestore(operation: OperationRow, code: RestoreProtocolError["code"], message: string): Promise<void> {
     const participants = this.many<ParticipantRow>(
-      "SELECT * FROM restore_participants WHERE restore_id = ? AND status IN ('fenced', 'ready') ORDER BY participant_id",
+      "SELECT * FROM restore_participants WHERE restore_id = ? ORDER BY participant_id",
       operation.restore_id,
     );
     for (const participant of participants) {
@@ -1295,11 +1389,24 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       }
     }
     for (let i = 0; i < this.catalogShardCount(); i += 1) {
+      try {
         await postToStub(this.env.CATALOG.getByName(`catalog-${i}`), "/restore-fence", {
           restoreId: operation.restore_id,
           generation: operation.fence_generation,
           action: "release",
-      });
+        });
+      } catch {
+        // CatalogDO release is idempotent when no local generation was ever
+        // installed. A transport failure is still ambiguous, so retain the
+        // external fleet gate and surface the exact catalog for repair.
+        await this.parkForManualRepair(
+          operation.restore_id,
+          failure("RESTORE_INTERRUPTED", message),
+          `catalog-${i}`,
+          null,
+        );
+        return;
+      }
     }
     const now = new Date().toISOString();
     this.ctx.storage.transactionSync(() => {
@@ -1761,6 +1868,11 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
        WHERE restore_id = ? AND status NOT IN ('retained', 'discarded')`,
       operation.restore_id,
     )?.n ?? 0;
+    const current = this.operation(operation.restore_id);
+    if (current?.stage !== "releasing_participants") {
+      await this.schedule();
+      return;
+    }
     if (incompleteParticipants > 0 || incompleteTransactions > 0 || incompleteCoordinators > 0) {
       throw failure("RESTORE_INVARIANT_FAILED", "Restore cannot release the fleet with incomplete work.");
     }
@@ -1803,6 +1915,26 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       verified_at: now,
     };
     this.ctx.storage.transactionSync(() => {
+      const current = this.operation(operation.restore_id);
+      const pendingParticipants = this.one<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM restore_participants WHERE restore_id = ? AND status != 'released'",
+        operation.restore_id,
+      )?.n ?? 0;
+      const pendingTransactions = this.one<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM restore_manifest_records WHERE restore_id = ? AND reconciliation_status != 'complete'",
+        operation.restore_id,
+      )?.n ?? 0;
+      const pendingCoordinators = this.one<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM restore_coordinator_work
+         WHERE restore_id = ? AND status NOT IN ('retained', 'discarded')`,
+        operation.restore_id,
+      )?.n ?? 0;
+      if (current?.stage !== "releasing_participants") {
+        throw failure("RESTORE_INVARIANT_FAILED", "Restore stage changed after final inventory linearization.");
+      }
+      if (pendingParticipants > 0 || pendingTransactions > 0 || pendingCoordinators > 0) {
+        throw failure("RESTORE_INVARIANT_FAILED", "Restore became incomplete during final fleet release.");
+      }
       this.sql.exec(
         `UPDATE restore_operations SET phase = 'complete', stage = 'complete', report_json = ?,
          completed_at = ?, updated_at = ?, blocker_json = NULL WHERE restore_id = ?`,
@@ -1811,12 +1943,15 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
         now,
         operation.restore_id,
       );
-      this.sql.exec(
+      const clearedGate = this.sql.exec(
         `UPDATE fleet_restore_gate SET active = 0, restore_id = NULL, phase = NULL, activated_at = NULL
          WHERE singleton = 1 AND restore_id = ? AND generation = ?`,
         operation.restore_id,
         operation.fence_generation,
       );
+      if (clearedGate.rowsWritten !== 1) {
+        throw failure("RESTORE_INVARIANT_FAILED", "Restore completion did not durably clear the fleet gate.");
+      }
     });
     this.recordEvent(operation.restore_id, "restore_complete", {
       discarded_write_count: lossHashes.length,
@@ -1908,7 +2043,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       try {
         await this.advance(operation.restore_id);
       } catch (error) {
-        await this.parkForManualRepair(operation.restore_id, error, null, null);
+        await this.retryOrPark(operation.restore_id, error, null, null);
       }
       await this.schedule();
       return json({ ok: true, status: "already_started", restore_id: body.restore_id, plan_hash: body.plan_hash }, 202);
@@ -1972,7 +2107,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     try {
       await this.advance(operation.restore_id);
     } catch (error) {
-      await this.parkForManualRepair(operation.restore_id, error, null, null);
+      await this.retryOrPark(operation.restore_id, error, null, null);
     }
     await this.schedule();
     return json({ ok: true, status: "accepted", restore_id: body.restore_id, plan_hash: body.plan_hash }, 202);
@@ -2151,10 +2286,44 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     try {
       await this.advance(operation.restore_id);
     } catch (error) {
-      await this.parkForManualRepair(operation.restore_id, error, null, null);
+      await this.retryOrPark(operation.restore_id, error, null, null);
     }
     await this.schedule();
     return json({ ok: true, status: "already_started", restore_id: operation.restore_id, plan_hash: operation.plan_hash }, 202);
+  }
+
+  private async retryOrPark(
+    restoreId: string,
+    error: unknown,
+    participantId: string | null,
+    txId: string | null,
+  ): Promise<void> {
+    if (error instanceof RestoreContractViolation && error.protocolError.retryable) {
+      const operation = this.operation(restoreId);
+      if (!operation || TERMINAL_RESTORE_STAGES.includes(operation.stage as typeof TERMINAL_RESTORE_STAGES[number])) return;
+      const attempt = operation.retry_count + 1;
+      if (attempt < MAX_RESTORE_RETRY_ATTEMPTS) {
+        const delayMs = Math.min(MAX_RESTORE_RETRY_DELAY_MS, RESTORE_ALARM_DELAY_MS * 2 ** (attempt - 1));
+        const now = Date.now();
+        this.sql.exec(
+          `UPDATE restore_operations SET retry_count = ?, retry_started_at_ms = COALESCE(retry_started_at_ms, ?),
+             retry_not_before_ms = ?, updated_at = ? WHERE restore_id = ?`,
+          attempt,
+          now,
+          now + delayMs,
+          new Date(now).toISOString(),
+          restoreId,
+        );
+        this.recordEvent(restoreId, "restore_retry_scheduled", {
+          code: error.protocolError.code,
+          attempt,
+          delay_ms: delayMs,
+        });
+        await this.schedule(delayMs);
+        return;
+      }
+    }
+    await this.parkForManualRepair(restoreId, error, participantId, txId);
   }
 
   private async parkForManualRepair(
@@ -2165,6 +2334,7 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
   ): Promise<void> {
     const operation = this.operation(restoreId);
     if (!operation) return;
+    if (TERMINAL_RESTORE_STAGES.includes(operation.stage as typeof TERMINAL_RESTORE_STAGES[number])) return;
     const protocolError = error instanceof RestoreContractViolation
       ? error.protocolError
       : restoreError("RESTORE_INTERRUPTED", error instanceof Error ? error.message : String(error));
@@ -2178,7 +2348,8 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
     }];
     const now = new Date().toISOString();
     this.sql.exec(
-      `UPDATE restore_operations SET phase = ?, stage = ?, blocker_json = ?, resume_phase = ?, resume_stage = ?, updated_at = ?
+      `UPDATE restore_operations SET phase = ?, stage = ?, blocker_json = ?, resume_phase = ?, resume_stage = ?,
+         retry_count = 0, retry_started_at_ms = NULL, retry_not_before_ms = NULL, updated_at = ?
        WHERE restore_id = ?`,
       phase,
       phase,
@@ -2201,6 +2372,10 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
   private async advance(restoreId: string): Promise<void> {
     const operation = this.operation(restoreId);
     if (!operation) throw failure("RESTORE_INVALID_REQUEST", "Restore operation was not found.");
+    if (operation.retry_not_before_ms !== null && operation.retry_not_before_ms > Date.now()) {
+      await this.schedule(operation.retry_not_before_ms - Date.now());
+      return;
+    }
     switch (operation.stage) {
       case "closing_manifest":
         await this.closeManifest(operation);
@@ -2261,6 +2436,11 @@ export class RestoreCoordinatorDO extends DurableObject<RestoreCoordinatorEnv> {
       default:
         throw failure("RESTORE_INTERRUPTED", `Unknown durable restore stage ${operation.stage}.`);
     }
+    this.sql.exec(
+      `UPDATE restore_operations SET retry_count = 0, retry_started_at_ms = NULL, retry_not_before_ms = NULL
+       WHERE restore_id = ?`,
+      restoreId,
+    );
     const refreshed = this.operation(restoreId);
     if (refreshed && !["previewed", "complete", "rolled_back", "failed", "manual_repair_required"].includes(refreshed.stage)) {
       await this.schedule();

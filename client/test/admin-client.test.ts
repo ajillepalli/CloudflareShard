@@ -221,7 +221,10 @@ describe("CloudflareShardAdminClient", () => {
     });
 
     it("projects ergonomic preview input to the exact versioned wire request", async () => {
-      const response = { ok: true, status: "previewing", restore_id: "restore-1", retry_after_ms: 1000 };
+      const response = {
+        ok: true, status: "previewing", restore_id: "restore-1", fleet_id: "default",
+        cutoff: "2026-08-05T12:00:00.000Z", retry_after_ms: 1000,
+      };
       const { fetchImpl, calls } = mockFetch(202, response);
       const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
@@ -291,6 +294,18 @@ describe("CloudflareShardAdminClient", () => {
     });
 
     it("rejects successful responses that are bound to a different restore request", async () => {
+      const pendingPreview = new CloudflareShardAdminClient({
+        baseUrl: "http://x",
+        token: "t",
+        fetchImpl: mockFetch(202, {
+          ok: true, status: "previewing", restore_id: "restore-other", fleet_id: "other",
+          cutoff: "2026-08-05T12:00:00.000Z", retry_after_ms: 1000,
+        }).fetchImpl,
+      });
+      await expect(pendingPreview.restorePreview({
+        fleetId: "default", cutoff: "2026-08-05T12:00:00.000Z", idempotencyKey: "preview-1",
+      })).rejects.toMatchObject({ code: "INVALID_RESTORE_RESPONSE", status: 502 });
+
       const accepted = new CloudflareShardAdminClient({
         baseUrl: "http://x",
         token: "t",
@@ -330,7 +345,10 @@ describe("CloudflareShardAdminClient", () => {
       const { fetchImpl, calls } = mockFetch(200, status(phase));
       const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
-      await expect(client.waitForRestore("restore-1", { intervalMs: 1 })).resolves.toMatchObject({ phase });
+      await expect(client.waitForRestore("restore-1", {
+        intervalMs: 1,
+        ...(phase === "previewed" ? { until: "preview" as const } : {}),
+      })).resolves.toMatchObject({ phase });
       expect(calls).toHaveLength(1);
     });
 

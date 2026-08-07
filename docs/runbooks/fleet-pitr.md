@@ -35,6 +35,10 @@ The separately bound `RESTORE_COORDINATOR` Durable Object must stay outside
 the shard histories it controls. Preserve the root and route-less
 control-plane namespaces during deploys and rollback. Do not clone only a
 subset of these namespaces into a new deployment and call it the same fleet.
+Every non-restore POST application/admin request consults this authority and
+fails closed with 503 if it is unavailable. This deliberate safety dependency
+adds one Durable Object hop. `GET /health` is exempt so liveness probes continue
+to answer while the restore authority is fenced or temporarily unavailable.
 
 ## Before preview
 
@@ -273,9 +277,10 @@ POST /admin/restore-rollback  {protocol_version:1, format_version:1, restore_id,
 
 The typed SDK methods are `restorePreview`, `restoreExecute`, `restoreStatus`,
 `restoreReconcile`, `restoreRollback`, and `waitForRestore`. `waitForRestore`
-defaults to polling every 500 ms for at most 30 minutes and returns `previewed`,
+defaults to polling execution every 500 ms for at most 30 minutes and returns
 `parked_lease_lost`, `complete`, `rolled_back`, `manual_repair_required`, and
-`failed` as visible non-progressing or terminal states.
+`failed` as visible non-progressing or terminal states. Pass `{until:"preview"}`
+when polling preview creation; only that explicit mode returns `previewed`.
 
 ## Release gate: three live rehearsals
 

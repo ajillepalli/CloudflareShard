@@ -69,6 +69,17 @@ describe("CLI", () => {
     expect(stdout).toContain("manual_repair_required");
   });
 
+  it("run maps restore input validation to exit 2", async () => {
+    let stderr = "";
+    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => { stderr += String(chunk); return true; }) as typeof process.stderr.write);
+
+    await expect(run([
+      "restore-preview", "--url", "http://x", "--token", "t", "--fleet-id", "default",
+      "--cutoff", "2026-08-05 12:00:00", "--idempotency-key", "preview-1",
+    ])).resolves.toBe(2);
+    expect(stderr).toContain("canonical UTC");
+  });
+
   it("converts receipt filesystem rejection into stable JSON and exit 3 without rejecting", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "cfs-cli-receipt-failure-"));
     const blockingFile = path.join(directory, "not-a-directory");
@@ -130,7 +141,10 @@ describe("CLI", () => {
     });
 
     it("restore-preview maps required operator flags to the versioned wire body", async () => {
-      const { fetchImpl, calls } = mockFetch(202, { ok: true, status: "previewing", restore_id: "restore-1", retry_after_ms: 1000 });
+      const { fetchImpl, calls } = mockFetch(202, {
+        ok: true, status: "previewing", restore_id: "restore-1", fleet_id: "default",
+        cutoff: "2026-08-05T12:00:00.000Z", retry_after_ms: 1000,
+      });
       const client = new CloudflareShardAdminClient({ baseUrl: "http://x", token: "t", fetchImpl });
 
       await dispatch(client, "restore-preview", {

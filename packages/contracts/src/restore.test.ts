@@ -178,7 +178,8 @@ describe("immutable restore plan", () => {
 describe("restore response contracts", () => {
   it("validates exact preview result variants", () => {
     expect(() => validateRestorePreviewResult({
-      ok: true, status: "previewing", restore_id: "restore-001", retry_after_ms: 1_000,
+      ok: true, status: "previewing", restore_id: "restore-001", fleet_id: "default",
+      cutoff: "2026-08-05T12:00:00.000Z", retry_after_ms: 1_000,
     })).not.toThrow();
     expect(() => validateRestorePreviewResult({
       ok: true, status: "previewed", plan: { ...planBody(), plan_hash: HASH_A },
@@ -187,7 +188,8 @@ describe("restore response contracts", () => {
       ok: true, status: "queued", restore_id: "restore-001", retry_after_ms: 1_000,
     }))).toBe("RESTORE_INVALID_REQUEST");
     expect(code(() => validateRestorePreviewResult({
-      ok: true, status: "previewing", restore_id: "restore-001", retry_after_ms: 1_000, extra: true,
+      ok: true, status: "previewing", restore_id: "restore-001", fleet_id: "default",
+      cutoff: "2026-08-05T12:00:00.000Z", retry_after_ms: 1_000, extra: true,
     }))).toBe("RESTORE_INVALID_REQUEST");
   });
 

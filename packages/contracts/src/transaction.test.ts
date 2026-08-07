@@ -8,6 +8,7 @@ import {
   MANIFEST_CATALOG_FORMAT_VERSION,
   MANIFEST_CURSOR_FORMAT_VERSION,
   MANIFEST_ENUMERATION_CURSOR_FORMAT_VERSION,
+  CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_ENUMERATION_FORMAT_VERSION,
   MANIFEST_ENUMERATION_V1_FORMAT_VERSION,
   MANIFEST_PARTITION_COUNT,
@@ -923,9 +924,11 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
   });
 
   it("validates fleet cursors, enumeration requests, per-bucket evidence, and completeness consistency", async () => {
+    expect(MANIFEST_ENUMERATION_FORMAT_VERSION).toBe(1);
+    expect(CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION).toBe(2);
     const request: ManifestEnumerationRequestV2 = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      format_version: CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
       fleet_id: "fleet-test",
       coverage_start: RESERVED_AT,
       cutoff: CUTOFF,
@@ -970,7 +973,7 @@ describe("manifest page, enumeration, cursor, and coverage contracts", () => {
     const record = await finalizedRecord();
     const result = {
       protocol_version: CURRENT_PROTOCOL_VERSION,
-      format_version: MANIFEST_ENUMERATION_FORMAT_VERSION,
+      format_version: CURRENT_MANIFEST_ENUMERATION_FORMAT_VERSION,
       request_hash: requestHash,
       catalog_close_key: request.catalog_close_key,
       fleet_root_hash: request.fleet_root_hash,

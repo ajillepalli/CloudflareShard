@@ -31,6 +31,8 @@ const COMMANDS = [...ONBOARDING_COMMANDS, ...ADMIN_COMMANDS] as const;
 type Command = (typeof COMMANDS)[number];
 type AdminCommand = (typeof ADMIN_COMMANDS)[number];
 
+class CliInputError extends Error {}
+
 export function usage(): string {
   return `cloudflareshard <command> [options]
 
@@ -63,6 +65,7 @@ Onboarding output:
   --receipt-dir PATH receipt directory (default: .cloudflareshard/receipts)
   Exit codes         0 success, 2 invalid/unsafe input, 3 prerequisite failure,
                      4 verification failure, 5 pending reconciliation
+  Restore status     parked/manual-repair/failed states exit 4 after printing
 
 Examples:
   cloudflareshard doctor
@@ -183,14 +186,23 @@ export async function run(argv: string[]): Promise<number> {
     return exitCodeFor(result);
   }
 
-  const result = await dispatch(client, command, values);
+  let result: unknown;
+  try {
+    result = await dispatch(client, command, values);
+  } catch (error) {
+    if (error instanceof CliInputError) {
+      process.stderr.write(`${error.message}\n`);
+      return 2;
+    }
+    throw error;
+  }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (
     command === "restore-status"
     && result !== null
     && typeof result === "object"
     && "phase" in result
-    && ["manual_repair_required", "failed"].includes(String(result.phase))
+    && ["parked_lease_lost", "manual_repair_required", "failed"].includes(String(result.phase))
   ) return 4;
   return 0;
 }
@@ -198,7 +210,7 @@ export async function run(argv: string[]): Promise<number> {
 export function requireFlag(values: Record<string, unknown>, flag: string): string {
   const value = values[flag];
   if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`Missing required flag: --${flag}`);
+    throw new CliInputError(`Missing required flag: --${flag}`);
   }
   return value;
 }
@@ -206,7 +218,7 @@ export function requireFlag(values: Record<string, unknown>, flag: string): stri
 export function requireSha256Flag(values: Record<string, unknown>, flag: string): string {
   const value = requireFlag(values, flag);
   if (!/^[a-f0-9]{64}$/.test(value)) {
-    throw new Error(`--${flag} must be a lowercase SHA-256 hexadecimal digest.`);
+    throw new CliInputError(`--${flag} must be a lowercase SHA-256 hexadecimal digest.`);
   }
   return value;
 }
@@ -215,7 +227,7 @@ export function requireCanonicalUtcFlag(values: Record<string, unknown>, flag: s
   const value = requireFlag(values, flag);
   const parsed = new Date(value);
   if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
-    throw new Error(`--${flag} must be a canonical UTC timestamp (for example 2026-08-05T12:00:00.000Z).`);
+    throw new CliInputError(`--${flag} must be a canonical UTC timestamp (for example 2026-08-05T12:00:00.000Z).`);
   }
   return value;
 }

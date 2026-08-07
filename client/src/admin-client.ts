@@ -354,14 +354,17 @@ export class CloudflareShardAdminClient extends CloudflareShardClient {
    * returned rather than hidden behind a generic exception. */
   async waitForRestore(
     restoreId: string,
-    options: { intervalMs?: number; maxWaitMs?: number } = {},
+    options: { intervalMs?: number; maxWaitMs?: number; until?: "preview" | "execution" } = {},
   ): Promise<RestoreStatusResponse> {
     const intervalMs = options.intervalMs ?? 500;
     const maxWaitMs = options.maxWaitMs ?? 30 * 60 * 1000;
     const deadline = Date.now() + maxWaitMs;
     for (;;) {
       const status = await this.restoreStatus({ restoreId });
-      if (["previewed", "parked_lease_lost", "complete", "rolled_back", "manual_repair_required", "failed"].includes(status.phase)) return status;
+      if (
+        ["parked_lease_lost", "complete", "rolled_back", "manual_repair_required", "failed"].includes(status.phase)
+        || (options.until === "preview" && status.phase === "previewed")
+      ) return status;
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out after ${maxWaitMs}ms waiting for restore ${restoreId} to become terminal (still '${status.phase}').`,

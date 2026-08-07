@@ -1,5 +1,6 @@
 import { SELF, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
+import { RestoreContractViolation, restoreError } from "../packages/contracts/src/index.js";
 import type { RestoreCoordinatorDO } from "./restore";
 import type { ParticipantPitrPort, ShardDO } from "./shard";
 
@@ -57,6 +58,252 @@ describe("RestoreCoordinatorDO external fleet gate", () => {
     });
   });
 
+  it("linearizes coordinator inventory before final fence release", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at, updated_at)
+         VALUES ('restore-release-race', 'default', ?, 'release-race', ?, 'verifying',
+                 'releasing_participants', ?, ?, 31, ?, ?, ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "a".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+        now,
+      );
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-release-race', generation = 31,
+         phase = 'verifying', activated_at = ? WHERE singleton = 1`,
+        now,
+      );
+      const mutable = instance as unknown as {
+        env: { CATALOG: unknown };
+        operation: (restoreId: string) => unknown;
+        completeRestore: (operation: unknown) => Promise<void>;
+        handleRegisterCoordinator: (request: Request) => Promise<Response>;
+        catalogShardCount: () => number;
+      };
+      let releaseCatalog!: () => void;
+      let catalogEntered!: () => void;
+      const catalogBlocked = new Promise<void>((resolve) => { releaseCatalog = resolve; });
+      const catalogStarted = new Promise<void>((resolve) => { catalogEntered = resolve; });
+      mutable.catalogShardCount = () => 1;
+      mutable.env.CATALOG = {
+        getByName: () => ({
+          fetch: async () => {
+            catalogEntered();
+            await catalogBlocked;
+            return Response.json({ ok: true, released: true });
+          },
+        }),
+      };
+      const completion = mutable.completeRestore(mutable.operation("restore-release-race"));
+      await catalogStarted;
+      const registration = () => mutable.handleRegisterCoordinator(internal("/register-coordinator", {
+          fleet_id: "default",
+          tx_id: "late-release-race",
+          existing_created_at: new Date(Date.now() - 120_000).toISOString(),
+        }));
+      await expect(registration()).rejects.toMatchObject({
+        protocolError: { code: "RESTORE_UNAVAILABLE", retryable: true },
+      });
+      releaseCatalog();
+      await completion;
+
+      expect(Array.from(state.storage.sql.exec<{ stage: string }>(
+        "SELECT stage FROM restore_operations WHERE restore_id = 'restore-release-race'",
+      ))[0].stage).toBe("complete");
+      expect(Array.from(state.storage.sql.exec<{ active: number }>(
+        "SELECT active FROM fleet_restore_gate WHERE singleton = 1",
+      ))[0].active).toBe(0);
+      const afterRelease = await registration();
+      expect(await afterRelease.json()).toMatchObject({
+        disposition: "discard_required",
+        restore_id: "restore-release-race",
+        generation: 31,
+      });
+    });
+  });
+
+  it("keeps coordinator inventory closed while final release is parked", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at,
+           resume_phase, resume_stage, updated_at)
+         VALUES ('restore-release-parked', 'default', ?, 'release-parked', ?, 'manual_repair_required',
+                 'manual_repair_required', ?, ?, 32, ?, ?, 'verifying', 'releasing_participants', ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "d".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+        now,
+      );
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-release-parked', generation = 32,
+         phase = 'manual_repair_required', activated_at = ? WHERE singleton = 1`,
+        now,
+      );
+    });
+
+    const response = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "default",
+      tx_id: "late-while-parked",
+      existing_created_at: new Date(Date.now() - 120_000).toISOString(),
+    }));
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "RESTORE_UNAVAILABLE", retryable: true } });
+  });
+
+  it("rolls back completion when the fleet gate cannot be cleared atomically", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at, updated_at)
+         VALUES ('restore-gate-mismatch', 'default', ?, 'gate-mismatch', ?, 'verifying',
+                 'releasing_participants', ?, ?, 33, ?, ?, ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "e".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+        now,
+        now,
+      );
+      state.storage.sql.exec(
+        `UPDATE fleet_restore_gate SET active = 1, restore_id = 'restore-gate-mismatch', generation = 34,
+         phase = 'verifying', activated_at = ? WHERE singleton = 1`,
+        now,
+      );
+      const mutable = instance as unknown as {
+        env: { CATALOG: unknown };
+        operation: (restoreId: string) => unknown;
+        completeRestore: (operation: unknown) => Promise<void>;
+        catalogShardCount: () => number;
+      };
+      mutable.catalogShardCount = () => 1;
+      mutable.env.CATALOG = {
+        getByName: () => ({ fetch: async () => Response.json({ ok: true, released: true }) }),
+      };
+
+      await expect(mutable.completeRestore(mutable.operation("restore-gate-mismatch"))).rejects.toMatchObject({
+        protocolError: { code: "RESTORE_INVARIANT_FAILED" },
+      });
+
+      expect(state.storage.sql.exec<{ stage: string }>(
+        "SELECT stage FROM restore_operations WHERE restore_id = 'restore-gate-mismatch'",
+      ).one().stage).toBe("releasing_participants");
+      expect(state.storage.sql.exec<{ active: number }>(
+        "SELECT active FROM fleet_restore_gate WHERE singleton = 1",
+      ).one().active).toBe(1);
+    });
+  });
+
+  it("keeps alarms armed for queued previews after another preview finishes", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      const later = new Date(Date.now() + 1).toISOString();
+      for (const [restoreId, updatedAt] of [["restore-preview-a", now], ["restore-preview-b", later]]) {
+        state.storage.sql.exec(
+          `INSERT INTO restore_operations
+            (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+             previewed_at, execute_before, updated_at)
+           VALUES (?, 'default', ?, ?, ?, 'previewing', 'closing_manifest', ?, ?, ?)`,
+          restoreId,
+          new Date(Date.now() - 60_000).toISOString(),
+          restoreId,
+          restoreId === "restore-preview-a" ? "a".repeat(64) : "b".repeat(64),
+          now,
+          new Date(Date.now() + 60_000).toISOString(),
+          updatedAt,
+        );
+      }
+      const mutable = instance as unknown as { advance: (restoreId: string) => Promise<void> };
+      mutable.advance = async (restoreId) => {
+        state.storage.sql.exec(
+          "UPDATE restore_operations SET stage = 'previewed', phase = 'previewed' WHERE restore_id = ?",
+          restoreId,
+        );
+      };
+
+      await instance.alarm();
+
+      expect(state.storage.sql.exec<{ stage: string }>(
+        "SELECT stage FROM restore_operations WHERE restore_id = 'restore-preview-b'",
+      ).one().stage).toBe("closing_manifest");
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("backs off transient advance failures and eventually surfaces a blocker", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    await runInDurableObject(stub, async (instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, updated_at)
+         VALUES ('restore-retry', 'default', ?, 'restore-retry', ?, 'previewing',
+                 'closing_manifest', ?, ?, ?)`,
+        new Date(Date.now() - 60_000).toISOString(),
+        "c".repeat(64),
+        now,
+        new Date(Date.now() + 60_000).toISOString(),
+        now,
+      );
+      const mutable = instance as unknown as { advance: () => Promise<void> };
+      mutable.advance = async () => {
+        throw new RestoreContractViolation(restoreError("RESTORE_UNAVAILABLE", "temporary"));
+      };
+
+      await instance.alarm();
+
+      expect(state.storage.sql.exec<{ stage: string; retry_count: number }>(
+        "SELECT stage, retry_count FROM restore_operations WHERE restore_id = 'restore-retry'",
+      ).one()).toEqual({ stage: "closing_manifest", retry_count: 1 });
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      state.storage.sql.exec(
+        "UPDATE restore_operations SET retry_not_before_ms = 0 WHERE restore_id = 'restore-retry'",
+      );
+      await state.storage.deleteAlarm();
+      const beforeSecondRetry = Date.now();
+      await instance.alarm();
+      expect((await state.storage.getAlarm())! - beforeSecondRetry).toBeGreaterThanOrEqual(400);
+      for (let attempt = 2; attempt < 10; attempt += 1) {
+        state.storage.sql.exec(
+          "UPDATE restore_operations SET retry_not_before_ms = 0 WHERE restore_id = 'restore-retry'",
+        );
+        await state.storage.deleteAlarm();
+        await instance.alarm();
+      }
+      const parked = state.storage.sql.exec<{ stage: string; blocker_json: string }>(
+        "SELECT stage, blocker_json FROM restore_operations WHERE restore_id = 'restore-retry'",
+      ).one();
+      expect(parked.stage).toBe("failed");
+      expect(JSON.parse(parked.blocker_json)).toMatchObject([{ code: "RESTORE_UNAVAILABLE" }]);
+    });
+  });
+
   it("registers coordinator inventory coverage and rejects another logical fleet", async () => {
     const stub = restoreStub();
     const rejected = await stub.fetch(internal("/register-coordinator", {
@@ -92,7 +339,7 @@ describe("RestoreCoordinatorDO external fleet gate", () => {
         `INSERT INTO restore_operations
           (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
            previewed_at, execute_before, fence_generation, fence_installed_at, started_at, updated_at)
-         VALUES ('restore-active', 'default', ?, 'active-registration', ?, 'verifying', 'releasing_participants',
+         VALUES ('restore-active', 'default', ?, 'active-registration', ?, 'verifying', 'discarding_coordinators',
                  ?, ?, 4, ?, ?, ?)`,
         new Date(Date.now() - 60_000).toISOString(),
         "d".repeat(64),
@@ -171,6 +418,40 @@ describe("RestoreCoordinatorDO external fleet gate", () => {
       restore_id: "restore-complete",
       generation: 8,
     });
+  });
+
+  it("does not discard a coordinator after a restore was rolled back", async () => {
+    const stub = restoreStub();
+    await stub.fetch(internal("/gate", { fleet_id: "default" }));
+    const createdAt = new Date(Date.now() - 120_000).toISOString();
+    await runInDurableObject(stub, async (_instance: RestoreCoordinatorDO, state: DurableObjectState) => {
+      const now = new Date().toISOString();
+      state.storage.sql.exec(
+        `INSERT INTO restore_operations
+          (restore_id, fleet_id, cutoff, idempotency_key, parameter_hash, phase, stage,
+           previewed_at, execute_before, fence_generation, fence_installed_at, started_at,
+           completed_at, updated_at)
+         VALUES ('restore-rolled-back', 'default', ?, 'rolled-back-registration', ?, 'rolled_back', 'rolled_back',
+                 ?, ?, 9, ?, ?, ?, ?)`,
+        createdAt,
+        "f".repeat(64),
+        createdAt,
+        now,
+        new Date(Date.now() - 60_000).toISOString(),
+        createdAt,
+        now,
+        now,
+      );
+    });
+
+    const response = await stub.fetch(internal("/register-coordinator", {
+      fleet_id: "default",
+      tx_id: "tx-after-rollback",
+      existing_created_at: createdAt,
+    }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ disposition: "registered" });
   });
 
   it("revalidates the live fenced head rather than requiring the preview head to stay unchanged", async () => {

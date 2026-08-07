@@ -34,7 +34,7 @@ export type RestoreErrorCode = (typeof RESTORE_ERROR_CODES)[number];
 
 const RESTORE_ERROR_HTTP_STATUS: Readonly<Record<RestoreErrorCode, number>> = {
   RESTORE_INVALID_REQUEST: 400,
-  RESTORE_VERSION_UNSUPPORTED: 503,
+  RESTORE_VERSION_UNSUPPORTED: 400,
   RESTORE_CUTOFF_IN_FUTURE: 409,
   RESTORE_CUTOFF_OUTSIDE_PITR_WINDOW: 410,
   RESTORE_BOOKMARK_MISSING: 409,
@@ -245,6 +245,8 @@ export interface RestorePreviewPendingResultV1 {
   readonly ok: true;
   readonly status: "previewing";
   readonly restore_id: string;
+  readonly fleet_id: string;
+  readonly cutoff: string;
   readonly retry_after_ms: number;
 }
 
@@ -491,9 +493,11 @@ export function validateRestorePlanStructure(value: unknown): asserts value is R
 export function validateRestorePreviewResult(value: unknown): asserts value is RestorePreviewResultV1 {
   assertPlainObject(value, "restore_preview_result");
   if (value.status === "previewing") {
-    assertExactKeys(value, "restore_preview_result", ["ok", "status", "restore_id", "retry_after_ms"]);
+    assertExactKeys(value, "restore_preview_result", ["ok", "status", "restore_id", "fleet_id", "cutoff", "retry_after_ms"]);
     if (value.ok !== true) failRestore("RESTORE_INVALID_REQUEST", "Restore preview result must be successful.");
     assertString(value.restore_id, "restore_id");
+    assertString(value.fleet_id, "fleet_id");
+    parseTimestamp(value.cutoff, "cutoff");
     assertInteger(value.retry_after_ms, "retry_after_ms");
     return;
   }

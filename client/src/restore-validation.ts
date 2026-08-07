@@ -144,9 +144,14 @@ export function validateRestorePreviewResponse(
 ): RestorePreviewResponse {
   const response = object(value, "preview response");
   if (response.status === "previewing") {
-    exact(response, "preview response", ["ok", "status", "restore_id", "retry_after_ms"]);
+    exact(response, "preview response", ["ok", "status", "restore_id", "fleet_id", "cutoff", "retry_after_ms"]);
     if (response.ok !== true) invalid("preview response must be successful.");
     string(response.restore_id, "preview response.restore_id");
+    const fleetId = string(response.fleet_id, "preview response.fleet_id");
+    const cutoff = timestamp(response.cutoff, "preview response.cutoff");
+    if (expected && (fleetId !== expected.fleetId || cutoff !== expected.cutoff)) {
+      invalid("previewing response is not bound to the requested fleet and cutoff.");
+    }
     integer(response.retry_after_ms, "preview response.retry_after_ms");
     return response as unknown as RestorePreviewResponse;
   }

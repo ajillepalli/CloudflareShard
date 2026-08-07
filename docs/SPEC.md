@@ -50,7 +50,8 @@ Milestone 1/2 in the `feature/next-stage` design doc. Section 10 reflects this.
     durable commit record.
 
 - RestoreCoordinatorDO (non-restored fleet recovery authority)
-  - One durable authority addressed by `fleet:<DEPLOYMENT_FLEET_ID>`.
+  - One durable authority addressed by the stable object name
+    `deployment-restore-authority`, independent of mutable fleet labels.
   - Lives outside the shard histories it rewinds, so restore generation,
     immutable plan/evidence pins, undo bookmarks, progress, and the fleet gate
     survive shard PITR.
@@ -761,7 +762,7 @@ Request:
 
 Response:
 - 200 `{ok:true, status:"previewed", plan}` when all proof is complete
-- 202 `{ok:true, status:"previewing", restore_id, retry_after_ms}` while
+- 202 `{ok:true, status:"previewing", restore_id, fleet_id, cutoff, retry_after_ms}` while
   bounded close/enumeration/bookmark work is durably continuing
 
 The immutable `plan` contains protocol/format, restore/fleet identity, cutoff,
@@ -794,8 +795,9 @@ shard. It then durably discards coordinators without a commit decision at or
 before the cutoff before releasing local fences and the external fleet gate
 last. Existing coordinators register before alarm recovery; a coordinator
 missing from an active inventory is added to its loss pass, while one first
-discovered after a completed restore is quarantined before mutation. All non-restore HTTP
-routes return 503 `FLEET_RESTORE_IN_PROGRESS` while the gate is active; local
+discovered after a completed restore is quarantined before mutation. All non-restore POST
+routes return 503 `FLEET_RESTORE_IN_PROGRESS` while the gate is active; `GET /health`
+is intentionally exempt and unsupported methods still return 405. Local
 catalog/shard gates and coordinator external-gate checks independently reject
 races and fail closed when the non-restored authority is unavailable.
 
@@ -834,7 +836,7 @@ Request:
 - plan_hash string
 
 Response:
-- 202 `{ok:true, status:"already_started", restore_id, plan_hash}` while the
+- 202 `{ok:true, status:"accepted|already_started", restore_id, plan_hash}` while the
   exact operation resumes
 - 200 `already_started` if already complete
 

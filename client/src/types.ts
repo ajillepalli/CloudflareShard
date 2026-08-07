@@ -446,7 +446,7 @@ export interface RestorePlan {
 }
 
 export type RestorePreviewResponse =
-  | { ok: true; status: "previewing"; restore_id: string; retry_after_ms: number }
+  | { ok: true; status: "previewing"; restore_id: string; fleet_id: string; cutoff: string; retry_after_ms: number }
   | { ok: true; status: "previewed"; plan: RestorePlan };
 
 export interface RestoreAcceptedResponse {
